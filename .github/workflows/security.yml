@@ -1,0 +1,35 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        # Advisory only: dependency-review requires GitHub Advanced Security /
+        # Dependency Graph, which is not enabled on this repository. Don't block
+        # the PR when the feature is unavailable.
+        continue-on-error: true
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check that no API keys are committed
+        run: |
+          # Fail if anything that looks like an FMP/DB secret is checked in.
+          if grep -rEn "fmp_key[[:space:]]*=[[:space:]]*\"[A-Za-z0-9]{8,}\"" \
+               --include="*.py" --include="*.toml" --include="*.sql" src etc; then
+            echo "::error::A non-empty API key appears to be committed."
+            exit 1
+          fi
+          echo "No committed secrets detected."

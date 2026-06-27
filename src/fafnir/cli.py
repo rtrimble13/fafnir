@@ -1,0 +1,313 @@
+"""
+``fafnir`` -- administration CLI for the warehouse: migrations, seeding, ingestion,
+adjustment, data-quality, and status. Read access for analysis is via ``duk`` (db mode).
+
+Examples
+--------
+    fafnir db migrate
+    fafnir db seed
+    fafnir ingest securities --limit 500
+    fafnir ingest prices --symbols AAPL,MSFT --from 2023-01-01
+    fafnir ingest actions --symbols AAPL && fafnir adjust
+    fafnir db refresh-marts
+    fafnir dq run
+    fafnir status
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import Optional
+
+import click
+
+from fafnir import __version__
+from fafnir.config import get_config
+from fafnir.db.connection import Database
+from fafnir.logging_config import setup_logging
+
+
+def _parse_date(value: Optional[str]) -> Optional[dt.date]:
+    if not value:
+        return None
+    return dt.datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _split_symbols(value: Optional[str]) -> list[str]:
+    if not value:
+        return []
+    return [s.strip().upper() for s in value.split(",") if s.strip()]
+
+
+@click.group()
+@click.version_option(version=__version__, message="%(version)s")
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True),
+    help="Path to config file (default: ~/.fafnirrc)",
+)
+@click.pass_context
+def main(ctx, config):
+    """fafnir -- financial market data warehouse administration."""
+    ctx.ensure_object(dict)
+    cfg = get_config(config)
+    ctx.obj["config"] = cfg
+    ctx.obj["logger"] = setup_logging(log_level=cfg.log_level, log_dir=cfg.log_dir)
+
+
+# ---------------------------------------------------------------------------
+# db group
+# ---------------------------------------------------------------------------
+@main.group()
+def db():
+    """Schema migrations, seeding, partitions, mart refresh."""
+
+
+@db.command("migrate")
+@click.option("--target", help="Apply up to this migration version (e.g. 0005)")
+@click.pass_context
+def db_migrate(ctx, target):
+    """Apply pending up-migrations."""
+    from fafnir.db import migrate as m
+
+    applied = m.migrate(ctx.obj["config"].dsn, target=target)
+    if applied:
+        click.echo(f"Applied: {', '.join(applied)}")
+    else:
+        click.echo("Up to date.")
+
+
+@db.command("rollback")
+@click.option("--steps", default=1, show_default=True, help="Migrations to roll back")
+@click.pass_context
+def db_rollback(ctx, steps):
+    """Roll back the most recently applied migration(s)."""
+    from fafnir.db import migrate as m
+
+    rolled = m.rollback(ctx.obj["config"].dsn, steps=steps)
+    click.echo(f"Rolled back: {', '.join(rolled) or '(none)'}")
+
+
+@db.command("status")
+@click.pass_context
+def db_status(ctx):
+    """Show migration status."""
+    from fafnir.db import migrate as m
+
+    for version, name, state in m.status(ctx.obj["config"].dsn):
+        click.echo(f"  {version}  {state:8s}  {name}")
+
+
+@db.command("seed")
+@click.pass_context
+def db_seed(ctx):
+    """Apply SQL seeds and generate the US trading calendar."""
+    from fafnir.db import seed as s
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        result = s.seed(database, cfg.calendar_start_year, cfg.calendar_end_year)
+    click.echo(
+        f"Seeds: {result['sql_seeds']}; calendar rows: {result['calendar_rows']}"
+    )
+
+
+@db.command("ensure-partitions")
+@click.option("--start-year", type=int)
+@click.option("--end-year", type=int)
+@click.pass_context
+def db_ensure_partitions(ctx, start_year, end_year):
+    """Create yearly price partitions for a year range."""
+    from fafnir.db import maintenance
+
+    cfg = ctx.obj["config"]
+    start_year = start_year or cfg.calendar_start_year
+    end_year = end_year or cfg.calendar_end_year
+    with Database(cfg.dsn) as database:
+        created = maintenance.ensure_partitions(database, start_year, end_year)
+    click.echo(f"Created {created} partition(s).")
+
+
+@db.command("refresh-marts")
+@click.pass_context
+def db_refresh_marts(ctx):
+    """Refresh derived materialized views."""
+    from fafnir.db import maintenance
+
+    with Database(ctx.obj["config"].dsn) as database:
+        maintenance.refresh_marts(database)
+    click.echo("Marts refreshed.")
+
+
+# ---------------------------------------------------------------------------
+# ingest group
+# ---------------------------------------------------------------------------
+@main.group()
+def ingest():
+    """Load data from sources into the warehouse."""
+
+
+def _fmp_client(cfg):
+    from fafnir.sources.fmp import FMPClient
+
+    key = cfg.fmp_key
+    if not key:
+        raise click.ClickException(
+            "No FMP API key. Set FMP_API_KEY or [api].fmp_key in ~/.fafnirrc"
+        )
+    return FMPClient(key, rate_per_min=cfg.request_rate_per_min)
+
+
+@ingest.command("securities")
+@click.option("--universe", default=None, help="Universe id (default from config)")
+@click.option("--no-etfs", is_flag=True, help="Exclude ETFs")
+@click.option("--limit", type=int, help="Cap securities (useful for testing)")
+@click.option(
+    "--enrich/--no-enrich",
+    default=False,
+    help="Also fetch per-symbol profiles (sector/industry)",
+)
+@click.pass_context
+def ingest_securities(ctx, universe, no_etfs, limit, enrich):
+    """Load the security master from FMP bulk lists."""
+    from fafnir.ingest import security_master
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    universe = universe or cfg.universe
+    with Database(cfg.dsn) as database:
+        n = security_master.load_securities(
+            database, fmp, universe=universe, include_etfs=not no_etfs, limit=limit
+        )
+        if enrich:
+            syms = [
+                r["primary_symbol"]
+                for r in database.fetchall(
+                    "SELECT primary_symbol FROM core.security ORDER BY security_id"
+                    + (f" LIMIT {int(limit)}" if limit else "")
+                )
+            ]
+            security_master.enrich_profiles(database, fmp, syms)
+    click.echo(
+        f"Loaded {n} securities. FMP requests: {fmp.request_count}, "
+        f"bytes: {fmp.bytes_downloaded}"
+    )
+
+
+@ingest.command("prices")
+@click.option("--symbols", help="Comma-separated symbols (default: all securities)")
+@click.option("--from", "from_date", help="Start date YYYY-MM-DD (else incremental)")
+@click.option("--to", "to_date", help="End date YYYY-MM-DD")
+@click.pass_context
+def ingest_prices(ctx, symbols, from_date, to_date):
+    """Load daily OHLCV (incremental by default)."""
+    from fafnir.ingest import daily_price
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    with Database(cfg.dsn) as database:
+        syms = _split_symbols(symbols) or [
+            r["primary_symbol"]
+            for r in database.fetchall(
+                "SELECT primary_symbol FROM core.security WHERE is_actively_trading "
+                "ORDER BY security_id"
+            )
+        ]
+        n = daily_price.load_prices(
+            database,
+            fmp,
+            syms,
+            start_date=_parse_date(from_date),
+            end_date=_parse_date(to_date),
+            overlap_days=cfg.overlap_days,
+        )
+    click.echo(
+        f"Loaded {n} price rows for {len(syms)} symbols. "
+        f"FMP bytes: {fmp.bytes_downloaded}"
+    )
+
+
+@ingest.command("actions")
+@click.option("--symbols", help="Comma-separated symbols (default: all securities)")
+@click.pass_context
+def ingest_actions(ctx, symbols):
+    """Load corporate actions (splits + dividends)."""
+    from fafnir.ingest import corporate_actions
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    with Database(cfg.dsn) as database:
+        syms = _split_symbols(symbols) or [
+            r["primary_symbol"]
+            for r in database.fetchall(
+                "SELECT primary_symbol FROM core.security ORDER BY security_id"
+            )
+        ]
+        n = corporate_actions.load_actions(database, fmp, syms)
+    click.echo(f"Loaded {n} corporate actions for {len(syms)} symbols.")
+
+
+@main.command("adjust")
+@click.option("--symbol", help="Recompute one symbol only (default: all with actions)")
+@click.pass_context
+def adjust(ctx, symbol):
+    """Recompute adjustment factors from corporate actions."""
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        sec_id = repo.resolve_security_id(database, symbol.upper()) if symbol else None
+        n = adjustments.adjust_all(database, security_id=sec_id)
+    click.echo(f"Recomputed adjustment factors for {n} securities.")
+
+
+# ---------------------------------------------------------------------------
+# dq + status
+# ---------------------------------------------------------------------------
+@main.group()
+def dq():
+    """Data-quality checks."""
+
+
+@dq.command("run")
+@click.option("--exchange", default="NASDAQ", show_default=True)
+@click.option("--outlier-threshold", default=0.5, show_default=True, type=float)
+@click.pass_context
+def dq_run(ctx, exchange, outlier_threshold):
+    """Run gap / outlier / freshness checks; write flags to ops.data_quality_flag."""
+    from fafnir.dq import checks
+
+    with Database(ctx.obj["config"].dsn) as database:
+        result = checks.run_all(
+            database, exchange_code=exchange, outlier_threshold=outlier_threshold
+        )
+    click.echo(f"DQ flags written: {result}")
+
+
+@main.command("status")
+@click.pass_context
+def status(ctx):
+    """Show warehouse freshness and volume."""
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        counts = repo.read_security_count(database)
+        price_rows = database.fetchval("SELECT count(*) FROM core.daily_price")
+        latest = database.fetchval("SELECT max(trade_date) FROM core.daily_price")
+        actions = database.fetchval("SELECT count(*) FROM core.corporate_action")
+        open_flags = database.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag WHERE resolved_at IS NULL"
+        )
+    click.echo(
+        f"Securities : {counts.get('securities', 0)} "
+        f"(active {counts.get('active', 0)}, delisted {counts.get('delisted', 0)})"
+    )
+    click.echo(f"Price rows : {price_rows}  (latest {latest})")
+    click.echo(f"Actions    : {actions}")
+    click.echo(f"Open DQ    : {open_flags}")
+
+
+if __name__ == "__main__":
+    main()

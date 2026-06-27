@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fafnir"
+version = "0.1.0"
+description = "A research-grade financial market data warehouse on PostgreSQL, with the duk data-access CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "rtrimble13" }]
+keywords = ["finance", "market-data", "postgresql", "warehouse", "fmp", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial",
+]
+
+# Core dependencies. psycopg powers the warehouse + duk db mode; click/pandas/
+# requests/scipy carry over from duk for the CLI and live mode.
+dependencies = [
+    "click>=8.0.0",
+    "pandas>=1.5.0",
+    "requests>=2.28.0",
+    "scipy>=1.9.0",
+    "psycopg[binary]>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "isort>=5.0.0",
+    "flake8>=4.0.0",
+]
+
+[project.scripts]
+fafnir = "fafnir.cli:main"
+duk = "duk.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# NOTE: SQL migrations/seeds live in sql/ at the repo root (so they can also be
+# run directly with psql). `fafnir db migrate` locates them via find_sql_dir(),
+# which walks up from the package / cwd. For non-source installs, set
+# FAFNIR_SQL_DIR to the checked-out sql/ directory.
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+markers = [
+    "integration: requires a PostgreSQL database (set FAFNIR_TEST_DSN)",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py311", "py312", "py313"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+# black formats code to 88 columns; flake8 is set to 100 so that long SQL string
+# literals (which black does not reflow) are not flagged.
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "W503"]
