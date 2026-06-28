@@ -1,0 +1,52 @@
+# fafnir / duk configuration
+# Copy to ~/.fafnirrc (and/or ~/.dukrc) and customize. Format: TOML.
+#
+# SECRETS: the database password and API keys should come from the environment
+# or a secrets manager in preference to this file. Environment variables always
+# win over file values:
+#   FAFNIR_DSN, FAFNIR_DB_PASSWORD / PGPASSWORD, FMP_API_KEY,
+#   FRED_API_KEY, BLS_API_KEY, BEA_API_KEY
+
+[database]
+# Either set a full libpq DSN ...
+# dsn = "host=localhost port=5432 dbname=fafnir user=fafnir_ingest password=..."
+# ... or the individual parts (password preferably via FAFNIR_DB_PASSWORD):
+host = "localhost"
+port = 5432
+dbname = "fafnir"
+user = "fafnir_ingest"
+# password = ""        # prefer FAFNIR_DB_PASSWORD / PGPASSWORD
+
+[api]
+# Financial Modeling Prep (Professional plan). Prefer FMP_API_KEY env var.
+fmp_key = ""
+# Fast-follow economic sources:
+fred_key = ""
+bls_key = ""
+bea_key = ""
+
+[general]
+# Target universe for the security master.
+universe = "us-equity-etf"
+
+# Proactive FMP throttle (Professional plan ~300 req/min; stay just under).
+request_rate_per_min = 280
+
+# Re-pull overlap window (days) on incremental price loads, to absorb late
+# corrections / re-adjustments.
+overlap_days = 5
+
+# Trading-calendar generation range (years).
+calendar_start_year = 2015
+calendar_end_year = 2027
+
+# Logging.
+log_level = "info"
+log_dir = "var/fafnir/log"
+
+# --- duk (read CLI) settings -------------------------------------------------
+# duk reuses [api].fmp_key (live mode) and [database] (db mode).
+# default_source: "db" or "live". If unset, duk uses db when a DSN is configured.
+default_source = "db"
+default_output_dir = "var/duk"
+default_output_type = "csv"

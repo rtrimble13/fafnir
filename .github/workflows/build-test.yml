@@ -1,0 +1,51 @@
+name: build-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    # A throwaway Postgres for the integration suite.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fafnir
+          POSTGRES_PASSWORD: fafnir
+          POSTGRES_DB: fafnir
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fafnir"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      FAFNIR_TEST_DSN: "host=localhost port=5432 dbname=fafnir user=fafnir password=fafnir"
+      FAFNIR_SQL_DIR: ${{ github.workspace }}/sql
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: pip install -e .[dev]
+      - name: Unit tests (no database)
+        run: pytest test/ -v -m "not integration"
+      - name: Integration tests (Postgres)
+        run: pytest test/ -v -m integration
+      - name: CLI smoke tests
+        run: |
+          fafnir --help
+          fafnir db --help
+          duk --help
+          duk ph --help

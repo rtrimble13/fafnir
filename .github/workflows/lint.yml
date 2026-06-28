@@ -1,0 +1,26 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install lint tools
+        run: pip install black isort flake8
+      - name: black
+        run: black --check --line-length 88 src test
+      - name: isort
+        run: isort --check-only --profile black --line-length 88 src test
+      - name: flake8
+        run: flake8 --max-line-length 100 --extend-ignore E203,W503 src test

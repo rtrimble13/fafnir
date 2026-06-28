@@ -1,0 +1,25 @@
+# fafnir cron schedule (example). Install with: crontab etc/crontab.example
+# Adjust paths and times to your host and market timezone. Secrets should be
+# sourced from a protected env file rather than inlined here.
+#
+# Times are server-local. US EOD data is typically settled a few hours after the
+# 16:00 ET close; 22:30 ET (here shown as a generic evening slot) is a safe slot.
+
+# Load environment (DSN + API key) from a root-only file.
+# Example fafnir.env contents:
+#   FAFNIR_DSN="host=localhost dbname=fafnir user=fafnir_ingest"
+#   FAFNIR_DB_PASSWORD="..."
+#   FMP_API_KEY="..."
+#   FAFNIR_SQL_DIR="/opt/fafnir/sql"
+
+SHELL=/bin/bash
+FAFNIR_HOME=/opt/fafnir
+
+# Daily incremental update (Mon-Fri evening, after settlement).
+30 22 * * 1-5  set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/daily_update.sh >> var/fafnir/log/cron_daily.log 2>&1
+
+# Mid-evening data-quality sweep.
+0 23 * * 1-5   set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/run_dq_checks.sh >> var/fafnir/log/cron_dq.log 2>&1
+
+# Weekly reconciliation over a rotating sample (Sunday).
+0 6 * * 0      set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/reconcile.sh AAPL,MSFT,SPY,BRK-B >> var/fafnir/log/cron_reconcile.log 2>&1
