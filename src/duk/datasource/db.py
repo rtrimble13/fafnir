@@ -94,7 +94,14 @@ def price_history(
     for col in ("open", "high", "low", "close", "volume"):
         if col in df.columns:
             df[col] = df[col].astype(float)
-    return shape_price_dataframe(df, frequency=frequency, limit=limit, fields=fields)
+    return shape_price_dataframe(
+        df,
+        frequency=frequency,
+        limit=limit,
+        fields=fields,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
 
 def screen(

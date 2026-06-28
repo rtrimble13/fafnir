@@ -42,10 +42,29 @@ def test_shape_field_selection():
     assert list(out.columns) == ["close"]
 
 
-def test_shape_limit_daily_head():
-    out = shape_price_dataframe(_daily_df(), frequency="day", limit=2)
+def test_shape_limit_start_only_keeps_head():
+    # start_date supplied, no end_date -> first `limit` rows (matches live).
+    out = shape_price_dataframe(
+        _daily_df(), frequency="day", limit=2, start_date="2023-01-02"
+    )
     assert len(out) == 2
     assert out.index[0] == pd.Timestamp("2023-01-02")
+
+
+def test_shape_limit_no_dates_keeps_tail():
+    # No dates supplied -> last `limit` rows (matches live, not head-by-frequency).
+    out = shape_price_dataframe(_daily_df(), frequency="day", limit=2)
+    assert len(out) == 2
+    assert out.index[-1] == pd.Timestamp("2023-01-04")
+    assert out.index[0] == pd.Timestamp("2023-01-03")
+
+
+def test_shape_limit_end_only_keeps_tail():
+    # end_date supplied, no start_date -> last `limit` rows, even for daily.
+    out = shape_price_dataframe(
+        _daily_df(), frequency="day", limit=2, end_date="2023-01-04"
+    )
+    assert out.index[-1] == pd.Timestamp("2023-01-04")
 
 
 def test_shape_weekly_resample_aggregates():

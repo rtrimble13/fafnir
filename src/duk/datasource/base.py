@@ -36,11 +36,18 @@ def shape_price_dataframe(
     frequency: str = "day",
     limit: Optional[int] = None,
     fields: Optional[list[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> pd.DataFrame:
     """Resample to frequency, select fields, and apply limit.
 
     Mirrors the live (FMP) shaping so db-mode output is identical. Input is a
     date-indexed OHLCV DataFrame (ascending).
+
+    The ``limit`` head/tail rule matches ``fmp_api.get_price_history`` exactly: keep
+    the first ``limit`` rows only when a start date was given without an end date,
+    otherwise keep the last ``limit`` rows. (This keys off the supplied date
+    arguments, not the frequency.)
     """
     if df.empty:
         return df
@@ -53,5 +60,8 @@ def shape_price_dataframe(
         if keep:
             df = df[keep]
     if limit is not None and limit > 0:
-        df = df.head(limit) if frequency == "day" else df.tail(limit)
+        if start_date is not None and end_date is None:
+            df = df.head(limit)
+        else:
+            df = df.tail(limit)
     return df

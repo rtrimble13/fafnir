@@ -9,6 +9,7 @@ import datetime as dt
 
 import pytest
 
+from fafnir.db import maintenance
 from fafnir.db import repository as repo
 from fafnir.dq import checks
 from fafnir.ingest import adjustments
@@ -221,3 +222,59 @@ def test_outlier_check_flags_unexplained_jump(db):
     repo.upsert_daily_prices(db, rows)
     n = checks.check_outliers(db, threshold=0.5)
     assert n >= 1
+
+
+def test_ensure_year_partition_relocates_default_rows(db):
+    # A row in a year with no dedicated partition lands in the DEFAULT partition;
+    # creating that year's partition must succeed and relocate the stray row
+    # (regression test for the attach-conflict bug).
+    # Repeatable: the partition table persists across runs (TRUNCATE won't drop it).
+    db.execute("DROP TABLE IF EXISTS core.daily_price_y2099")
+    sid = _mk_security(db, "FFF")
+    # 2099 has no dedicated partition -> goes to daily_price_default.
+    far = dt.date(2099, 3, 15)
+    repo.upsert_daily_prices(
+        db,
+        _prices(
+            sid,
+            [
+                {
+                    "trade_date": far,
+                    "open": 10,
+                    "high": 10,
+                    "low": 10,
+                    "close": 10,
+                    "volume": 1,
+                }
+            ],
+        ),
+    )
+    in_default = db.fetchval(
+        "SELECT count(*) FROM core.daily_price_default WHERE security_id=%s", (sid,)
+    )
+    assert in_default == 1
+
+    # Creating the 2099 partition must not raise and must relocate the row.
+    created = maintenance.ensure_year_partition(db, 2099)
+    assert created is True
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price_default WHERE security_id=%s",
+            (sid,),
+        )
+        == 0
+    )
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price_y2099 WHERE security_id=%s", (sid,)
+        )
+        == 1
+    )
+    # Row is still visible through the parent partitioned table.
+    assert (
+        db.fetchval(
+            "SELECT close FROM core.daily_price WHERE security_id=%s AND trade_date=%s",
+            (sid, far),
+        )
+        == 10
+    )
