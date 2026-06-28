@@ -22,6 +22,9 @@ from fafnir.logging_config import get_logger
 
 logger = get_logger("source")
 
+# Cap on a server-supplied Retry-After so a misbehaving header can't stall a load.
+MAX_RETRY_AFTER_SECONDS = 120
+
 
 class SourceError(Exception):
     """Raised when a source request fails after retries."""
@@ -78,12 +81,14 @@ class BaseSource:
         exhaustion. The API key in ``params`` is never logged.
         """
         params = dict(params or {})
+        last_status: int | None = None
         for attempt in range(self.max_retries):
+            is_last = attempt == self.max_retries - 1
             self.limiter.acquire()
             try:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
             except requests.RequestException as exc:
-                if attempt == self.max_retries - 1:
+                if is_last:
                     raise SourceError(f"GET {url} failed: {exc}") from exc
                 self._backoff(attempt)
                 continue
@@ -93,13 +98,24 @@ class BaseSource:
             self.bytes_downloaded += nbytes
 
             if resp.status_code == 429:
+                last_status = 429
+                retry_after = self._retry_after_seconds(resp.headers.get("Retry-After"))
                 logger.warning(
-                    "HTTP 429 from %s (attempt %d); backing off", self.name, attempt + 1
+                    "HTTP 429 from %s (attempt %d)%s",
+                    self.name,
+                    attempt + 1,
+                    f"; honoring Retry-After={retry_after}s" if retry_after else "",
                 )
-                self._backoff(attempt, base=2.0, floor=1.0)
+                if not is_last:
+                    if retry_after is not None:
+                        time.sleep(retry_after)
+                    else:
+                        self._backoff(attempt, base=2.0, floor=1.0)
                 continue
             if resp.status_code >= 500:
-                self._backoff(attempt)
+                last_status = resp.status_code
+                if not is_last:
+                    self._backoff(attempt)
                 continue
             try:
                 resp.raise_for_status()
@@ -115,7 +131,22 @@ class BaseSource:
                 raise SourceError(f"{self.name} error: {data['Error Message']}")
             return data, resp.status_code, nbytes
 
-        raise SourceError(f"GET {url} exhausted retries")
+        raise SourceError(
+            f"GET {url} exhausted retries"
+            + (f" (last status {last_status})" if last_status else "")
+        )
+
+    @staticmethod
+    def _retry_after_seconds(value: str | None) -> int | None:
+        """Parse a Retry-After header (delta-seconds form), capped. Returns None
+        for an absent/HTTP-date value so the caller falls back to exponential."""
+        if not value:
+            return None
+        try:
+            secs = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return max(0, min(secs, MAX_RETRY_AFTER_SECONDS))
 
     def _backoff(self, attempt: int, base: float = 2.0, floor: float = 0.0) -> None:
         delay = floor + (base**attempt) + random.uniform(0, 0.5)

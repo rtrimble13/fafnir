@@ -37,8 +37,9 @@ def _norm_exchange(entry: dict) -> Optional[str]:
 
 
 def _is_us(entry: dict) -> bool:
-    code = (entry.get("exchangeShortName") or entry.get("exchange") or "").upper()
-    return any(x in code for x in US_EXCHANGES)
+    # Equality on the normalized code, not substring containment: otherwise foreign
+    # venues like "NASDAQ DUBAI" / "CBOE EUROPE" / "XOTC" would leak in.
+    return _norm_exchange(entry) in US_EXCHANGES
 
 
 def load_securities(

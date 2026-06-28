@@ -22,6 +22,10 @@ logger = get_logger("ingest.price")
 
 ENDPOINT = "historical-price-eod/full"
 
+# A bar quarantined this many times stops holding the watermark (it stays flagged
+# for review, but ingestion is allowed to advance past it).
+MAX_QUARANTINE_HOLDS = 5
+
 
 def _parse_date(value) -> Optional[date]:
     if value in (None, ""):
@@ -117,7 +121,7 @@ def load_symbol_prices(
     )
 
     clean: list[dict] = []
-    max_date: Optional[date] = None
+    quarantined_dates: list[date] = []
     for bar in bars:
         row, reason = _validate_bar(bar)
         if reason:
@@ -132,15 +136,39 @@ def load_symbol_prices(
                 detail={"reason": reason},
                 ingestion_run_id=run.run_id,
             )
+            # Remember the (parseable) date so the watermark won't skip past it.
+            qd = _parse_date(bar.get("date"))
+            if qd is not None:
+                quarantined_dates.append(qd)
             continue
         row["security_id"] = sec_id
         clean.append(row)
-        if max_date is None or row["trade_date"] > max_date:
-            max_date = row["trade_date"]
 
     written = repo.upsert_daily_prices(db, clean, ingestion_run_id=run.run_id)
-    if max_date is not None:
-        repo.set_watermark(db, "fmp", ENDPOINT, max_date, sec_id)
+
+    # Advance the watermark only up to the latest *contiguous* clean date: never
+    # past the earliest quarantined bar, so the overlap re-fetches that date next
+    # run and a later upstream correction can still land (no permanent gap).
+    #
+    # Bounded: a date that has already been quarantined MAX_QUARANTINE_HOLDS times
+    # stops holding the line (it stays flagged for review, but the watermark is
+    # allowed past it) so a permanently-bad bar can't stall ingestion forever and
+    # grow the re-pull window without bound.
+    holding = [
+        qd
+        for qd in quarantined_dates
+        if repo.count_price_quarantines(db, sec_id, qd.isoformat())
+        < MAX_QUARANTINE_HOLDS
+    ]
+    clean_dates = [r["trade_date"] for r in clean]
+    if holding:
+        cutoff = min(holding)
+        safe_dates = [d for d in clean_dates if d < cutoff]
+    else:
+        safe_dates = clean_dates
+    if safe_dates:
+        repo.set_watermark(db, "fmp", ENDPOINT, max(safe_dates), sec_id)
+
     run.rows_inserted += written
     return written
 

@@ -6,6 +6,7 @@ idempotency, adjustment correctness, point-in-time stability, and DQ checks.
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import pytest
 
@@ -13,8 +14,25 @@ from fafnir.db import maintenance
 from fafnir.db import repository as repo
 from fafnir.dq import checks
 from fafnir.ingest import adjustments
+from fafnir.ingest.daily_price import ENDPOINT as PRICE_ENDPOINT
+from fafnir.ingest.daily_price import load_symbol_prices
+from fafnir.ingest.runlog import RunLog
 
 pytestmark = pytest.mark.integration
+
+DSN = os.environ.get("FAFNIR_TEST_DSN", "")
+
+
+class _FakeFMP:
+    """Minimal FMP stand-in returning canned bars (no network)."""
+
+    bytes_downloaded = 0
+
+    def __init__(self, bars):
+        self._bars = bars
+
+    def eod_full(self, symbol, from_date=None, to_date=None):
+        return self._bars
 
 
 def _mk_security(db, symbol="AAA"):
@@ -278,3 +296,125 @@ def test_ensure_year_partition_relocates_default_rows(db):
         )
         == 10
     )
+
+
+def test_watermark_not_advanced_past_quarantined_bar(db):
+    # 6/1 clean, 6/2 bad (high<low) -> quarantined, 6/5 clean. The watermark must
+    # stay at 6/1 so the overlap re-fetches 6/2 next run (no permanent gap).
+    sid = _mk_security(db, "GGG")
+    bars = [
+        {
+            "date": "2023-06-01",
+            "open": 10,
+            "high": 10,
+            "low": 10,
+            "close": 10,
+            "volume": 1,
+        },
+        {
+            "date": "2023-06-02",
+            "open": 10,
+            "high": 8,
+            "low": 9,
+            "close": 10,
+            "volume": 1,
+        },
+        {
+            "date": "2023-06-05",
+            "open": 10,
+            "high": 10,
+            "low": 10,
+            "close": 10,
+            "volume": 1,
+        },
+    ]
+    with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+        load_symbol_prices(
+            db,
+            _FakeFMP(bars),
+            "GGG",
+            run=run,
+            start_date=dt.date(2023, 6, 1),
+            end_date=dt.date(2023, 6, 5),
+        )
+    # Clean bars were still written (6/1 and 6/5); 6/2 quarantined.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id=%s", (sid,)
+        )
+        == 2
+    )
+    # Watermark held at the last contiguous clean date before the quarantine.
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 1)
+
+
+def test_resolvers_agree_on_ambiguous_symbol(db):
+    # Two securities share primary_symbol with no xref row -> exercise the fallback.
+    sid_fmp = repo.upsert_security(
+        db, primary_symbol="DUP", company_name="A", source="fmp"
+    )
+    repo.upsert_security(db, primary_symbol="DUP", company_name="B", source="other")
+
+    from_repo = repo.resolve_security_id(db, "DUP")
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    from duk.datasource.db import _resolve_security_id
+
+    with psycopg.connect(DSN, row_factory=dict_row) as conn, conn.cursor() as cur:
+        from_duk = _resolve_security_id(cur, "DUP")
+
+    # Both paths resolve identically, and to the fmp-source row (deterministic).
+    assert from_repo == from_duk == sid_fmp
+
+
+def test_watermark_releases_after_quarantine_budget(db):
+    # A persistently-bad bar holds the watermark for MAX_QUARANTINE_HOLDS runs,
+    # then ingestion is allowed past it (no unbounded stall).
+    from fafnir.ingest.daily_price import MAX_QUARANTINE_HOLDS
+
+    sid = _mk_security(db, "HHH")
+    bars = [
+        {
+            "date": "2023-06-01",
+            "open": 10,
+            "high": 10,
+            "low": 10,
+            "close": 10,
+            "volume": 1,
+        },
+        {
+            "date": "2023-06-02",
+            "open": 10,
+            "high": 8,
+            "low": 9,
+            "close": 10,
+            "volume": 1,
+        },
+        {
+            "date": "2023-06-05",
+            "open": 10,
+            "high": 10,
+            "low": 10,
+            "close": 10,
+            "volume": 1,
+        },
+    ]
+    for i in range(MAX_QUARANTINE_HOLDS):
+        with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+            load_symbol_prices(
+                db,
+                _FakeFMP(bars),
+                "HHH",
+                run=run,
+                start_date=dt.date(2023, 6, 1),
+                end_date=dt.date(2023, 6, 5),
+            )
+        if i < MAX_QUARANTINE_HOLDS - 1:
+            # Still within budget -> held below the bad 6/2 bar.
+            assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(
+                2023, 6, 1
+            )
+    # Budget exhausted -> watermark advances past the bad bar to the latest clean.
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 5)
