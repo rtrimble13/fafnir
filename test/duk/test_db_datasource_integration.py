@@ -93,6 +93,61 @@ def test_db_price_history_raw_and_adjusted(db):
     assert adj.loc["2023-05-31", "close"] == 50.0  # back-adjusted for 2:1 split
 
 
+def test_db_adjusted_volume_above_int64_does_not_crash(db):
+    # Adjusted volume can exceed int64 (the view is numeric(38,0) for that reason);
+    # the read must not OverflowError on astype("int64").
+    repo.ensure_exchange(db, "NASDAQ", "Nasdaq", "US")
+    sid = repo.upsert_security(
+        db, primary_symbol="BIGV", company_name="Big Vol", exchange_code="NASDAQ"
+    )
+    repo.upsert_symbol_xref(db, security_id=sid, symbol="BIGV")
+    repo.upsert_daily_prices(
+        db,
+        [
+            {  # raw volume just under BIGINT max; a 2:1 split pushes adjusted > int64
+                "security_id": sid,
+                "trade_date": dt.date(2023, 5, 31),
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "volume": 9_000_000_000_000_000_000,
+            },
+            {
+                "security_id": sid,
+                "trade_date": dt.date(2023, 6, 2),
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "volume": 1,
+            },
+        ],
+    )
+    repo.upsert_corporate_action(
+        db,
+        security_id=sid,
+        action_type="split",
+        ex_date=dt.date(2023, 6, 2),
+        split_numerator=2,
+        split_denominator=1,
+    )
+    adjustments.compute_for_security(db, sid)
+
+    out = ds_db.price_history(
+        dsn=DSN,
+        symbol="BIGV",
+        start_date=None,
+        end_date=None,
+        frequency="day",
+        limit=None,
+        fields=None,
+        adjusted=True,
+    )
+    # 9e18 * 2 = 1.8e19, beyond int64 max; preserved exactly, no crash.
+    assert int(out.loc["2023-05-31", "volume"]) == 18_000_000_000_000_000_000
+
+
 def test_db_price_history_unknown_symbol_returns_empty(db):
     out = ds_db.price_history(
         dsn=DSN,

@@ -511,6 +511,23 @@ def add_dq_flag(
     )
 
 
+def count_price_quarantines(db: Database, security_id: int, date_iso: str) -> int:
+    """How many times a given trade_date has been quarantined for this security
+    (price_* checks). Used to bound the watermark hold on a persistently-bad bar."""
+    return int(
+        db.fetchval(
+            """
+            SELECT count(*) FROM ops.data_quality_flag
+            WHERE security_id = %s
+              AND check_name LIKE 'price\\_%%'
+              AND record_key->>'date' = %s
+            """,
+            (security_id, date_iso),
+        )
+        or 0
+    )
+
+
 # ---------------------------------------------------------------------------
 # Read API (used by duk db datasource and `fafnir status`)
 # ---------------------------------------------------------------------------

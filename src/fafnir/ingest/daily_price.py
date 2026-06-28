@@ -22,6 +22,10 @@ logger = get_logger("ingest.price")
 
 ENDPOINT = "historical-price-eod/full"
 
+# A bar quarantined this many times stops holding the watermark (it stays flagged
+# for review, but ingestion is allowed to advance past it).
+MAX_QUARANTINE_HOLDS = 5
+
 
 def _parse_date(value) -> Optional[date]:
     if value in (None, ""):
@@ -145,9 +149,20 @@ def load_symbol_prices(
     # Advance the watermark only up to the latest *contiguous* clean date: never
     # past the earliest quarantined bar, so the overlap re-fetches that date next
     # run and a later upstream correction can still land (no permanent gap).
+    #
+    # Bounded: a date that has already been quarantined MAX_QUARANTINE_HOLDS times
+    # stops holding the line (it stays flagged for review, but the watermark is
+    # allowed past it) so a permanently-bad bar can't stall ingestion forever and
+    # grow the re-pull window without bound.
+    holding = [
+        qd
+        for qd in quarantined_dates
+        if repo.count_price_quarantines(db, sec_id, qd.isoformat())
+        < MAX_QUARANTINE_HOLDS
+    ]
     clean_dates = [r["trade_date"] for r in clean]
-    if quarantined_dates:
-        cutoff = min(quarantined_dates)
+    if holding:
+        cutoff = min(holding)
         safe_dates = [d for d in clean_dates if d < cutoff]
     else:
         safe_dates = clean_dates
