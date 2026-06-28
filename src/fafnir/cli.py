@@ -129,6 +129,44 @@ def db_ensure_partitions(ctx, start_year, end_year):
     click.echo(f"Created {created} partition(s).")
 
 
+@db.command("ensure-horizon")
+@click.option(
+    "--through-year",
+    type=int,
+    help="Target horizon year (default: max(current year + horizon_extra_years, "
+    "calendar_end_year)).",
+)
+@click.option(
+    "--floor-year",
+    type=int,
+    help="Earliest year to guarantee a partition for (default: calendar_start_year).",
+)
+@click.pass_context
+def db_ensure_horizon(ctx, through_year, floor_year):
+    """Roll partitions + trading calendar forward to a future horizon.
+
+    Run nightly (it is in scripts/daily_update.sh) so the warehouse always stays
+    a couple of years ahead with no config edits.
+    """
+    from fafnir.db import maintenance
+
+    cfg = ctx.obj["config"]
+    if through_year is None:
+        through_year = max(
+            maintenance.current_horizon_year(cfg.horizon_extra_years),
+            cfg.calendar_end_year,
+        )
+    floor_year = floor_year or cfg.calendar_start_year
+    with Database(cfg.dsn) as database:
+        created, cal_rows = maintenance.ensure_horizon(
+            database, through_year=through_year, floor_year=floor_year
+        )
+    click.echo(
+        f"Horizon ensured through {through_year}: "
+        f"{created} partition(s), {cal_rows} calendar rows."
+    )
+
+
 @db.command("refresh-marts")
 @click.pass_context
 def db_refresh_marts(ctx):

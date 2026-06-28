@@ -1,14 +1,24 @@
 """
-Routine maintenance helpers: create future yearly price partitions and refresh
-the screening materialized view.
+Routine maintenance helpers: keep price partitions and the trading calendar
+extended to a rolling horizon, and refresh the screening materialized view.
 """
 
 from __future__ import annotations
+
+import datetime as dt
 
 from fafnir.db.connection import Database
 from fafnir.logging_config import get_logger
 
 logger = get_logger("maintenance")
+
+# Default number of years the rolling horizon stays ahead of the current year.
+HORIZON_EXTRA_YEARS = 2
+
+
+def current_horizon_year(extra_years: int = HORIZON_EXTRA_YEARS) -> int:
+    """Target horizon = this calendar year + ``extra_years``."""
+    return dt.date.today().year + extra_years
 
 
 def _table_exists(db: Database, name: str) -> bool:
@@ -80,6 +90,42 @@ def ensure_partitions(db: Database, start_year: int, end_year: int) -> int:
         if ensure_year_partition(db, year):
             created += 1
     return created
+
+
+def _max_calendar_year(db: Database) -> int | None:
+    val = db.fetchval(
+        "SELECT max(extract(year FROM trade_date))::int FROM ref.trading_calendar"
+    )
+    return int(val) if val is not None else None
+
+
+def ensure_horizon(
+    db: Database, *, through_year: int, floor_year: int
+) -> tuple[int, int]:
+    """Extend partitions and the trading calendar out to ``through_year``.
+
+    Idempotent and cheap to run nightly: existing yearly partitions are skipped,
+    and only the missing tail of the calendar is generated. ``floor_year`` is the
+    earliest year to guarantee a partition for (the backfill start). Returns
+    ``(partitions_created, calendar_rows_added)``.
+    """
+    created = ensure_partitions(db, floor_year, through_year)
+
+    # Extend only the calendar tail (years not already present).
+    from fafnir.db.seed import seed_calendar
+
+    max_cal = _max_calendar_year(db)
+    cal_start = (max_cal + 1) if max_cal is not None else floor_year
+    cal_rows = 0
+    if cal_start <= through_year:
+        cal_rows = seed_calendar(db, cal_start, through_year)
+    logger.info(
+        "Horizon ensured through %d: %d partition(s), %d calendar rows",
+        through_year,
+        created,
+        cal_rows,
+    )
+    return created, cal_rows
 
 
 def refresh_marts(db: Database, concurrently: bool = True) -> None:

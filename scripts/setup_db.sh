@@ -35,8 +35,8 @@ fafnir db migrate
 echo "==> Seeding reference data + trading calendar"
 fafnir db seed
 
-echo "==> Ensuring price partitions"
-fafnir db ensure-partitions
+echo "==> Ensuring price partitions + calendar to the rolling horizon"
+fafnir db ensure-horizon
 
 echo "==> Migration status"
 fafnir db status

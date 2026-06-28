@@ -12,8 +12,9 @@ set -euo pipefail
 START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo "==> daily_update started ${START}"
 
-# Make sure the current year's partition exists before loading into it.
-fafnir db ensure-partitions
+# Keep partitions + trading calendar rolled forward to the horizon (auto-extends
+# to current year + horizon_extra_years; no yearly config edits needed).
+fafnir db ensure-horizon
 
 echo "==> Incremental prices (active universe)"
 fafnir ingest prices

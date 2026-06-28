@@ -12,6 +12,8 @@ read through the `duk` CLI.
 
 ## Operating it
 
+- [Initial Setup & Backfill](backfill.md) — stand up the DB and backfill history
+  (single run, a few hours)
 - [Ingestion](ingestion.md) — FMP endpoint→table map, idempotency, watermarks, the
   adjustment step
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,
