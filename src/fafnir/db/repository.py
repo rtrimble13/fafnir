@@ -206,24 +206,31 @@ def upsert_company_profile(
     )
 
 
+# Canonical security-id resolution. The duk db datasource
+# (duk/datasource/db.py::_resolve_security_id) MUST use these identical queries so
+# the loader and the read path always resolve the same ticker to the same id.
+XREF_RESOLVE_SQL = (
+    "SELECT security_id FROM core.symbol_xref "
+    "WHERE symbol = %s AND valid_to IS NULL "
+    "ORDER BY is_primary DESC, valid_from DESC LIMIT 1"
+)
+# Deterministic fallback: prefer the given source, then lowest id. Ordering (not a
+# hard source filter) so a symbol that only exists under another source still
+# resolves — and resolves identically in both code paths.
+PRIMARY_RESOLVE_SQL = (
+    "SELECT security_id FROM core.security WHERE primary_symbol = %s "
+    "ORDER BY (source = %s) DESC, security_id ASC LIMIT 1"
+)
+
+
 def resolve_security_id(
     db: Database, symbol: str, source: str = "fmp"
 ) -> Optional[int]:
     """Resolve a ticker to a security_id via the current xref, falling back to primary_symbol."""
-    val = db.fetchval(
-        """
-        SELECT security_id FROM core.symbol_xref
-        WHERE symbol = %s AND valid_to IS NULL
-        ORDER BY is_primary DESC, valid_from DESC LIMIT 1
-        """,
-        (symbol,),
-    )
+    val = db.fetchval(XREF_RESOLVE_SQL, (symbol,))
     if val is not None:
         return int(val)
-    val = db.fetchval(
-        "SELECT security_id FROM core.security WHERE primary_symbol = %s AND source = %s LIMIT 1",
-        (symbol, source),
-    )
+    val = db.fetchval(PRIMARY_RESOLVE_SQL, (symbol, source))
     return int(val) if val is not None else None
 
 

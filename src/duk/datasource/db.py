@@ -33,19 +33,27 @@ def _connect(dsn: str):
     return psycopg.connect(dsn, row_factory=dict_row)
 
 
-def _resolve_security_id(cur, symbol: str) -> Optional[int]:
-    cur.execute(
-        "SELECT security_id FROM core.symbol_xref WHERE symbol = %s AND valid_to IS NULL "
-        "ORDER BY is_primary DESC, valid_from DESC LIMIT 1",
-        (symbol,),
-    )
+# These two queries MUST stay identical to fafnir.db.repository.resolve_security_id
+# (XREF_RESOLVE_SQL / PRIMARY_RESOLVE_SQL) so the read path resolves a ticker to the
+# same security_id the loader used. Duplicated (not imported) to keep duk's db
+# datasource free of a hard fafnir/psycopg import at module load.
+_XREF_RESOLVE_SQL = (
+    "SELECT security_id FROM core.symbol_xref "
+    "WHERE symbol = %s AND valid_to IS NULL "
+    "ORDER BY is_primary DESC, valid_from DESC LIMIT 1"
+)
+_PRIMARY_RESOLVE_SQL = (
+    "SELECT security_id FROM core.security WHERE primary_symbol = %s "
+    "ORDER BY (source = %s) DESC, security_id ASC LIMIT 1"
+)
+
+
+def _resolve_security_id(cur, symbol: str, source: str = "fmp") -> Optional[int]:
+    cur.execute(_XREF_RESOLVE_SQL, (symbol,))
     row = cur.fetchone()
     if row:
         return int(row["security_id"])
-    cur.execute(
-        "SELECT security_id FROM core.security WHERE primary_symbol = %s LIMIT 1",
-        (symbol,),
-    )
+    cur.execute(_PRIMARY_RESOLVE_SQL, (symbol, source))
     row = cur.fetchone()
     return int(row["security_id"]) if row else None
 
@@ -90,10 +98,14 @@ def price_history(
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
-    # Exact decimals -> float for downstream numeric ops, matching live output.
-    for col in ("open", "high", "low", "close", "volume"):
+    # Prices: exact decimals -> float for downstream numeric ops (matches live).
+    for col in ("open", "high", "low", "close"):
         if col in df.columns:
             df[col] = df[col].astype(float)
+    # Volume stays integer to match the live path's int64 dtype (the adjusted
+    # view returns numeric(38,0), so coerce Decimal/int -> int64).
+    if "volume" in df.columns:
+        df["volume"] = df["volume"].astype("int64")
     return shape_price_dataframe(
         df,
         frequency=frequency,

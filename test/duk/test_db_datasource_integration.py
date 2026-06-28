@@ -75,6 +75,9 @@ def test_db_price_history_raw_and_adjusted(db):
     )
     assert list(raw.columns) == ["open", "high", "low", "close", "volume"]
     assert raw.loc["2023-05-31", "close"] == 100.0
+    # Volume stays integer (matches live int64), prices are float.
+    assert str(raw["volume"].dtype) == "int64"
+    assert str(raw["close"].dtype) == "float64"
 
     adj = ds_db.price_history(
         dsn=DSN,
