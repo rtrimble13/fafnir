@@ -36,9 +36,16 @@ request_rate_per_min = 280
 # corrections / re-adjustments.
 overlap_days = 5
 
-# Trading-calendar generation range (years).
+# Trading-calendar / partition horizon.
+#   calendar_start_year : earliest year to build (set to your backfill start, e.g. 1990).
+#   calendar_end_year   : minimum/initial horizon. The nightly `fafnir db ensure-horizon`
+#                         (in daily_update.sh) auto-extends partitions + calendar to a
+#                         rolling current_year + horizon_extra_years, so you do NOT need
+#                         to bump this every year.
+#   horizon_extra_years : how far ahead of the current year to stay (default 2).
 calendar_start_year = 2015
 calendar_end_year = 2027
+horizon_extra_years = 2
 
 # Logging.
 log_level = "info"

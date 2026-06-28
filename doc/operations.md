@@ -33,7 +33,7 @@ crontab etc/crontab.example   # edit paths/times first
 ```
 
 The daily job performs, in order:
-`ensure-partitions → ingest prices → ingest actions → adjust → refresh-marts → dq run`.
+`ensure-horizon → ingest prices → ingest actions → adjust → refresh-marts → dq run`.
 
 ## Monitoring
 
@@ -67,8 +67,11 @@ a rotating sample. It reports differences; it does not auto-overwrite.
 
 ## Maintenance tasks
 
-- **New year partition** — created automatically by `ensure-partitions` in the daily
-  job; or pre-create a range: `fafnir db ensure-partitions --start-year 2028 --end-year 2030`.
+- **Partitions & calendar horizon** — kept rolling automatically by
+  `fafnir db ensure-horizon` in the daily job (extends to
+  `max(current_year + horizon_extra_years, calendar_end_year)`), so no yearly config
+  edits are needed. To force a specific target: `fafnir db ensure-horizon --through-year 2035`;
+  to create an explicit fixed range instead: `fafnir db ensure-partitions --start-year 2028 --end-year 2030`.
 - **Mart refresh** — `fafnir db refresh-marts` (also part of the daily job).
 - **Re-run adjustments** — `fafnir adjust` (whole universe) or `fafnir adjust --symbol AAPL`.
 

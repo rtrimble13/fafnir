@@ -137,7 +137,15 @@ class FafnirConfig:
 
     @property
     def calendar_end_year(self) -> int:
+        """Minimum/initial horizon for the calendar + partitions. The daily job
+        (`fafnir db ensure-horizon`) auto-extends beyond this to a rolling
+        `current_year + horizon_extra_years`, so this rarely needs changing."""
         return int(self._get("general", "calendar_end_year", 2027))
+
+    @property
+    def horizon_extra_years(self) -> int:
+        """How many years past the current year the rolling horizon stays ahead."""
+        return int(self._get("general", "horizon_extra_years", 2))
 
     def is_loaded(self) -> bool:
         return bool(self._data)
