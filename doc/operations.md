@@ -4,17 +4,27 @@ Day-to-day upkeep of a fafnir deployment (bare-metal Postgres on Linux).
 
 ## One-time setup
 
+Provisioning a cloud host from nothing? Use
+**[install_hetzner.md](install_hetzner.md)** — it walks the whole path (server, OS
+hardening, PostgreSQL 16 install and tuning, service user, schedule, backups). The
+condensed version:
+
 ```bash
 # 1. PostgreSQL 16 running locally; create the database + roles + schema.
 #    setup_db.sh uses FAFNIR_ADMIN_DSN (a superuser conn) to CREATE DATABASE,
 #    then migrates and seeds.
 export FAFNIR_ADMIN_DSN="host=localhost dbname=postgres user=postgres"
 export FAFNIR_DSN="host=localhost dbname=fafnir user=fafnir_ingest"
-export FAFNIR_DB_PASSWORD=...        # ingest role password
+export PGPASSWORD=...                # ingest role password; FAFNIR_DB_PASSWORD is
+                                     # ignored when FAFNIR_DSN is set (see backfill.md §3)
 export FMP_API_KEY=...
 export FAFNIR_SQL_DIR=/opt/fafnir/sql
 
+# Migration 0001 comments on the roles, which needs superuser on PG16. Elevate for
+# the migration only -- everything afterwards runs unprivileged.
+sudo -u postgres psql -c "ALTER ROLE fafnir_ingest SUPERUSER;"
 scripts/setup_db.sh
+sudo -u postgres psql -c "ALTER ROLE fafnir_ingest NOSUPERUSER;"
 
 # 2. Assign role passwords (out of band) and harden grants as needed.
 #    psql -c "ALTER ROLE fafnir_ingest PASSWORD '...';" etc.

@@ -4,6 +4,11 @@ How to stand up fafnir and backfill **active US equities + ETFs** from a chosen
 start date (e.g. 1990) to present. Target host: Linux + PostgreSQL 16 + Python 3.11+,
 with an FMP **Professional** key.
 
+> **Standing up a cloud server from scratch?** Follow
+> [install_hetzner.md](install_hetzner.md) instead — it covers provisioning, OS
+> hardening, cluster tuning, service users, and scheduling, then hands off to §6 here
+> for the load itself.
+
 > **Scope:** `ingest securities` loads the *active* universe (FMP `stock-list` +
 > `etf-list`). Retaining *delisted* names (survivorship-bias-free) needs the
 > delisted endpoint — a documented fast-follow. So this backfill covers active
@@ -32,11 +37,12 @@ fafnir --version && duk --version
 
 ## 2. Bootstrap Postgres roles + database (once, as the `postgres` superuser)
 
-Pre-creating the roles lets the migrator run as a non-superuser DB owner
-(migration `0001` sees them and skips its `CREATE ROLE`):
+Pre-creating the roles lets migration `0001` skip its `CREATE ROLE`, and makes
+`fafnir_ingest` the database owner — which it must be, so the nightly
+`fafnir db ensure-horizon` can attach new partitions to `core.daily_price`:
 
 ```bash
-sudo -u postgres psql <<'SQL'
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE fafnir_ingest LOGIN PASSWORD 'CHANGE_ME_ingest';
 CREATE ROLE fafnir_read   LOGIN PASSWORD 'CHANGE_ME_read';
 CREATE ROLE fafnir_app    LOGIN PASSWORD 'CHANGE_ME_app';
@@ -73,21 +79,41 @@ Secrets via the environment (put in a root-only `/etc/fafnir/fafnir.env`, `chmod
 
 ```bash
 export FAFNIR_DSN="host=localhost dbname=fafnir user=fafnir_ingest"
-export FAFNIR_DB_PASSWORD="CHANGE_ME_ingest"
+export PGPASSWORD="CHANGE_ME_ingest"      # see the note below
 export FMP_API_KEY="your_fmp_pro_key"
 export FAFNIR_SQL_DIR="/opt/fafnir/sql"   # so the migrator finds sql/ outside a checkout
 ```
 
+> **`FAFNIR_DB_PASSWORD` is ignored when `FAFNIR_DSN` is set** — the DSN is used
+> verbatim, and the password is only merged in when the DSN is assembled from the
+> `[database]` parts in `~/.fafnirrc`. With `FAFNIR_DSN` exported, supply the password
+> via `PGPASSWORD` (libpq reads it), a `~/.pgpass` entry (`chmod 600`), or
+> `password=` inside the DSN itself — otherwise the connection fails with
+> `fe_sendauth: no password supplied`.
+
 ## 4. Create the schema (migrate + seed + horizon)
 
-The database already exists (step 2), so run the schema steps directly:
+The database already exists (step 2), so run the schema steps directly. Migration
+`0001` runs `COMMENT ON ROLE`, which on PostgreSQL 16 requires superuser (a role can
+never hold `ADMIN OPTION` on itself, so granting `CREATEROLE` is not enough), so
+elevate `fafnir_ingest` for the migration and drop the attribute straight afterwards:
 
 ```bash
 cd /opt/fafnir
+sudo -u postgres psql -c "ALTER ROLE fafnir_ingest SUPERUSER;"
 fafnir db migrate          # applies all migrations
+sudo -u postgres psql -c "ALTER ROLE fafnir_ingest NOSUPERUSER;"
+
 fafnir db seed             # exchanges + trading calendar (calendar_start_year..calendar_end_year)
 fafnir db ensure-horizon   # creates yearly partitions + extends calendar to the rolling horizon
 fafnir db status           # all migrations 'applied'
+```
+
+Everything after `db migrate` — seeds, partitions, ingestion, the nightly job — runs
+as an ordinary non-superuser role. Verify the attribute is gone:
+
+```bash
+sudo -u postgres psql -tAc "SELECT rolsuper FROM pg_roles WHERE rolname='fafnir_ingest';"   # f
 ```
 
 Checkpoint:

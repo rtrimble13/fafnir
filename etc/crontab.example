@@ -5,12 +5,15 @@
 # Times are server-local. US EOD data is typically settled a few hours after the
 # 16:00 ET close; 22:30 ET (here shown as a generic evening slot) is a safe slot.
 
-# Load environment (DSN + API key) from a root-only file.
+# Load environment (DSN + API key) from a root-only file. Values must be quoted --
+# the recipes below source this file with `set -a; . file`.
 # Example fafnir.env contents:
 #   FAFNIR_DSN="host=localhost dbname=fafnir user=fafnir_ingest"
-#   FAFNIR_DB_PASSWORD="..."
+#   PGPASSWORD="..."                 # NOT FAFNIR_DB_PASSWORD: that is ignored when
+#                                    # FAFNIR_DSN is set (see etc/fafnirrc).
 #   FMP_API_KEY="..."
 #   FAFNIR_SQL_DIR="/opt/fafnir/sql"
+#   PATH="/opt/fafnir/.venv/bin:/usr/local/bin:/usr/bin:/bin"   # if installed in a venv
 
 SHELL=/bin/bash
 FAFNIR_HOME=/opt/fafnir
