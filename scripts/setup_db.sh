@@ -42,6 +42,14 @@ END
 $$;
 SQL
 
+    # A custom FAFNIR_DB_OWNER is not one of the three above, so create it too --
+    # otherwise CREATE DATABASE ... OWNER fails with "role does not exist".
+    if ! psql "${ADMIN_DSN}" -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname='${FAFNIR_DB_OWNER}'" | grep -q '^1$'; then
+        echo "==> Creating database owner role '${FAFNIR_DB_OWNER}'"
+        psql "${ADMIN_DSN}" -v ON_ERROR_STOP=1 -c "CREATE ROLE ${FAFNIR_DB_OWNER} LOGIN"
+    fi
+
     echo "==> Ensuring database '${FAFNIR_DB}' exists (owner: ${FAFNIR_DB_OWNER})"
     if ! psql "${ADMIN_DSN}" -tAc "SELECT 1 FROM pg_database WHERE datname='${FAFNIR_DB}'" | grep -q 1; then
         psql "${ADMIN_DSN}" -c "CREATE DATABASE ${FAFNIR_DB} OWNER ${FAFNIR_DB_OWNER}"

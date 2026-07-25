@@ -43,6 +43,13 @@ DRIFT = "drift"  # applied from something else -- someone edited it
 # drift guard: an edit that is *not* listed here still raises, so accidental edits
 # to applied migrations are caught as before.
 #
+# Why this exists rather than a one-off "UPDATE meta.schema_migration SET checksum"
+# in the release notes: drift is reported by `fafnir db status` and raised by
+# `fafnir db migrate`, so an operator who upgrades without reading the notes hits a
+# hard error telling them to add a new migration -- advice they cannot act on,
+# because the two revisions are equivalent. Encoding the supersession in the runner
+# makes the upgrade self-healing and keeps the guard strict for every other case.
+#
 # Only add an entry when the new revision leaves an already-migrated database
 # byte-for-byte equivalent to the old one. Anything that changes the schema needs a
 # new migration instead.
@@ -53,7 +60,14 @@ SUPERSEDED_CHECKSUMS: dict[str, frozenset[str]] = {
     # superuser for COMMENT ON ROLE. Databases migrated before this already have the
     # comments; no schema difference either way.
     "0001": frozenset(
-        {"2d0c8a20afe1c6b3deae69dcec310f1266dd1ba94c7ff96ed2fa2cfeb7139d4e"}
+        {
+            # Original revision, as released.
+            "2d0c8a20afe1c6b3deae69dcec310f1266dd1ba94c7ff96ed2fa2cfeb7139d4e",
+            # First pass at the fix; reported the skip with RAISE NOTICE, which
+            # psycopg discards. Short-lived (unmerged branch), but listed so anyone
+            # who applied it from the branch upgrades cleanly.
+            "e5317d068b7c4b3decdb2e47f8fd10650bb997720cbeb8efe2fe2ef522945a91",
+        }
     ),
 }
 
@@ -196,6 +210,11 @@ def migrate(
                         "UPDATE meta.schema_migration SET checksum = %s WHERE version = %s",
                         (mig.checksum, mig.version),
                     )
+                # Stop at the target even when it needed no work, otherwise a
+                # re-run of `migrate --target 0003` would sail past it and apply
+                # everything after it.
+                if target is not None and mig.version == target:
+                    break
                 continue
             logger.info("Applying migration %s_%s", mig.version, mig.name)
             db.execute_script(mig.up_path.read_text())

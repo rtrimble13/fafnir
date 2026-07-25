@@ -57,11 +57,14 @@ BEGIN
 EXCEPTION WHEN insufficient_privilege THEN
     -- The roles are referenced by the GRANTs below, so this is fatal -- but say
     -- exactly how to fix it instead of surfacing a bare "permission denied".
+    -- Keep SQLSTATE 42501 so callers matching on the error code still see
+    -- insufficient_privilege rather than a generic raise_exception (P0001).
     RAISE EXCEPTION
-        'the fafnir roles do not exist and the current user (%) lacks CREATEROLE. '
-        'Create them once as a superuser, then re-run the migration: '
-        'CREATE ROLE fafnir_ingest LOGIN; CREATE ROLE fafnir_read LOGIN; '
-        'CREATE ROLE fafnir_app LOGIN;', current_user;
+        'one or more of the fafnir roles is missing and the current user (%) '
+        'lacks CREATEROLE. Create whichever are absent, once, as a superuser, '
+        'then re-run the migration: CREATE ROLE fafnir_ingest LOGIN; '
+        'CREATE ROLE fafnir_read LOGIN; CREATE ROLE fafnir_app LOGIN;', current_user
+        USING ERRCODE = '42501';
 END
 $$;
 
@@ -69,15 +72,22 @@ $$;
 -- least-privilege migrator does not have, and losing a catalog comment is not a
 -- reason to fail an install. To set them, run these three statements as a
 -- superuser (e.g. `sudo -u postgres psql -d fafnir`) at any time.
+--
+-- Reported with RAISE WARNING, not NOTICE, so it is visible: the fafnir CLI logs
+-- server warnings but keeps routine notices at debug level (see
+-- fafnir.db.connection). Something the operator asked for did not happen, so it
+-- should not be silent.
 DO $$
 BEGIN
     COMMENT ON ROLE fafnir_ingest IS 'Write path: loaders. Writes landing/core/ref/ops. No DROP/ALTER in prod.';
     COMMENT ON ROLE fafnir_read   IS 'Read path: research/notebooks. Reads core/mart/ref.';
     COMMENT ON ROLE fafnir_app    IS 'Least-privilege app/MCP/duk-db role. Reads mart (+ ref) only.';
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE
-        'Skipped COMMENT ON ROLE: % is not a superuser. Role comments are '
-        'documentation only -- the schema and grants are unaffected.', current_user;
+    RAISE WARNING
+        'skipped COMMENT ON ROLE: % is not a superuser. Role comments are '
+        'documentation only -- the schema and grants are unaffected. To set them, '
+        'run the three COMMENT ON ROLE statements in this migration as a superuser.',
+        current_user;
 END
 $$;
 

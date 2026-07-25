@@ -367,17 +367,26 @@ sudo -u postgres psql -d fafnir -c "CREATE EXTENSION IF NOT EXISTS pg_stat_state
 Map the OS user `fafnir` to the database role `fafnir_ingest` over the Unix socket.
 The nightly job then needs **no database password anywhere on disk**.
 
+Both edits are guarded so re-running this step cannot append duplicates:
+
 ```bash
 # The OS user is created in §4.1; this ident map refers to it.
-echo 'fafnirmap  fafnir  fafnir_ingest' | sudo tee -a /etc/postgresql/16/main/pg_ident.conf
+sudo grep -q '^fafnirmap' /etc/postgresql/16/main/pg_ident.conf \
+  || echo 'fafnirmap  fafnir  fafnir_ingest' | sudo tee -a /etc/postgresql/16/main/pg_ident.conf
 
 # IMPORTANT: this line must sit ABOVE the generic "local all all peer" rule.
-sudo sed -i '/^# TYPE  DATABASE/a local   all             fafnir_ingest                           peer map=fafnirmap' \
-  /etc/postgresql/16/main/pg_hba.conf
+sudo grep -q 'peer map=fafnirmap' /etc/postgresql/16/main/pg_hba.conf \
+  || sudo sed -i '/^# TYPE  DATABASE/a local   all             fafnir_ingest                           peer map=fafnirmap' \
+       /etc/postgresql/16/main/pg_hba.conf
 
 sudo systemctl reload postgresql@16-main
-grep -nE '^(local|host)' /etc/postgresql/16/main/pg_hba.conf
+sudo grep -nE '^(local|host)' /etc/postgresql/16/main/pg_hba.conf
 ```
+
+The `sed` anchors on the `# TYPE  DATABASE` header that ships in the packaged
+`pg_hba.conf` (note the two spaces). If your file has been rewritten and the anchor
+is missing, the command silently does nothing — the `grep` above will show no
+`fafnirmap` line, and you should add it by hand above `local all all peer`.
 
 pg_hba is first-match-wins, so this rule must appear before `local all all peer` —
 otherwise peer auth demands an OS user literally named `fafnir_ingest` and fails. The
@@ -542,8 +551,13 @@ that is the point of pre-creating the roles and giving it the database in §3.4:
   handled inside the migration. `CREATE ROLE` is skipped because §3.4 already created
   the roles (if they are missing, the migration stops with an error telling you the
   exact SQL to run). The three `COMMENT ON ROLE` statements — catalog documentation
-  only — are best-effort: PostgreSQL requires superuser for those, so they are skipped
-  with a `NOTICE` instead of failing the install.
+  only — are best-effort: PostgreSQL requires superuser for those, so instead of
+  failing the install they are skipped and logged:
+
+  ```
+  WARNING  | fafnir.db | postgres: skipped COMMENT ON ROLE: fafnir_ingest is not a
+             superuser. Role comments are documentation only ...
+  ```
 
 If you want the role comments in the catalog, apply them any time as a superuser; see
 the block at the top of

@@ -19,9 +19,31 @@ from fafnir.logging_config import get_logger
 logger = get_logger("db")
 
 
+def _log_server_message(diag: psycopg.errors.Diagnostic) -> None:
+    """
+    Route a PostgreSQL server message into the fafnir log.
+
+    psycopg discards notices unless a handler is registered, which would hide
+    anything a migration or function reports with RAISE. Severity decides the
+    level: WARNING and above are surfaced by default (e.g. migration 0001
+    reporting that it could not set the role comments), while routine NOTICE
+    chatter -- "schema ... already exists, skipping" on every idempotent re-run --
+    stays at debug so ordinary CLI output remains clean.
+    """
+    severity = (diag.severity_nonlocalized or diag.severity or "NOTICE").upper()
+    message = diag.message_primary or ""
+    if diag.message_detail:
+        message = f"{message} ({diag.message_detail})"
+    if severity in ("WARNING", "ERROR", "FATAL", "PANIC", "EXCEPTION"):
+        logger.warning("postgres: %s", message)
+    else:
+        logger.debug("postgres[%s]: %s", severity.lower(), message)
+
+
 def connect(dsn: str, autocommit: bool = False) -> psycopg.Connection:
     """Open a psycopg connection. Caller owns the lifecycle."""
     conn = psycopg.connect(dsn, autocommit=autocommit)
+    conn.add_notice_handler(_log_server_message)
     return conn
 
 

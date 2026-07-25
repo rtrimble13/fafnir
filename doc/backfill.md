@@ -106,8 +106,8 @@ fafnir db status           # all migrations 'applied'
 
 Migration `0001` needs no elevation: step 2 pre-created the roles, and its three
 `COMMENT ON ROLE` statements (catalog documentation, which PostgreSQL restricts to
-superusers) are best-effort — skipped with a `NOTICE` when the migrating role cannot
-set them. Confirm the role stayed unprivileged:
+superusers) are best-effort — skipped, and logged as a `WARNING`, when the migrating
+role cannot set them. Confirm the role stayed unprivileged:
 
 ```bash
 sudo -u postgres psql -tAc "SELECT rolsuper, rolcreaterole FROM pg_roles
