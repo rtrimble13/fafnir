@@ -10,6 +10,12 @@
 [database]
 # Either set a full libpq DSN ...
 # dsn = "host=localhost port=5432 dbname=fafnir user=fafnir_ingest password=..."
+#
+# NOTE: a DSN (from `dsn` here or the FAFNIR_DSN env var) is used VERBATIM --
+# FAFNIR_DB_PASSWORD is *not* merged into it. With a DSN, pass the password inside it,
+# via PGPASSWORD, or via ~/.pgpass. FAFNIR_DB_PASSWORD applies only when the DSN is
+# assembled from the host/port/dbname/user parts below.
+#
 # ... or the individual parts (password preferably via FAFNIR_DB_PASSWORD):
 host = "localhost"
 port = 5432

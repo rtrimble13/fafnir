@@ -37,6 +37,10 @@ and `meta` (migrations). See **[doc/architecture.md](doc/architecture.md)** and 
 
 ## Quick start (bare-metal Postgres)
 
+> Installing on a fresh cloud server? **[doc/install_hetzner.md](doc/install_hetzner.md)**
+> is a step-by-step walkthrough for a Hetzner Cloud host (Ubuntu 24.04 + PostgreSQL 16),
+> from provisioning through nightly scheduling and backups.
+
 ```bash
 # 1. Install
 make build                      # pip install -e .[dev]
@@ -46,7 +50,9 @@ cp etc/fafnirrc ~/.fafnirrc      # set [database] + FMP_API_KEY (env preferred)
 export FMP_API_KEY=...           # never commit keys
 
 # 3. Create DB, roles, schema, seeds
-scripts/setup_db.sh             # createdb + migrate + seed
+scripts/setup_db.sh             # roles + createdb (via FAFNIR_ADMIN_DSN) + migrate + seed
+                                # the schema itself is created by the ordinary
+                                # fafnir_ingest role -- no superuser needed
 
 # 4. Initial build (security master → prices → actions → adjust)
 fafnir ingest securities --limit 500     # or full universe (omit --limit)
@@ -85,6 +91,8 @@ fast-follow lands.
 | [architecture.md](doc/architecture.md) | Layers, ERD, role model, design decisions |
 | [data_dictionary.md](doc/data_dictionary.md) | Every table/column: grain, source, units, adjustment, cadence |
 | [ingestion.md](doc/ingestion.md) | FMP endpoint→table map, idempotency, watermarks |
+| [install_hetzner.md](doc/install_hetzner.md) | Fresh install on a Hetzner Cloud server: provision → Postgres → fafnir → cron |
+| [backfill.md](doc/backfill.md) | Initial setup & historical backfill (bandwidth, chunking, resumability) |
 | [operations.md](doc/operations.md) | Daily upkeep runbook, cron, backfill, recovery |
 | [duk.md](doc/duk.md) | CLI usage (live vs db) |
 | [extending.md](doc/extending.md) | Add a source (FRED/BLS/BEA), a table, or the MCP server |

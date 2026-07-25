@@ -8,6 +8,18 @@
 -- where the roles already exist (e.g. shared cluster). Passwords are NOT set
 -- here -- assign them out-of-band (ALTER ROLE ... PASSWORD) or via your secrets
 -- manager. Login is granted so the ingest/read roles can connect.
+--
+-- This migration is designed to run as the (non-superuser) database owner, which
+-- is what a least-privilege install uses: the owner must own these objects so that
+-- routine maintenance (`fafnir db ensure-horizon` attaching yearly partitions to
+-- core.daily_price) keeps working. Two statements would otherwise demand more
+-- privilege than that, so both are handled explicitly below:
+--   * CREATE ROLE      -- needs CREATEROLE; skipped when the roles already exist,
+--                         and raises an actionable error when they do not.
+--   * COMMENT ON ROLE  -- needs superuser (CREATEROLE is not enough: it also wants
+--                         ADMIN OPTION on the role, and a role can never hold that
+--                         on itself). Applied best-effort; these comments are
+--                         catalog documentation, not structure.
 
 BEGIN;
 
@@ -42,12 +54,42 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fafnir_app') THEN
         CREATE ROLE fafnir_app LOGIN;
     END IF;
+EXCEPTION WHEN insufficient_privilege THEN
+    -- The roles are referenced by the GRANTs below, so this is fatal -- but say
+    -- exactly how to fix it instead of surfacing a bare "permission denied".
+    -- Keep SQLSTATE 42501 so callers matching on the error code still see
+    -- insufficient_privilege rather than a generic raise_exception (P0001).
+    RAISE EXCEPTION
+        'one or more of the fafnir roles is missing and the current user (%) '
+        'lacks CREATEROLE. Create whichever are absent, once, as a superuser, '
+        'then re-run the migration: CREATE ROLE fafnir_ingest LOGIN; '
+        'CREATE ROLE fafnir_read LOGIN; CREATE ROLE fafnir_app LOGIN;', current_user
+        USING ERRCODE = '42501';
 END
 $$;
 
-COMMENT ON ROLE fafnir_ingest IS 'Write path: loaders. Writes landing/core/ref/ops. No DROP/ALTER in prod.';
-COMMENT ON ROLE fafnir_read   IS 'Read path: research/notebooks. Reads core/mart/ref.';
-COMMENT ON ROLE fafnir_app    IS 'Least-privilege app/MCP/duk-db role. Reads mart (+ ref) only.';
+-- Role documentation. Best-effort: COMMENT ON ROLE requires superuser, which a
+-- least-privilege migrator does not have, and losing a catalog comment is not a
+-- reason to fail an install. To set them, run these three statements as a
+-- superuser (e.g. `sudo -u postgres psql -d fafnir`) at any time.
+--
+-- Reported with RAISE WARNING, not NOTICE, so it is visible: the fafnir CLI logs
+-- server warnings but keeps routine notices at debug level (see
+-- fafnir.db.connection). Something the operator asked for did not happen, so it
+-- should not be silent.
+DO $$
+BEGIN
+    COMMENT ON ROLE fafnir_ingest IS 'Write path: loaders. Writes landing/core/ref/ops. No DROP/ALTER in prod.';
+    COMMENT ON ROLE fafnir_read   IS 'Read path: research/notebooks. Reads core/mart/ref.';
+    COMMENT ON ROLE fafnir_app    IS 'Least-privilege app/MCP/duk-db role. Reads mart (+ ref) only.';
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE WARNING
+        'skipped COMMENT ON ROLE: % is not a superuser. Role comments are '
+        'documentation only -- the schema and grants are unaffected. To set them, '
+        'run the three COMMENT ON ROLE statements in this migration as a superuser.',
+        current_user;
+END
+$$;
 
 -- ---------------------------------------------------------------------------
 -- Grants: usage on schemas

@@ -64,6 +64,11 @@ get point-in-time-stable data for free.
 - Migrations are code: versioned, reviewed, reversible, one logical change each.
   Never edit an applied migration (the runner detects checksum drift) — add a new
   one.
+  - The single exception is a revision that leaves an already-migrated database
+    *identical* — e.g. relaxing the privileges a statement needs. Then record the
+    previous checksum in `SUPERSEDED_CHECKSUMS` (`src/fafnir/db/migrate.py`) so
+    existing deployments are re-stamped instead of reporting drift they cannot
+    act on. Anything that touches the schema still needs a new migration.
 - Backfills are separate, batched, restartable — not an unbounded `UPDATE`.
 - Never change a fact table's grain in place; that is a data-loss risk. Plan it
   explicitly with a new table + migration.
