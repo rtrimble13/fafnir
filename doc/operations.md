@@ -10,9 +10,10 @@ hardening, PostgreSQL 16 install and tuning, service user, schedule, backups). T
 condensed version:
 
 ```bash
-# 1. PostgreSQL 16 running locally; create the database + roles + schema.
-#    setup_db.sh uses FAFNIR_ADMIN_DSN (a superuser conn) to CREATE DATABASE,
-#    then migrates and seeds.
+# 1. PostgreSQL 16 running locally; create the roles, database and schema.
+#    setup_db.sh uses FAFNIR_ADMIN_DSN (a superuser conn) to create the three roles
+#    and a database owned by FAFNIR_DB_OWNER (default fafnir_ingest), then migrates
+#    and seeds as that ordinary role -- no superuser beyond the admin connection.
 export FAFNIR_ADMIN_DSN="host=localhost dbname=postgres user=postgres"
 export FAFNIR_DSN="host=localhost dbname=fafnir user=fafnir_ingest"
 export PGPASSWORD=...                # ingest role password; FAFNIR_DB_PASSWORD is
@@ -20,11 +21,7 @@ export PGPASSWORD=...                # ingest role password; FAFNIR_DB_PASSWORD 
 export FMP_API_KEY=...
 export FAFNIR_SQL_DIR=/opt/fafnir/sql
 
-# Migration 0001 comments on the roles, which needs superuser on PG16. Elevate for
-# the migration only -- everything afterwards runs unprivileged.
-sudo -u postgres psql -c "ALTER ROLE fafnir_ingest SUPERUSER;"
 scripts/setup_db.sh
-sudo -u postgres psql -c "ALTER ROLE fafnir_ingest NOSUPERUSER;"
 
 # 2. Assign role passwords (out of band) and harden grants as needed.
 #    psql -c "ALTER ROLE fafnir_ingest PASSWORD '...';" etc.

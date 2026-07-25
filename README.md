@@ -50,9 +50,9 @@ cp etc/fafnirrc ~/.fafnirrc      # set [database] + FMP_API_KEY (env preferred)
 export FMP_API_KEY=...           # never commit keys
 
 # 3. Create DB, roles, schema, seeds
-scripts/setup_db.sh             # createdb + migrate + seed
-                                # migration 0001 comments on roles -> needs a superuser
-                                # connection for this step only (see doc/operations.md)
+scripts/setup_db.sh             # roles + createdb (via FAFNIR_ADMIN_DSN) + migrate + seed
+                                # the schema itself is created by the ordinary
+                                # fafnir_ingest role -- no superuser needed
 
 # 4. Initial build (security master → prices → actions → adjust)
 fafnir ingest securities --limit 500     # or full universe (omit --limit)

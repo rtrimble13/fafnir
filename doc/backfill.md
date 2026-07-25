@@ -93,27 +93,25 @@ export FAFNIR_SQL_DIR="/opt/fafnir/sql"   # so the migrator finds sql/ outside a
 
 ## 4. Create the schema (migrate + seed + horizon)
 
-The database already exists (step 2), so run the schema steps directly. Migration
-`0001` runs `COMMENT ON ROLE`, which on PostgreSQL 16 requires superuser (a role can
-never hold `ADMIN OPTION` on itself, so granting `CREATEROLE` is not enough), so
-elevate `fafnir_ingest` for the migration and drop the attribute straight afterwards:
+The database and roles already exist (step 2), so run the schema steps directly — all
+of them as the ordinary, non-superuser `fafnir_ingest`:
 
 ```bash
 cd /opt/fafnir
-sudo -u postgres psql -c "ALTER ROLE fafnir_ingest SUPERUSER;"
 fafnir db migrate          # applies all migrations
-sudo -u postgres psql -c "ALTER ROLE fafnir_ingest NOSUPERUSER;"
-
 fafnir db seed             # exchanges + trading calendar (calendar_start_year..calendar_end_year)
 fafnir db ensure-horizon   # creates yearly partitions + extends calendar to the rolling horizon
 fafnir db status           # all migrations 'applied'
 ```
 
-Everything after `db migrate` — seeds, partitions, ingestion, the nightly job — runs
-as an ordinary non-superuser role. Verify the attribute is gone:
+Migration `0001` needs no elevation: step 2 pre-created the roles, and its three
+`COMMENT ON ROLE` statements (catalog documentation, which PostgreSQL restricts to
+superusers) are best-effort — skipped with a `NOTICE` when the migrating role cannot
+set them. Confirm the role stayed unprivileged:
 
 ```bash
-sudo -u postgres psql -tAc "SELECT rolsuper FROM pg_roles WHERE rolname='fafnir_ingest';"   # f
+sudo -u postgres psql -tAc "SELECT rolsuper, rolcreaterole FROM pg_roles
+  WHERE rolname='fafnir_ingest';"                                     # f|f
 ```
 
 Checkpoint:

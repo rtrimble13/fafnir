@@ -256,11 +256,20 @@ cluster is empty:
 ```bash
 sudo -u postgres psql -tAc "SHOW data_checksums;"        # off  <-- the default
 sudo pg_dropcluster --stop 16 main
-sudo pg_createcluster --start 16 main -- --data-checksums
+sudo pg_createcluster --start 16 main --locale=C.UTF-8 --encoding=UTF8 -- --data-checksums
+
 sudo -u postgres psql -tAc "SHOW data_checksums;"        # on
-sudo -u postgres psql -tAc "SHOW server_encoding;"       # UTF8
+sudo -u postgres psql -tAc "SHOW server_encoding;"       # UTF8   <-- verify, don't assume
 sudo -u postgres psql -tAc "SHOW password_encryption;"   # scram-sha-256
 ```
+
+> **Pin the locale explicitly** — that is not belt-and-braces. `pg_createcluster`
+> takes the locale from its environment, and `sudo` scrubs `LANG`/`LC_ALL`, so on a
+> cloud image where the locale is unset you get an **`SQL_ASCII` / `C`** cluster. That
+> breaks the seeds outright (`fafnir db seed` fails with a foreign-key error on
+> `ref.exchange`) and would mangle every non-ASCII company name that made it in. If
+> `SHOW server_encoding` says anything but `UTF8`, drop the cluster and redo this step
+> — encoding cannot be changed in place.
 
 > Already have data in the cluster? Don't drop it — stop the cluster and run
 > `sudo -u postgres /usr/lib/postgresql/16/bin/pg_checksums --enable -D /var/lib/postgresql/16/main`
@@ -521,39 +530,33 @@ Why each line matters:
 
 ## 5. Create the schema
 
-### 5.1 Why the migrator needs superuser, briefly
+### 5.1 The privileges this needs (none beyond §3.4)
 
-Migration `0001` runs `COMMENT ON ROLE` on the three fafnir roles. On PostgreSQL 16
-that requires superuser, or `CREATEROLE` **plus** `ADMIN OPTION` on each role — and a
-role can never hold `ADMIN OPTION` on itself, so `fafnir_ingest` cannot comment on
-`fafnir_ingest` no matter what you grant it. Without the elevation you get:
+The whole schema is created by `fafnir_ingest` as an ordinary, non-superuser role —
+that is the point of pre-creating the roles and giving it the database in §3.4:
 
-```
-psycopg.errors.InsufficientPrivilege: permission denied
-DETAIL:  The current user must have the CREATEROLE attribute.
-```
+- It **must** own the objects. Ownership is what lets the nightly
+  `fafnir db ensure-horizon` attach new yearly partitions to `core.daily_price`, so
+  running migrations as `postgres` would break maintenance later.
+- Two statements in migration `0001` would otherwise want more privilege, and both are
+  handled inside the migration. `CREATE ROLE` is skipped because §3.4 already created
+  the roles (if they are missing, the migration stops with an error telling you the
+  exact SQL to run). The three `COMMENT ON ROLE` statements — catalog documentation
+  only — are best-effort: PostgreSQL requires superuser for those, so they are skipped
+  with a `NOTICE` instead of failing the install.
 
-Running the migrations as `postgres` instead is **not** a fix: the tables would be
-owned by `postgres`, and `fafnir_ingest` could no longer create partitions on
-`core.daily_price` — the nightly `ensure-horizon` would fail. So: elevate
-`fafnir_ingest` for the migration, then drop the attribute immediately.
+If you want the role comments in the catalog, apply them any time as a superuser; see
+the block at the top of
+[`sql/migrations/0001_schemas_and_roles.up.sql`](../sql/migrations/0001_schemas_and_roles.up.sql).
 
 ### 5.2 Migrate, seed, set the horizon
 
 ```bash
-# Elevate for the migration only.
-sudo -u postgres psql -c "ALTER ROLE fafnir_ingest SUPERUSER;"
-
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir; fafnir db migrate'
-
-# Drop it again, and verify.
-sudo -u postgres psql -c "ALTER ROLE fafnir_ingest NOSUPERUSER;"
-sudo -u postgres psql -tAc "SELECT rolsuper FROM pg_roles WHERE rolname='fafnir_ingest';"   # f
 ```
 
-Expected from `db migrate`: `Applied: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008`.
-
-Everything after this point runs as an ordinary, unprivileged role:
+Expected: `Applied: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008`. Then the seeds and
+the partition/calendar horizon:
 
 ```bash
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
@@ -970,9 +973,10 @@ A `~/.pgpass` line then keeps the password out of your shell history and environ
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `InsufficientPrivilege: ... must have the CREATEROLE attribute` on `db migrate` | Migration `0001` comments on roles; PG16 requires superuser | §5.2 — elevate `fafnir_ingest`, migrate, `NOSUPERUSER` |
+| `db migrate`: *the fafnir roles do not exist and the current user lacks CREATEROLE* | Migration `0001` cannot create the roles it grants to | Run the `CREATE ROLE` statements from §3.4 as a superuser, then re-run `db migrate` |
+| `db migrate`: `permission denied for database fafnir` | The database is owned by `postgres`, not the migrating role | `sudo -u postgres psql -c "ALTER DATABASE fafnir OWNER TO fafnir_ingest;"` (§3.4) |
+| `db seed`: foreign-key error, `Key (exchange_code)=(\x4e4153444151) is not present` | Cluster was created `SQL_ASCII` because the locale was unset (§3.2) | `SHOW server_encoding` — if not `UTF8`, drop and recreate the cluster with `--locale=C.UTF-8 --encoding=UTF8` |
 | `error: externally-managed-environment` from pip | Ubuntu 24.04 system Python is PEP 668 managed | Install into `/opt/fafnir/.venv` (§4.2) |
-| `make test-int` errors with the same `CREATEROLE` message | The integration suite applies the migrations, so `FAFNIR_TEST_DSN`'s role needs the same elevation as §5.2 | Point `FAFNIR_TEST_DSN` at a scratch database and elevate that role for the run (all 15 integration tests then pass) |
 | `fafnir: command not found` in cron/systemd | venv not on `PATH` | Set `PATH=` in `/etc/fafnir/fafnir.env` (§4.4) |
 | `fe_sendauth: no password supplied` | `FAFNIR_DB_PASSWORD` set alongside `FAFNIR_DSN` | Use `PGPASSWORD`, `~/.pgpass`, or peer auth — see the table in §4.4 |
 | `Peer authentication failed for user "fafnir_ingest"` | The `pg_hba` peer rule landed *below* `local all all peer`, or the ident map name is wrong | §3.5 — reorder so the `fafnir_ingest` rule comes first, then reload |
@@ -1006,7 +1010,8 @@ sudo -u postgres psql -tAc "SHOW data_checksums;"                     # on
 sudo -u postgres psql -tAc "SHOW server_encoding;"                    # UTF8
 sudo ss -lntp | grep 5432                                             # 127.0.0.1 only
 sudo -u postgres psql -tAc "SELECT count(*) FROM pg_file_settings WHERE error IS NOT NULL;"   # 0
-sudo -u postgres psql -tAc "SELECT rolsuper FROM pg_roles WHERE rolname='fafnir_ingest';"     # f
+sudo -u postgres psql -tAc "SELECT rolsuper, rolcreaterole FROM pg_roles
+  WHERE rolname='fafnir_ingest';"                                     # f|f -- least privilege
 
 # --- fafnir -----------------------------------------------------------------
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
