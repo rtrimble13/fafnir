@@ -83,7 +83,7 @@ Notes:
 - **Local disk vs Volume:** the server's built-in NVMe is faster and simpler. But a
   server **disk upgrade is irreversible** (you can never scale that server back down),
   so if you expect to grow — or want to snapshot the data independently of the OS —
-  put the data directory on a **Volume** (§3.7). Volumes are network-attached: slightly
+  put the data directory on a **Volume** (§3.2). Volumes are network-attached: slightly
   higher latency, resizable up at any time.
 
 ### 1.2 Create the server
@@ -149,7 +149,9 @@ ssh root@<SERVER_IP>
 
 ## 2. Base OS hardening
 
-All of §2 runs as `root` on the server.
+All of §2 runs as `root` on the server. If you are on a host that already disables
+root login, run these under `sudo` from the administrator account you have — §2.2's
+fallback covers the one step where that difference matters.
 
 ```bash
 # 2.1 Patch, set a hostname, keep the clock on UTC (leave it UTC -- §8 handles market time)
@@ -158,14 +160,59 @@ hostnamectl set-hostname fafnir-db
 timedatectl set-timezone UTC
 timedatectl                                  # expect: Time zone: UTC (UTC, +0000)
 
-# 2.2 A human sudo user (SSH keys copied from root)
+# 2.2 A human sudo user (SSH keys copied from the account you logged in with)
 adduser --disabled-password --gecos "" deploy
 usermod -aG sudo deploy
-install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
-cp /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
-chown deploy:deploy /home/deploy/.ssh/authorized_keys
-chmod 600 /home/deploy/.ssh/authorized_keys
 
+# SRC is the authorized_keys file that let *you* in. On a fresh Hetzner server
+# that is root's; see the fallback below if it is missing or empty.
+SRC=/root/.ssh/authorized_keys
+test -s "$SRC" || echo "!! EMPTY OR MISSING: $SRC -- stop and read the fallback below"
+
+install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+install -m 600 -o deploy -g deploy "$SRC" /home/deploy/.ssh/authorized_keys
+```
+
+> **Fallback — no usable `/root/.ssh/authorized_keys`.** Some images disable root
+> login out of the box, and a rebuilt or handed-over host may carry an administrator
+> account instead. Copy from **that** account — the one whose key you are logged in
+> with right now — not from root:
+>
+> ```bash
+> getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1, $6}'   # candidate accounts
+> SRC=/home/<that-account>/.ssh/authorized_keys
+> ```
+>
+> Then re-run the two `install` lines above. Copying the file you actually
+> authenticated with is what makes this reliable — it is known-good by construction,
+> whereas root's copy may hold a different key, or none at all.
+
+**Verify the key landed before you go any further.** §2.3 disables root login, so a
+`deploy` that cannot log in leaves you with only the Cloud Console:
+
+```bash
+ssh-keygen -lf /home/deploy/.ssh/authorized_keys
+ls -ld /home/deploy /home/deploy/.ssh /home/deploy/.ssh/authorized_keys
+```
+
+```
+256 SHA256:<your-key-fingerprint> you@example.com (ED25519)
+drwxr-x--- 3 deploy deploy 4096 ... /home/deploy
+drwx------ 2 deploy deploy 4096 ... /home/deploy/.ssh
+-rw------- 1 deploy deploy  103 ... /home/deploy/.ssh/authorized_keys
+```
+
+Two things have to hold, and each fails silently:
+
+- Both directories and the file must be owned by `deploy` and be **neither group- nor
+  world-writable**. sshd's `StrictModes` ignores `authorized_keys` otherwise, and the
+  client just reports `Permission denied (publickey)`.
+- The fingerprint listed must be one your client will actually offer — compare with
+  `ssh-keygen -lf ~/.ssh/id_ed25519.pub` on your laptop. If your `~/.ssh/config` pins
+  the host with `IdentitiesOnly yes` and a single `IdentityFile`, that is the *only*
+  key offered, and a mismatch here fails the login however correct everything else is.
+
+```bash
 # Give deploy a password -- sudo needs one, and `--disabled-password` left the
 # account locked (sudo would fail with "a password is required"). SSH password
 # login stays disabled by 2.3, so this password is only ever used for sudo.
@@ -197,6 +244,11 @@ account can escalate:
 ssh deploy@<SERVER_IP> 'id -nG | tr " " "\n" | grep -qw sudo && echo sudo-group-ok'
 ssh -t deploy@<SERVER_IP> 'sudo true && echo sudo-ok'      # prompts unless NOPASSWD
 ```
+
+If either fails, **do not close the first terminal** — root login is now off, and that
+session is your only way back in short of the Cloud Console. Re-run §2.2's verification
+from it, and add `-v` to the failing `ssh` to see which key the client actually offered
+(`debug1: Offering public key: ...`).
 
 ```bash
 # 2.4 Host firewall (defence in depth behind the Cloud Firewall)
@@ -246,7 +298,83 @@ sudo apt-get install -y postgresql-16 postgresql-client-16
 `pg_stat_statements` (used in §12) ships inside the `postgresql-16` package — no
 separate `-contrib` install is needed.
 
-### 3.2 Re-create the cluster with data checksums
+### 3.2 Optional: prepare a Volume for the data directory
+
+Skip to §3.3 if you sized the server's local disk for your backfill (§1.1). Do this
+**before** §3.3 — creating the cluster straight onto the Volume is simpler than moving
+it afterwards, and §3.3 has to drop and recreate the cluster anyway. To retrofit a
+Volume onto a cluster that already holds data, see §3.8 instead.
+
+#### Create and attach
+
+```bash
+hcloud volume create --name fafnir-data --size 80 --server fafnir-db --format ext4
+hcloud volume list                      # SERVER column must show fafnir-db
+```
+
+80 GB matches the recommended baseline in §1.1. Unlike a server disk upgrade, a Volume
+grows later (`hcloud volume resize`, then `sudo resize2fs $DEV` on the server), so buy
+for the backfill you are doing now.
+
+#### Locate the device
+
+```bash
+ls -l /dev/disk/by-id/ | grep HC_Volume
+lsblk -f
+```
+
+Address the Volume by its `by-id` path — `/dev/sdb` and friends are assigned in attach
+order and can move across reboots or when a second Volume appears:
+
+```bash
+DEV=/dev/disk/by-id/scsi-0HC_Volume_<VOLUME_ID>
+```
+
+`<VOLUME_ID>` is the numeric ID from `hcloud volume list` or the Cloud Console. If
+`lsblk -f` shows an empty `FSTYPE` for that device — you created the Volume without
+`--format` — make the filesystem now:
+
+```bash
+sudo mkfs.ext4 -L fafnir-data "$DEV"
+```
+
+#### Persist the mount
+
+```bash
+sudo mkdir -p /mnt/fafnir-data
+echo "$DEV /mnt/fafnir-data ext4 defaults,discard,nofail 0 0" | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload && sudo mount -a
+findmnt /mnt/fafnir-data
+df -h /mnt/fafnir-data                  # ~78G available on an 80 GB Volume
+```
+
+`nofail` matters: without it, a Volume that isn't attached yet at boot leaves the
+server stuck in emergency mode. `discard` lets the Volume reclaim freed blocks.
+
+#### Make Postgres wait for the mount at boot
+
+`nofail` is what lets the boot continue when the Volume is missing or slow to attach,
+and nothing otherwise tells Postgres to wait for it. State the dependency explicitly:
+
+```bash
+sudo systemctl edit postgresql@16-main
+```
+
+```ini
+[Unit]
+RequiresMountsFor=/mnt/fafnir-data
+```
+
+```bash
+sudo systemctl daemon-reload
+systemctl show postgresql@16-main -p RequiresMountsFor    # must list /mnt/fafnir-data
+```
+
+Without this, a boot where the Volume attaches late simply fails to start Postgres —
+not data loss, since it will not initialise a fresh cluster over a missing directory,
+but a silent outage until something notices.
+
+### 3.3 Re-create the cluster with data checksums
 
 The cluster the package creates for you has **`data_checksums = off`**. For a
 warehouse whose first pillar is correctness, turn them on — silent page corruption
@@ -263,6 +391,20 @@ sudo -u postgres psql -tAc "SHOW server_encoding;"       # UTF8   <-- verify, do
 sudo -u postgres psql -tAc "SHOW password_encryption;"   # scram-sha-256
 ```
 
+**Putting the data on a Volume (§3.2)?** Use this `pg_createcluster` instead — the only
+change is `--datadir`:
+
+```bash
+sudo pg_createcluster --start 16 main --datadir=/mnt/fafnir-data/16/main \
+  --locale=C.UTF-8 --encoding=UTF8 -- --data-checksums
+
+sudo -u postgres psql -tAc "SHOW data_directory;"        # /mnt/fafnir-data/16/main
+```
+
+`pg_createcluster` creates the directory, sets `postgres:postgres` and mode `0700`, and
+records the path in the cluster's own `postgresql.conf` — no `data_directory` drop-in is
+needed, and nothing is left behind on the root disk to clean up.
+
 > **Pin the locale explicitly** — that is not belt-and-braces. `pg_createcluster`
 > takes the locale from its environment, and `sudo` scrubs `LANG`/`LC_ALL`, so on a
 > cloud image where the locale is unset you get an **`SQL_ASCII` / `C`** cluster. That
@@ -275,7 +417,7 @@ sudo -u postgres psql -tAc "SHOW password_encryption;"   # scram-sha-256
 > `sudo -u postgres /usr/lib/postgresql/16/bin/pg_checksums --enable -D /var/lib/postgresql/16/main`
 > instead (offline, rewrites every page).
 
-### 3.3 Tune for the instance size
+### 3.4 Tune for the instance size
 
 Ubuntu's `postgresql.conf` ends with `include_dir = 'conf.d'`, so a drop-in file
 cleanly overrides the defaults without editing the packaged config.
@@ -343,7 +485,7 @@ sudo -u postgres psql -c "SELECT name, setting, unit FROM pg_settings
 Expect `shared_buffers = 262144` (8 kB pages = 2 GB) and
 `effective_cache_size = 786432` (= 6 GB).
 
-### 3.4 Create the roles and the database
+### 3.5 Create the roles and the database
 
 Passwords: generate them now and keep them somewhere safe (`openssl rand -base64 24`).
 `fafnir_ingest` is the **database owner** — it must own the objects so the nightly
@@ -362,7 +504,7 @@ SQL
 sudo -u postgres psql -d fafnir -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
 ```
 
-### 3.5 Password-free local auth for the nightly job (recommended)
+### 3.6 Password-free local auth for the nightly job (recommended)
 
 Map the OS user `fafnir` to the database role `fafnir_ingest` over the Unix socket.
 The nightly job then needs **no database password anywhere on disk**.
@@ -396,49 +538,59 @@ works for maintenance databases, such as the restore drill in §9.4.
 Keep the default `host all all 127.0.0.1/32 scram-sha-256` line — that is the path
 `duk` uses with `fafnir_app` (§11).
 
-### 3.6 Confirm nothing is exposed
+### 3.7 Confirm nothing is exposed
 
 ```bash
 sudo ss -lntp | grep 5432        # loopback only: 127.0.0.1:5432 and/or [::1]:5432
 ```
 
 Any non-loopback bind address (`0.0.0.0:5432`, `*:5432`, the server's public IP) means
-`listen_addresses` did not take effect — fix the drop-in from §3.3 and restart.
+`listen_addresses` did not take effect — fix the drop-in from §3.4 and restart.
 
-### 3.7 Optional: move the data directory to a Volume
+### 3.8 Moving an existing cluster onto a Volume
 
-Skip this if you sized the server's local disk for your backfill (§1.1).
+Only needed if the cluster already exists and you did not take §3.2 + §3.3's
+`--datadir` route — a host that has outgrown its local disk, say. Do §3.2 first (create,
+attach, mount, `RequiresMountsFor`), then move the data.
 
-```bash
-hcloud volume create --name fafnir-data --size 100 --server fafnir-db --format ext4
-```
-
-On the server (`<VOLUME_ID>` is shown in the console / `hcloud volume list`):
-
-```bash
-DEV=/dev/disk/by-id/scsi-0HC_Volume_<VOLUME_ID>
-sudo mkdir -p /mnt/fafnir-data
-echo "$DEV /mnt/fafnir-data ext4 defaults,discard,nofail 0 0" | sudo tee -a /etc/fstab
-sudo systemctl daemon-reload && sudo mount -a && df -h /mnt/fafnir-data
-```
-
-`nofail` matters: without it, a Volume that isn't attached yet at boot leaves the
-server stuck in emergency mode. `discard` lets the volume reclaim freed blocks.
-
-Move the cluster (it is still empty, so this is instant):
+Stop the cluster before copying: rsyncing a running data directory captures an
+inconsistent snapshot.
 
 ```bash
+sudo -u postgres psql -tAc "SHOW data_directory;"    # note the current path
 sudo systemctl stop postgresql@16-main
-sudo rsync -a /var/lib/postgresql/16/main/ /mnt/fafnir-data/16/main/
+
+sudo rsync -aHAX --numeric-ids /var/lib/postgresql/16/main/ /mnt/fafnir-data/16/main/
 sudo chown -R postgres:postgres /mnt/fafnir-data/16
 sudo chmod 700 /mnt/fafnir-data/16/main
+
 echo "data_directory = '/mnt/fafnir-data/16/main'" \
   | sudo tee /etc/postgresql/16/main/conf.d/20-datadir.conf
 sudo systemctl start postgresql@16-main
 sudo -u postgres psql -tAc "SHOW data_directory;"    # /mnt/fafnir-data/16/main
 ```
 
-Only after verifying the new path: `sudo rm -rf /var/lib/postgresql/16/main`.
+The drop-in wins because `include_dir = 'conf.d'` is the last line of the packaged
+`postgresql.conf` (§3.4). `-HAX --numeric-ids` preserves hard links, ACLs and xattrs —
+usually redundant for a Postgres data directory, but free.
+
+Only after `SHOW data_directory` reports the new path **and** the database answers
+queries: `sudo rm -rf /var/lib/postgresql/16/main`.
+
+Then prove it survives a restart — that, not the `SHOW`, is the real test:
+
+```bash
+sudo reboot
+# once it is back:
+sudo systemctl is-active postgresql@16-main          # active
+sudo -u postgres psql -tAc "SHOW data_directory;"
+findmnt /mnt/fafnir-data
+```
+
+Two follow-ons elsewhere in this guide once the data lives on a Volume: §10's disk check
+should watch `/mnt/fafnir-data`, and §9.1 writes dumps to `/var/backups/fafnir` on the
+**root** disk — on a server whose OS disk is small next to the Volume, either point
+`OUT=` at a directory on the Volume or lean on the off-server copy in §9.2.
 
 ---
 
@@ -503,7 +655,7 @@ sudo -u fafnir sed -i \
 ```bash
 sudo install -d -m 755 /etc/fafnir
 sudo tee /etc/fafnir/fafnir.env > /dev/null <<'ENV'
-# Socket + peer auth (§3.5): no database password needed.
+# Socket + peer auth (§3.6): no database password needed.
 FAFNIR_DSN="host=/var/run/postgresql port=5432 dbname=fafnir user=fafnir_ingest"
 FMP_API_KEY="your_fmp_pro_key"
 FAFNIR_SQL_DIR="/opt/fafnir/sql"
@@ -525,7 +677,7 @@ Why each line matters:
 > ### Password gotcha: `FAFNIR_DB_PASSWORD` is ignored when `FAFNIR_DSN` is set
 > `FAFNIR_DSN` is used **verbatim**. The password is only merged in when the DSN is
 > assembled from the `[database]` parts in `~/.fafnirrc`. So if you use TCP + password
-> auth instead of §3.5, pick one of these — the third combination fails with
+> auth instead of §3.6, pick one of these — the third combination fails with
 > `fe_sendauth: no password supplied`:
 >
 > | Pattern | Works |
@@ -539,16 +691,16 @@ Why each line matters:
 
 ## 5. Create the schema
 
-### 5.1 The privileges this needs (none beyond §3.4)
+### 5.1 The privileges this needs (none beyond §3.5)
 
 The whole schema is created by `fafnir_ingest` as an ordinary, non-superuser role —
-that is the point of pre-creating the roles and giving it the database in §3.4:
+that is the point of pre-creating the roles and giving it the database in §3.5:
 
 - It **must** own the objects. Ownership is what lets the nightly
   `fafnir db ensure-horizon` attach new yearly partitions to `core.daily_price`, so
   running migrations as `postgres` would break maintenance later.
 - Two statements in migration `0001` would otherwise want more privilege, and both are
-  handled inside the migration. `CREATE ROLE` is skipped because §3.4 already created
+  handled inside the migration. `CREATE ROLE` is skipped because §3.5 already created
   the roles (if they are missing, the migration stops with an error telling you the
   exact SQL to run). The three `COMMENT ON ROLE` statements — catalog documentation
   only — are best-effort: PostgreSQL requires superuser for those, so instead of
@@ -828,7 +980,7 @@ re-applying every migration, and without the `mart` views there is nothing for
 `fafnir db refresh-marts` to refresh. The extra bytes are negligible — the derived
 `mart` is a screening snapshot, not a copy of the price history.
 
-Role definitions live outside a database dump. Recreate them with §3.4 on a new host,
+Role definitions live outside a database dump. Recreate them with §3.5 on a new host,
 or capture them with `sudo -u postgres pg_dumpall --globals-only > globals.sql`.
 
 Schedule the dump with a second timer (`OnCalendar=Mon..Sat 04:00 America/New_York`,
@@ -877,7 +1029,7 @@ partition count to match the live database.
 
 > Restoring as `fafnir_ingest` ends with `errors ignored on restore: 2` — both are the
 > `pg_stat_statements` extension, which only a superuser may create. Harmless for the
-> data; if you are rebuilding a real host, re-create it afterwards as in §3.4.
+> data; if you are rebuilding a real host, re-create it afterwards as in §3.5.
 
 ---
 
@@ -896,7 +1048,7 @@ journalctl -u fafnir-daily.service --since '2 days ago'
 
 What to watch, and the SQL for each, is in
 [operations.md](operations.md#monitoring): freshness, quarantine spikes, FMP bandwidth,
-failed runs. `pg_stat_statements` (enabled in §3.3) gives you the slow-query view:
+failed runs. `pg_stat_statements` (enabled in §3.4) gives you the slow-query view:
 
 ```sql
 SELECT calls, round(mean_exec_time) AS avg_ms, round(total_exec_time) AS total_ms,
@@ -933,7 +1085,7 @@ you alerts on them.
 
 ## 11. Reading the warehouse from your laptop
 
-Postgres is not exposed (§3.6), so tunnel it over the SSH port you already allow:
+Postgres is not exposed (§3.7), so tunnel it over the SSH port you already allow:
 
 ```bash
 # On your laptop -- forwards local port 15432 to the server's 127.0.0.1:5432 listener.
@@ -987,25 +1139,27 @@ A `~/.pgpass` line then keeps the password out of your shell history and environ
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `db migrate`: *the fafnir roles do not exist and the current user lacks CREATEROLE* | Migration `0001` cannot create the roles it grants to | Run the `CREATE ROLE` statements from §3.4 as a superuser, then re-run `db migrate` |
-| `db migrate`: `permission denied for database fafnir` | The database is owned by `postgres`, not the migrating role | `sudo -u postgres psql -c "ALTER DATABASE fafnir OWNER TO fafnir_ingest;"` (§3.4) |
-| `db seed`: foreign-key error, `Key (exchange_code)=(\x4e4153444151) is not present` | Cluster was created `SQL_ASCII` because the locale was unset (§3.2) | `SHOW server_encoding` — if not `UTF8`, drop and recreate the cluster with `--locale=C.UTF-8 --encoding=UTF8` |
+| `db migrate`: *the fafnir roles do not exist and the current user lacks CREATEROLE* | Migration `0001` cannot create the roles it grants to | Run the `CREATE ROLE` statements from §3.5 as a superuser, then re-run `db migrate` |
+| `db migrate`: `permission denied for database fafnir` | The database is owned by `postgres`, not the migrating role | `sudo -u postgres psql -c "ALTER DATABASE fafnir OWNER TO fafnir_ingest;"` (§3.5) |
+| `db seed`: foreign-key error, `Key (exchange_code)=(\x4e4153444151) is not present` | Cluster was created `SQL_ASCII` because the locale was unset (§3.3) | `SHOW server_encoding` — if not `UTF8`, drop and recreate the cluster with `--locale=C.UTF-8 --encoding=UTF8` |
 | `error: externally-managed-environment` from pip | Ubuntu 24.04 system Python is PEP 668 managed | Install into `/opt/fafnir/.venv` (§4.2) |
 | `fafnir: command not found` in cron/systemd | venv not on `PATH` | Set `PATH=` in `/etc/fafnir/fafnir.env` (§4.4) |
 | `fe_sendauth: no password supplied` | `FAFNIR_DB_PASSWORD` set alongside `FAFNIR_DSN` | Use `PGPASSWORD`, `~/.pgpass`, or peer auth — see the table in §4.4 |
-| `Peer authentication failed for user "fafnir_ingest"` | The `pg_hba` peer rule landed *below* `local all all peer`, or the ident map name is wrong | §3.5 — reorder so the `fafnir_ingest` rule comes first, then reload |
+| `Peer authentication failed for user "fafnir_ingest"` | The `pg_hba` peer rule landed *below* `local all all peer`, or the ident map name is wrong | §3.6 — reorder so the `fafnir_ingest` rule comes first, then reload |
 | `Could not locate sql/migrations` | Running outside the checkout | Export `FAFNIR_SQL_DIR=/opt/fafnir/sql` |
 | Calendar/partitions start at 2015, not your backfill year | `~/.fafnirrc` not found (missing `-H`/`HOME`), or seeded before setting `calendar_start_year` | §5.2; then re-run `fafnir db seed` and `fafnir db ensure-horizon` |
 | `permission denied for schema core` from `duk` | `fafnir_app` reads `mart` + `ref` only | Correct by design — use `mart.*` views, or connect as `fafnir_read` |
 | Nightly job never ran | Timer not enabled, or clock/timezone confusion | `systemctl list-timers 'fafnir-*'`; `systemd-analyze calendar '<expr>'` |
 | Postgres won't start after a config edit | Bad value in the drop-in | `journalctl -u postgresql@16-main -n 50`; `sudo -u postgres psql -c "SELECT * FROM pg_file_settings WHERE error IS NOT NULL;"` |
-| Server stuck at boot after adding a Volume | `fstab` entry without `nofail` | Console → **Rescue**, fix `/etc/fstab` (§3.7) |
+| Server stuck at boot after adding a Volume | `fstab` entry without `nofail` | Console → **Rescue**, fix `/etc/fstab` (§3.2) |
+| Postgres fails to start after a reboot, data directory missing | Volume mounted late (or not at all) and nothing made Postgres wait for it | Add `RequiresMountsFor=` to the unit (§3.2); `findmnt /mnt/fafnir-data` to confirm the mount |
 | `No space left on device`; Postgres read-only | Disk full (usually WAL + a dump on the same disk) | Delete old dumps, then grow: resize the Volume, or resize the server (irreversible) |
+| `ssh deploy@<host>`: `Permission denied (publickey)` | The key never landed in `/home/deploy/.ssh/authorized_keys`, the file/dirs fail `StrictModes`, or the client is pinned to a key that isn't in the file | §2.2 — `ssh-keygen -lf` the file on the server, `ssh -v` on the client, and compare the fingerprints; copy `authorized_keys` from the account you can log in with |
 | Locked out by SSH/ufw changes | Firewall or `sshd_config` mistake | Cloud Console → **Console** (VNC) or **Rescue** system |
 
 Rebuilding from scratch: `fafnir db rollback --steps N` unwinds migrations, but never
 roll back past `core.daily_price` without a current dump (§9). To start completely
-over, `sudo -u postgres dropdb fafnir` and return to §3.4 — you keep the OS, Postgres,
+over, `sudo -u postgres dropdb fafnir` and return to §3.5 — you keep the OS, Postgres,
 and venv work.
 
 ---
