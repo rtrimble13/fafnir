@@ -173,6 +173,27 @@ class FMPClient(BaseSource):
         return None
 
     # -- prices -------------------------------------------------------------
+    # The unadjusted endpoint names its price fields adjOpen/adjHigh/adjLow/
+    # adjClose. The values are as-traded; only the *names* carry "adj". Map them
+    # to the canonical names so the loader never has to know which endpoint the
+    # bars came from.
+    _EOD_FIELD_ALIASES = {
+        "adjOpen": "open",
+        "adjHigh": "high",
+        "adjLow": "low",
+        "adjClose": "close",
+    }
+
+    @classmethod
+    def _normalize_bar(cls, bar: dict) -> dict:
+        if not isinstance(bar, dict):
+            return bar
+        out = dict(bar)
+        for alias, canonical in cls._EOD_FIELD_ALIASES.items():
+            if canonical not in out and alias in out:
+                out[canonical] = out[alias]
+        return out
+
     def _eod_window(
         self,
         symbol: str,
@@ -189,7 +210,9 @@ class FMPClient(BaseSource):
         data, _, _ = self._call(endpoint or self.EP_EOD_RAW, params)
         if isinstance(data, dict) and "historical" in data:
             return data["historical"]
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        return [self._normalize_bar(bar) for bar in data]
 
     def eod_split_adjusted(
         self,
