@@ -77,6 +77,8 @@ def upsert_security(
     is_actively_trading: bool = True,
     is_etf: bool = False,
     is_fund: bool = False,
+    market_cap_usd: Optional[float] = None,
+    beta: Optional[float] = None,
     ipo_date: Optional[date] = None,
     delisted_date: Optional[date] = None,
     cik: Optional[str] = None,
@@ -98,8 +100,9 @@ def upsert_security(
         INSERT INTO core.security
             (primary_symbol, company_name, asset_type, exchange_code, sector_id,
              industry_id, currency, country, is_actively_trading, is_etf, is_fund,
-             ipo_date, delisted_date, cik, isin, cusip, source, updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+             market_cap_usd, beta, ipo_date, delisted_date, cik, isin, cusip,
+             source, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
         ON CONFLICT (source, primary_symbol, COALESCE(exchange_code, ''))
             WHERE delisted_date IS NULL
         DO UPDATE SET
@@ -112,6 +115,11 @@ def upsert_security(
             is_actively_trading = EXCLUDED.is_actively_trading,
             is_etf              = EXCLUDED.is_etf,
             is_fund             = EXCLUDED.is_fund,
+            -- COALESCE: a caller without screener fields (enrich_profiles, the
+            -- bulk-list universes) must not blank out what the screener set.
+            market_cap_usd      = COALESCE(EXCLUDED.market_cap_usd,
+                                           core.security.market_cap_usd),
+            beta                = COALESCE(EXCLUDED.beta, core.security.beta),
             ipo_date            = COALESCE(EXCLUDED.ipo_date, core.security.ipo_date),
             delisted_date       = EXCLUDED.delisted_date,
             cik                 = COALESCE(EXCLUDED.cik, core.security.cik),
@@ -132,6 +140,8 @@ def upsert_security(
             is_actively_trading,
             is_etf,
             is_fund,
+            market_cap_usd,
+            beta,
             ipo_date,
             delisted_date,
             cik,
@@ -218,47 +228,24 @@ def upsert_company_profile(
     *,
     security_id: int,
     description: Optional[str],
-    ceo: Optional[str],
-    full_time_employees: Optional[int],
-    website: Optional[str],
-    beta: Optional[float],
-    market_cap_usd: Optional[float],
-    last_dividend: Optional[float],
-    price_range: Optional[str],
-    image_url: Optional[str],
     source: str = "fmp",
 ) -> None:
+    """Store the long-form description.
+
+    Everything else 0003 kept here either moved to ``core.security`` (0010:
+    market_cap_usd, beta -- the screener supplies both for free) or was dropped.
+    Description is the one attribute that genuinely needs the per-symbol profile
+    request, which is why ``--enrich`` is now optional.
+    """
     db.execute(
         """
-        INSERT INTO core.company_profile
-            (security_id, description, ceo, full_time_employees, website, beta,
-             market_cap_usd, last_dividend, price_range, image_url, loaded_at, source)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), %s)
+        INSERT INTO core.company_profile (security_id, description, loaded_at, source)
+        VALUES (%s, %s, now(), %s)
         ON CONFLICT (security_id) DO UPDATE SET
             description = EXCLUDED.description,
-            ceo = EXCLUDED.ceo,
-            full_time_employees = EXCLUDED.full_time_employees,
-            website = EXCLUDED.website,
-            beta = EXCLUDED.beta,
-            market_cap_usd = EXCLUDED.market_cap_usd,
-            last_dividend = EXCLUDED.last_dividend,
-            price_range = EXCLUDED.price_range,
-            image_url = EXCLUDED.image_url,
             loaded_at = now()
         """,
-        (
-            security_id,
-            description,
-            ceo,
-            full_time_employees,
-            website,
-            beta,
-            market_cap_usd,
-            last_dividend,
-            price_range,
-            image_url,
-            source,
-        ),
+        (security_id, description, source),
     )
 
 

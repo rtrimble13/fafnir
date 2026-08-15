@@ -721,7 +721,7 @@ the block at the top of
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir; fafnir db migrate'
 ```
 
-Expected: `Applied: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009`. Then the seeds and
+Expected: `Applied: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010`. Then the seeds and
 the partition/calendar horizon:
 
 ```bash
@@ -762,7 +762,7 @@ sudo -u postgres psql -d fafnir -c "SELECT version, name, applied_at FROM meta.s
 Expected on a 1990 install, with the rolling horizon at 2028: **40** partitions
 (1990–2028 = 39 years, plus the `DEFAULT` catch-all), calendar
 `1990-01-02 → 2028-12-29` (49,115 rows = 9,823 open days × 5 exchanges), database size
-**~16 MB**, and migrations `0001`–`0009` applied.
+**~16 MB**, and migrations `0001`–`0010` applied.
 
 Now confirm the least-privilege model actually holds — this is the check that catches
 a migration run by the wrong role:
@@ -1024,7 +1024,7 @@ done
 sudo -u postgres dropdb fafnir_restore_test
 ```
 
-Expect the migration count (9), your price-row count, the calendar rows, and the
+Expect the migration count (10), your price-row count, the calendar rows, and the
 partition count to match the live database.
 
 > Restoring as `fafnir_ingest` ends with `errors ignored on restore: 2` — both are the
@@ -1183,7 +1183,7 @@ sudo -u postgres psql -tAc "SELECT rolsuper, rolcreaterole FROM pg_roles
 
 # --- fafnir -----------------------------------------------------------------
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
-  fafnir db status        # 0001..0009 all "applied", no DRIFT
+  fafnir db status        # 0001..0010 all "applied", no DRIFT
   fafnir status           # securities > 0, latest date = last trading day
   fafnir dq run'          # flag counts you can explain
 

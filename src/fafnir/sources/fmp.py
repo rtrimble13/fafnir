@@ -15,9 +15,13 @@ one-line change.
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
+from fafnir.logging_config import get_logger
 from fafnir.sources.base import BaseSource, SourceError, payload_hash
+
+logger = get_logger("source.fmp")
 
 BASE_STABLE = "https://financialmodelingprep.com/stable"
 
@@ -43,6 +47,15 @@ class FMPClient(BaseSource):
     # 1000 keeps a single page small enough to retry cheaply.
     SCREENER_PAGE_SIZE = 1000
     DELISTED_PAGE_SIZE = 100
+
+    # historical-price-eod/full silently truncates to the most recent 5000 bars,
+    # ignoring how far back `from` reaches: a 1990-01-01 request for AAPL and MSFT
+    # both came back starting 2006-09-28 -- the same date for two companies, which
+    # is a row cap, not history. 5000 bars is ~19.8 trading years, so a 15-year
+    # window (~3780 bars) leaves ~25% headroom and needs three requests to cover a
+    # 1990-to-now backfill.
+    EOD_MAX_ROWS = 5000
+    EOD_CHUNK_DAYS = 5475
 
     def __init__(self, api_key: str, rate_per_min: int = 280, **kwargs):
         if not api_key:
@@ -148,14 +161,10 @@ class FMPClient(BaseSource):
         return None
 
     # -- prices -------------------------------------------------------------
-    def eod_full(
-        self,
-        symbol: str,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
+    def _eod_window(
+        self, symbol: str, from_date: Optional[str], to_date: Optional[str]
     ) -> list[dict]:
-        """Raw daily OHLCV. Returns list of bar dicts (date, open, high, low,
-        close, volume, vwap, ...)."""
+        """One request. May be silently truncated to ``EOD_MAX_ROWS``."""
         params: dict[str, Any] = {"symbol": symbol}
         if from_date:
             params["from"] = from_date
@@ -165,6 +174,62 @@ class FMPClient(BaseSource):
         if isinstance(data, dict) and "historical" in data:
             return data["historical"]
         return data if isinstance(data, list) else []
+
+    def eod_full(
+        self,
+        symbol: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> list[dict]:
+        """Raw daily OHLCV over the whole window, in ascending date order.
+
+        Splits the window into ``EOD_CHUNK_DAYS`` slices and stitches them,
+        because a single request is capped at ``EOD_MAX_ROWS`` and drops the
+        *oldest* bars to fit -- without an error, a flag, or a short-payload hint.
+        Asking for 1990 and receiving 2006 onward looks exactly like success.
+
+        Incremental callers pass a from_date a few days back, so they still cost
+        one request; only a genuine backfill pays for the extra slices.
+        """
+        if from_date is None:
+            # No lower bound to slice against. One request, but say so if it
+            # comes back exactly at the cap, since that means truncation.
+            bars = self._eod_window(symbol, None, to_date)
+            if len(bars) >= self.EOD_MAX_ROWS:
+                logger.warning(
+                    "%s: %d bars is the endpoint cap -- older history was dropped; "
+                    "pass an explicit from date so the window can be chunked",
+                    symbol,
+                    len(bars),
+                )
+            return bars
+
+        start = _as_date(from_date)
+        end = _as_date(to_date) or date.today()
+        by_date: dict[str, dict] = {}
+        cursor = start
+        while cursor <= end:
+            window_end = min(cursor + timedelta(days=self.EOD_CHUNK_DAYS - 1), end)
+            bars = self._eod_window(
+                symbol, cursor.isoformat(), window_end.isoformat()
+            )
+            if len(bars) >= self.EOD_MAX_ROWS:
+                logger.warning(
+                    "%s: %s..%s returned the %d-row cap; bars may be missing -- "
+                    "lower FMPClient.EOD_CHUNK_DAYS",
+                    symbol,
+                    cursor,
+                    window_end,
+                    self.EOD_MAX_ROWS,
+                )
+            for bar in bars:
+                key = str(bar.get("date") or "")[:10]
+                if key:
+                    # Windows do not overlap, but dedup keeps a vendor-side
+                    # boundary repeat from double-counting.
+                    by_date[key] = bar
+            cursor = window_end + timedelta(days=1)
+        return [by_date[k] for k in sorted(by_date)]
 
     # -- corporate actions --------------------------------------------------
     def splits(self, symbol: str) -> list[dict]:
@@ -187,6 +252,14 @@ class FMPClient(BaseSource):
     def industries(self) -> list[str]:
         data, _, _ = self._call(self.EP_INDUSTRIES)
         return _flatten_names(data, "industry")
+
+
+def _as_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
 
 
 def _flatten_names(data: Any, key: str) -> list[str]:

@@ -2,11 +2,11 @@
 Security-master loader.
 
 Builds ``core.security`` + ``core.symbol_xref`` from FMP. The default
-``us-equity-etf`` universe comes from ``company-screener``, the only bulk
-endpoint carrying the exchange; ``stock-list`` / ``etf-list`` back the
-unfiltered universes. Profiles
-(sector/industry/description) are enriched separately via :func:`enrich_profiles`
-because the per-symbol profile endpoint is far more expensive than the bulk lists.
+``us-equity-etf`` universe comes from ``company-screener``, the only bulk endpoint
+carrying the exchange; ``stock-list`` / ``etf-list`` back the unfiltered universes.
+The screener also supplies market cap and beta, so screening data costs nothing
+beyond the universe load (0010). :func:`enrich_profiles` is optional and adds only
+the long-form description and the identifiers, at one request per symbol.
 
 Delisted/inactive securities are never deleted; a reconciliation step (fast-follow,
 using FMP's delisted endpoint) flips ``is_actively_trading``/``delisted_date``.
@@ -14,6 +14,7 @@ using FMP's delisted endpoint) flips ``is_actively_trading``/``delisted_date``.
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import Iterable, Optional
 
 from fafnir.db import repository as repo
@@ -36,6 +37,15 @@ SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
 # Securities committed per batch. The bulk list is already in memory, so this is
 # purely a durability boundary, not a rate limit.
 COMMIT_EVERY = 500
+
+# A NUMERIC(p, s) column cannot hold a value >= 10 ** (p - s); these precisions are
+# 0010's, on core.security. FMP occasionally returns an absurd magnitude, and
+# psycopg raises NumericValueOutOfRange -- which once aborted a 21k-symbol run at
+# whichever symbol happened to carry it.
+SECURITY_NUMERIC_LIMITS = {
+    "market_cap_usd": 10 ** (24 - 2),
+    "beta": 10 ** (12 - 6),
+}
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:
@@ -111,6 +121,46 @@ def _us_entries(fmp: FMPClient, include_etfs: bool) -> list[tuple[dict, str, boo
     return entries
 
 
+def _bounded_security_numerics(
+    db: Database, *, row: dict, symbol: str, run: RunLog, sec_id: Optional[int] = None
+) -> dict:
+    """Return the screener's numerics, nulling any the column cannot hold.
+
+    Never silently: an out-of-range value becomes NULL *and* a DQ flag, the same
+    contract the price loader applies to a bad bar. Dropping one field beats
+    aborting the run -- the rest of that security is still good, and so are the
+    thousands of symbols behind it.
+    """
+    values = {
+        "market_cap_usd": _to_float(row.get("marketCap") or row.get("mktCap")),
+        "beta": _to_float(row.get("beta")),
+    }
+    for field, value in list(values.items()):
+        if value is None:
+            continue
+        # isfinite also catches the inf/nan that float("inf") happily produces
+        # from a malformed payload.
+        if not isfinite(value) or abs(value) >= SECURITY_NUMERIC_LIMITS[field]:
+            values[field] = None
+            run.rows_quarantined += 1
+            logger.warning(
+                "%s: %s=%r is out of range for its column; storing NULL",
+                symbol,
+                field,
+                value,
+            )
+            repo.add_dq_flag(
+                db,
+                check_name=f"security_{field}_out_of_range",
+                security_id=sec_id,
+                table_name="core.security",
+                record_key={"symbol": symbol},
+                detail={"field": field, "value": str(value)},
+                ingestion_run_id=run.run_id,
+            )
+    return values
+
+
 def load_securities(
     db: Database,
     fmp: FMPClient,
@@ -158,6 +208,10 @@ def load_securities(
             # screener's fields, which the bulk lists do not carry.
             exchange = _norm_exchange(entry)
             repo.ensure_exchange(db, exchange) if exchange else None
+            # The screener carries market cap and beta, so screening data costs
+            # nothing beyond this call -- `--enrich` is only needed for the
+            # long-form description now (0010).
+            nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
             sec_id = repo.upsert_security(
                 db,
                 primary_symbol=symbol,
@@ -168,6 +222,8 @@ def load_securities(
                 is_actively_trading=bool(entry.get("isActivelyTrading", True)),
                 is_etf=is_etf,
                 is_fund=bool(entry.get("isFund", False)),
+                market_cap_usd=nums["market_cap_usd"],
+                beta=nums["beta"],
             )
             repo.upsert_symbol_xref(db, security_id=sec_id, symbol=symbol)
             count += 1
@@ -186,7 +242,13 @@ def load_securities(
 
 
 def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:
-    """Fetch per-symbol profiles and populate sector/industry/description."""
+    """Fetch per-symbol profiles for the long-form description.
+
+    Optional since 0010: market cap and beta now come from the screener in
+    :func:`load_securities`, so the only thing this adds is `description`
+    (plus CIK/ISIN/CUSIP and the IPO date). One request per symbol -- over an
+    hour across a 21k universe -- so weigh it against what you actually read.
+    """
     symbols = list(symbols)
     with RunLog(
         db, source="fmp", endpoint="profile", params={"symbols": len(symbols)}
@@ -201,6 +263,9 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
                 continue
             sector_id = repo.get_or_create_sector(db, prof.get("sector"))
             industry_id = repo.get_or_create_industry(db, prof.get("industry"))
+            nums = _bounded_security_numerics(
+                db, row=prof, symbol=symbol, run=run, sec_id=sec_id
+            )
             repo.upsert_security(
                 db,
                 primary_symbol=symbol,
@@ -214,25 +279,15 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
                 is_actively_trading=bool(prof.get("isActivelyTrading", True)),
                 is_etf=bool(prof.get("isEtf", False)),
                 is_fund=bool(prof.get("isFund", False)),
+                market_cap_usd=nums["market_cap_usd"],
+                beta=nums["beta"],
                 ipo_date=prof.get("ipoDate") or None,
                 cik=prof.get("cik"),
                 isin=prof.get("isin"),
                 cusip=prof.get("cusip"),
             )
             repo.upsert_company_profile(
-                db,
-                security_id=sec_id,
-                description=prof.get("description"),
-                ceo=prof.get("ceo"),
-                full_time_employees=_to_int(prof.get("fullTimeEmployees")),
-                website=prof.get("website"),
-                beta=_to_float(prof.get("beta")),
-                market_cap_usd=_to_float(prof.get("mktCap") or prof.get("marketCap")),
-                last_dividend=_to_float(
-                    prof.get("lastDiv") or prof.get("lastDividend")
-                ),
-                price_range=prof.get("range"),
-                image_url=prof.get("image"),
+                db, security_id=sec_id, description=prof.get("description")
             )
             count += 1
             run.rows_inserted = count
@@ -242,13 +297,6 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
         run.symbols_requested = len(symbols)
         run.bytes_downloaded = fmp.bytes_downloaded
         return count
-
-
-def _to_int(value) -> Optional[int]:
-    try:
-        return int(str(value).replace(",", "")) if value not in (None, "") else None
-    except (ValueError, TypeError):
-        return None
 
 
 def _to_float(value) -> Optional[float]:
