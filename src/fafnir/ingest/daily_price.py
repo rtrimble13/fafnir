@@ -16,7 +16,7 @@ from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
 from fafnir.logging_config import get_logger
-from fafnir.sources.fmp import FMPClient, payload_hash
+from fafnir.sources.fmp import FMPClient, SourceError, payload_hash
 
 logger = get_logger("ingest.price")
 
@@ -86,11 +86,23 @@ def load_symbol_prices(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     overlap_days: int = 5,
+    stats: Optional[dict] = None,
 ) -> int:
-    """Load prices for one symbol within the (incremental) window. Returns rows upserted."""
+    """Load one symbol's prices within the (incremental) window.
+
+    Returns rows upserted. ``stats``, when given, accumulates outcomes that only mean
+    something in aggregate -- see :func:`load_prices`, which uses them to tell a
+    genuinely empty load apart from a successful one.
+    """
+
+    def _tally(key: str) -> None:
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + 1
+
     sec_id = repo.resolve_security_id(db, symbol)
     if sec_id is None:
         logger.warning("Unknown symbol %s; skipping (load securities first)", symbol)
+        _tally("unknown")
         return 0
 
     if start_date is None:
@@ -119,6 +131,14 @@ def load_symbol_prices(
         nbytes=0,
         ingestion_run_id=run.run_id,
     )
+
+    if stats is not None:
+        stats["bars"] = stats.get("bars", 0) + len(bars)
+    if not bars:
+        # Routine on an incremental run (no new session yet); a red flag on a
+        # backfill. Only the caller can tell which, so record and move on.
+        _tally("empty")
+        logger.debug("No bars returned for %s (from=%s)", symbol, start_date)
 
     clean: list[dict] = []
     quarantined_dates: list[date] = []
@@ -182,7 +202,20 @@ def load_prices(
     end_date: Optional[date] = None,
     overlap_days: int = 5,
 ) -> int:
+    """Load prices for many symbols.
+
+    Raises rather than returning a quiet zero when the load cannot have worked.
+    A run that reports success having written nothing is the most expensive kind
+    of failure here: ``initial_backfill.sh`` would march on to the adjustment and
+    mart steps, and the warehouse would look finished while holding no prices.
+    """
     symbols = list(symbols)
+    if not symbols:
+        raise ValueError(
+            "No symbols to load. Populate the security master first "
+            "(fafnir ingest securities), or pass --symbols."
+        )
+
     with RunLog(
         db,
         source="fmp",
@@ -192,6 +225,7 @@ def load_prices(
         window_to=end_date,
     ) as run:
         total = 0
+        stats: dict[str, int] = {}
         for symbol in symbols:
             total += load_symbol_prices(
                 db,
@@ -201,8 +235,41 @@ def load_prices(
                 start_date=start_date,
                 end_date=end_date,
                 overlap_days=overlap_days,
+                stats=stats,
             )
+            # One symbol -- its landing payload, bars, DQ flags and watermark --
+            # is the unit of work. Committing here is what makes the backfill
+            # resumable in practice: an interruption costs this symbol, and the
+            # watermarks already written let a re-run skip what is done.
+            db.commit()
         run.symbols_requested = len(symbols)
         run.bytes_downloaded = fmp.bytes_downloaded
+
+        unknown = stats.get("unknown", 0)
+        empty = stats.get("empty", 0)
+        bars = stats.get("bars", 0)
+        if unknown == len(symbols):
+            raise ValueError(
+                f"None of the {len(symbols)} requested symbols exist in the "
+                "security master -- run `fafnir ingest securities` first"
+            )
+        if unknown:
+            logger.warning(
+                "%d of %d symbols are not in the security master", unknown, len(symbols)
+            )
+        # An explicit window means we asked for history that must exist. With no
+        # window this is the incremental path, where "nothing new" is the normal
+        # answer outside trading hours and must not fail the nightly run.
+        if start_date is not None and bars == 0:
+            raise SourceError(
+                f"FMP returned no bars for any of {len(symbols)} symbols since "
+                f"{start_date} -- treating a backfill that loaded nothing as a failure"
+            )
+        if empty:
+            logger.info(
+                "%d of %d symbols returned no bars in the requested window",
+                empty,
+                len(symbols),
+            )
         logger.info("Loaded %d price rows across %d symbols", total, len(symbols))
         return total

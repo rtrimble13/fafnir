@@ -139,6 +139,10 @@ def load_actions(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:
                 total += 1
 
             run.rows_inserted = total
+            # Same unit boundary as the price loader: one symbol's splits and
+            # dividends land together or not at all, and an interruption keeps
+            # every symbol already processed.
+            db.commit()
         run.symbols_requested = len(symbols)
         run.bytes_downloaded = fmp.bytes_downloaded
         logger.info(

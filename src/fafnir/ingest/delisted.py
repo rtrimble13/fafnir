@@ -89,6 +89,7 @@ def load_delisted(
                 continue
             if repo.mark_delisted(db, security_id=sec_id, delisted_date=when):
                 marked += 1
+                db.commit()
                 logger.info("delisted %s (%s) on %s", symbol, exchange, when)
 
         run.symbols_requested = seen

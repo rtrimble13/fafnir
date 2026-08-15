@@ -75,6 +75,29 @@ class Database:
             raise RuntimeError("Database used outside of a context manager")
         return self._conn
 
+    def commit(self) -> None:
+        """Commit work so far, starting a fresh transaction.
+
+        Long loaders call this at a natural unit boundary -- one symbol's landing
+        payload, bars, watermark and DQ flags -- so a failure costs that unit
+        rather than the whole run. Without it a multi-hour backfill that raises
+        at the last symbol discards every watermark and re-spends the bandwidth,
+        which is precisely the resumability ``initial_backfill.sh`` advertises.
+
+        No-op under autocommit, where every statement is already durable.
+        """
+        if self._conn is not None and not self._autocommit:
+            self._conn.commit()
+
+    def rollback(self) -> None:
+        """Discard the uncommitted tail, keeping everything already committed.
+
+        Used to clear an aborted transaction so a final bookkeeping write (the
+        run's failed status) can still go through.
+        """
+        if self._conn is not None and not self._autocommit:
+            self._conn.rollback()
+
     @contextmanager
     def transaction(self) -> Iterator[psycopg.Connection]:
         """Explicit transaction block; commits on success, rolls back on error."""

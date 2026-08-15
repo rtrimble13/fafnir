@@ -33,6 +33,10 @@ US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", "OTC"}
 # listed-equity research warehouse, and OTC roughly doubled the universe.
 SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
 
+# Securities committed per batch. The bulk list is already in memory, so this is
+# purely a durability boundary, not a rate limit.
+COMMIT_EVERY = 500
+
 
 def _norm_exchange(entry: dict) -> Optional[str]:
     code = (
@@ -168,6 +172,11 @@ def load_securities(
             repo.upsert_symbol_xref(db, security_id=sec_id, symbol=symbol)
             count += 1
             run.rows_inserted = count
+            # Batched, unlike the price and action loaders: there is no network
+            # call per row here, so a commit per security would dominate the
+            # runtime for no resumability gain worth having.
+            if count % COMMIT_EVERY == 0:
+                db.commit()
             if limit and count >= limit:
                 break
         run.symbols_requested = count
@@ -227,6 +236,9 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
             )
             count += 1
             run.rows_inserted = count
+            # One HTTP call per symbol here, so commit per symbol: enrichment of
+            # a 20k universe runs for over an hour and must not be all-or-nothing.
+            db.commit()
         run.symbols_requested = len(symbols)
         run.bytes_downloaded = fmp.bytes_downloaded
         return count

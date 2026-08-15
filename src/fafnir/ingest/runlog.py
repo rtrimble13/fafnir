@@ -47,6 +47,10 @@ class RunLog:
             ),
         )
         self.run_id = int(row["ingestion_run_id"])
+        # Commit the open row immediately: until it is durable no other session
+        # can see the run, so nothing can monitor a backfill in flight, and a
+        # crash would erase the evidence that it ever started.
+        self.db.commit()
         logger.info(
             "ingestion_run %s started: %s/%s", self.run_id, self.source, self.endpoint
         )
@@ -58,6 +62,11 @@ class RunLog:
         if exc_type is not None:
             status = "failed"
             error_message = f"{exc_type.__name__}: {exc}"
+            # The failing statement may have aborted the transaction, which would
+            # reject the UPDATE below with InFailedSqlTransaction. Discard only
+            # the uncommitted tail -- everything committed at a unit boundary
+            # stays -- so the run can still be marked failed.
+            self.db.rollback()
         elif self.rows_quarantined > 0:
             status = "partial"
         self.db.execute(
@@ -77,6 +86,10 @@ class RunLog:
                 self.run_id,
             ),
         )
+        # Make the outcome durable here rather than leaving it to the caller: on
+        # the failure path Database.__exit__ rolls back, which would otherwise
+        # discard the very record that says the run failed.
+        self.db.commit()
         level = logger.error if status == "failed" else logger.info
         level(
             "ingestion_run %s %s: inserted=%d quarantined=%d bytes=%d",

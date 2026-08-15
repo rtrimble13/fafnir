@@ -34,6 +34,10 @@ class _FakeDB:
         self.known = known
         self.already_delisted = set(already_delisted)
         self.marked: list[tuple[int, date]] = []
+        self.commits = 0
+
+    def commit(self) -> None:
+        self.commits += 1
 
 
 @pytest.fixture()
