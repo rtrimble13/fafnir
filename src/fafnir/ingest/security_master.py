@@ -27,9 +27,11 @@ logger = get_logger("ingest.security")
 US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", "OTC"}
 
 # Codes used to *query* the screener, largest venues first so a --limit run gets
-# the recognizable names. US_EXCHANGES stays the acceptance set: it also has to
-# admit the aliases FMP hands back (NYSEAMERICAN, which normalizes to AMEX).
-SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE", "OTC")
+# the recognizable names. US_EXCHANGES stays the wider acceptance set: it also
+# has to admit the aliases FMP hands back (NYSEAMERICAN, which normalizes to
+# AMEX), and OTC, which is a US venue we simply do not ingest -- this is a
+# listed-equity research warehouse, and OTC roughly doubled the universe.
+SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:

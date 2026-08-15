@@ -37,10 +37,12 @@ class FMPClient(BaseSource):
     EP_SECTORS = "available-sectors"
     EP_INDUSTRIES = "available-industries"
     EP_SCREENER = "company-screener"
+    EP_DELISTED = "delisted-companies"
 
     # Screener rows per request. Confirmed to return a full 5000-row page, but
     # 1000 keeps a single page small enough to retry cheaply.
     SCREENER_PAGE_SIZE = 1000
+    DELISTED_PAGE_SIZE = 100
 
     def __init__(self, api_key: str, rate_per_min: int = 280, **kwargs):
         if not api_key:
@@ -63,6 +65,37 @@ class FMPClient(BaseSource):
         data, _, _ = self._call(self.EP_ETF_LIST)
         return data if isinstance(data, list) else []
 
+    def _paged(
+        self,
+        endpoint: str,
+        params: dict | None = None,
+        *,
+        page_size: int,
+        max_pages: int,
+    ) -> list[dict]:
+        """Accumulate an endpoint's pages until it runs out of rows.
+
+        Stops on an empty page, a short page, or a page whose first symbol
+        repeats the previous one -- that last guard catches a server that
+        ignores ``page`` and would otherwise be re-downloaded ``max_pages`` times.
+        """
+        out: list[dict] = []
+        prev_first: Optional[str] = None
+        base = dict(params or {})
+        for page in range(max_pages):
+            merged: dict[str, Any] = dict(base, limit=page_size, page=page)
+            data, _, _ = self._call(endpoint, merged)
+            if not isinstance(data, list) or not data:
+                break
+            first = data[0].get("symbol") if isinstance(data[0], dict) else None
+            if first is not None and first == prev_first:
+                break
+            prev_first = first
+            out.extend(data)
+            if len(data) < page_size:
+                break
+        return out
+
     def company_screener(
         self,
         *,
@@ -78,29 +111,33 @@ class FMPClient(BaseSource):
         endpoint that also returns ``exchangeShortName``, ``country`` and the
         ``isEtf`` / ``isFund`` flags, so the US universe has to be built from it.
         """
-        out: list[dict] = []
-        prev_first: Optional[str] = None
-        for page in range(max_pages):
-            params: dict[str, Any] = {"limit": self.SCREENER_PAGE_SIZE, "page": page}
-            if exchange:
-                params["exchange"] = exchange
-            if country:
-                params["country"] = country
-            if is_etf is not None:
-                params["isEtf"] = "true" if is_etf else "false"
-            data, _, _ = self._call(self.EP_SCREENER, params)
-            if not isinstance(data, list) or not data:
-                break
-            # A server that ignores `page` hands back the same slice forever;
-            # stop on a repeat rather than re-downloading it max_pages times.
-            first = data[0].get("symbol") if isinstance(data[0], dict) else None
-            if first is not None and first == prev_first:
-                break
-            prev_first = first
-            out.extend(data)
-            if len(data) < self.SCREENER_PAGE_SIZE:
-                break
-        return out
+        params: dict[str, Any] = {}
+        if exchange:
+            params["exchange"] = exchange
+        if country:
+            params["country"] = country
+        if is_etf is not None:
+            params["isEtf"] = "true" if is_etf else "false"
+        return self._paged(
+            self.EP_SCREENER,
+            params,
+            page_size=self.SCREENER_PAGE_SIZE,
+            max_pages=max_pages,
+        )
+
+    def delisted_companies(self, *, max_pages: int = 5) -> list[dict]:
+        """Delisted companies, newest delisting first.
+
+        Rows carry ``symbol``, ``companyName``, ``exchange``, ``ipoDate`` and
+        ``delistedDate``, and the list is global -- callers filter to the venues
+        they ingest. The ordering is why ``max_pages`` defaults low: the nightly
+        run only needs the recent tail, and a full sweep is an explicit choice.
+        """
+        return self._paged(
+            self.EP_DELISTED,
+            page_size=self.DELISTED_PAGE_SIZE,
+            max_pages=max_pages,
+        )
 
     def profile(self, symbol: str) -> Optional[dict]:
         data, _, _ = self._call(self.EP_PROFILE, {"symbol": symbol})

@@ -16,6 +16,12 @@ echo "==> daily_update started ${START}"
 # to current year + horizon_extra_years; no yearly config edits needed).
 fafnir db ensure-horizon
 
+# Before prices: a name that stopped trading today should be marked before the
+# price step asks it for fresh bars. Retaining it (rather than dropping it) is
+# what keeps the accumulating history free of survivorship bias.
+echo "==> Delisting sweep"
+fafnir ingest delisted
+
 echo "==> Incremental prices (active universe)"
 fafnir ingest prices
 

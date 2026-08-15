@@ -44,7 +44,8 @@ _XREF_RESOLVE_SQL = (
 )
 _PRIMARY_RESOLVE_SQL = (
     "SELECT security_id FROM core.security WHERE primary_symbol = %s "
-    "ORDER BY (source = %s) DESC, security_id ASC LIMIT 1"
+    "ORDER BY (source = %s) DESC, (delisted_date IS NULL) DESC, security_id ASC "
+    "LIMIT 1"
 )
 
 

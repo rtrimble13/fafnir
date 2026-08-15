@@ -86,6 +86,11 @@ def upsert_security(
 ) -> int:
     """Insert/update a security by its (source, primary_symbol, exchange) soft key.
 
+    The conflict arbiter is 0009's *partial* index, which covers only rows with
+    ``delisted_date IS NULL``. A delisted security is therefore invisible here: a
+    reused ticker inserts a new row and mints a new security_id rather than
+    overwriting the dead issuer's identity and price history.
+
     Returns the security_id.
     """
     row = db.fetchone(
@@ -95,7 +100,9 @@ def upsert_security(
              industry_id, currency, country, is_actively_trading, is_etf, is_fund,
              ipo_date, delisted_date, cik, isin, cusip, source, updated_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-        ON CONFLICT (source, primary_symbol, COALESCE(exchange_code, '')) DO UPDATE SET
+        ON CONFLICT (source, primary_symbol, COALESCE(exchange_code, ''))
+            WHERE delisted_date IS NULL
+        DO UPDATE SET
             company_name        = EXCLUDED.company_name,
             asset_type          = EXCLUDED.asset_type,
             sector_id           = EXCLUDED.sector_id,
@@ -141,20 +148,69 @@ def upsert_symbol_xref(
     *,
     security_id: int,
     symbol: str,
-    valid_from: date | str = "1900-01-01",
+    valid_from: date | str | None = None,
     is_primary: bool = True,
     source: str = "fmp",
 ) -> None:
+    """Map a ticker to a security_id for a validity period.
+
+    ``valid_from=None`` means "start after any period this ticker has already
+    served". A reused ticker therefore opens a *new* period instead of hijacking
+    the dead issuer's row -- which, since XREF_RESOLVE_SQL only reads open
+    periods, is what keeps a delisted company's price history addressable and
+    stops the new issuer from inheriting it.
+    """
     db.execute(
         """
         INSERT INTO core.symbol_xref (security_id, symbol, valid_from, is_primary, source)
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (
+            %s, %s,
+            COALESCE(
+                %s::date,
+                (SELECT max(valid_to) + 1 FROM core.symbol_xref
+                  WHERE symbol = %s AND valid_to IS NOT NULL),
+                '1900-01-01'::date
+            ),
+            %s, %s
+        )
         ON CONFLICT (symbol, valid_from) DO UPDATE SET
             security_id = EXCLUDED.security_id,
             is_primary  = EXCLUDED.is_primary
+        WHERE core.symbol_xref.valid_to IS NULL
         """,
-        (security_id, symbol, valid_from, is_primary, source),
+        (security_id, symbol, valid_from, symbol, is_primary, source),
     )
+
+
+def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> bool:
+    """Flip a listed security to delisted and close its open ticker period.
+
+    One-way and idempotent: a row that already carries a ``delisted_date`` is
+    left untouched, so re-running the loader can never rewrite a delisting or
+    resurrect a dead issuer. Returns True only when this call did the delisting.
+    """
+    row = db.fetchone(
+        """
+        UPDATE core.security
+           SET is_actively_trading = FALSE,
+               delisted_date       = %s,
+               updated_at          = now()
+         WHERE security_id = %s AND delisted_date IS NULL
+        RETURNING security_id
+        """,
+        (delisted_date, security_id),
+    )
+    if row is None:
+        return False
+    db.execute(
+        """
+        UPDATE core.symbol_xref
+           SET valid_to = %s
+         WHERE security_id = %s AND valid_to IS NULL AND valid_from <= %s
+        """,
+        (delisted_date, security_id, delisted_date),
+    )
+    return True
 
 
 def upsert_company_profile(
@@ -219,7 +275,8 @@ XREF_RESOLVE_SQL = (
 # resolves — and resolves identically in both code paths.
 PRIMARY_RESOLVE_SQL = (
     "SELECT security_id FROM core.security WHERE primary_symbol = %s "
-    "ORDER BY (source = %s) DESC, security_id ASC LIMIT 1"
+    "ORDER BY (source = %s) DESC, (delisted_date IS NULL) DESC, security_id ASC "
+    "LIMIT 1"
 )
 
 

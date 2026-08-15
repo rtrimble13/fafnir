@@ -237,18 +237,29 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
 @click.option("--symbols", help="Comma-separated symbols (default: all securities)")
 @click.option("--from", "from_date", help="Start date YYYY-MM-DD (else incremental)")
 @click.option("--to", "to_date", help="End date YYYY-MM-DD")
+@click.option(
+    "--include-inactive",
+    is_flag=True,
+    help="Also load delisted securities (use for backfills -- omitting it is "
+    "what makes a history survivorship-biased)",
+)
 @click.pass_context
-def ingest_prices(ctx, symbols, from_date, to_date):
+def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
     """Load daily OHLCV (incremental by default)."""
     from fafnir.ingest import daily_price
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
     with Database(cfg.dsn) as database:
+        # The nightly run wants active names only -- a delisted security will
+        # never have another bar, so re-polling it burns requests forever. A
+        # historical backfill wants everything, or the resulting history only
+        # contains companies that happened to survive to today.
+        where = "" if include_inactive else "WHERE is_actively_trading "
         syms = _split_symbols(symbols) or [
             r["primary_symbol"]
             for r in database.fetchall(
-                "SELECT primary_symbol FROM core.security WHERE is_actively_trading "
+                f"SELECT primary_symbol FROM core.security {where}"
                 "ORDER BY security_id"
             )
         ]
@@ -262,6 +273,29 @@ def ingest_prices(ctx, symbols, from_date, to_date):
         )
     click.echo(
         f"Loaded {n} price rows for {len(syms)} symbols. "
+        f"FMP bytes: {fmp.bytes_downloaded}"
+    )
+
+
+@ingest.command("delisted")
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Sweep the entire delisted feed instead of only its recent tail",
+)
+@click.pass_context
+def ingest_delisted(ctx, full):
+    """Mark securities that have stopped trading (survivorship-bias guard)."""
+    from fafnir.ingest import delisted
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    with Database(cfg.dsn) as database:
+        marked, seen = delisted.load_delisted(
+            database, fmp, max_pages=500 if full else 5
+        )
+    click.echo(
+        f"Marked {marked} newly delisted securities ({seen} feed rows on our venues). "
         f"FMP bytes: {fmp.bytes_downloaded}"
     )
 
