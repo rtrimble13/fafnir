@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import time
 from collections import deque
 from typing import Any
@@ -24,6 +25,20 @@ logger = get_logger("source")
 
 # Cap on a server-supplied Retry-After so a misbehaving header can't stall a load.
 MAX_RETRY_AFTER_SECONDS = 120
+
+# Query parameters whose values must never reach a log, an exception message or a
+# traceback. requests renders the *full* URL -- key included -- into the string
+# form of HTTPError and of the connection errors, so anything derived from an
+# upstream exception has to be scrubbed before it is re-raised or logged.
+SECRET_QUERY_PARAMS = ("apikey", "api_key", "token", "access_key", "secret")
+_SECRET_RE = re.compile(
+    r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask API keys in any text bound for a log or an exception message."""
+    return _SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
 
 
 class SourceError(Exception):
@@ -78,7 +93,8 @@ class BaseSource:
         """GET with throttle + exponential backoff on 429/5xx/timeouts.
 
         Returns (parsed_json, http_status, nbytes). Raises SourceError on
-        exhaustion. The API key in ``params`` is never logged.
+        exhaustion. The API key in ``params`` never reaches a log, an exception
+        message or a traceback -- see :func:`redact_secrets`.
         """
         params = dict(params or {})
         last_status: int | None = None
@@ -89,7 +105,13 @@ class BaseSource:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
             except requests.RequestException as exc:
                 if is_last:
-                    raise SourceError(f"GET {url} failed: {exc}") from exc
+                    # `from None`, not `from exc`: the chained RequestException
+                    # renders the full URL -- API key and all -- into the
+                    # traceback. The redacted detail is carried over instead.
+                    raise SourceError(
+                        f"GET {redact_secrets(url)} failed: "
+                        f"{type(exc).__name__}: {redact_secrets(str(exc))}"
+                    ) from None
                 self._backoff(attempt)
                 continue
 
@@ -120,19 +142,27 @@ class BaseSource:
             try:
                 resp.raise_for_status()
             except requests.HTTPError as exc:
-                raise SourceError(f"GET {url} returned {resp.status_code}") from exc
+                # Same reason as above -- HTTPError stringifies to
+                # "<code> ... for url: <full url with apikey>".
+                raise SourceError(
+                    f"GET {redact_secrets(url)} returned {resp.status_code}: "
+                    f"{redact_secrets(str(exc))}"
+                ) from None
 
             try:
                 data = resp.json()
             except ValueError as exc:
-                raise SourceError(f"GET {url} returned non-JSON body") from exc
+                # Safe to chain: a JSON decode error carries no URL.
+                raise SourceError(
+                    f"GET {redact_secrets(url)} returned non-JSON body"
+                ) from exc
 
             if isinstance(data, dict) and "Error Message" in data:
                 raise SourceError(f"{self.name} error: {data['Error Message']}")
             return data, resp.status_code, nbytes
 
         raise SourceError(
-            f"GET {url} exhausted retries"
+            f"GET {redact_secrets(url)} exhausted retries"
             + (f" (last status {last_status})" if last_status else "")
         )
 

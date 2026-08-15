@@ -20,7 +20,7 @@ from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
 from fafnir.logging_config import get_logger
-from fafnir.sources.fmp import FMPClient
+from fafnir.sources.fmp import FMPClient, SourceError
 
 logger = get_logger("ingest.security")
 
@@ -59,8 +59,18 @@ def _us_entries(fmp: FMPClient, include_etfs: bool) -> list[tuple[dict, str, boo
     """
     entries: list[tuple[dict, str, bool]] = []
     seen: set[str] = set()
+    rows_seen = 0
+    us_rows = 0
     for code in SCREENER_EXCHANGES:
-        rows = fmp.company_screener(exchange=code)
+        try:
+            rows = fmp.company_screener(exchange=code)
+        except SourceError as exc:
+            # A venue the plan does not cover (FMP answers 402) or does not
+            # recognize must not sink the load: the venues already fetched are
+            # still a valid universe, and NASDAQ/NYSE/AMEX carry the bulk of it.
+            logger.warning("screener exchange=%s unavailable, skipping (%s)", code, exc)
+            continue
+        rows_seen += len(rows)
         kept = 0
         for row in rows:
             symbol = (row.get("symbol") or "").strip()
@@ -69,13 +79,29 @@ def _us_entries(fmp: FMPClient, include_etfs: bool) -> list[tuple[dict, str, boo
             # page, not an error. `seen` then keeps the overlap out.
             if not symbol or symbol in seen or not _is_us(row):
                 continue
+            seen.add(symbol)
+            us_rows += 1
             is_etf = bool(row.get("isEtf"))
             if is_etf and not include_etfs:
                 continue
-            seen.add(symbol)
             entries.append((row, "etf" if is_etf else "equity", is_etf))
             kept += 1
         logger.info("screener exchange=%s: %d rows, %d kept", code, len(rows), kept)
+
+    # Fail loudly on an empty universe -- a silent "Loaded 0 securities" against
+    # a multi-megabyte download is what made the stock-list regression invisible.
+    # An empty `entries` is legitimate when --no-etfs filtered out the only rows,
+    # so the guards test what came back from FMP, not what survived the filters.
+    if not rows_seen:
+        raise SourceError(
+            "company-screener returned nothing for any venue in "
+            f"{list(SCREENER_EXCHANGES)} -- check the plan covers the endpoint"
+        )
+    if not us_rows:
+        raise SourceError(
+            f"company-screener returned {rows_seen} rows, none carrying a US "
+            "venue -- the payload shape or the exchange codes have changed"
+        )
     return entries
 
 

@@ -6,6 +6,7 @@ to retrieve financial and market data.
 """
 
 import logging
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,20 @@ import requests
 from duk.date_utils import get_api_date_range
 
 logger = logging.getLogger(__name__)
+
+# Query parameters whose values must never reach a log, an exception message or a
+# traceback. requests renders the *full* URL -- key included -- into the string
+# form of HTTPError and of the connection errors, so anything derived from an
+# upstream exception has to be scrubbed before it is re-raised or logged.
+SECRET_QUERY_PARAMS = ("apikey", "api_key", "token", "access_key", "secret")
+_SECRET_RE = re.compile(
+    r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask API keys in any text bound for a log or an exception message."""
+    return _SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
 
 
 class FMPAPIError(Exception):
@@ -77,8 +92,11 @@ def price_history_api(
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch price history for {symbol}: {e}")
-        raise FMPAPIError(f"Failed to fetch price history for {symbol}: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch price history for {symbol}: {detail}")
+        raise FMPAPIError(
+            f"Failed to fetch price history for {symbol}: {detail}"
+        ) from None
 
     try:
         data = response.json()
@@ -162,12 +180,13 @@ def adjusted_price_history_api(
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
+        detail = redact_secrets(str(e))
         logger.error(
-            f"Failed to fetch dividend-adjusted price history for {symbol}: {e}"
+            f"Failed to fetch dividend-adjusted price history for {symbol}: {detail}"
         )
         raise FMPAPIError(
-            f"Failed to fetch dividend-adjusted price history for {symbol}: {e}"
-        ) from e
+            f"Failed to fetch dividend-adjusted price history for {symbol}: {detail}"
+        ) from None
 
     try:
         data = response.json()
@@ -248,8 +267,9 @@ def treasury_rates_api(
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch treasury rates: {e}")
-        raise FMPAPIError(f"Failed to fetch treasury rates: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch treasury rates: {detail}")
+        raise FMPAPIError(f"Failed to fetch treasury rates: {detail}") from None
 
     try:
         data = response.json()
@@ -310,8 +330,9 @@ def company_list_api(api_key: str) -> List[Dict[str, Any]]:
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch company list: {e}")
-        raise FMPAPIError(f"Failed to fetch company list: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch company list: {detail}")
+        raise FMPAPIError(f"Failed to fetch company list: {detail}") from None
 
     try:
         data = response.json()
@@ -372,8 +393,9 @@ def etf_symbol_list_api(api_key: str) -> List[Dict[str, Any]]:
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch ETF symbol list: {e}")
-        raise FMPAPIError(f"Failed to fetch ETF symbol list: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch ETF symbol list: {detail}")
+        raise FMPAPIError(f"Failed to fetch ETF symbol list: {detail}") from None
 
     try:
         data = response.json()
@@ -433,8 +455,9 @@ def sector_list_api(api_key: str) -> List[Dict[str, Any]]:
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch sector list: {e}")
-        raise FMPAPIError(f"Failed to fetch sector list: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch sector list: {detail}")
+        raise FMPAPIError(f"Failed to fetch sector list: {detail}") from None
 
     try:
         data = response.json()
@@ -494,8 +517,9 @@ def industry_list_api(api_key: str) -> List[Dict[str, Any]]:
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch industry list: {e}")
-        raise FMPAPIError(f"Failed to fetch industry list: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch industry list: {detail}")
+        raise FMPAPIError(f"Failed to fetch industry list: {detail}") from None
 
     try:
         data = response.json()
@@ -556,8 +580,9 @@ def actively_trading_list_api(api_key: str) -> List[Dict[str, Any]]:
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch actively trading list: {e}")
-        raise FMPAPIError(f"Failed to fetch actively trading list: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch actively trading list: {detail}")
+        raise FMPAPIError(f"Failed to fetch actively trading list: {detail}") from None
 
     try:
         data = response.json()
@@ -708,8 +733,9 @@ def screener_api(
         response = requests.get(endpoint, params=params, timeout=30)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch stock screener results: {e}")
-        raise FMPAPIError(f"Failed to fetch stock screener results: {e}") from e
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to fetch stock screener results: {detail}")
+        raise FMPAPIError(f"Failed to fetch stock screener results: {detail}") from None
 
     try:
         data = response.json()

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 from fafnir.ingest.security_master import (
     SCREENER_EXCHANGES,
+    SourceError,
     _is_us,
     _norm_exchange,
     _us_entries,
@@ -15,14 +18,25 @@ def _e(code: str) -> dict:
 
 
 class _FakeFMP:
-    """Screener stub: serves rows for the venues it knows, empty otherwise."""
+    """Screener stub: serves rows for the venues it knows, empty otherwise.
 
-    def __init__(self, by_exchange: dict[str, list[dict]]):
+    Venues listed in ``unavailable`` raise, standing in for FMP's 402 on a
+    venue the plan does not cover.
+    """
+
+    def __init__(
+        self,
+        by_exchange: dict[str, list[dict]],
+        unavailable: frozenset[str] = frozenset(),
+    ):
         self.by_exchange = by_exchange
+        self.unavailable = unavailable
         self.calls: list[str] = []
 
     def company_screener(self, *, exchange=None, **_kw) -> list[dict]:
         self.calls.append(exchange)
+        if exchange in self.unavailable:
+            raise SourceError("GET company-screener returned 402")
         return self.by_exchange.get(exchange, [])
 
 
@@ -78,3 +92,37 @@ def test_us_entries_dedups_across_venues_and_honours_no_etfs():
 
     assert len(_us_entries(fmp, include_etfs=True)) == 1
     assert _us_entries(fmp, include_etfs=False) == []
+
+
+def test_us_entries_survives_a_venue_the_plan_does_not_cover():
+    # Regression: FMP answers 402 for BATS on the Professional plan, and that
+    # used to abort the whole load after NASDAQ/NYSE/AMEX had already succeeded.
+    fmp = _FakeFMP(
+        {"NASDAQ": [{"symbol": "AAPL", "exchangeShortName": "NASDAQ"}]},
+        unavailable=frozenset({"BATS", "CBOE", "OTC"}),
+    )
+    entries = _us_entries(fmp, include_etfs=True)
+
+    assert [e[0]["symbol"] for e in entries] == ["AAPL"]
+    assert fmp.calls == list(SCREENER_EXCHANGES)  # kept going past the failures
+
+
+def test_us_entries_raises_when_every_venue_fails():
+    # A zero universe must be an error, never a silent "Loaded 0 securities".
+    fmp = _FakeFMP({}, unavailable=frozenset(SCREENER_EXCHANGES))
+    with pytest.raises(SourceError, match="returned nothing for any venue"):
+        _us_entries(fmp, include_etfs=True)
+
+
+def test_us_entries_raises_when_rows_carry_no_venue():
+    # The original regression, as an error this time: rows arrive but none has
+    # an exchange, so the universe is empty for a reason worth shouting about.
+    fmp = _FakeFMP({"NASDAQ": [{"symbol": "AAPL", "companyName": "Apple Inc."}]})
+    with pytest.raises(SourceError, match="none carrying a US venue"):
+        _us_entries(fmp, include_etfs=True)
+
+
+def test_us_entries_allows_an_empty_result_when_etfs_are_excluded():
+    # Not an error: the venue answered, the rows were US, --no-etfs removed them.
+    spy = {"symbol": "SPY", "exchangeShortName": "AMEX", "isEtf": True}
+    assert _us_entries(_FakeFMP({"AMEX": [spy]}), include_etfs=False) == []

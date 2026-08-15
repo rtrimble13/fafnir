@@ -2,7 +2,47 @@
 
 from __future__ import annotations
 
-from fafnir.sources.base import MAX_RETRY_AFTER_SECONDS, BaseSource
+from fafnir.sources.base import (
+    MAX_RETRY_AFTER_SECONDS,
+    BaseSource,
+    redact_secrets,
+)
+
+# The exact string requests builds for a failed response -- this is what leaked
+# the key into a traceback before redaction.
+_HTTP_ERROR = (
+    "402 Client Error: Payment Required for url: "
+    "https://financialmodelingprep.com/stable/company-screener"
+    "?limit=1000&page=0&exchange=BATS&apikey=2F6Gza19PPjluyAomWz16vmQGwH2DwvW"
+)
+
+
+def test_redact_masks_the_api_key_requests_puts_in_its_error():
+    out = redact_secrets(_HTTP_ERROR)
+    assert "2F6Gza19PPjluyAomWz16vmQGwH2DwvW" not in out
+    assert "apikey=***" in out
+    # The diagnostic parts must survive -- that is the point of scrubbing rather
+    # than suppressing the upstream message.
+    assert "402 Client Error: Payment Required" in out
+    assert "exchange=BATS" in out and "limit=1000" in out
+
+
+def test_redact_covers_the_other_secret_param_spellings():
+    for param in ("api_key", "token", "access_key", "secret", "APIKEY"):
+        out = redact_secrets(f"https://x/y?{param}=hunter2&page=1")
+        assert "hunter2" not in out, param
+        assert "page=1" in out, param
+
+
+def test_redact_stops_at_the_parameter_boundary():
+    out = redact_secrets("?apikey=abc123&symbol=AAPL")
+    assert out == "?apikey=***&symbol=AAPL"
+
+
+def test_redact_leaves_clean_text_alone():
+    assert redact_secrets("GET .../stock-list returned 401") == (
+        "GET .../stock-list returned 401"
+    )
 
 
 def test_retry_after_parses_delta_seconds():

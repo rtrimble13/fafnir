@@ -16,10 +16,42 @@ from duk.fmp_api import (
     etf_symbol_list_api,
     industry_list_api,
     price_history_api,
+    redact_secrets,
     screener_api,
     sector_list_api,
     treasury_rates_api,
 )
+
+SECRET = "2F6Gza19PPjluyAomWz16vmQGwH2DwvW"
+
+
+class TestRedaction:
+    """The API key must not survive into a log line, a message or a traceback."""
+
+    def test_redact_masks_the_key_requests_embeds_in_its_error(self):
+        out = redact_secrets(
+            "402 Client Error: Payment Required for url: "
+            "https://financialmodelingprep.com/stable/profile"
+            f"?symbol=AAPL&apikey={SECRET}"
+        )
+        assert SECRET not in out
+        assert "apikey=***" in out
+        assert "402 Client Error" in out and "symbol=AAPL" in out
+
+    @mock.patch("duk.fmp_api.requests.get")
+    def test_request_failure_neither_logs_nor_raises_the_key(self, mock_get, caplog):
+        mock_get.side_effect = requests.exceptions.ConnectionError(
+            f"Max retries exceeded with url: /stable/x?apikey={SECRET}"
+        )
+        with pytest.raises(FMPAPIError) as excinfo:
+            price_history_api("AAPL", SECRET)
+
+        assert SECRET not in str(excinfo.value)
+        assert SECRET not in caplog.text
+        # `from None`: no __cause__/__context__ for a traceback to print the
+        # unredacted upstream message from.
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
 
 
 class TestPriceHistoryAPI:
