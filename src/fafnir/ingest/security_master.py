@@ -1,8 +1,10 @@
 """
 Security-master loader.
 
-Builds ``core.security`` + ``core.symbol_xref`` from FMP's ``stock-list`` and
-``etf-list``. The universe filter keeps US-listed equities and ETFs. Profiles
+Builds ``core.security`` + ``core.symbol_xref`` from FMP. The default
+``us-equity-etf`` universe comes from ``company-screener``, the only bulk
+endpoint carrying the exchange; ``stock-list`` / ``etf-list`` back the
+unfiltered universes. Profiles
 (sector/industry/description) are enriched separately via :func:`enrich_profiles`
 because the per-symbol profile endpoint is far more expensive than the bulk lists.
 
@@ -24,6 +26,11 @@ logger = get_logger("ingest.security")
 
 US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", "OTC"}
 
+# Codes used to *query* the screener, largest venues first so a --limit run gets
+# the recognizable names. US_EXCHANGES stays the acceptance set: it also has to
+# admit the aliases FMP hands back (NYSEAMERICAN, which normalizes to AMEX).
+SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE", "OTC")
+
 
 def _norm_exchange(entry: dict) -> Optional[str]:
     code = (
@@ -42,6 +49,36 @@ def _is_us(entry: dict) -> bool:
     return _norm_exchange(entry) in US_EXCHANGES
 
 
+def _us_entries(fmp: FMPClient, include_etfs: bool) -> list[tuple[dict, str, bool]]:
+    """Build the US universe from the company screener, one paged pass per venue.
+
+    ``stock-list`` / ``etf-list`` cannot answer this question: their stable
+    payloads are ``symbol`` + name only, so the exchange that *defines* the
+    universe is absent and every row fails :func:`_is_us` -- which showed up as a
+    silent "Loaded 0 securities" against a multi-megabyte download.
+    """
+    entries: list[tuple[dict, str, bool]] = []
+    seen: set[str] = set()
+    for code in SCREENER_EXCHANGES:
+        rows = fmp.company_screener(exchange=code)
+        kept = 0
+        for row in rows:
+            symbol = (row.get("symbol") or "").strip()
+            # Re-check client-side rather than trusting the server filter: an
+            # exchange code FMP does not recognize comes back as an unfiltered
+            # page, not an error. `seen` then keeps the overlap out.
+            if not symbol or symbol in seen or not _is_us(row):
+                continue
+            is_etf = bool(row.get("isEtf"))
+            if is_etf and not include_etfs:
+                continue
+            seen.add(symbol)
+            entries.append((row, "etf" if is_etf else "equity", is_etf))
+            kept += 1
+        logger.info("screener exchange=%s: %d rows, %d kept", code, len(rows), kept)
+    return entries
+
+
 def load_securities(
     db: Database,
     fmp: FMPClient,
@@ -57,32 +94,36 @@ def load_securities(
         endpoint="stock-list",
         params={"universe": universe, "limit": limit},
     ) as run:
-        stocks = fmp.stock_list()
-        entries = [(s, "equity", False) for s in stocks]
-        if include_etfs:
-            etfs = fmp.etf_list()
-            etf_symbols = {e.get("symbol") for e in etfs}
-            # stock-list may already include ETFs; de-dup by symbol, prefer ETF flag.
-            entries = [
-                (
-                    s,
-                    ("etf" if s.get("symbol") in etf_symbols else "equity"),
-                    s.get("symbol") in etf_symbols,
-                )
-                for s in stocks
-            ]
-            known = {s.get("symbol") for s in stocks}
-            for e in etfs:
-                if e.get("symbol") not in known:
-                    entries.append((e, "etf", True))
+        if universe == "us-equity-etf":
+            entries = _us_entries(fmp, include_etfs)
+        else:
+            stocks = fmp.stock_list()
+            entries = [(s, "equity", False) for s in stocks]
+            if include_etfs:
+                etfs = fmp.etf_list()
+                etf_symbols = {e.get("symbol") for e in etfs}
+                # stock-list may already include ETFs; de-dup by symbol, prefer
+                # the ETF flag.
+                entries = [
+                    (
+                        s,
+                        ("etf" if s.get("symbol") in etf_symbols else "equity"),
+                        s.get("symbol") in etf_symbols,
+                    )
+                    for s in stocks
+                ]
+                known = {s.get("symbol") for s in stocks}
+                for e in etfs:
+                    if e.get("symbol") not in known:
+                        entries.append((e, "etf", True))
 
         count = 0
         for entry, asset_type, is_etf in entries:
             symbol = (entry.get("symbol") or "").strip()
             if not symbol:
                 continue
-            if universe == "us-equity-etf" and not _is_us(entry):
-                continue
+            # The us-equity-etf filter lives in _us_entries now -- it needs the
+            # screener's fields, which the bulk lists do not carry.
             exchange = _norm_exchange(entry)
             repo.ensure_exchange(db, exchange) if exchange else None
             sec_id = repo.upsert_security(
@@ -91,8 +132,10 @@ def load_securities(
                 company_name=entry.get("name") or entry.get("companyName"),
                 asset_type=asset_type,
                 exchange_code=exchange,
+                country=entry.get("country"),
+                is_actively_trading=bool(entry.get("isActivelyTrading", True)),
                 is_etf=is_etf,
-                is_fund=False,
+                is_fund=bool(entry.get("isFund", False)),
             )
             repo.upsert_symbol_xref(db, security_id=sec_id, symbol=symbol)
             count += 1

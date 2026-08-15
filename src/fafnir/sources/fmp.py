@@ -38,6 +38,10 @@ class FMPClient(BaseSource):
     EP_INDUSTRIES = "available-industries"
     EP_SCREENER = "company-screener"
 
+    # Screener rows per request. Confirmed to return a full 5000-row page, but
+    # 1000 keeps a single page small enough to retry cheaply.
+    SCREENER_PAGE_SIZE = 1000
+
     def __init__(self, api_key: str, rate_per_min: int = 280, **kwargs):
         if not api_key:
             raise ValueError("FMP API key is required")
@@ -58,6 +62,45 @@ class FMPClient(BaseSource):
     def etf_list(self) -> list[dict]:
         data, _, _ = self._call(self.EP_ETF_LIST)
         return data if isinstance(data, list) else []
+
+    def company_screener(
+        self,
+        *,
+        exchange: Optional[str] = None,
+        country: Optional[str] = None,
+        is_etf: Optional[bool] = None,
+        max_pages: int = 60,
+    ) -> list[dict]:
+        """Bulk company rows, paged until a short page comes back.
+
+        The stable ``stock-list`` / ``etf-list`` payloads carry only ``symbol``
+        and a name -- no exchange, no country. The screener is the one bulk
+        endpoint that also returns ``exchangeShortName``, ``country`` and the
+        ``isEtf`` / ``isFund`` flags, so the US universe has to be built from it.
+        """
+        out: list[dict] = []
+        prev_first: Optional[str] = None
+        for page in range(max_pages):
+            params: dict[str, Any] = {"limit": self.SCREENER_PAGE_SIZE, "page": page}
+            if exchange:
+                params["exchange"] = exchange
+            if country:
+                params["country"] = country
+            if is_etf is not None:
+                params["isEtf"] = "true" if is_etf else "false"
+            data, _, _ = self._call(self.EP_SCREENER, params)
+            if not isinstance(data, list) or not data:
+                break
+            # A server that ignores `page` hands back the same slice forever;
+            # stop on a repeat rather than re-downloading it max_pages times.
+            first = data[0].get("symbol") if isinstance(data[0], dict) else None
+            if first is not None and first == prev_first:
+                break
+            prev_first = first
+            out.extend(data)
+            if len(data) < self.SCREENER_PAGE_SIZE:
+                break
+        return out
 
     def profile(self, symbol: str) -> Optional[dict]:
         data, _, _ = self._call(self.EP_PROFILE, {"symbol": symbol})
