@@ -207,3 +207,81 @@ def test_a_bar_with_no_volume_at_all_is_zero_not_a_quarantine():
     )
     assert reason is None
     assert row["volume"] == 0
+
+
+# -- review finding 5 (PR #11) ------------------------------------------------
+#
+# _ohlc returned the first PRESENT value, so a zero in the preferred spelling
+# quarantined the bar even when the other spelling carried a real price. It now
+# returns the first USABLE value, while still reporting the precise reason when
+# nothing is usable.
+
+
+def test_zero_in_the_preferred_spelling_falls_through_to_a_valid_one():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": 0,
+            "adjOpen": 39.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "volume": 100,
+        }
+    )
+    assert reason is None
+    assert row["open"] == 39.0
+
+
+def test_junk_in_the_preferred_spelling_falls_through_to_a_valid_one():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": "n/a",
+            "adjOpen": 39.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "volume": 100,
+        }
+    )
+    assert reason is None
+    assert row["open"] == 39.0
+
+
+def test_an_all_zero_bar_still_reports_non_positive_price():
+    """The precise quarantine reason must survive the fallback logic."""
+    _, reason = _validate_bar(
+        {"date": "1990-01-02", "open": 0, "high": 0, "low": 0, "close": 0, "volume": 1}
+    )
+    assert reason == "non_positive_price"
+
+
+def test_an_all_junk_bar_still_reports_nonnumeric():
+    _, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": "x",
+            "high": "x",
+            "low": "x",
+            "close": "x",
+            "volume": 1,
+        }
+    )
+    assert reason == "missing_or_nonnumeric_ohlc"
+
+
+def test_plain_name_still_wins_when_both_spellings_are_usable():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": 39.0,
+            "adjOpen": 1.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "volume": 100,
+        }
+    )
+    assert reason is None
+    assert row["open"] == 39.0

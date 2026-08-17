@@ -223,3 +223,69 @@ def test_volume_section_renders():
     assert "Volume cross-check" in text
     assert "unadjusted feed `volume`" in text
     assert "`unadjustedVolume`" in text
+
+
+# -- review findings (PR #11) -------------------------------------------------
+#
+# Each of these reproduces a defect the pre-merge review found by executing the
+# code. They exist so the specific failure mode cannot come back.
+
+
+def test_feeds_are_compared_on_the_same_trading_day():
+    """Finding 1: selecting each feed's nearest bar independently compared
+    different days and charged the price move between them to the split ratio,
+    turning a correct 4:1 feed into a `ratio_mismatch` that blocks a backfill."""
+    fmp = _FMP(
+        [_bar(Decimal("40.00"), prefixed=True, date="1990-01-02")],
+        [_bar(Decimal("10.60"), date="1990-01-03")],  # different day, +6% move
+        [{"date": "2020-08-31", "numerator": 4, "denominator": 1}],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["verdict"] == "inconclusive"
+    assert r["compared_date"] == dt.date(1990, 1, 2)
+    assert "split-adjusted feed does not" in r["detail"]
+
+
+def test_a_matched_pair_still_evaluates_normally():
+    fmp = _FMP(
+        [_bar(Decimal("40.00"), prefixed=True, date="1990-01-02")],
+        [_bar(Decimal("10.00"), date="1990-01-02")],
+        [{"date": "2020-08-31", "numerator": 4, "denominator": 1}],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["verdict"] == "unadjusted_confirmed"
+    assert r["compared_date"] == dt.date(1990, 1, 2)
+
+
+def test_duplicate_dates_do_not_raise():
+    """Finding 3: min() over (date, bar) tuples fell through to comparing dicts.
+
+    The bars must DIFFER -- identical dicts compare equal, so the tuples never
+    reach `<` and a naive fixture misses the bug entirely.
+    """
+    dupes = [
+        _bar_v(ADJ_CLOSE, 1000, date="1990-01-02"),
+        _bar_v(ADJ_CLOSE + Decimal("0.01"), 1100, date="1990-01-02"),
+    ]
+    r = probe.probe_prices(_FMP([_bar(RAW_CLOSE, prefixed=True)], dupes))
+    assert r["verdict"] == "unadjusted_confirmed"
+
+
+def test_non_numeric_unadjusted_volume_is_a_failure_not_a_pass():
+    """Finding 4: presence of the key was treated as proof of rawness, so the
+    probe passed a payload the loader quarantines as nonnumeric_volume."""
+    bad = _bar_v(RAW_CLOSE, RAW_VOL, prefixed=True, unadj="N/A")
+    r = probe.probe_prices(_FMP([bad], [_bar_v(ADJ_CLOSE, RAW_VOL * 112)]))
+    assert r["volume_verdict"] == "volume_unusable"
+    assert "nonnumeric_volume" in r["volume_detail"]
+    # And the loader agrees, which is the point.
+    from fafnir.ingest.daily_price import _validate_bar
+
+    assert _validate_bar(bad)[1] == "nonnumeric_volume"
+
+
+def test_zero_unadjusted_volume_is_still_conclusive():
+    """A genuine zero-volume day parses fine and must not read as unusable."""
+    bar = _bar_v(RAW_CLOSE, 0, prefixed=True, unadj=0)
+    r = probe.probe_prices(_FMP([bar], [_bar_v(ADJ_CLOSE, 0)]))
+    assert r["volume_verdict"] == "volume_raw_confirmed"

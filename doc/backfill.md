@@ -314,7 +314,13 @@ nothing, and reports:
 | `unadjusted_confirmed` | The feeds differ by exactly the split ratio. Safe to backfill. |
 | `feeds_agree` | Both returned the same price despite a split — the "unadjusted" endpoint is **not** unadjusted. Stop; fafnir would double-adjust. |
 | `ratio_mismatch` | They differ, but not by the split ratio. Splits payload incomplete, or a feed changed meaning. |
-| `inconclusive` | No splits after that date (use an earlier `--date` or a symbol that has split), or a feed returned no bar. |
+| `inconclusive` | No splits after that date (use an earlier `--date` or a symbol that has split), a feed returned no bar, or the two feeds have no bar for the *same* trading day. |
+
+Both feeds are always compared **on the same trading day**. The probe anchors on the
+unadjusted feed's first bar on/after `--date` and then demands that exact date from
+the other feed; if it is missing it reports `inconclusive` rather than comparing
+adjacent days, since the price move between them would otherwise be charged to the
+split ratio. The bar actually used is printed under the header.
 
 It also prints the payload's raw field names and whether the ingestion boundary would
 accept the bar — worth a glance, since FMP labels OHLC as
@@ -334,6 +340,7 @@ volume — it is the quieter of the two failures, which is why it gets its own v
 | `volume_raw_confirmed` | Volume being ingested is raw — either the feeds differ by the split ratio, or the payload carries an explicit `unadjustedVolume`, or both feeds agree *and* match `unadjustedVolume`. |
 | `volume_adjusted` | Both feeds report a volume larger than `unadjustedVolume` — what is being ingested is split-adjusted, and fafnir would inflate it again. |
 | `volume_ambiguous` | Both feeds report the same volume and neither carries `unadjustedVolume`. See below. |
+| `volume_unusable` | `unadjustedVolume` is present but not a number. The loader prefers that field, so every bar would quarantine as `nonnumeric_volume`. |
 | `volume_ratio_mismatch` | The feeds differ by something that is neither 1 nor the split ratio. |
 
 **`volume_ambiguous` is a real limit, not a bug.** "FMP never split-adjusts volume"
@@ -349,8 +356,8 @@ The loader hedges the same way: where a payload offers `unadjustedVolume` it is
 preferred over `volume`, because `core.daily_price` is defined as raw and
 `unadjustedVolume` is raw by definition.
 
-The command exits non-zero on `feeds_agree`, `ratio_mismatch`, `volume_adjusted` and
-`volume_ratio_mismatch`, so it can gate a scripted backfill.
+The command exits non-zero on `feeds_agree`, `ratio_mismatch`, `volume_adjusted`,
+`volume_unusable` and `volume_ratio_mismatch`, so it can gate a scripted backfill.
 
 ---
 
@@ -362,7 +369,9 @@ data (`ref.exchange`, `ref.sector`, `ref.industry`, `ref.trading_calendar`) all
 survive, so you go straight back to ingesting.
 
 **Dry run is the default** — it reports the row counts it would delete and stops.
-Pass `--yes` to execute.
+Pass `--yes` to execute. It names the target as `db=<dbname> host=<host>`, parsed
+from either DSN form; the DSN itself is never echoed, so a URL-form password cannot
+reach the terminal or a redirected log.
 
 ```bash
 scripts/reset_data.sh --scope prices            # preview

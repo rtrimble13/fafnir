@@ -145,8 +145,38 @@ esac
 # Normalize whitespace so the list prints and re-parses cleanly.
 TABLES="$(echo "${TABLES}" | tr -s ' \n\t' ' ' | sed 's/^ //; s/ $//')"
 
+# Describe the target WITHOUT echoing the DSN. A URL-form DSN
+# (postgresql://user:pass@host/db -- supported, see src/fafnir/config.py) contains
+# no spaces, so any "print a prefix of it" approach leaks the password into the
+# terminal and into whatever log the operator redirected to. The project already
+# holds this line elsewhere (redact_secrets/SECRET_QUERY_PARAMS in duk/fmp_api.py
+# and sources/base.py). The dbname is the useful confirmation anyway: it names the
+# database about to be truncated.
+describe_dsn() {
+    local dsn="$1" host="" db="" rest=""
+    if [[ "${dsn}" == *"://"* ]]; then
+        rest="${dsn#*://}"
+        rest="${rest##*@}"              # drop any user:password@ (greedy: last @)
+        host="${rest%%/*}"
+        host="${host%%\?*}"
+        if [[ "${rest}" == */* ]]; then
+            db="${rest#*/}"
+            db="${db%%\?*}"
+        fi
+    else
+        # Key-value form. Anchored to start-or-whitespace so `host=` does not also
+        # match inside another key, and `|| true` so a DSN missing either key does
+        # not trip `set -e`.
+        host="$(grep -oE '(^|[[:space:]])host=[^[:space:]]+' <<< "${dsn}" \
+                | tail -1 | cut -d= -f2- || true)"
+        db="$(grep -oE '(^|[[:space:]])dbname=[^[:space:]]+' <<< "${dsn}" \
+              | tail -1 | cut -d= -f2- || true)"
+    fi
+    echo "db=${db:-<unknown>} host=${host:-<unknown>}"
+}
+
 echo "==> reset_data.sh  scope=${SCOPE}"
-echo "    Target: ${DSN%% *}..."
+echo "    Target: $(describe_dsn "${DSN}")"
 echo
 
 echo "==> Rows that would be removed:"

@@ -105,11 +105,23 @@ def classify_volume(raw_bar: dict, adj_bar: dict, ratio: Decimal) -> tuple[str, 
     adj_vol = _decimal(adj_bar.get("volume"))
     unadj = _decimal(raw_bar.get("unadjustedVolume", adj_bar.get("unadjustedVolume")))
 
-    if raw_bar.get("unadjustedVolume") not in (None, ""):
+    # Gate on the value PARSING, not on the key existing: a present-but-non-numeric
+    # `unadjustedVolume` is what the loader would quarantine as `nonnumeric_volume`,
+    # so treating its mere presence as proof of rawness green-lights a backfill in
+    # which every bar fails validation.
+    raw_unadj = _decimal(raw_bar.get("unadjustedVolume"))
+    if raw_unadj is not None and raw_unadj >= 0:
         return (
             "volume_raw_confirmed",
             "The unadjusted feed carries an explicit `unadjustedVolume`, which the "
             "loader prefers over `volume`. That is raw by definition.",
+        )
+    if raw_bar.get("unadjustedVolume") not in (None, ""):
+        return (
+            "volume_unusable",
+            f"`unadjustedVolume` is present but not a usable number "
+            f"({raw_bar['unadjustedVolume']!r}). The loader prefers that field, so "
+            "every bar would quarantine as `nonnumeric_volume`.",
         )
 
     if raw_vol is None or adj_vol is None or raw_vol <= 0 or adj_vol <= 0:
@@ -156,17 +168,31 @@ def classify_volume(raw_bar: dict, adj_bar: dict, ratio: Decimal) -> tuple[str, 
     )
 
 
+def _bar_date(bar: dict) -> Optional[date]:
+    try:
+        return datetime.strptime(str(bar.get("date"))[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
 def _bar_on_or_after(bars: list[dict], target: date) -> Optional[dict]:
-    """First bar dated on/after ``target`` -- the date itself may be a holiday."""
-    dated = []
+    """First bar dated on/after ``target`` -- the date itself may be a holiday.
+
+    Keyed on the date alone. Comparing whole ``(date, bar)`` tuples would fall
+    through to comparing the dicts when two bars share a date and differ in
+    content, which raises TypeError -- and duplicate dates are a real possibility
+    here, since ``eod_split_adjusted`` does not dedup the way ``eod_raw`` does.
+    """
+    dated = [(when, bar) for bar in bars if (when := _bar_date(bar)) and when >= target]
+    return min(dated, key=lambda pair: pair[0])[1] if dated else None
+
+
+def _bar_on_date(bars: list[dict], target: date) -> Optional[dict]:
+    """The bar for exactly ``target``, or None."""
     for bar in bars:
-        try:
-            when = datetime.strptime(str(bar.get("date"))[:10], "%Y-%m-%d").date()
-        except (TypeError, ValueError):
-            continue
-        if when >= target:
-            dated.append((when, bar))
-    return min(dated)[1] if dated else None
+        if _bar_date(bar) == target:
+            return bar
+    return None
 
 
 def cumulative_split_ratio(splits: list[dict], after: date) -> Decimal:
@@ -217,12 +243,19 @@ def probe_prices(
     adj_bars = fmp.eod_split_adjusted(symbol, from_date=from_date, to_date=to_date)
     splits = fmp.splits(symbol)
 
+    # Both bars MUST be the same trading day. Selecting each feed's nearest bar
+    # independently silently compares different days whenever the feeds' coverage
+    # differs, and charges the intervening price move to the adjustment ratio -- a
+    # 6% one-day move is enough to turn a correct 4:1 feed into a `ratio_mismatch`.
+    # So anchor on the unadjusted feed, then demand that exact date from the other.
     raw_bar = _bar_on_or_after(raw_bars, on_date)
-    adj_bar = _bar_on_or_after(adj_bars, on_date)
+    compared_date = _bar_date(raw_bar) if raw_bar else None
+    adj_bar = _bar_on_date(adj_bars, compared_date) if compared_date else None
 
     report: dict[str, Any] = {
         "symbol": symbol,
         "date": on_date,
+        "compared_date": compared_date,
         "unadjusted_fields": sorted(raw_bar) if raw_bar else [],
         "split_adjusted_fields": sorted(adj_bar) if adj_bar else [],
         "ohlc_spelling": None,
@@ -274,10 +307,19 @@ def probe_prices(
     ratio = report["split_ratio"]
 
     if raw_close is None or adj_close is None or adj_close <= 0:
-        report["detail"] = (
-            "One of the feeds returned no usable bar near this date. Pick a date "
-            "inside the symbol's trading history, or try another symbol."
-        )
+        if raw_bar is not None and adj_bar is None:
+            report["detail"] = (
+                f"The unadjusted feed has a bar for {compared_date} but the "
+                "split-adjusted feed does not, so there is no like-for-like pair to "
+                "compare. Comparing adjacent days instead would charge the price "
+                "move between them to the split ratio, so this reports nothing "
+                "rather than a wrong answer. Try a nearby --date."
+            )
+        else:
+            report["detail"] = (
+                "One of the feeds returned no usable bar near this date. Pick a "
+                "date inside the symbol's trading history, or try another symbol."
+            )
         return report
 
     implied = raw_close / adj_close
@@ -328,6 +370,12 @@ def format_report(report: dict[str, Any]) -> str:
     vol_status = vol_ok.get(report["volume_verdict"], "FAIL")
     lines = [
         f"FMP price-feed probe: {report['symbol']} @ {report['date']}",
+        f"  bar compared: {report.get('compared_date') or '(none found)'}"
+        + (
+            ""
+            if report.get("compared_date") in (None, report["date"])
+            else "  (nearest trading day on/after the requested date)"
+        ),
         "",
         "Field names",
         f"  unadjusted     : {', '.join(report['unadjusted_fields']) or '(no bar)'}",

@@ -63,13 +63,31 @@ def _parse_date(value) -> Optional[date]:
 def _ohlc(bar: dict, field: str):
     """Read one OHLC field, accepting either FMP spelling (``open``/``adjOpen``).
 
-    Raises KeyError when neither spelling carries a value, so the caller's existing
-    quarantine path handles it.
+    Returns the first spelling carrying a *usable* price -- numeric and positive --
+    so a payload with `"open": 0` next to a valid `"adjOpen": 39.0` is read from the
+    field that has the price, rather than being quarantined on the strength of the
+    one that does not. Preferring the unprefixed name is only a tie-break between
+    two usable values, not a reason to discard a good one.
+
+    When nothing is usable it falls back to the first value that was *present*, so
+    the caller still reports the precise reason (``non_positive_price`` for a zero,
+    ``missing_or_nonnumeric_ohlc`` for junk) instead of collapsing both into one.
+    Raises KeyError when neither spelling carries a value at all.
     """
+    present = None
     for key in _OHLC_ALIASES[field]:
         value = bar.get(key)
-        if value not in (None, ""):
-            return value
+        if value in (None, ""):
+            continue
+        if present is None:
+            present = value
+        try:
+            if float(value) > 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    if present is not None:
+        return present
     raise KeyError(field)
 
 

@@ -203,8 +203,17 @@ class FMPClient(BaseSource):
         on top of an already-split-adjusted series adjusts every split twice (see
         doc/adr/0004-unadjusted-price-feed.md). It exists so ``fafnir source
         probe-prices`` can compare the two feeds and prove which one is raw.
+
+        Deduplicated by date for parity with ``eod_raw`` -- a vendor-side repeat
+        would otherwise leave two bars for one day on this side of the comparison.
         """
-        return self._eod_window(symbol, from_date, to_date, self.EP_EOD_SPLIT_ADJUSTED)
+        bars = self._eod_window(symbol, from_date, to_date, self.EP_EOD_SPLIT_ADJUSTED)
+        by_date: dict[str, dict] = {}
+        for bar in bars:
+            key = str(bar.get("date") or "")[:10]
+            if key:
+                by_date[key] = bar
+        return [by_date[k] for k in sorted(by_date)]
 
     def eod_raw(
         self,
