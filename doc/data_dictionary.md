@@ -77,17 +77,23 @@ enrichment. History is retained in `landing.fmp_raw`.
 | `source` | TEXT | |
 
 ### `core.daily_price` — raw daily OHLCV  ⟵ primary fact
-**Grain:** `(security_id, trade_date)`. **Source:** FMP `historical-price-eod/full`.
+**Grain:** `(security_id, trade_date)`. **Source:** FMP
+`historical-price-eod/non-split-adjusted` — the *unadjusted* endpoint. `.../full` is
+already split-adjusted and must not be used here; see
+[adr/0004](adr/0004-unadjusted-price-feed.md).
 **Units:** price NUMERIC(20,6) in the security's currency; volume shares (BIGINT).
 **Adjustment status:** **RAW (unadjusted).** **Cadence:** daily; immutable once the
 day closes. Range-partitioned by `trade_date` (yearly).
+
+Because these are the prices as traded, the series contains split-sized jumps. That
+is correct: a 4:1 split shows a ~75% drop with no gap in the data.
 
 | Column | Type | Notes |
 |---|---|---|
 | `security_id` | BIGINT → core.security | |
 | `trade_date` | DATE | Exchange trading day. |
 | `open` `high` `low` `close` | NUMERIC(20,6) | **Raw** prices. |
-| `volume` | BIGINT | **Raw** volume (shares). |
+| `volume` | BIGINT | **Raw** volume (shares), in the share count of the day it traded. Taken from `unadjustedVolume` where the payload offers it, else `volume`. |
 | `vwap` | NUMERIC(20,6) | Volume-weighted average price (nullable). |
 | `source` | TEXT | |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | Lineage. |
@@ -139,10 +145,16 @@ derived on read.** Point-in-time stable.
 | Column | Type | Notes |
 |---|---|---|
 | `security_id`, `trade_date` | | |
-| `open` `high` `low` `close` | NUMERIC(20,6) | Back-adjusted prices. |
-| `volume` | BIGINT | Back-adjusted volume (post-split share terms). |
+| `open` `high` `low` `close` | NUMERIC(20,10) | Back-adjusted prices. 10 dp so a heavily back-adjusted low-priced stock does not round to zero (migration 0008). |
+| `volume` | NUMERIC(38,0) | Back-adjusted volume (post-split share terms). Rounded, not truncated; wider than BIGINT so a large back-adjustment cannot overflow on read (migration 0008). |
 | `close_raw` | NUMERIC(20,6) | The unadjusted close, for reference. |
-| `price_factor` / `volume_factor` | NUMERIC | The factor applied to this row. |
+| `price_factor` / `volume_factor` | NUMERIC(20,10) | The factor applied to this row. |
+
+Factors are stored at 10 decimal places, so a large cumulative split leaves a small
+rounding residue in the adjusted price — for AAPL's 112:1 the relative error is
+~3×10⁻⁹ (sub-nanodollar on a $40 close), far below a cent and immaterial for
+returns. The factor arithmetic itself is exact `Decimal`; only the stored result is
+rounded.
 
 ### `mart.security_latest` — screening snapshot (MATERIALIZED VIEW)
 **Grain:** one row per `security_id`. **Source:** `core.security` + `company_profile`
@@ -210,7 +222,7 @@ field whose meaning is later questioned.
 |---|---|---|
 | `stock-list`, `etf-list` | `core.security`, `core.symbol_xref` | security_id |
 | `profile` | `core.security` (enrich), `core.company_profile` | security_id |
-| `historical-price-eod/full` | `core.daily_price` | (security_id, trade_date) |
+| `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
 | `splits` | `core.corporate_action` (split) | (security_id, split, ex_date) |
 | `dividends` | `core.corporate_action` (dividend) | (security_id, dividend, ex_date) |
 | `available-sectors` / `available-industries` | `ref.sector` / `ref.industry` | name |

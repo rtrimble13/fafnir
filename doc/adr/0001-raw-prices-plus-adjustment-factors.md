@@ -5,11 +5,18 @@
 
 ## Context
 
-FMP returns both raw `close` and an adjusted close, plus `volume` vs
-`unadjustedVolume`. Adjusted values are correct for return calculations but are
-**not stable**: every new split or dividend re-scales the entire historical
-adjusted series. A stored adjusted close therefore silently drifts and is not
-point-in-time reproducible — fatal for backtesting.
+FMP exposes several adjustment variants of its EOD price history. Adjusted values
+are correct for return calculations but are **not stable**: every new split or
+dividend re-scales the entire historical adjusted series. A stored adjusted close
+therefore silently drifts and is not point-in-time reproducible — fatal for
+backtesting.
+
+> **Correction (2026-08-17).** This ADR originally described FMP as returning "both
+> raw `close` and an adjusted close". That is wrong, and the error propagated into
+> the loader: on `historical-price-eod/full`, `close` is already **split-adjusted**
+> and `adjClose` is split- *and* dividend-adjusted. Neither is raw. Which endpoint
+> actually delivers raw prices is settled in
+> [ADR 0004](0004-unadjusted-price-feed.md); the decision below is unchanged.
 
 ## Decision
 

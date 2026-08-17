@@ -9,7 +9,9 @@ client.
   without a grain change).
 - **Primary source:** Financial Modeling Prep (FMP, Professional plan). Economic
   sources (FRED, BLS, BEA) are fast-follows.
-- **Correct by construction:** money is exact `NUMERIC`; raw OHLCV is immutable and
+- **Correct by construction:** money is exact `NUMERIC`; prices are ingested
+  *unadjusted* (FMP's `historical-price-eod/non-split-adjusted`, so fafnir's own
+  factors are the only adjustment ever applied), raw OHLCV is immutable, and
   adjusted prices are *derived on read* (point-in-time stable); delisted securities
   are retained (no survivorship bias); every load is idempotent and logged.
 

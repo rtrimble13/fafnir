@@ -224,9 +224,10 @@ class TestPriceHistoryAPI:
 
             price_history_api("AAPL", "test_api_key")
 
-            # Verify the correct URL was called
+            # Verify the correct URL was called. The unadjusted endpoint is the one
+            # that returns prices as they actually traded; `.../full` is split-adjusted.
             call_args = mock_get.call_args
-            assert "historical-price-eod/full" in call_args[0][0]
+            assert "historical-price-eod/non-split-adjusted" in call_args[0][0]
             assert "symbol=AAPL" in call_args[0][0]
             assert call_args[1]["params"]["apikey"] == "test_api_key"
             assert call_args[1]["timeout"] == 30
@@ -1215,9 +1216,11 @@ class TestGetPriceHistory:
 
             result = get_price_history("test_api_key", "AAPL", adjusted=False)
 
-            # Verify the correct API endpoint was called (regular price history)
+            # Verify the correct API endpoint was called (unadjusted price history).
+            # NOT `.../full`: that payload is already split-adjusted, so it would
+            # disagree with the warehouse's raw prices for any symbol that has split.
             call_args = mock_get.call_args
-            assert "historical-price-eod/full" in call_args[0][0]
+            assert "historical-price-eod/non-split-adjusted" in call_args[0][0]
             assert "dividend-adjusted" not in call_args[0][0]
 
             # Verify regular column names

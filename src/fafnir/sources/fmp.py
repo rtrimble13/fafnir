@@ -11,6 +11,15 @@ NOTE ON ENDPOINTS: the split/dividend stable paths below should be confirmed
 against a live response for a known symbol before the first production backfill
 (see doc/ingestion.md). They are isolated here as constants so a correction is a
 one-line change.
+
+NOTE ON PRICE ADJUSTMENT: prices come from ``historical-price-eod/non-split-adjusted``,
+NOT ``.../full``. FMP's ``full`` payload is already **split-adjusted** -- its ``close``
+is adjusted for splits and its ``adjClose`` for splits *and* dividends. Storing ``full``
+in ``core.daily_price`` and then applying fafnir's own split factor double-counts every
+split: AAPL's 1990-01-02 close arrives as ~$0.35 (the true raw close ~$39.20 divided by
+the 112:1 cumulative split since) and the adjustment routine drives it to ~$0.003.
+``core.daily_price`` is defined as genuinely raw, so the unadjusted endpoint is the only
+correct feed. See doc/adr/0004-unadjusted-price-feed.md.
 """
 
 from __future__ import annotations
@@ -35,7 +44,10 @@ class FMPClient(BaseSource):
     EP_STOCK_LIST = "stock-list"
     EP_ETF_LIST = "etf-list"
     EP_PROFILE = "profile"
-    EP_EOD_FULL = "historical-price-eod/full"
+    # Unadjusted OHLCV. `.../full` is split-adjusted -- see the module docstring.
+    EP_EOD_RAW = "historical-price-eod/non-split-adjusted"
+    # Diagnostics only (`fafnir source probe-prices`); never ingested.
+    EP_EOD_SPLIT_ADJUSTED = "historical-price-eod/full"
     EP_SPLITS = "splits"
     EP_DIVIDENDS = "dividends"
     EP_SECTORS = "available-sectors"
@@ -48,10 +60,10 @@ class FMPClient(BaseSource):
     SCREENER_PAGE_SIZE = 1000
     DELISTED_PAGE_SIZE = 100
 
-    # historical-price-eod/full silently truncates to the most recent 5000 bars,
-    # ignoring how far back `from` reaches: a 1990-01-01 request for AAPL and MSFT
-    # both came back starting 2006-09-28 -- the same date for two companies, which
-    # is a row cap, not history. 5000 bars is ~19.8 trading years, so a 15-year
+    # The historical-price-eod endpoints silently truncate to the most recent 5000
+    # bars, ignoring how far back `from` reaches: a 1990-01-01 request for AAPL and
+    # MSFT both came back starting 2006-09-28 -- the same date for two companies,
+    # which is a row cap, not history. 5000 bars is ~19.8 trading years, so a 15-year
     # window (~3780 bars) leaves ~25% headroom and needs three requests to cover a
     # 1990-to-now backfill.
     EOD_MAX_ROWS = 5000
@@ -162,7 +174,11 @@ class FMPClient(BaseSource):
 
     # -- prices -------------------------------------------------------------
     def _eod_window(
-        self, symbol: str, from_date: Optional[str], to_date: Optional[str]
+        self,
+        symbol: str,
+        from_date: Optional[str],
+        to_date: Optional[str],
+        endpoint: Optional[str] = None,
     ) -> list[dict]:
         """One request. May be silently truncated to ``EOD_MAX_ROWS``."""
         params: dict[str, Any] = {"symbol": symbol}
@@ -170,18 +186,50 @@ class FMPClient(BaseSource):
             params["from"] = from_date
         if to_date:
             params["to"] = to_date
-        data, _, _ = self._call(self.EP_EOD_FULL, params)
+        data, _, _ = self._call(endpoint or self.EP_EOD_RAW, params)
         if isinstance(data, dict) and "historical" in data:
             return data["historical"]
         return data if isinstance(data, list) else []
 
-    def eod_full(
+    def eod_split_adjusted(
         self,
         symbol: str,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
     ) -> list[dict]:
-        """Raw daily OHLCV over the whole window, in ascending date order.
+        """SPLIT-ADJUSTED bars from ``historical-price-eod/full``. **Diagnostics only.**
+
+        Never ingest this into ``core.daily_price``: applying fafnir's split factors
+        on top of an already-split-adjusted series adjusts every split twice (see
+        doc/adr/0004-unadjusted-price-feed.md). It exists so ``fafnir source
+        probe-prices`` can compare the two feeds and prove which one is raw.
+
+        Deduplicated by date for parity with ``eod_raw`` -- a vendor-side repeat
+        would otherwise leave two bars for one day on this side of the comparison.
+        """
+        bars = self._eod_window(symbol, from_date, to_date, self.EP_EOD_SPLIT_ADJUSTED)
+        by_date: dict[str, dict] = {}
+        for bar in bars:
+            key = str(bar.get("date") or "")[:10]
+            if key:
+                by_date[key] = bar
+        return [by_date[k] for k in sorted(by_date)]
+
+    def eod_raw(
+        self,
+        symbol: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> list[dict]:
+        """Unadjusted daily OHLCV over the whole window, in ascending date order.
+
+        "Unadjusted" is the point: these bars carry the prices as they actually
+        traded, so fafnir's own split/dividend factors are the only adjustment ever
+        applied. Payloads are returned exactly as FMP sends them (the caller lands
+        them verbatim); note that the unadjusted endpoint labels its OHLC fields
+        ``adjOpen``/``adjHigh``/``adjLow``/``adjClose`` -- an FMP naming quirk, not a
+        second adjustment. ``fafnir.ingest.daily_price`` normalizes at the transform
+        boundary.
 
         Splits the window into ``EOD_CHUNK_DAYS`` slices and stitches them,
         because a single request is capped at ``EOD_MAX_ROWS`` and drops the
@@ -210,9 +258,7 @@ class FMPClient(BaseSource):
         cursor = start
         while cursor <= end:
             window_end = min(cursor + timedelta(days=self.EOD_CHUNK_DAYS - 1), end)
-            bars = self._eod_window(
-                symbol, cursor.isoformat(), window_end.isoformat()
-            )
+            bars = self._eod_window(symbol, cursor.isoformat(), window_end.isoformat())
             if len(bars) >= self.EOD_MAX_ROWS:
                 logger.warning(
                     "%s: %s..%s returned the %d-row cap; bars may be missing -- "

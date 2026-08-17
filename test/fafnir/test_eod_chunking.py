@@ -47,7 +47,7 @@ def _client(cap=FMPClient.EOD_MAX_ROWS, first_listed=date(1980, 12, 12)):
 
 def test_a_1990_window_actually_starts_in_1990():
     client, calls = _client()
-    bars = client.eod_full("AAPL", from_date="1990-01-01", to_date="2026-08-14")
+    bars = client.eod_raw("AAPL", from_date="1990-01-01", to_date="2026-08-14")
 
     assert bars[0]["date"] == "1990-01-01"
     assert bars[-1]["date"] == "2026-08-14"
@@ -65,7 +65,7 @@ def test_one_unchunked_request_would_have_been_truncated():
 
 def test_no_individual_slice_reaches_the_cap():
     client, calls = _client()
-    client.eod_full("AAPL", from_date="1990-01-01", to_date="2026-08-14")
+    client.eod_raw("AAPL", from_date="1990-01-01", to_date="2026-08-14")
     for from_date, to_date in list(calls):
         window = client._eod_window("AAPL", from_date, to_date)
         assert len(window) < FMPClient.EOD_MAX_ROWS
@@ -75,7 +75,7 @@ def test_results_are_ascending_and_deduplicated():
     client, _ = _client()
     dates = [
         b["date"]
-        for b in client.eod_full("AAPL", from_date="1990-01-01", to_date="2026-08-14")
+        for b in client.eod_raw("AAPL", from_date="1990-01-01", to_date="2026-08-14")
     ]
     assert dates == sorted(dates)
     assert len(dates) == len(set(dates))
@@ -84,20 +84,20 @@ def test_results_are_ascending_and_deduplicated():
 def test_incremental_window_still_costs_one_request():
     # The nightly path asks for a few days; it must not pay for chunking.
     client, calls = _client()
-    client.eod_full("AAPL", from_date="2026-08-01", to_date="2026-08-14")
+    client.eod_raw("AAPL", from_date="2026-08-01", to_date="2026-08-14")
     assert len(calls) == 1
 
 
 def test_a_recent_listing_yields_only_its_real_history():
     client, _ = _client(first_listed=date(2020, 1, 2))
-    bars = client.eod_full("NEW", from_date="1990-01-01", to_date="2026-08-14")
+    bars = client.eod_raw("NEW", from_date="1990-01-01", to_date="2026-08-14")
     assert bars[0]["date"] == "2020-01-02"
 
 
 def test_no_from_date_warns_at_the_cap(caplog):
     client, calls = _client()
     with caplog.at_level("WARNING"):
-        bars = client.eod_full("AAPL")
+        bars = client.eod_raw("AAPL")
     assert len(calls) == 1
     assert len(bars) == FMPClient.EOD_MAX_ROWS
     assert "endpoint cap" in caplog.text

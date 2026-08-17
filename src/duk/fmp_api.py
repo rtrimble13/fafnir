@@ -22,9 +22,7 @@ logger = logging.getLogger(__name__)
 # form of HTTPError and of the connection errors, so anything derived from an
 # upstream exception has to be scrubbed before it is re-raised or logged.
 SECRET_QUERY_PARAMS = ("apikey", "api_key", "token", "access_key", "secret")
-_SECRET_RE = re.compile(
-    r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)"
-)
+_SECRET_RE = re.compile(r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)")
 
 
 def redact_secrets(text: str) -> str:
@@ -75,9 +73,15 @@ def price_history_api(
     if not api_key:
         raise ValueError("API key cannot be empty")
 
-    # Construct the base URL
+    # Construct the base URL.
+    #
+    # non-split-adjusted, not `full`: FMP's `full` payload is already adjusted for
+    # splits, so it would disagree with the warehouse's raw core.daily_price for any
+    # symbol that has ever split -- and `duk`'s unadjusted price history is defined
+    # as the prices that actually traded. This keeps `-S live` and `-S db` on the
+    # same footing, which is what scripts/reconcile.sh depends on.
     base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/historical-price-eod/full?symbol={symbol}"
+    endpoint = f"{base_url}/historical-price-eod/non-split-adjusted?symbol={symbol}"
 
     # Build query parameters
     params = {"apikey": api_key}
@@ -896,9 +900,16 @@ def get_price_history(
     # Convert df columns to lower case for consistency
     df.columns = [col.lower() for col in df.columns]
 
-    # Strip "adj" prefix from column names if adjusted data is used
-    if adjusted:
-        df.columns = [col.removeprefix("adj").strip() for col in df.columns]
+    # Strip the "adj" prefix FMP puts on OHLC fields in both the dividend-adjusted
+    # and non-split-adjusted payloads, so callers always see open/high/low/close.
+    # On the unadjusted feed the prefix is only a naming convention -- the values
+    # are the prices as traded. Renaming a column onto one that already exists
+    # would create a duplicate, so only fill gaps.
+    renamed = []
+    for col in df.columns:
+        stripped = col.removeprefix("adj").strip()
+        renamed.append(stripped if stripped and stripped not in df.columns else col)
+    df.columns = renamed
 
     # Keep only the relevant columns
     expected_columns = ["date"] + fields

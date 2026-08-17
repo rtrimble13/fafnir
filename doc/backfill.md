@@ -128,6 +128,7 @@ Validate the FMP key, the split/dividend field mappings, and the whole pipeline 
 a tiny slice first:
 
 ```bash
+fafnir source probe-prices          # is the price feed actually unadjusted?
 fafnir ingest securities --limit 50
 fafnir ingest prices  --symbols AAPL,MSFT --from 1990-01-01
 fafnir ingest actions --symbols AAPL,MSFT
@@ -193,6 +194,26 @@ duk -S db ls --sector Technology -n 10
 duk -S db ph SPY --adj -f week -n 8
 ```
 
+**Check a deep-history price level against a known value.** Counts and DQ flags
+cannot catch a wrongly-adjusted feed — a doubly-adjusted series is internally
+consistent and passes every structural check. Only comparing a level to an outside
+reference will reveal it:
+
+```bash
+psql "$FAFNIR_DSN" -c "
+  SELECT p.trade_date, p.close AS raw_close, v.close AS adj_close, v.price_factor
+  FROM core.daily_price p
+  JOIN mart.v_daily_price_adjusted v USING (security_id, trade_date)
+  JOIN core.security s USING (security_id)
+  WHERE s.primary_symbol = 'AAPL' AND p.trade_date = '1990-01-02';"
+```
+
+Expect `raw_close` around **\$39** (the price AAPL actually traded at in 1990) and
+`adj_close` around **\$0.35** (that divided by the 112:1 cumulative split since).
+A `raw_close` near \$0.35 means the split-adjusted endpoint is being loaded and
+`adj_close` will be ~\$0.003 — stop and re-read
+[adr/0004](adr/0004-unadjusted-price-feed.md).
+
 ## 8. Schedule daily upkeep
 
 ```bash
@@ -203,6 +224,182 @@ crontab /opt/fafnir/etc/crontab.example     # edit paths/times first
 (`ensure-horizon` → prices → actions → adjust → refresh-marts → dq), so a missed
 day is caught up automatically and the partition/calendar horizon keeps rolling
 forward on its own.
+
+---
+
+## Switching to the unadjusted price feed
+
+**Who this is for:** anyone whose warehouse was loaded before
+[ADR 0004](adr/0004-unadjusted-price-feed.md), i.e. while `ingest prices` still read
+`historical-price-eod/full`. A fresh install can skip this section.
+
+Those bars were already split-adjusted, so `fafnir adjust` applied the split factor
+a second time and deep history collapsed toward zero. The rows cannot be repaired
+in place by topping up — they have to be replaced.
+
+Check whether you are affected:
+
+```bash
+psql "$FAFNIR_DSN" -c "
+  SELECT endpoint, count(*) AS symbols, max(last_loaded_date) AS through
+  FROM ops.load_watermark WHERE source='fmp'
+    AND endpoint LIKE 'historical-price-eod%' GROUP BY endpoint;"
+```
+
+Rows under `historical-price-eod/full` mean the old feed. `fafnir ingest prices` will
+refuse to run incrementally in that state rather than half-refill the table.
+
+Re-backfill (a few hours, same cost as the original run):
+
+```bash
+# 1. Confirm the unadjusted feed is really unadjusted before spending the run.
+#    3 requests, writes nothing. See "Confirming the price feed" below.
+fafnir source probe-prices --symbol AAPL --date 1990-01-02
+
+# 2. Drop the split-adjusted prices, their derived factors, and the stale
+#    watermarks. Corporate actions, the security master and landing payloads are
+#    all kept -- only the price fact is wrong. Preview first (the default), then
+#    commit with --yes.
+scripts/reset_data.sh --scope prices
+scripts/reset_data.sh --scope prices --yes
+
+# 3. Reload from the unadjusted endpoint. The explicit --from is REQUIRED:
+#    without it each request is capped at 5000 bars (~19.8y) and you would
+#    silently lose everything older.
+fafnir ingest prices --include-inactive --from 1990-01-01
+
+# 4. Recompute factors against the new raw closes, then refresh and check.
+fafnir adjust
+fafnir db refresh-marts
+fafnir dq run
+```
+
+Step 4's `fafnir adjust` is not optional: dividend factors are valued against the
+prior raw close, so every factor derived from the old prices is stale. (Step 2
+clears `core.adjustment_factor` for exactly that reason — a stale factor is more
+dangerous than a missing one, because the view silently applies it.)
+
+Then run the deep-history level check in [§7 Verify](#7-verify) — that is what
+actually confirms the switch worked.
+
+Expect `dq run` to report more `outlier` flags than before. Raw prices contain real
+split-sized jumps; the check excludes moves landing on a known split ex-date, so
+what remains is usually a **missing** corporate action — worth investigating, and a
+detection capability the pre-adjusted feed did not have.
+
+---
+
+## Confirming the price feed
+
+```bash
+fafnir source probe-prices                              # AAPL @ 1990-01-02
+fafnir source probe-prices --symbol MSFT --date 1995-01-03
+```
+
+Field names alone cannot tell you whether a feed is adjusted — a payload can be
+named `close` and still be split-adjusted, which is precisely how ADR 0004's bug
+went unnoticed. So the probe checks arithmetic instead. It pulls the same old bar
+from both the unadjusted and split-adjusted endpoints, pulls the split history, and
+verifies:
+
+```
+unadjusted close  ==  split-adjusted close  ×  cumulative split ratio
+```
+
+For AAPL at 1990-01-02 that is `$39.20 == $0.35 × 112`. It costs 3 requests, writes
+nothing, and reports:
+
+| Verdict | Meaning |
+|---|---|
+| `unadjusted_confirmed` | The feeds differ by exactly the split ratio. Safe to backfill. |
+| `feeds_agree` | Both returned the same price despite a split — the "unadjusted" endpoint is **not** unadjusted. Stop; fafnir would double-adjust. |
+| `ratio_mismatch` | They differ, but not by the split ratio. Splits payload incomplete, or a feed changed meaning. |
+| `inconclusive` | No splits after that date (use an earlier `--date` or a symbol that has split), a feed returned no bar, or the two feeds have no bar for the *same* trading day. |
+
+Both feeds are always compared **on the same trading day**. The probe anchors on the
+unadjusted feed's first bar on/after `--date` and then demands that exact date from
+the other feed; if it is missing it reports `inconclusive` rather than comparing
+adjacent days, since the price move between them would otherwise be charged to the
+split ratio. The bar actually used is printed under the header.
+
+It also prints the payload's raw field names and whether the ingestion boundary would
+accept the bar — worth a glance, since FMP labels OHLC as
+`adjOpen`/`adjHigh`/`adjLow`/`adjClose` on this endpoint and a *third* spelling
+appearing would quarantine every bar.
+
+### Volume is checked separately
+
+Volume back-adjusts the **opposite way** to price: a 4:1 split multiplies pre-split
+share counts by 4 rather than dividing them. So a volume that arrives already
+split-adjusted is **inflated by the split ratio squared** (12,544× for AAPL's 112:1),
+not collapsed toward zero. There is no vanish-to-zero tell, and no DQ check covers
+volume — it is the quieter of the two failures, which is why it gets its own verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `volume_raw_confirmed` | Volume being ingested is raw — either the feeds differ by the split ratio, or the payload carries an explicit `unadjustedVolume`, or both feeds agree *and* match `unadjustedVolume`. |
+| `volume_adjusted` | Both feeds report a volume larger than `unadjustedVolume` — what is being ingested is split-adjusted, and fafnir would inflate it again. |
+| `volume_ambiguous` | Both feeds report the same volume and neither carries `unadjustedVolume`. See below. |
+| `volume_unusable` | `unadjustedVolume` is present but not a number. The loader prefers that field, so every bar would quarantine as `nonnumeric_volume`. |
+| `volume_ratio_mismatch` | The feeds differ by something that is neither 1 nor the split ratio. |
+
+**`volume_ambiguous` is a real limit, not a bug.** "FMP never split-adjusts volume"
+(fine) and "FMP split-adjusts volume on both endpoints" (double-counted) produce an
+*identical* signature from these two feeds — equal volumes on each. Only
+`unadjustedVolume` breaks the tie, and the stable endpoints may not return it. If you
+land here, check one deep-history date against an outside source (the exchange, or
+another vendor) before trusting old volume. The probe reports this rather than
+guessing, and does **not** exit non-zero on it, since it is a prompt to verify rather
+than evidence of breakage.
+
+The loader hedges the same way: where a payload offers `unadjustedVolume` it is
+preferred over `volume`, because `core.daily_price` is defined as raw and
+`unadjustedVolume` is raw by definition.
+
+The command exits non-zero on `feeds_agree`, `ratio_mismatch`, `volume_adjusted`,
+`volume_unusable` and `volume_ratio_mismatch`, so it can gate a scripted backfill.
+
+---
+
+## Clearing data for a reload
+
+`scripts/reset_data.sh` truncates the tables a reload has to **replace** rather than
+top up. It never touches structure: migrations, partitions, and the seeded reference
+data (`ref.exchange`, `ref.sector`, `ref.industry`, `ref.trading_calendar`) all
+survive, so you go straight back to ingesting.
+
+**Dry run is the default** — it reports the row counts it would delete and stops.
+Pass `--yes` to execute. It names the target as `db=<dbname> host=<host>`, parsed
+from either DSN form; the DSN itself is never echoed, so a URL-form password cannot
+reach the terminal or a redirected log.
+
+```bash
+scripts/reset_data.sh --scope prices            # preview
+scripts/reset_data.sh --scope prices --yes      # execute
+scripts/reset_data.sh --scope all --yes --vacuum
+```
+
+| Scope | Clears | Keeps |
+|---|---|---|
+| `prices` | `daily_price`, `adjustment_factor`, price watermarks (current **and** retired endpoint) | security master, actions, landing |
+| `actions` | `corporate_action`, `adjustment_factor` | prices, security master |
+| `market-data` | prices + actions + factors + price watermarks | security master (skips re-ingesting ~8k securities) |
+| `landing` | `landing.fmp_raw` | everything else — reclaims disk, loses the payload audit trail |
+| `dq-flags` | `ops.data_quality_flag` | everything else |
+| `all` | every core/ops/landing table, identities restarted | reference data, partitions, migrations |
+
+Each scope prints the exact reload sequence to run next. Three design notes worth
+knowing:
+
+- **Factors go with prices.** `adjustment_factor` is derived partly from raw closes
+  (dividends are valued against the prior close), so factors left behind after a
+  price reload are stale — and the adjusted view applies them silently.
+- **The truncate is one transaction, without `CASCADE`.** Each scope's table list is
+  closed under foreign keys. Omitting `CASCADE` means that if a future migration adds
+  a referencing table, this fails loudly instead of quietly wiping it.
+- **Marts are not refreshed.** `mart.security_latest` keeps its pre-reset snapshot
+  until you run `fafnir db refresh-marts` after reloading. An empty mart is honest;
+  a stale one pretending to be current is not.
 
 ---
 

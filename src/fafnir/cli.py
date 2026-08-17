@@ -339,6 +339,51 @@ def adjust(ctx, symbol):
 # dq + status
 # ---------------------------------------------------------------------------
 @main.group()
+def source():
+    """Inspect the upstream data source."""
+
+
+@source.command("probe-prices")
+@click.option("--symbol", default=None, help="Symbol to probe [default: AAPL]")
+@click.option(
+    "--date",
+    "on_date",
+    default=None,
+    help="Date to compare, YYYY-MM-DD. Must sit behind a known split to be "
+    "conclusive [default: 1990-01-02]",
+)
+@click.pass_context
+def source_probe_prices(ctx, symbol, on_date):
+    """Confirm FMP's price feed is unadjusted, and show its OHLC field names.
+
+    Compares the unadjusted and split-adjusted endpoints for one old bar: they
+    should differ by exactly the cumulative split ratio since that date. Costs 3
+    requests and writes nothing. Run it before a backfill, and after any change to
+    the price loader.
+    """
+    from fafnir.sources import probe
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    kwargs = {}
+    if symbol:
+        kwargs["symbol"] = symbol.upper()
+    if on_date:
+        kwargs["on_date"] = _parse_date(on_date)
+    report = probe.probe_prices(fmp, **kwargs)
+    click.echo(probe.format_report(report))
+    # `volume_ambiguous` is not a failure: it means the two feeds cannot settle the
+    # question, which is a prompt to check one date against an outside source, not a
+    # reason to block the run.
+    passing = ("unadjusted_confirmed", "inconclusive")
+    vol_passing = ("volume_raw_confirmed", "inconclusive", "volume_ambiguous")
+    if report["verdict"] not in passing or report["volume_verdict"] not in vol_passing:
+        raise click.ClickException(
+            "Price feed check FAILED -- do not backfill until this is resolved."
+        )
+
+
+@main.group()
 def dq():
     """Data-quality checks."""
 

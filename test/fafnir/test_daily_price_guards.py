@@ -22,13 +22,21 @@ class _FMP:
 
 
 class _DB:
-    """load_prices commits at each symbol boundary; count them."""
+    """load_prices commits at each symbol boundary; count them.
 
-    def __init__(self):
+    ``watermarks`` maps endpoint -> row count, which is all the split-adjusted
+    changeover guard reads. The default is a fresh warehouse (no watermarks at all).
+    """
+
+    def __init__(self, watermarks: dict | None = None):
         self.commits = 0
+        self._watermarks = watermarks or {}
 
     def commit(self) -> None:
         self.commits += 1
+
+    def fetchval(self, sql, params=None):
+        return self._watermarks.get(params[1], 0)
 
 
 class _RunLogStub:
@@ -102,3 +110,37 @@ def test_bars_arrived_but_all_quarantined_does_not_raise(outcomes):
     # 'partial'), so it is not the silent failure these guards exist for.
     outcomes({"AAPL": (500, 0)})
     assert load_prices(_DB(), _FMP(), ["AAPL"], start_date=date(1990, 1, 1)) == 0
+
+
+# -- the split-adjusted -> unadjusted feed changeover -------------------------
+#
+# The endpoint switch also changes the watermark key, so every symbol looks new.
+# Left alone, the next incremental run would fetch each symbol with no from_date,
+# hit the 5000-bar cap, and refill the warehouse with ~20 years of history while
+# every older row stayed split-adjusted -- a silently wrong price series.
+
+_LEGACY = {dp.LEGACY_SPLIT_ADJUSTED_ENDPOINT: 8000}
+
+
+def test_incremental_run_refuses_to_cross_the_changeover(outcomes):
+    outcomes({"AAPL": "empty"})
+    with pytest.raises(SourceError, match="split-adjusted"):
+        load_prices(_DB(_LEGACY), _FMP(), ["AAPL"])
+
+
+def test_explicit_backfill_is_allowed_across_the_changeover(outcomes):
+    # An explicit window IS the re-backfill, so it must not be blocked.
+    outcomes({"AAPL": (500, 500)})
+    got = load_prices(_DB(_LEGACY), _FMP(), ["AAPL"], start_date=date(1990, 1, 1))
+    assert got == 500
+
+
+def test_incremental_run_is_allowed_once_the_new_feed_has_watermarks(outcomes):
+    outcomes({"AAPL": "empty"})
+    marks = dict(_LEGACY, **{dp.ENDPOINT: 8000})
+    assert load_prices(_DB(marks), _FMP(), ["AAPL"]) == 0
+
+
+def test_fresh_warehouse_is_not_blocked(outcomes):
+    outcomes({"AAPL": "empty"})
+    assert load_prices(_DB(), _FMP(), ["AAPL"]) == 0

@@ -9,6 +9,7 @@ them into the DataFrame contracts the CLI expects.
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 from fafnir.db.connection import Database
@@ -402,8 +403,14 @@ def corporate_actions_for(db: Database, security_id: int) -> list[dict]:
     )
 
 
-def close_on_or_before(db: Database, security_id: int, d: date) -> Optional[float]:
-    """Raw close on the latest trade_date <= d (used to value dividends for adjustment)."""
+def close_before(db: Database, security_id: int, d: date) -> Optional[Decimal]:
+    """Raw close on the latest trade_date STRICTLY BEFORE ``d``.
+
+    Used to value a dividend for adjustment: the reference price is the last close
+    that still carried the dividend, i.e. the close before the ex-date, never the
+    ex-date's own (already-lower) close. Returns NUMERIC as ``Decimal`` so the
+    factor math stays exact.
+    """
     return db.fetchval(
         """
         SELECT close FROM core.daily_price
@@ -465,6 +472,20 @@ def get_watermark(
         WHERE source = %s AND endpoint = %s AND security_id = %s
         """,
         (source, endpoint, security_id),
+    )
+
+
+def count_watermarks(db: Database, source: str, endpoint: str) -> int:
+    """How many per-security watermarks exist for a source/endpoint pair."""
+    return (
+        db.fetchval(
+            """
+            SELECT count(*) FROM ops.load_watermark
+            WHERE source = %s AND endpoint = %s
+            """,
+            (source, endpoint),
+        )
+        or 0
     )
 
 

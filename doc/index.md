@@ -15,7 +15,9 @@ read through the `duk` CLI.
 - [Install on a Hetzner Cloud Server](install_hetzner.md) — end-to-end fresh install:
   provision, harden, PostgreSQL 16, fafnir, schedule, backups
 - [Initial Setup & Backfill](backfill.md) — stand up the DB and backfill history
-  (single run, a few hours)
+  (single run, a few hours); also
+  [confirming the price feed](backfill.md#confirming-the-price-feed) and
+  [clearing data for a reload](backfill.md#clearing-data-for-a-reload)
 - [Ingestion](ingestion.md) — FMP endpoint→table map, idempotency, watermarks, the
   adjustment step
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,
@@ -29,6 +31,7 @@ read through the `duk` CLI.
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
   - [ADR 0003 — Postgres now, TimescaleDB later](adr/0003-postgres-now-timescale-later.md)
+  - [ADR 0004 — Unadjusted price feed](adr/0004-unadjusted-price-feed.md)
 
 ## Reference
 

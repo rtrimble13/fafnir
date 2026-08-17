@@ -31,9 +31,7 @@ MAX_RETRY_AFTER_SECONDS = 120
 # form of HTTPError and of the connection errors, so anything derived from an
 # upstream exception has to be scrubbed before it is re-raised or logged.
 SECRET_QUERY_PARAMS = ("apikey", "api_key", "token", "access_key", "secret")
-_SECRET_RE = re.compile(
-    r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)"
-)
+_SECRET_RE = re.compile(r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)")
 
 
 def redact_secrets(text: str) -> str:

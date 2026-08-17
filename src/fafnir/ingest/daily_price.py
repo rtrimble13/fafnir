@@ -20,11 +20,33 @@ from fafnir.sources.fmp import FMPClient, SourceError, payload_hash
 
 logger = get_logger("ingest.price")
 
-ENDPOINT = "historical-price-eod/full"
+ENDPOINT = "historical-price-eod/non-split-adjusted"
+
+# The endpoint this loader used before the unadjusted-feed fix. Its bars were
+# split-adjusted, so anything ingested under it is wrong for core.daily_price and
+# its watermarks must not be reused. Kept only so the changeover can be detected.
+LEGACY_SPLIT_ADJUSTED_ENDPOINT = "historical-price-eod/full"
 
 # A bar quarantined this many times stops holding the watermark (it stays flagged
 # for review, but ingestion is allowed to advance past it).
 MAX_QUARANTINE_HOLDS = 5
+
+# FMP's unadjusted (and dividend-adjusted) endpoints prefix the OHLC field names
+# with "adj"; the `full` endpoint does not. The prefix is a naming convention on
+# those payloads, not a claim that the values carry an extra adjustment.
+_OHLC_ALIASES = {
+    "open": ("open", "adjOpen"),
+    "high": ("high", "adjHigh"),
+    "low": ("low", "adjLow"),
+    "close": ("close", "adjClose"),
+}
+
+# Volume gets back-adjusted the opposite way to price -- a 4:1 split multiplies
+# pre-split share counts by 4 -- so a volume that arrived already split-adjusted
+# would be inflated by the split ratio SQUARED, not collapsed toward zero. Where a
+# payload offers `unadjustedVolume` it is by definition the raw count, so prefer it;
+# core.daily_price is defined as raw. See doc/adr/0004-unadjusted-price-feed.md.
+_VOLUME_ALIASES = ("unadjustedVolume", "volume")
 
 
 def _parse_date(value) -> Optional[date]:
@@ -38,19 +60,55 @@ def _parse_date(value) -> Optional[date]:
         return None
 
 
+def _ohlc(bar: dict, field: str):
+    """Read one OHLC field, accepting either FMP spelling (``open``/``adjOpen``).
+
+    Returns the first spelling carrying a *usable* price -- numeric and positive --
+    so a payload with `"open": 0` next to a valid `"adjOpen": 39.0` is read from the
+    field that has the price, rather than being quarantined on the strength of the
+    one that does not. Preferring the unprefixed name is only a tie-break between
+    two usable values, not a reason to discard a good one.
+
+    When nothing is usable it falls back to the first value that was *present*, so
+    the caller still reports the precise reason (``non_positive_price`` for a zero,
+    ``missing_or_nonnumeric_ohlc`` for junk) instead of collapsing both into one.
+    Raises KeyError when neither spelling carries a value at all.
+    """
+    present = None
+    for key in _OHLC_ALIASES[field]:
+        value = bar.get(key)
+        if value in (None, ""):
+            continue
+        if present is None:
+            present = value
+        try:
+            if float(value) > 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    if present is not None:
+        return present
+    raise KeyError(field)
+
+
 def _validate_bar(bar: dict) -> tuple[Optional[dict], Optional[str]]:
     """Type and sanity-check a single bar. Returns (clean_row, reason_if_bad)."""
     trade_date = _parse_date(bar.get("date"))
     if trade_date is None:
         return None, "unparseable_date"
     try:
-        o = float(bar["open"])
-        h = float(bar["high"])
-        lo = float(bar["low"])
-        c = float(bar["close"])
+        o = float(_ohlc(bar, "open"))
+        h = float(_ohlc(bar, "high"))
+        lo = float(_ohlc(bar, "low"))
+        c = float(_ohlc(bar, "close"))
     except (KeyError, TypeError, ValueError):
         return None, "missing_or_nonnumeric_ohlc"
-    vol = bar.get("volume", 0) or 0
+    vol = 0
+    for key in _VOLUME_ALIASES:
+        value = bar.get(key)
+        if value not in (None, ""):
+            vol = value
+            break
     try:
         vol = int(float(vol))
     except (TypeError, ValueError):
@@ -110,7 +168,7 @@ def load_symbol_prices(
         if wm is not None:
             start_date = wm - timedelta(days=overlap_days)
 
-    bars = fmp.eod_full(
+    bars = fmp.eod_raw(
         symbol,
         from_date=start_date.isoformat() if start_date else None,
         to_date=end_date.isoformat() if end_date else None,
@@ -193,6 +251,35 @@ def load_symbol_prices(
     return written
 
 
+def _guard_split_adjusted_changeover(db: Database, start_date: Optional[date]) -> None:
+    """Refuse to run incrementally on a warehouse still holding split-adjusted prices.
+
+    Switching to the unadjusted endpoint also changes the watermark key, so every
+    symbol looks brand new. On an incremental run that means ``from_date=None``, and
+    a bare request is capped at 5000 bars -- the warehouse would quietly refill with
+    ~20 years of history and keep the old split-adjusted rows for everything older.
+    A backfill with an explicit ``--from`` is the only safe path across the boundary,
+    so make the operator take it.
+    """
+    if start_date is not None:
+        return  # explicit window: this IS the re-backfill.
+    if repo.count_watermarks(db, "fmp", ENDPOINT):
+        return  # already loading from the unadjusted feed.
+    legacy = repo.count_watermarks(db, "fmp", LEGACY_SPLIT_ADJUSTED_ENDPOINT)
+    if not legacy:
+        return  # a fresh warehouse: nothing to migrate.
+    raise SourceError(
+        f"{legacy} symbol(s) were last loaded from "
+        f"{LEGACY_SPLIT_ADJUSTED_ENDPOINT}, whose bars are split-adjusted. "
+        f"core.daily_price must hold raw prices, so those rows have to be replaced, "
+        "not appended to. Re-backfill explicitly (see doc/backfill.md, "
+        "'Switching to the unadjusted price feed'):\n"
+        "  fafnir ingest prices --include-inactive --from <backfill-start>\n"
+        "then `fafnir adjust` and `fafnir db refresh-marts`. An incremental run "
+        "cannot cross this boundary safely and has been refused."
+    )
+
+
 def load_prices(
     db: Database,
     fmp: FMPClient,
@@ -215,6 +302,7 @@ def load_prices(
             "No symbols to load. Populate the security master first "
             "(fafnir ingest securities), or pass --symbols."
         )
+    _guard_split_adjusted_changeover(db, start_date)
 
     with RunLog(
         db,
