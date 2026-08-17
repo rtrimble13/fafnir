@@ -20,6 +20,14 @@ from documentation:
    agree instead of differing by the split ratio, the "unadjusted" feed is not
    unadjusted and ingestion must stop.
 
+3. **Is the VOLUME unadjusted?** Asked separately, because volume back-adjusts the
+   opposite way to price -- a split multiplies pre-split share counts rather than
+   dividing them -- so an already-adjusted volume is inflated by the split ratio
+   squared instead of collapsing toward zero. There is no vanish-to-zero tell and no
+   DQ check covers volume, which makes it the quieter of the two failures.
+   ``classify_volume`` documents the one case the two feeds cannot settle on their
+   own.
+
 Costs 3 requests (two price windows + splits) and writes nothing.
 """
 
@@ -29,7 +37,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Optional
 
-from fafnir.ingest.daily_price import _OHLC_ALIASES, _validate_bar
+from fafnir.ingest.daily_price import _OHLC_ALIASES, _VOLUME_ALIASES, _validate_bar
 from fafnir.logging_config import get_logger
 
 logger = get_logger("source.probe")
@@ -53,6 +61,99 @@ def _close_of(bar: dict) -> Optional[Decimal]:
             except (ArithmeticError, ValueError):
                 return None
     return None
+
+
+def _decimal(value) -> Optional[Decimal]:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, ValueError):
+        return None
+
+
+def _volume_of(bar: dict) -> tuple[Optional[Decimal], Optional[str]]:
+    """The bar's volume and which key it came from."""
+    for key in _VOLUME_ALIASES:
+        value = bar.get(key)
+        if value not in (None, ""):
+            try:
+                return Decimal(str(value)), key
+            except (ArithmeticError, ValueError):
+                return None, key
+    return None, None
+
+
+def classify_volume(raw_bar: dict, adj_bar: dict, ratio: Decimal) -> tuple[str, str]:
+    """Decide whether the unadjusted feed's VOLUME is also unadjusted.
+
+    Volume back-adjusts the opposite way to price -- pre-split share counts are
+    multiplied by the split ratio, not divided -- so an already-adjusted volume is
+    inflated by ratio**2 rather than collapsed. There is no vanish-to-zero tell, and
+    no DQ check covers volume, so this is worth reading carefully.
+
+    The honest limitation: comparing the two feeds cannot always settle it. "FMP
+    adjusts volume on neither endpoint" and "FMP adjusts volume on both" produce an
+    identical signature (equal volumes on both feeds). The tiebreaker is
+    ``unadjustedVolume`` -- where the payload carries it, it is by definition raw.
+    When it is absent and the volumes match, this says so instead of guessing.
+    """
+    # Compare each feed's HEADLINE `volume`; `unadjustedVolume` is the reference
+    # against which that headline is judged, so it must not stand in for it here
+    # (unlike in the loader, which deliberately prefers it).
+    raw_vol = _decimal(raw_bar.get("volume"))
+    adj_vol = _decimal(adj_bar.get("volume"))
+    unadj = _decimal(raw_bar.get("unadjustedVolume", adj_bar.get("unadjustedVolume")))
+
+    if raw_bar.get("unadjustedVolume") not in (None, ""):
+        return (
+            "volume_raw_confirmed",
+            "The unadjusted feed carries an explicit `unadjustedVolume`, which the "
+            "loader prefers over `volume`. That is raw by definition.",
+        )
+
+    if raw_vol is None or adj_vol is None or raw_vol <= 0 or adj_vol <= 0:
+        return "inconclusive", "One of the feeds returned no usable volume."
+
+    implied = adj_vol / raw_vol
+    if ratio != 1 and abs(implied - ratio) / ratio <= TOLERANCE:
+        return (
+            "volume_raw_confirmed",
+            f"The split-adjusted feed reports {implied:.4f}x the unadjusted feed's "
+            f"volume, matching the {ratio}:1 split. Volume is restated in today's "
+            "shares there and raw here -- which also means the retired `.../full` "
+            "feed was inflating stored volume.",
+        )
+
+    if abs(implied - 1) <= TOLERANCE:
+        if unadj is not None and unadj > 0:
+            if abs(raw_vol - unadj) / unadj <= TOLERANCE:
+                return (
+                    "volume_raw_confirmed",
+                    "Both feeds report the same volume, and it equals the "
+                    "payload's `unadjustedVolume` -- FMP does not split-adjust "
+                    "volume at all. Raw either way.",
+                )
+            return (
+                "volume_adjusted",
+                f"Both feeds report {raw_vol}, but `unadjustedVolume` is "
+                f"{unadj}. The volume being ingested is split-adjusted; "
+                "fafnir would inflate it again by the split ratio.",
+            )
+        return (
+            "volume_ambiguous",
+            "Both feeds report the same volume and neither carries "
+            "`unadjustedVolume`, so this cannot distinguish 'FMP never adjusts "
+            "volume' (fine) from 'FMP adjusts it on both endpoints' (would be "
+            "double-counted). Check one date against an outside source -- an "
+            "exchange or another vendor -- before trusting deep-history volume.",
+        )
+
+    return (
+        "volume_ratio_mismatch",
+        f"The feeds' volumes differ by {implied:.4f}x, which matches neither 1 nor "
+        f"the {ratio}:1 split. Investigate before relying on volume.",
+    )
 
 
 def _bar_on_or_after(bars: list[dict], target: date) -> Optional[dict]:
@@ -133,7 +234,23 @@ def probe_prices(
         "implied_ratio": None,
         "verdict": "inconclusive",
         "detail": "",
+        # Headline `volume` from each feed -- the pair the verdict compares. The
+        # `unadjustedVolume` reference is reported separately so the two are never
+        # confused, and volume_key names the field the loader will actually ingest.
+        "unadjusted_volume": _decimal(raw_bar.get("volume")) if raw_bar else None,
+        "split_adjusted_volume": _decimal(adj_bar.get("volume")) if adj_bar else None,
+        "unadjusted_volume_field": (
+            _decimal(raw_bar.get("unadjustedVolume")) if raw_bar else None
+        ),
+        "volume_key": _volume_of(raw_bar)[1] if raw_bar else None,
+        "volume_verdict": "inconclusive",
+        "volume_detail": "",
     }
+
+    if raw_bar and adj_bar:
+        report["volume_verdict"], report["volume_detail"] = classify_volume(
+            raw_bar, adj_bar, report["split_ratio"]
+        )
 
     if raw_bar:
         # Which spelling did the unadjusted payload actually use, and would the
@@ -203,6 +320,12 @@ def format_report(report: dict[str, Any]) -> str:
     """Render a probe report for the terminal."""
     ok = {"unadjusted_confirmed": "PASS", "inconclusive": "INCONCLUSIVE"}
     status = ok.get(report["verdict"], "FAIL")
+    vol_ok = {
+        "volume_raw_confirmed": "PASS",
+        "inconclusive": "INCONCLUSIVE",
+        "volume_ambiguous": "UNDECIDED",
+    }
+    vol_status = vol_ok.get(report["volume_verdict"], "FAIL")
     lines = [
         f"FMP price-feed probe: {report['symbol']} @ {report['date']}",
         "",
@@ -230,5 +353,18 @@ def format_report(report: dict[str, Any]) -> str:
         "",
         f"  {status}: {report['verdict']}",
         f"  {report['detail']}",
+        "",
+        "Volume cross-check",
+        f"  unadjusted feed `volume`     : {report['unadjusted_volume']}",
+        f"  split-adjusted feed `volume` : {report['split_adjusted_volume']}",
+        "  `unadjustedVolume`           : "
+        + (
+            str(report["unadjusted_volume_field"])
+            if report["unadjusted_volume_field"] is not None
+            else "(not present)"
+        ),
+        f"  loader would ingest          : `{report['volume_key'] or 'n/a'}`",
+        f"  {vol_status}: {report['volume_verdict']}",
+        f"  {report['volume_detail']}",
     ]
     return "\n".join(lines)

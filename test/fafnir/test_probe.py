@@ -129,3 +129,97 @@ def test_report_renders_without_a_bar():
     text = probe.format_report(probe.probe_prices(_FMP([], [])))
     assert "INCONCLUSIVE" in text
     assert "implied ratio" in text
+
+
+# -- volume ------------------------------------------------------------------
+#
+# Volume back-adjusts the OPPOSITE way to price: a 112:1 split multiplies pre-split
+# share counts by 112. So a volume that arrives already split-adjusted is inflated
+# by 112**2, not collapsed toward zero -- there is no vanish-to-zero tell, and no DQ
+# check covers volume. These pin the classifier, including the case it cannot decide.
+
+RAW_VOL = Decimal("1000000")
+
+
+def _bar_v(close, volume, prefixed=False, unadj=None, date="1990-01-02"):
+    bar = _bar(close, prefixed=prefixed, date=date)
+    bar["volume"] = volume
+    if unadj is not None:
+        bar["unadjustedVolume"] = unadj
+    return bar
+
+
+def test_volume_raw_when_feeds_differ_by_the_split_ratio():
+    """full restates volume into today's shares; non-split-adjusted leaves it raw."""
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL, prefixed=True)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL * 112)],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["volume_verdict"] == "volume_raw_confirmed"
+    assert r["unadjusted_volume"] == RAW_VOL
+    assert r["split_adjusted_volume"] == RAW_VOL * 112
+    assert "inflating stored volume" in r["volume_detail"]
+
+
+def test_explicit_unadjusted_volume_is_preferred_and_conclusive():
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL * 112, prefixed=True, unadj=RAW_VOL)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL * 112, unadj=RAW_VOL)],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["volume_verdict"] == "volume_raw_confirmed"
+    assert r["volume_key"] == "unadjustedVolume"
+    assert r["unadjusted_volume_field"] == RAW_VOL
+
+
+def test_matching_volumes_that_equal_unadjusted_volume_mean_fmp_never_adjusts():
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL, prefixed=True)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL, unadj=RAW_VOL)],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["volume_verdict"] == "volume_raw_confirmed"
+    assert "does not split-adjust volume" in r["volume_detail"]
+
+
+def test_matching_volumes_that_exceed_unadjusted_volume_are_caught():
+    """Both feeds adjusted -- fafnir would inflate by the ratio a second time."""
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL * 112, prefixed=True)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL * 112, unadj=RAW_VOL)],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["volume_verdict"] == "volume_adjusted"
+    assert "inflate it again" in r["volume_detail"]
+
+
+def test_matching_volumes_without_a_tiebreaker_are_reported_as_undecidable():
+    """The honest case: identical signatures for 'never adjusts' and 'both adjust'."""
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL, prefixed=True)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL)],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["volume_verdict"] == "volume_ambiguous"
+    assert "outside source" in r["volume_detail"]
+
+
+def test_volume_mismatch_matching_neither_is_flagged():
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL, prefixed=True)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL * 5)],
+    )
+    r = probe.probe_prices(fmp)
+    assert r["volume_verdict"] == "volume_ratio_mismatch"
+
+
+def test_volume_section_renders():
+    fmp = _FMP(
+        [_bar_v(RAW_CLOSE, RAW_VOL, prefixed=True)],
+        [_bar_v(ADJ_CLOSE, RAW_VOL * 112)],
+    )
+    text = probe.format_report(probe.probe_prices(fmp))
+    assert "Volume cross-check" in text
+    assert "unadjusted feed `volume`" in text
+    assert "`unadjustedVolume`" in text

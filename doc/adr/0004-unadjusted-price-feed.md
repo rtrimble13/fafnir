@@ -69,6 +69,21 @@ Pull daily OHLCV from **`historical-price-eod/non-split-adjusted`**.
   detectability over the pre-adjusted feed.
 - Symbols with no splits are unaffected, which is why the bug survived the initial
   test suite: every fixture used flat, split-free prices.
+- **Volume is exposed to the same class of error, in the opposite direction.**
+  `core.adjustment_factor` back-adjusts volume by `num/den` — a split *multiplies*
+  pre-split share counts — so a volume that arrives already split-adjusted is
+  inflated by the ratio **squared**, not driven toward zero. AAPL's 1990 volume would
+  come out 12,544× too large. That has no vanish-to-zero tell and no DQ check behind
+  it, so the loader now prefers `unadjustedVolume` over `volume` wherever a payload
+  carries it (it is raw by definition), and `fafnir source probe-prices` reports a
+  separate volume verdict.
+
+  Whether FMP split-adjusts `volume` on `.../full` is not settled by its docs; the
+  legacy v3 payload exposed both `volume` and `unadjustedVolume`, which only makes
+  sense if the former is adjusted. Note the two feeds alone cannot always decide it:
+  "never adjusts volume" and "adjusts it on both endpoints" look identical from the
+  outside. `unadjustedVolume` is the tiebreaker where present; where it is absent the
+  probe reports `volume_ambiguous` rather than guessing.
 
 ## Alternatives considered
 

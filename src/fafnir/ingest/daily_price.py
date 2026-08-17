@@ -41,6 +41,13 @@ _OHLC_ALIASES = {
     "close": ("close", "adjClose"),
 }
 
+# Volume gets back-adjusted the opposite way to price -- a 4:1 split multiplies
+# pre-split share counts by 4 -- so a volume that arrived already split-adjusted
+# would be inflated by the split ratio SQUARED, not collapsed toward zero. Where a
+# payload offers `unadjustedVolume` it is by definition the raw count, so prefer it;
+# core.daily_price is defined as raw. See doc/adr/0004-unadjusted-price-feed.md.
+_VOLUME_ALIASES = ("unadjustedVolume", "volume")
+
 
 def _parse_date(value) -> Optional[date]:
     if value in (None, ""):
@@ -78,7 +85,12 @@ def _validate_bar(bar: dict) -> tuple[Optional[dict], Optional[str]]:
         c = float(_ohlc(bar, "close"))
     except (KeyError, TypeError, ValueError):
         return None, "missing_or_nonnumeric_ohlc"
-    vol = bar.get("volume", 0) or 0
+    vol = 0
+    for key in _VOLUME_ALIASES:
+        value = bar.get(key)
+        if value not in (None, ""):
+            vol = value
+            break
     try:
         vol = int(float(vol))
     except (TypeError, ValueError):

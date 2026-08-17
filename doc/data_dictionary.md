@@ -93,7 +93,7 @@ is correct: a 4:1 split shows a ~75% drop with no gap in the data.
 | `security_id` | BIGINT → core.security | |
 | `trade_date` | DATE | Exchange trading day. |
 | `open` `high` `low` `close` | NUMERIC(20,6) | **Raw** prices. |
-| `volume` | BIGINT | **Raw** volume (shares). |
+| `volume` | BIGINT | **Raw** volume (shares), in the share count of the day it traded. Taken from `unadjustedVolume` where the payload offers it, else `volume`. |
 | `vwap` | NUMERIC(20,6) | Volume-weighted average price (nullable). |
 | `source` | TEXT | |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | Lineage. |

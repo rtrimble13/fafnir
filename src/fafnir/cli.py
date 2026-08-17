@@ -372,7 +372,12 @@ def source_probe_prices(ctx, symbol, on_date):
         kwargs["on_date"] = _parse_date(on_date)
     report = probe.probe_prices(fmp, **kwargs)
     click.echo(probe.format_report(report))
-    if report["verdict"] not in ("unadjusted_confirmed", "inconclusive"):
+    # `volume_ambiguous` is not a failure: it means the two feeds cannot settle the
+    # question, which is a prompt to check one date against an outside source, not a
+    # reason to block the run.
+    passing = ("unadjusted_confirmed", "inconclusive")
+    vol_passing = ("volume_raw_confirmed", "inconclusive", "volume_ambiguous")
+    if report["verdict"] not in passing or report["volume_verdict"] not in vol_passing:
         raise click.ClickException(
             "Price feed check FAILED -- do not backfill until this is resolved."
         )

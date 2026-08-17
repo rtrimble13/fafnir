@@ -74,6 +74,13 @@ Two details follow from the endpoint choice:
 - Dividends are taken from the as-declared `dividend` field, not the restated
   `adjDividend`, so the dividend and the raw prior close it divides into are quoted
   in the same share terms.
+- Volume is taken from `unadjustedVolume` where a payload offers it, else `volume`.
+  Volume back-adjusts the *opposite* way to price — a split multiplies pre-split
+  share counts — so an already-adjusted volume would be inflated by the split ratio
+  squared rather than collapsed, with no vanish-to-zero tell and no DQ check to catch
+  it. `fafnir source probe-prices` reports a separate volume verdict; see
+  [backfill.md](backfill.md#volume-is-checked-separately) for the case the two feeds
+  cannot decide on their own.
 
 Full rationale and the migration consequences: [adr/0004](adr/0004-unadjusted-price-feed.md).
 

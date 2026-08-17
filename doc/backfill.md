@@ -316,11 +316,41 @@ nothing, and reports:
 | `ratio_mismatch` | They differ, but not by the split ratio. Splits payload incomplete, or a feed changed meaning. |
 | `inconclusive` | No splits after that date (use an earlier `--date` or a symbol that has split), or a feed returned no bar. |
 
-It exits non-zero on `feeds_agree` and `ratio_mismatch`, so it can gate a scripted
-backfill. It also prints the payload's raw field names and whether the ingestion
-boundary would accept the bar — worth a glance, since FMP labels OHLC as
+It also prints the payload's raw field names and whether the ingestion boundary would
+accept the bar — worth a glance, since FMP labels OHLC as
 `adjOpen`/`adjHigh`/`adjLow`/`adjClose` on this endpoint and a *third* spelling
 appearing would quarantine every bar.
+
+### Volume is checked separately
+
+Volume back-adjusts the **opposite way** to price: a 4:1 split multiplies pre-split
+share counts by 4 rather than dividing them. So a volume that arrives already
+split-adjusted is **inflated by the split ratio squared** (12,544× for AAPL's 112:1),
+not collapsed toward zero. There is no vanish-to-zero tell, and no DQ check covers
+volume — it is the quieter of the two failures, which is why it gets its own verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `volume_raw_confirmed` | Volume being ingested is raw — either the feeds differ by the split ratio, or the payload carries an explicit `unadjustedVolume`, or both feeds agree *and* match `unadjustedVolume`. |
+| `volume_adjusted` | Both feeds report a volume larger than `unadjustedVolume` — what is being ingested is split-adjusted, and fafnir would inflate it again. |
+| `volume_ambiguous` | Both feeds report the same volume and neither carries `unadjustedVolume`. See below. |
+| `volume_ratio_mismatch` | The feeds differ by something that is neither 1 nor the split ratio. |
+
+**`volume_ambiguous` is a real limit, not a bug.** "FMP never split-adjusts volume"
+(fine) and "FMP split-adjusts volume on both endpoints" (double-counted) produce an
+*identical* signature from these two feeds — equal volumes on each. Only
+`unadjustedVolume` breaks the tie, and the stable endpoints may not return it. If you
+land here, check one deep-history date against an outside source (the exchange, or
+another vendor) before trusting old volume. The probe reports this rather than
+guessing, and does **not** exit non-zero on it, since it is a prompt to verify rather
+than evidence of breakage.
+
+The loader hedges the same way: where a payload offers `unadjustedVolume` it is
+preferred over `volume`, because `core.daily_price` is defined as raw and
+`unadjustedVolume` is raw by definition.
+
+The command exits non-zero on `feeds_agree`, `ratio_mismatch`, `volume_adjusted` and
+`volume_ratio_mismatch`, so it can gate a scripted backfill.
 
 ---
 

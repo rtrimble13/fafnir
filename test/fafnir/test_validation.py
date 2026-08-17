@@ -144,3 +144,66 @@ def test_null_plain_field_falls_back_to_the_adj_spelling():
     )
     assert reason is None
     assert row["close"] == 39.2
+
+
+# -- volume spellings ---------------------------------------------------------
+#
+# core.daily_price is raw, and volume back-adjusts the opposite way to price (a 4:1
+# split multiplies pre-split share counts by 4). An already-adjusted volume would be
+# inflated by the split ratio squared, so where a payload offers `unadjustedVolume`
+# -- raw by definition -- it wins over `volume`.
+
+
+def test_unadjusted_volume_is_preferred_over_volume():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": 39.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "volume": 112_000_000,
+            "unadjustedVolume": 1_000_000,
+        }
+    )
+    assert reason is None
+    assert row["volume"] == 1_000_000
+
+
+def test_volume_is_used_when_unadjusted_volume_is_absent():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": 39.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "volume": 1_000_000,
+        }
+    )
+    assert reason is None
+    assert row["volume"] == 1_000_000
+
+
+def test_null_unadjusted_volume_falls_back_to_volume():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": 39.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "volume": 1_000_000,
+            "unadjustedVolume": None,
+        }
+    )
+    assert reason is None
+    assert row["volume"] == 1_000_000
+
+
+def test_a_bar_with_no_volume_at_all_is_zero_not_a_quarantine():
+    row, reason = _validate_bar(
+        {"date": "1990-01-02", "open": 39.0, "high": 39.5, "low": 38.5, "close": 39.2}
+    )
+    assert reason is None
+    assert row["volume"] == 0
