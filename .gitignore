@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local code-review reports (`/pr-review`, `/project-review`). Reviews belong on
+# the PR, not in the tree -- keeping them untracked also stops a review OF a
+# change from landing INSIDE that change's diff.
+PR_REVIEW.md
+PROJECT_REVIEW.md
