@@ -15,7 +15,9 @@ read through the `duk` CLI.
 - [Install on a Hetzner Cloud Server](install_hetzner.md) — end-to-end fresh install:
   provision, harden, PostgreSQL 16, fafnir, schedule, backups
 - [Initial Setup & Backfill](backfill.md) — stand up the DB and backfill history
-  (single run, a few hours)
+  (single run, a few hours); also
+  [confirming the price feed](backfill.md#confirming-the-price-feed) and
+  [clearing data for a reload](backfill.md#clearing-data-for-a-reload)
 - [Ingestion](ingestion.md) — FMP endpoint→table map, idempotency, watermarks, the
   adjustment step
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,

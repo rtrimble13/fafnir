@@ -101,6 +101,13 @@ the compared window is not by itself a reason for the two to disagree.
   resume per symbol.
 - **Suspected bad load** — the raw payload is in `landing.fmp_raw` (by endpoint +
   symbol + `fetched_at`); re-pull the window to upsert corrected values.
+- **Suspected bad *feed*** — `fafnir source probe-prices` checks that FMP's
+  unadjusted endpoint really is unadjusted (3 requests, writes nothing). See
+  [backfill.md](backfill.md#confirming-the-price-feed).
+- **Reload that must replace, not top up** — `scripts/reset_data.sh --scope <scope>`
+  clears prices / actions / landing / everything, keeping migrations, partitions and
+  reference data. Dry run by default; `--yes` to execute. Scope table in
+  [backfill.md](backfill.md#clearing-data-for-a-reload).
 - **Schema rollback** — `fafnir db rollback --steps N` (uses the `.down.sql`).
   Never roll back in a way that drops `core.daily_price` history without a backup.
 

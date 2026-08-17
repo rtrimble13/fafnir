@@ -128,6 +128,7 @@ Validate the FMP key, the split/dividend field mappings, and the whole pipeline 
 a tiny slice first:
 
 ```bash
+fafnir source probe-prices          # is the price feed actually unadjusted?
 fafnir ingest securities --limit 50
 fafnir ingest prices  --symbols AAPL,MSFT --from 1990-01-01
 fafnir ingest actions --symbols AAPL,MSFT
@@ -251,30 +252,32 @@ refuse to run incrementally in that state rather than half-refill the table.
 Re-backfill (a few hours, same cost as the original run):
 
 ```bash
-# 1. Drop the split-adjusted prices and their watermarks. Corporate actions,
-#    the security master, and landing payloads are all kept -- only the price
-#    fact is wrong. Take a backup first if you want one.
-psql "$FAFNIR_DSN" <<'SQL'
-BEGIN;
-TRUNCATE core.daily_price;
-DELETE FROM ops.load_watermark
- WHERE source='fmp' AND endpoint='historical-price-eod/full';
-COMMIT;
-SQL
+# 1. Confirm the unadjusted feed is really unadjusted before spending the run.
+#    3 requests, writes nothing. See "Confirming the price feed" below.
+fafnir source probe-prices --symbol AAPL --date 1990-01-02
 
-# 2. Reload from the unadjusted endpoint. The explicit --from is REQUIRED:
+# 2. Drop the split-adjusted prices, their derived factors, and the stale
+#    watermarks. Corporate actions, the security master and landing payloads are
+#    all kept -- only the price fact is wrong. Preview first (the default), then
+#    commit with --yes.
+scripts/reset_data.sh --scope prices
+scripts/reset_data.sh --scope prices --yes
+
+# 3. Reload from the unadjusted endpoint. The explicit --from is REQUIRED:
 #    without it each request is capped at 5000 bars (~19.8y) and you would
 #    silently lose everything older.
 fafnir ingest prices --include-inactive --from 1990-01-01
 
-# 3. Recompute factors against the new raw closes, then refresh and check.
+# 4. Recompute factors against the new raw closes, then refresh and check.
 fafnir adjust
 fafnir db refresh-marts
 fafnir dq run
 ```
 
-Step 3's `fafnir adjust` is not optional: dividend factors are valued against the
-prior raw close, so every factor derived from the old prices is stale.
+Step 4's `fafnir adjust` is not optional: dividend factors are valued against the
+prior raw close, so every factor derived from the old prices is stale. (Step 2
+clears `core.adjustment_factor` for exactly that reason — a stale factor is more
+dangerous than a missing one, because the view silently applies it.)
 
 Then run the deep-history level check in [§7 Verify](#7-verify) — that is what
 actually confirms the switch worked.
@@ -283,6 +286,81 @@ Expect `dq run` to report more `outlier` flags than before. Raw prices contain r
 split-sized jumps; the check excludes moves landing on a known split ex-date, so
 what remains is usually a **missing** corporate action — worth investigating, and a
 detection capability the pre-adjusted feed did not have.
+
+---
+
+## Confirming the price feed
+
+```bash
+fafnir source probe-prices                              # AAPL @ 1990-01-02
+fafnir source probe-prices --symbol MSFT --date 1995-01-03
+```
+
+Field names alone cannot tell you whether a feed is adjusted — a payload can be
+named `close` and still be split-adjusted, which is precisely how ADR 0004's bug
+went unnoticed. So the probe checks arithmetic instead. It pulls the same old bar
+from both the unadjusted and split-adjusted endpoints, pulls the split history, and
+verifies:
+
+```
+unadjusted close  ==  split-adjusted close  ×  cumulative split ratio
+```
+
+For AAPL at 1990-01-02 that is `$39.20 == $0.35 × 112`. It costs 3 requests, writes
+nothing, and reports:
+
+| Verdict | Meaning |
+|---|---|
+| `unadjusted_confirmed` | The feeds differ by exactly the split ratio. Safe to backfill. |
+| `feeds_agree` | Both returned the same price despite a split — the "unadjusted" endpoint is **not** unadjusted. Stop; fafnir would double-adjust. |
+| `ratio_mismatch` | They differ, but not by the split ratio. Splits payload incomplete, or a feed changed meaning. |
+| `inconclusive` | No splits after that date (use an earlier `--date` or a symbol that has split), or a feed returned no bar. |
+
+It exits non-zero on `feeds_agree` and `ratio_mismatch`, so it can gate a scripted
+backfill. It also prints the payload's raw field names and whether the ingestion
+boundary would accept the bar — worth a glance, since FMP labels OHLC as
+`adjOpen`/`adjHigh`/`adjLow`/`adjClose` on this endpoint and a *third* spelling
+appearing would quarantine every bar.
+
+---
+
+## Clearing data for a reload
+
+`scripts/reset_data.sh` truncates the tables a reload has to **replace** rather than
+top up. It never touches structure: migrations, partitions, and the seeded reference
+data (`ref.exchange`, `ref.sector`, `ref.industry`, `ref.trading_calendar`) all
+survive, so you go straight back to ingesting.
+
+**Dry run is the default** — it reports the row counts it would delete and stops.
+Pass `--yes` to execute.
+
+```bash
+scripts/reset_data.sh --scope prices            # preview
+scripts/reset_data.sh --scope prices --yes      # execute
+scripts/reset_data.sh --scope all --yes --vacuum
+```
+
+| Scope | Clears | Keeps |
+|---|---|---|
+| `prices` | `daily_price`, `adjustment_factor`, price watermarks (current **and** retired endpoint) | security master, actions, landing |
+| `actions` | `corporate_action`, `adjustment_factor` | prices, security master |
+| `market-data` | prices + actions + factors + price watermarks | security master (skips re-ingesting ~8k securities) |
+| `landing` | `landing.fmp_raw` | everything else — reclaims disk, loses the payload audit trail |
+| `dq-flags` | `ops.data_quality_flag` | everything else |
+| `all` | every core/ops/landing table, identities restarted | reference data, partitions, migrations |
+
+Each scope prints the exact reload sequence to run next. Three design notes worth
+knowing:
+
+- **Factors go with prices.** `adjustment_factor` is derived partly from raw closes
+  (dividends are valued against the prior close), so factors left behind after a
+  price reload are stale — and the adjusted view applies them silently.
+- **The truncate is one transaction, without `CASCADE`.** Each scope's table list is
+  closed under foreign keys. Omitting `CASCADE` means that if a future migration adds
+  a referencing table, this fails loudly instead of quietly wiping it.
+- **Marts are not refreshed.** `mart.security_latest` keeps its pre-reset snapshot
+  until you run `fafnir db refresh-marts` after reloading. An empty mart is honest;
+  a stale one pretending to be current is not.
 
 ---
 

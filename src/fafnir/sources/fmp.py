@@ -46,6 +46,8 @@ class FMPClient(BaseSource):
     EP_PROFILE = "profile"
     # Unadjusted OHLCV. `.../full` is split-adjusted -- see the module docstring.
     EP_EOD_RAW = "historical-price-eod/non-split-adjusted"
+    # Diagnostics only (`fafnir source probe-prices`); never ingested.
+    EP_EOD_SPLIT_ADJUSTED = "historical-price-eod/full"
     EP_SPLITS = "splits"
     EP_DIVIDENDS = "dividends"
     EP_SECTORS = "available-sectors"
@@ -172,7 +174,11 @@ class FMPClient(BaseSource):
 
     # -- prices -------------------------------------------------------------
     def _eod_window(
-        self, symbol: str, from_date: Optional[str], to_date: Optional[str]
+        self,
+        symbol: str,
+        from_date: Optional[str],
+        to_date: Optional[str],
+        endpoint: Optional[str] = None,
     ) -> list[dict]:
         """One request. May be silently truncated to ``EOD_MAX_ROWS``."""
         params: dict[str, Any] = {"symbol": symbol}
@@ -180,10 +186,25 @@ class FMPClient(BaseSource):
             params["from"] = from_date
         if to_date:
             params["to"] = to_date
-        data, _, _ = self._call(self.EP_EOD_RAW, params)
+        data, _, _ = self._call(endpoint or self.EP_EOD_RAW, params)
         if isinstance(data, dict) and "historical" in data:
             return data["historical"]
         return data if isinstance(data, list) else []
+
+    def eod_split_adjusted(
+        self,
+        symbol: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> list[dict]:
+        """SPLIT-ADJUSTED bars from ``historical-price-eod/full``. **Diagnostics only.**
+
+        Never ingest this into ``core.daily_price``: applying fafnir's split factors
+        on top of an already-split-adjusted series adjusts every split twice (see
+        doc/adr/0004-unadjusted-price-feed.md). It exists so ``fafnir source
+        probe-prices`` can compare the two feeds and prove which one is raw.
+        """
+        return self._eod_window(symbol, from_date, to_date, self.EP_EOD_SPLIT_ADJUSTED)
 
     def eod_raw(
         self,
