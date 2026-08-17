@@ -54,9 +54,9 @@ def load_delisted(
     exchanges: Iterable[str] = SCREENER_EXCHANGES,
 ) -> tuple[int, int]:
     """Mark newly delisted securities. Returns (marked, seen_for_our_venues)."""
-    wanted = {
-        _norm_exchange({"exchangeShortName": code}) for code in exchanges
-    } - {None}
+    wanted = {_norm_exchange({"exchangeShortName": code}) for code in exchanges} - {
+        None
+    }
 
     with RunLog(
         db,

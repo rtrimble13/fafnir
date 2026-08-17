@@ -249,9 +249,7 @@ class FMPClient(BaseSource):
         cursor = start
         while cursor <= end:
             window_end = min(cursor + timedelta(days=self.EOD_CHUNK_DAYS - 1), end)
-            bars = self._eod_window(
-                symbol, cursor.isoformat(), window_end.isoformat()
-            )
+            bars = self._eod_window(symbol, cursor.isoformat(), window_end.isoformat())
             if len(bars) >= self.EOD_MAX_ROWS:
                 logger.warning(
                     "%s: %s..%s returned the %d-row cap; bars may be missing -- "

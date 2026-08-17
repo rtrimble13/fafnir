@@ -16,8 +16,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # Pinned deliberately. Formatters change their output between releases, so an
+      # unpinned install makes this job fail on code nobody touched, the first time
+      # upstream ships a new style -- which is exactly what happened when black
+      # 26.5.x started joining lines that 26.1 had split. Bump these on purpose, in
+      # a commit that also reformats, rather than being surprised by it mid-review.
       - name: Install lint tools
-        run: pip install black isort flake8
+        run: pip install black==26.5.1 isort==8.0.1 flake8==7.3.0
       - name: black
         run: black --check --line-length 88 src test
       - name: isort
