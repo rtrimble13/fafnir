@@ -75,3 +75,72 @@ def test_unparseable_date_rejected():
 def test_missing_ohlc_rejected():
     _, reason = _validate_bar({"date": "2023-06-01", "open": 10, "high": 11})
     assert reason == "missing_or_nonnumeric_ohlc"
+
+
+# -- FMP field-name variants --------------------------------------------------
+#
+# The unadjusted endpoint (historical-price-eod/non-split-adjusted) labels its OHLC
+# fields adjOpen/adjHigh/adjLow/adjClose, the same convention the dividend-adjusted
+# payload uses. On the unadjusted feed the prefix is only a name -- the values are
+# the prices as traded. Rejecting those bars would quarantine every row.
+
+
+def test_adj_prefixed_ohlc_is_accepted():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "adjOpen": 39.0,
+            "adjHigh": 39.5,
+            "adjLow": 38.5,
+            "adjClose": 39.2,
+            "volume": 100,
+        }
+    )
+    assert reason is None
+    assert row["close"] == 39.2
+    assert row["open"] == 39.0
+    assert row["high"] == 39.5
+    assert row["low"] == 38.5
+
+
+def test_plain_names_win_when_a_payload_carries_both():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": 39.0,
+            "high": 39.5,
+            "low": 38.5,
+            "close": 39.2,
+            "adjOpen": 1.0,
+            "adjHigh": 1.0,
+            "adjLow": 1.0,
+            "adjClose": 1.0,
+            "volume": 100,
+        }
+    )
+    assert reason is None
+    assert row["close"] == 39.2
+
+
+def test_bar_with_neither_spelling_is_quarantined():
+    _, reason = _validate_bar({"date": "1990-01-02", "volume": 100})
+    assert reason == "missing_or_nonnumeric_ohlc"
+
+
+def test_null_plain_field_falls_back_to_the_adj_spelling():
+    row, reason = _validate_bar(
+        {
+            "date": "1990-01-02",
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": None,
+            "adjOpen": 39.0,
+            "adjHigh": 39.5,
+            "adjLow": 38.5,
+            "adjClose": 39.2,
+            "volume": 100,
+        }
+    )
+    assert reason is None
+    assert row["close"] == 39.2

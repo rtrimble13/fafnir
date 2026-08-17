@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -31,7 +32,7 @@ class _FakeFMP:
     def __init__(self, bars):
         self._bars = bars
 
-    def eod_full(self, symbol, from_date=None, to_date=None):
+    def eod_raw(self, symbol, from_date=None, to_date=None):
         return self._bars
 
 
@@ -418,3 +419,90 @@ def test_watermark_releases_after_quarantine_budget(db):
             )
     # Budget exhausted -> watermark advances past the bad bar to the latest clean.
     assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 5)
+
+
+# -- the split-adjusted feed regression ---------------------------------------
+#
+# fafnir's factors are the ONLY adjustment applied to core.daily_price, so the feed
+# behind it has to be genuinely unadjusted. Loading FMP's `historical-price-eod/full`
+# (already split-adjusted) instead put AAPL's 1990-01-02 close in at ~$0.35 rather
+# than its true ~$39.20, and the adjustment routine then divided by the 112:1
+# cumulative split a second time, landing at ~$0.003. These pin both halves: the
+# routine reproduces the real split-adjusted series from raw input, and the loader
+# asks for the unadjusted endpoint.
+
+# AAPL splits with an ex-date after 1990-01-02: 2:1, 2:1, 7:1, 4:1.
+_AAPL_SPLITS = [
+    (dt.date(2000, 6, 21), 2),
+    (dt.date(2005, 2, 28), 2),
+    (dt.date(2014, 6, 9), 7),
+    (dt.date(2020, 8, 31), 4),
+]
+_AAPL_CUM_SPLIT = 2 * 2 * 7 * 4  # 112
+
+
+def test_raw_1990_close_survives_a_112_to_1_cumulative_split(db):
+    """A deep-history bar must adjust to raw/112, not raw/112/112."""
+    sid = _mk_security(db, "AAPL")
+    repo.upsert_daily_prices(
+        db,
+        _prices(
+            sid,
+            [
+                # The close as it actually traded in 1990, pre all four splits.
+                {
+                    "trade_date": dt.date(1990, 1, 2),
+                    "open": 39.20,
+                    "high": 39.20,
+                    "low": 39.20,
+                    "close": 39.20,
+                    "volume": 1_000_000,
+                },
+                {
+                    "trade_date": dt.date(2026, 8, 14),
+                    "open": 231,
+                    "high": 231,
+                    "low": 231,
+                    "close": 231,
+                    "volume": 50_000_000,
+                },
+            ],
+        ),
+    )
+    for ex_date, num in _AAPL_SPLITS:
+        repo.upsert_corporate_action(
+            db,
+            security_id=sid,
+            action_type="split",
+            ex_date=ex_date,
+            split_numerator=num,
+            split_denominator=1,
+        )
+    adjustments.compute_for_security(db, sid)
+
+    rows = db.fetchall(
+        "SELECT trade_date, close, close_raw, volume, price_factor "
+        "FROM mart.v_daily_price_adjusted WHERE security_id=%s ORDER BY trade_date",
+        (sid,),
+    )
+    old, recent = rows
+
+    # ~0.35, i.e. 39.20/112 -- the published split-adjusted 1990 close.
+    expected = Decimal("39.20") / _AAPL_CUM_SPLIT
+    assert abs(Decimal(old["close"]) - expected) < Decimal("0.000001")
+    # The distinguishing assertion: a second application would land near 0.003.
+    assert Decimal(old["close"]) > Decimal("0.3")
+    assert Decimal(old["close_raw"]) == Decimal("39.200000")
+    # Volume back-adjusts the other way, into today's share terms.
+    assert int(old["volume"]) == 1_000_000 * _AAPL_CUM_SPLIT
+    # Nothing happens after the last ex-date, so a recent bar is untouched.
+    assert Decimal(recent["price_factor"]) == 1
+    assert Decimal(recent["close"]) == Decimal("231")
+
+
+def test_price_loader_reads_the_unadjusted_endpoint():
+    """The loader's endpoint is also its watermark key, so pin it explicitly."""
+    from fafnir.sources.fmp import FMPClient
+
+    assert PRICE_ENDPOINT == "historical-price-eod/non-split-adjusted"
+    assert FMPClient.EP_EOD_RAW == PRICE_ENDPOINT

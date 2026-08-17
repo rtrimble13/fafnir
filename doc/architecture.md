@@ -49,13 +49,22 @@ Market data lives on three separate clocks; fafnir keeps them distinct:
 
 ## Raw prices + derive-on-read adjustment (the key decision)
 
-FMP returns both `close` (raw) and an adjusted close. Adjusted values are **not
-stable**: every new split or dividend re-scales the entire historical adjusted
-series, so a stored adjusted close silently drifts.
+Adjusted price series are **not stable**: every new split or dividend re-scales the
+entire history, so a stored adjusted close silently drifts and stops being
+point-in-time reproducible.
 
 Fafnir therefore stores **raw OHLCV only** (`core.daily_price`, immutable once the
 day closes) plus a **corporate-actions** table and a derived **adjustment-factor**
-table. Adjusted series are computed **on read** in `mart.v_daily_price_adjusted`.
+table.
+
+Getting genuinely raw prices takes care, because most of FMP's price payloads are
+adjusted already. On `historical-price-eod/full`, `close` is adjusted **for splits**
+and `adjClose` for splits *and* dividends — neither is raw. Prices are therefore
+pulled from **`historical-price-eod/non-split-adjusted`**, the one endpoint that
+returns prices as they actually traded. Feeding a pre-adjusted series into fafnir's
+own factors would adjust it twice: AAPL's 1990-01-02 close would enter as ~$0.35
+rather than its true ~$39.20, and the view would report ~$0.003. See
+[adr/0004-unadjusted-price-feed.md](adr/0004-unadjusted-price-feed.md). Adjusted series are computed **on read** in `mart.v_daily_price_adjusted`.
 Because factors are derived deterministically from corporate actions, the adjusted
 series is **point-in-time stable and reproducible**. See
 [adr/0001-raw-prices-plus-adjustment-factors.md](adr/0001-raw-prices-plus-adjustment-factors.md).

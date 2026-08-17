@@ -109,7 +109,14 @@ def load_actions(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:
             )
             for rec in divs:
                 ex_date = _parse_date(rec.get("date"))
-                amount = rec.get("dividend", rec.get("adjDividend"))
+                # `dividend` is the as-declared cash amount; `adjDividend` is
+                # restated into today's share terms. core.daily_price holds
+                # unadjusted prices, so the as-declared amount is the one that
+                # divides into the raw prior close -- adjDividend is only a
+                # fallback for rows where FMP omits `dividend` entirely.
+                amount = rec.get("dividend")
+                if amount in (None, ""):
+                    amount = rec.get("adjDividend")
                 try:
                     amount = float(amount) if amount not in (None, "") else None
                 except (TypeError, ValueError):

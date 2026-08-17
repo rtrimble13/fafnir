@@ -4,6 +4,16 @@ Adjustment-factor computation.
 Derives cumulative back-adjustment factors from corporate actions so that
 ``mart.v_daily_price_adjusted`` can produce split/dividend-adjusted OHLCV on read.
 
+Precondition
+------------
+``core.daily_price`` must hold **genuinely unadjusted** prices. These factors are the
+only adjustment in the system, so a vendor feed that has already been split-adjusted
+gets adjusted twice: AAPL's 1990-01-02 close would enter as ~$0.35 instead of ~$39.20
+and leave the view at ~$0.003. ``fafnir.ingest.daily_price`` therefore loads from FMP's
+``historical-price-eod/non-split-adjusted`` endpoint, and dividend amounts are taken
+from the as-declared ``dividend`` field (not the split-adjusted ``adjDividend``) so that
+D and P below are quoted in the same share terms.
+
 Conventions
 -----------
 Per-event factors (applied to all prices STRICTLY BEFORE the ex-date):
@@ -55,7 +65,7 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
             amount = Decimal(act["dividend_amount"] or 0)
             if amount <= 0:
                 continue
-            prior_close = repo.close_on_or_before(db, security_id, ex_date)
+            prior_close = repo.close_before(db, security_id, ex_date)
             if prior_close is None or Decimal(prior_close) <= 0:
                 # No price to value the dividend against -> skip (factor 1) and flag.
                 repo.add_dq_flag(

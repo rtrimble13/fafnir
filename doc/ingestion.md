@@ -37,7 +37,7 @@ the Professional plan in the original `duk`.
 |---|---|---|---|
 | `ingest securities` | `stock-list`, `etf-list` | `core.security`, `core.symbol_xref` | (source, primary_symbol, exchange) |
 | `ingest securities --enrich` | `profile` | `core.security`, `core.company_profile` | security_id |
-| `ingest prices` | `historical-price-eod/full` | `core.daily_price` | (security_id, trade_date) |
+| `ingest prices` | `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
 | `ingest actions` | `splits`, `dividends` | `core.corporate_action` | (security_id, action_type, ex_date) |
 | `adjust` | (derived) | `core.adjustment_factor` | (security_id, effective_date) |
 
@@ -46,6 +46,36 @@ the Professional plan in the original `duk`.
 > be confirmed against a live response for a known symbol (e.g. AAPL). The loader
 > already tolerates the common alternates; the endpoint paths are centralized as
 > constants in `FMPClient` for a one-line correction.
+
+## Why the *unadjusted* price endpoint
+
+`core.daily_price` is defined as raw, and `core.adjustment_factor` is the only
+adjustment fafnir applies. Most FMP price payloads are adjusted before they arrive,
+so the endpoint choice is load-bearing:
+
+| Endpoint / field | Adjusted for |
+|---|---|
+| `historical-price-eod/full` → `close` | splits |
+| `historical-price-eod/full` → `adjClose` | splits **and** dividends |
+| `historical-price-eod/dividend-adjusted` | splits and dividends |
+| **`historical-price-eod/non-split-adjusted`** | **nothing — prices as traded** |
+
+Loading a pre-adjusted series adjusts it twice. AAPL has split 112:1 cumulatively
+since 1990, so its true 1990-01-02 close of ~$39.20 arrives from `.../full` as
+~$0.35; storing that as raw and applying the 1/112 factor again yields ~$0.003. The
+symptom only appears on symbols that have split, and only in deep history.
+
+Two details follow from the endpoint choice:
+
+- The unadjusted payload names its OHLC fields `adjOpen`/`adjHigh`/`adjLow`/
+  `adjClose`. That prefix is FMP's naming convention on this family of endpoints,
+  **not** a second adjustment. The loader accepts either spelling (preferring the
+  unprefixed one) and lands the payload verbatim.
+- Dividends are taken from the as-declared `dividend` field, not the restated
+  `adjDividend`, so the dividend and the raw prior close it divides into are quoted
+  in the same share terms.
+
+Full rationale and the migration consequences: [adr/0004](adr/0004-unadjusted-price-feed.md).
 
 ## The adjustment step
 
@@ -69,3 +99,15 @@ ensure-partitions → prices → actions → adjust → refresh-marts → dq run
 
 Prices precede actions so dividend adjustment can value against fresh closes.
 `scripts/daily_update.sh` encodes this order.
+
+## Watermarks and the endpoint string
+
+`ops.load_watermark` is keyed on `(source, endpoint, security_id)`, so the endpoint
+path is part of ingestion state, not just a URL. Changing it retires every existing
+watermark and makes each symbol look new — which on an incremental run means an
+unbounded request, and an unbounded request is capped at 5000 bars (~19.8 years).
+
+`load_prices` therefore refuses to run incrementally when watermarks exist only
+under the retired `historical-price-eod/full` endpoint, directing the operator to a
+re-backfill instead. If you ever change a loader's endpoint again, plan the
+watermark migration at the same time.

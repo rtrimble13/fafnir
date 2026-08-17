@@ -54,6 +54,13 @@ Things to watch:
   Stale securities raise `stale` DQ flags.
 - **Quarantine spikes** — a jump in `ops.data_quality_flag` (warn/error) on a load
   signals a source change or bad data. Investigate the `landing.fmp_raw` payload.
+  A load where *every* bar quarantines as `price_missing_or_nonnumeric_ohlc` points
+  at FMP renaming the OHLC fields; the loader accepts `open…close` and
+  `adjOpen…adjClose`, so a third spelling would need adding to `_OHLC_ALIASES`.
+- **Price levels, not just counts** — a wrongly-adjusted feed is internally
+  consistent and passes every structural check. The deep-history spot check in
+  [backfill.md §7](backfill.md#7-verify) is the one that catches it; it is worth
+  re-running after any change to the price loader.
 - **Bandwidth** — sum `ops.ingestion_run.bytes_downloaded` over the month against
   the 50 GB FMP budget:
   ```sql
@@ -72,6 +79,10 @@ Things to watch:
 warehouse to catch silent drift (re-adjustments, late corrections). Run weekly over
 a rotating sample. It reports differences; it does not auto-overwrite.
 
+It compares **raw** closes, and both sides are unadjusted — `core.daily_price` on one
+side, FMP's `historical-price-eod/non-split-adjusted` on the other — so a split in
+the compared window is not by itself a reason for the two to disagree.
+
 ## Maintenance tasks
 
 - **Partitions & calendar horizon** — kept rolling automatically by
@@ -81,6 +92,8 @@ a rotating sample. It reports differences; it does not auto-overwrite.
   to create an explicit fixed range instead: `fafnir db ensure-partitions --start-year 2028 --end-year 2030`.
 - **Mart refresh** — `fafnir db refresh-marts` (also part of the daily job).
 - **Re-run adjustments** — `fafnir adjust` (whole universe) or `fafnir adjust --symbol AAPL`.
+  Run it after any price reload as well as after an actions load: dividend factors
+  are valued against the prior raw close, so new prices can change them.
 
 ## Recovery
 

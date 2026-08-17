@@ -193,6 +193,26 @@ duk -S db ls --sector Technology -n 10
 duk -S db ph SPY --adj -f week -n 8
 ```
 
+**Check a deep-history price level against a known value.** Counts and DQ flags
+cannot catch a wrongly-adjusted feed — a doubly-adjusted series is internally
+consistent and passes every structural check. Only comparing a level to an outside
+reference will reveal it:
+
+```bash
+psql "$FAFNIR_DSN" -c "
+  SELECT p.trade_date, p.close AS raw_close, v.close AS adj_close, v.price_factor
+  FROM core.daily_price p
+  JOIN mart.v_daily_price_adjusted v USING (security_id, trade_date)
+  JOIN core.security s USING (security_id)
+  WHERE s.primary_symbol = 'AAPL' AND p.trade_date = '1990-01-02';"
+```
+
+Expect `raw_close` around **\$39** (the price AAPL actually traded at in 1990) and
+`adj_close` around **\$0.35** (that divided by the 112:1 cumulative split since).
+A `raw_close` near \$0.35 means the split-adjusted endpoint is being loaded and
+`adj_close` will be ~\$0.003 — stop and re-read
+[adr/0004](adr/0004-unadjusted-price-feed.md).
+
 ## 8. Schedule daily upkeep
 
 ```bash
@@ -203,6 +223,66 @@ crontab /opt/fafnir/etc/crontab.example     # edit paths/times first
 (`ensure-horizon` → prices → actions → adjust → refresh-marts → dq), so a missed
 day is caught up automatically and the partition/calendar horizon keeps rolling
 forward on its own.
+
+---
+
+## Switching to the unadjusted price feed
+
+**Who this is for:** anyone whose warehouse was loaded before
+[ADR 0004](adr/0004-unadjusted-price-feed.md), i.e. while `ingest prices` still read
+`historical-price-eod/full`. A fresh install can skip this section.
+
+Those bars were already split-adjusted, so `fafnir adjust` applied the split factor
+a second time and deep history collapsed toward zero. The rows cannot be repaired
+in place by topping up — they have to be replaced.
+
+Check whether you are affected:
+
+```bash
+psql "$FAFNIR_DSN" -c "
+  SELECT endpoint, count(*) AS symbols, max(last_loaded_date) AS through
+  FROM ops.load_watermark WHERE source='fmp'
+    AND endpoint LIKE 'historical-price-eod%' GROUP BY endpoint;"
+```
+
+Rows under `historical-price-eod/full` mean the old feed. `fafnir ingest prices` will
+refuse to run incrementally in that state rather than half-refill the table.
+
+Re-backfill (a few hours, same cost as the original run):
+
+```bash
+# 1. Drop the split-adjusted prices and their watermarks. Corporate actions,
+#    the security master, and landing payloads are all kept -- only the price
+#    fact is wrong. Take a backup first if you want one.
+psql "$FAFNIR_DSN" <<'SQL'
+BEGIN;
+TRUNCATE core.daily_price;
+DELETE FROM ops.load_watermark
+ WHERE source='fmp' AND endpoint='historical-price-eod/full';
+COMMIT;
+SQL
+
+# 2. Reload from the unadjusted endpoint. The explicit --from is REQUIRED:
+#    without it each request is capped at 5000 bars (~19.8y) and you would
+#    silently lose everything older.
+fafnir ingest prices --include-inactive --from 1990-01-01
+
+# 3. Recompute factors against the new raw closes, then refresh and check.
+fafnir adjust
+fafnir db refresh-marts
+fafnir dq run
+```
+
+Step 3's `fafnir adjust` is not optional: dividend factors are valued against the
+prior raw close, so every factor derived from the old prices is stale.
+
+Then run the deep-history level check in [§7 Verify](#7-verify) — that is what
+actually confirms the switch worked.
+
+Expect `dq run` to report more `outlier` flags than before. Raw prices contain real
+split-sized jumps; the check excludes moves landing on a known split ex-date, so
+what remains is usually a **missing** corporate action — worth investigating, and a
+detection capability the pre-adjusted feed did not have.
 
 ---
 

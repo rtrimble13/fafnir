@@ -43,6 +43,15 @@ For db mode, point `duk` at the least-privilege `fafnir_app` role (mart read-onl
 | Command | Description | db mode | live mode |
 |---|---|---|---|
 | `ph SYMBOL` | price history (OHLCV, raw or `--adj`) | ✅ warehouse | ✅ FMP |
+
+`ph` without `--adj` means **raw** — prices as they actually traded, so a split shows
+up as a real jump. Both sources honour that: `db` reads `core.daily_price`, and
+`live` reads FMP's `historical-price-eod/non-split-adjusted` (not `.../full`, which
+is already split-adjusted). That is what makes the two sources comparable, and what
+`scripts/reconcile.sh` relies on. With `--adj`, `db` reads
+`mart.v_daily_price_adjusted` (split + dividend, point-in-time stable) while `live`
+reads FMP's `dividend-adjusted` endpoint — close, but a moving vendor snapshot
+rather than a reproducible series, so small differences on old dates are expected.
 | `ls` | list/screen securities, sectors, industries | ✅ `mart.security_latest` / `ref.*` | ✅ FMP |
 | `yc` | treasury yield curve | ⤳ falls back to live | ✅ FMP |
 | `rc` | return calculations from an input file | source-agnostic | source-agnostic |
