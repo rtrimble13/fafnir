@@ -9,12 +9,30 @@ usable in live mode without it installed.
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any, Optional
 
 import pandas as pd
 
 from duk.datasource.base import DataSourceError, shape_price_dataframe
 from duk.date_utils import get_api_date_range
+
+
+def _parse_date(value: Optional[str | date], label: str) -> Optional[date]:
+    """Coerce a ``YYYY-MM-DD`` CLI string to a ``date``.
+
+    ``get_api_date_range`` does date arithmetic (start + limit * frequency), so it
+    must never see a raw string. The live path parses in
+    ``fmp_api.get_price_history``; the db path parses here so both sources agree.
+    """
+    if value is None or isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise DataSourceError(
+            f"Invalid {label} '{value}': expected YYYY-MM-DD"
+        ) from exc
 
 
 def _connect(dsn: str):
@@ -72,7 +90,12 @@ def price_history(
 ) -> pd.DataFrame:
     """Return a date-indexed OHLCV DataFrame from fafnir, shaped like the live path."""
     symbol = symbol.upper()
-    start, end = get_api_date_range(start_date, end_date, limit, frequency)
+    start, end = get_api_date_range(
+        _parse_date(start_date, "start date"),
+        _parse_date(end_date, "end date"),
+        limit,
+        frequency,
+    )
 
     with _connect(dsn) as conn, conn.cursor() as cur:
         sec_id = _resolve_security_id(cur, symbol)

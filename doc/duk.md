@@ -62,12 +62,24 @@ rather than a reproducible series, so small differences on old dates are expecte
 
 ## Examples
 
+`-n` counts **bars**, not calendar days: `-n 5` returns five trading periods at the
+selected `--frequency`, whichever weekends and holidays fall inside them. The query
+window is widened accordingly and the series trimmed back to `-n` rows, so `-n` pairs
+with `--start-date` (the first N bars from that date) or `--end-date` (the last N up
+to it); all three together is an error.
+
 ```bash
 # Adjusted daily closes from the warehouse
 duk -S db ph AAPL --adj --close
 
 # Weekly OHLC, last 52 weeks
 duk -S db ph AAPL -f week -n 52 --ohlc
+
+# The first five trading days of 1990
+duk -S db ph AAPL --start-date 1990-01-01 -n 5
+
+# Prices print at 2dp by default; -p widens it
+duk -S db ph AAPL --adj -p 4
 
 # Screen tech names by market cap (warehouse snapshot)
 duk -S db ls --sector Technology --market-cap ">1000000000"
@@ -79,6 +91,18 @@ duk ti sma -i prices.csv -c close -w 20
 # Reconcile a symbol: same series from both sources should match
 diff <(duk -S db ph AAPL --close --csv) <(duk -S live ph AAPL --close --csv)
 ```
+
+### Price formatting
+
+`ph` prints prices at two decimals (`250.00`). Sub-penny prices are **not** floored
+to `0.00`: anything too small for the requested precision keeps four significant
+digits instead (`0.0003123`), so a back-adjusted series with a long split record
+still reports a real traded price. `-p/--precision` changes the decimal places.
+
+Formatting is applied at the output boundary only. The DataFrame keeps full
+precision, `--json` stays numeric, and `-o` files are written unrounded unless you
+pass `-p` explicitly -- they feed the `ti`/`rc` compute path, where quantizing a
+sub-dollar series would introduce real error.
 
 ## Library use
 

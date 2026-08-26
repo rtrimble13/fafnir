@@ -10,6 +10,7 @@ from pathlib import Path
 
 import click
 import pandas as pd
+from click.core import ParameterSource
 
 from duk import __version__
 from duk.config import get_config
@@ -22,8 +23,13 @@ from duk.fmp_api import (
     industry_list_api,
     sector_list_api,
 )
+from duk.format_utils import (
+    DEFAULT_DECIMALS,
+    format_price_columns,
+    round_price_columns,
+)
 from duk.indicators import calculate_ema, calculate_macd, calculate_rsi, calculate_sma
-from duk.logging_config import setup_logging
+from duk.logging_config import enable_console_logging, setup_logging
 from duk.ls_utils import process_industries, process_sectors
 from duk.return_utils import (
     annualized_return,
@@ -96,10 +102,12 @@ def main(ctx, config, source):
 
     # Setup logging
     cfg = ctx.obj["config"]
+    # Console output is opt-in per subcommand via -v/--verbose; until then the
+    # terminal carries only the command's own output.
     logger = setup_logging(
         log_level=cfg.log_level,
         log_dir=cfg.log_dir,
-        console_output=True,
+        console_output=False,
     )
     ctx.obj["logger"] = logger
 
@@ -114,13 +122,23 @@ def main(ctx, config, source):
 
 @main.command()
 @click.argument("symbol")
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing price history data to stdout"
 )
 @click.option("-s", "--start-date", help="Start date (YYYY-MM-DD)")
 @click.option("-e", "--end-date", help="End date (YYYY-MM-DD)")
-@click.option("-n", "--limit", type=int, help="Limit number of records to return")
+@click.option(
+    "-n",
+    "--limit",
+    type=int,
+    help="Number of bars to return (trading periods at --frequency)",
+)
 @click.option(
     "-f",
     "--frequency",
@@ -139,6 +157,17 @@ def main(ctx, config, source):
 )
 @click.option("--cv", is_flag=True, help="Return Date, Close, Volume fields")
 @click.option("--adj", is_flag=True, help="Retrieve dividend-adjusted price history")
+@click.option(
+    "-p",
+    "--precision",
+    type=int,
+    default=DEFAULT_DECIMALS,
+    help=(
+        f"Decimal places for price columns (default: {DEFAULT_DECIMALS}). Prices too "
+        "small for that precision keep significant digits instead of showing 0.00. "
+        "Applies to --output files only when given explicitly."
+    ),
+)
 @click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
@@ -171,6 +200,7 @@ def ph(
     hlcv,
     cv,
     adj,
+    precision,
     output_csv,
     output_json,
     summary,
@@ -186,13 +216,7 @@ def ph(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     # Make symbol uppercase for consistency
     symbol = symbol.upper()
@@ -288,6 +312,21 @@ def ph(
     # Reset index to include date as a column in output
     output_df = df.reset_index()
 
+    # Display precision is applied at the output boundary only: `df` itself keeps
+    # full precision, so the library contract and the db/live parity guarantee are
+    # untouched. --output files are left alone unless --precision was given
+    # explicitly, because -o feeds the `ti`/`rc` compute pipeline and rounding a
+    # sub-dollar adjusted series to 2dp there is a real quantization error.
+    precision_requested = (
+        ctx.get_parameter_source("precision") == ParameterSource.COMMANDLINE
+    )
+
+    def _as_text(frame):
+        return format_price_columns(frame, decimals=precision)
+
+    def _as_numbers(frame):
+        return round_price_columns(frame, decimals=precision)
+
     # Handle output to file
     if output:
         output_path = Path(output)
@@ -305,9 +344,11 @@ def ph(
 
         # Write to file based on format
         if output_format == "json":
-            output_df.to_json(output_path, orient="records", date_format="iso")
+            file_df = _as_numbers(output_df) if precision_requested else output_df
+            file_df.to_json(output_path, orient="records", date_format="iso")
         else:
-            output_df.to_csv(output_path, index=False)
+            file_df = _as_text(output_df) if precision_requested else output_df
+            file_df.to_csv(output_path, index=False)
 
         logger.info(f"Data written to {output_path}")
 
@@ -324,19 +365,31 @@ def ph(
         # Otherwise print data
         else:
             if output_format == "json":
-                click.echo(output_df.to_json(orient="records", date_format="iso"))
+                click.echo(
+                    _as_numbers(output_df).to_json(orient="records", date_format="iso")
+                )
             else:
-                click.echo(output_df.to_csv(index=False))
+                click.echo(_as_text(output_df).to_csv(index=False))
 
 
 @main.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing yield curve data to stdout"
 )
 @click.option("-s", "--start-date", help="Start date (YYYY-MM-DD)")
 @click.option("-e", "--end-date", help="End date (YYYY-MM-DD)")
-@click.option("-n", "--limit", type=int, help="Limit number of records to return")
+@click.option(
+    "-n",
+    "--limit",
+    type=int,
+    help="Number of observations (trading days) to return",
+)
 @click.option(
     "-z",
     "--zero-rates",
@@ -415,13 +468,7 @@ def yc(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     logger.info("Requesting yield curve data")
 
@@ -582,7 +629,12 @@ def yc(
 
 
 @main.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing list data to stdout"
 )
@@ -726,13 +778,7 @@ def ls(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     # Resolve data source and credentials
     cfg = ctx.obj["config"]
@@ -1029,7 +1075,12 @@ def ls(
 
 
 @main.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing return data to stdout"
 )
@@ -1146,13 +1197,7 @@ def rc(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     logger.info(f"Computing returns from {input_file}")
 
@@ -1438,7 +1483,12 @@ def ti(ctx):
 
 
 @ti.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
 )
@@ -1511,13 +1561,7 @@ def sma(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     logger.info(f"Computing SMA from {input_file}")
 
@@ -1577,10 +1621,12 @@ def sma(
 
     # Check if we have enough data points
     if len(df) < window:
-        logger.warning(
+        msg = (
             f"Input data has {len(df)} records, but window size is {window}. "
             f"SMA will be NaN for all records."
         )
+        logger.warning(msg)
+        click.echo(f"Warning: {msg}", err=True)
 
     # Calculate SMA
     try:
@@ -1633,7 +1679,12 @@ def sma(
 
 
 @ti.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
 )
@@ -1706,13 +1757,7 @@ def ema(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     logger.info(f"Computing EMA from {input_file}")
 
@@ -1772,10 +1817,12 @@ def ema(
 
     # Check if we have enough data points
     if len(df) < window:
-        logger.warning(
+        msg = (
             f"Input data has {len(df)} records, but window size is {window}. "
             f"EMA will be NaN for all records."
         )
+        logger.warning(msg)
+        click.echo(f"Warning: {msg}", err=True)
 
     # Calculate EMA
     try:
@@ -1828,7 +1875,12 @@ def ema(
 
 
 @ti.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
 )
@@ -1906,13 +1958,7 @@ def rsi(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     logger.info(f"Computing RSI from {input_file}")
 
@@ -1973,11 +2019,13 @@ def rsi(
     # Check if we have enough data points
     # RSI needs window+1 records (window periods + 1 for price difference)
     if len(df) < window + 1:
-        logger.warning(
+        msg = (
             f"Input data has {len(df)} records, but window size is {window}. "
             f"RSI requires at least {window + 1} records. "
             f"RSI will be NaN for all records."
         )
+        logger.warning(msg)
+        click.echo(f"Warning: {msg}", err=True)
 
     # Calculate RSI
     try:
@@ -2030,7 +2078,12 @@ def rsi(
 
 
 @ti.command()
-@click.option("-v", "--verbose", is_flag=True, help="Print all logging to stdout")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
 @click.option(
     "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
 )
@@ -2123,13 +2176,7 @@ def macd(
 
     # Adjust logging based on verbose flag
     if verbose:
-        logger.setLevel(logging.INFO)
-        # Enable console output for all handlers
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(
-                handler, logging.FileHandler
-            ):
-                handler.setLevel(logging.DEBUG)
+        enable_console_logging(logger)
 
     logger.info(f"Computing MACD from {input_file}")
 
@@ -2203,12 +2250,14 @@ def macd(
     # MACD needs slow_window + signal_window records for full calculation
     min_required = slow_window + signal_window
     if len(df) < min_required:
-        logger.warning(
+        msg = (
             f"Input data has {len(df)} records, but MACD with "
             f"slow_window={slow_window} and signal_window={signal_window} "
             f"requires at least {min_required} records. "
             f"MACD values will be NaN for early records."
         )
+        logger.warning(msg)
+        click.echo(f"Warning: {msg}", err=True)
 
     # Calculate MACD
     try:
