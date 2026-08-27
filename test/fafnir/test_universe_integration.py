@@ -380,12 +380,14 @@ def test_new_listing_has_no_watermark_so_its_first_pull_is_a_backfill(db):
 
 def test_active_security_keys_ignores_delisted_rows(db):
     sid = _mk_security(db, "AAA")
-    assert ("AAA", "NASDAQ") in repo.active_security_keys(db)
+    # The key is the symbol alone (0012); the venue is an attribute, so that a
+    # company changing exchange is a refresh rather than a new listing.
+    assert "AAA" in repo.active_security_keys(db)
 
     repo.mark_delisted(db, security_id=sid, delisted_date=dt.date(2024, 1, 2))
-    # A delisted row is invisible to 0009's partial index, so the same ticker
+    # A delisted row is invisible to the partial index, so the same ticker
     # listing again is genuinely new -- and must be reported as such.
-    assert ("AAA", "NASDAQ") not in repo.active_security_keys(db)
+    assert "AAA" not in repo.active_security_keys(db)
     assert _load(db, ["AAA"]).new_symbols == ["AAA"]
     assert db.fetchval("SELECT count(*) FROM core.security") == 2
 
@@ -700,3 +702,108 @@ def test_a_delisting_closes_a_renamed_tickers_period_even_if_backdated(db):
 
     assert repo.resolve_security_id(db, "XYZ") == newcomer
     assert repo.active_security_for_symbol(db, "XYZ") == newcomer
+
+
+# ---------------------------------------------------------------------------
+# A venue transfer is not a new company
+# ---------------------------------------------------------------------------
+
+
+class _VenueFMP:
+    """Screener stub that lists one symbol on whichever venue it is given."""
+
+    bytes_downloaded = 0
+    request_count = 0
+
+    def __init__(self, venue, symbol="ABC"):
+        self.venue = venue
+        self.symbol = symbol
+
+    def company_screener(self, *, exchange=None, **_kw):
+        if exchange != self.venue:
+            return []
+        return [
+            {
+                "symbol": self.symbol,
+                "exchangeShortName": self.venue,
+                "name": "Acme Corp",
+                "isEtf": False,
+            }
+        ]
+
+
+def test_a_venue_transfer_keeps_the_security_its_history_and_its_watermark(db):
+    """Regression: the exchange used to be part of the identity key, so a company
+    moving NYSE -> NASDAQ failed to match and inserted a *second* listed row. That
+    row then captured the ticker's xref period, leaving the company's entire price
+    history unreachable by symbol -- `duk ph ABC` returned nothing — and, having no
+    watermark, caused the next price run to re-download all of it."""
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    security_master.load_securities(db, _VenueFMP("NYSE"))
+    sid = repo.resolve_security_id(db, "ABC")
+    _give_history(db, sid)
+    repo.set_watermark(db, "fmp", PRICE_ENDPOINT, dt.date(2024, 6, 3), sid)
+
+    result = security_master.load_securities(db, _VenueFMP("NASDAQ"))
+
+    # One company, one security_id, now listed on the new venue.
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    assert (
+        db.fetchval(
+            "SELECT exchange_code FROM core.security WHERE security_id = %s", (sid,)
+        )
+        == "NASDAQ"
+    )
+    # A transfer is a refresh, not an arrival.
+    assert result.new_symbols == []
+    # The history and the watermark stay reachable by ticker -- this is the part
+    # that was broken.
+    assert repo.resolve_security_id(db, "ABC") == sid
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id = %s", (sid,)
+        )
+        == 1
+    )
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2024, 6, 3)
+
+
+def test_the_duk_read_path_still_reaches_a_transferred_security(db):
+    from psycopg.rows import dict_row
+
+    from duk.datasource.db import _resolve_security_id
+
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    security_master.load_securities(db, _VenueFMP("NYSE"))
+    sid = repo.resolve_security_id(db, "ABC")
+    _give_history(db, sid)
+    security_master.load_securities(db, _VenueFMP("NASDAQ"))
+
+    with db.conn.cursor(row_factory=dict_row) as cur:
+        assert _resolve_security_id(cur, "ABC") == sid
+
+
+def test_ticker_reuse_after_a_delisting_still_mints_a_new_security(db):
+    """The venue drop must not weaken 0009: the key is still scoped to LISTED rows,
+    so a dead issuer's ticker cannot be overwritten by its next owner."""
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    security_master.load_securities(db, _VenueFMP("NYSE"))
+    dead = repo.resolve_security_id(db, "ABC")
+    _give_history(db, dead)
+    repo.mark_delisted(db, security_id=dead, delisted_date=dt.date(2024, 6, 10))
+
+    security_master.load_securities(db, _VenueFMP("NASDAQ"))
+
+    newcomer = repo.resolve_security_id(db, "ABC")
+    assert newcomer != dead
+    assert db.fetchval("SELECT count(*) FROM core.security") == 2
+    # The dead issuer keeps its history and stays dead.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id = %s", (dead,)
+        )
+        == 1
+    )
+    assert db.fetchval(
+        "SELECT delisted_date FROM core.security WHERE security_id = %s", (dead,)
+    ) == dt.date(2024, 6, 10)

@@ -27,7 +27,7 @@ on enrichment.
 | `primary_symbol` | TEXT NOT NULL | Current/best-known ticker. **Not** an identifier. |
 | `company_name` | TEXT | |
 | `asset_type` | TEXT CHECK | `equity` / `etf` / `fund` / `other`. |
-| `exchange_code` | TEXT → ref.exchange | Listing venue. |
+| `exchange_code` | TEXT → ref.exchange | Current listing venue. Mutable; **not** part of identity — a venue transfer keeps the `security_id`. |
 | `sector_id` | INT → ref.sector | Set during profile enrichment. |
 | `industry_id` | INT → ref.industry | Set during profile enrichment. |
 | `currency` | TEXT | Default `USD`. |
@@ -40,8 +40,13 @@ on enrichment.
 | `source` | TEXT | Origin feed (default `fmp`). |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. |
 
-Soft natural key: `UNIQUE (source, primary_symbol, COALESCE(exchange_code,''))`
-makes the security upsert idempotent without keying on the ticker.
+Soft natural key: `UNIQUE (source, primary_symbol) WHERE delisted_date IS NULL`
+makes the security upsert idempotent without keying on the ticker globally. Scoped
+to *listed* rows (0009) so a reused ticker mints a new `security_id` instead of
+overwriting a dead issuer. The **exchange is deliberately not part of it** (0012):
+it is an attribute of the listing, not the company, so a venue transfer
+(NYSE → NASDAQ) updates the security that already holds the history rather than
+forking it into a second row.
 
 ### `core.symbol_xref` — ticker history / cross-reference
 **Grain:** `(symbol, valid_from)`. **Source:** derived. **Cadence:** on security loads.

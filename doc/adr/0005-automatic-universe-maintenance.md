@@ -98,6 +98,36 @@ Three sub-decisions worth stating:
   or a row for the retired `FB` would stamp a delisting on the live `META` it was
   renamed away from, silently dropping it out of the active price universe.
 
+### Amendment: the venue is not part of a company's identity
+
+Review of this change surfaced a second way the nightly security master could fork
+an identity, latent until it started running nightly. The key from 0003/0009 was
+`(source, primary_symbol, exchange)`, which treats the *listing venue* as part of
+who a company is. It is not: a company moving from NYSE to NASDAQ is the same
+issuer with the same history. But the key changed, so the upsert inserted — and the
+consequences compounded:
+
+- a second **listed** `security_id` appeared for one ticker;
+- `upsert_symbol_xref` **repointed** the ticker's open period to the new, empty row,
+  so the symbol resolved to a security with no bars — `duk ph ABC` returned nothing
+  while years of history sat unreachable on the old id;
+- the new row had no watermark, so the next price run re-downloaded the entire
+  history into it;
+- the old row stayed `is_actively_trading`, so it was polled forever.
+
+Migration 0012 keys a listed security on `(source, primary_symbol)` and lets the
+exchange be the mutable attribute it always was. This is safe because a US ticker is
+unique across the national market system — NYSE, NASDAQ, AMEX, BATS and CBOE do not
+assign one symbol to two issuers — and FMP namespaces foreign venues with a suffix
+(`2958.HK`, `SAP.DE`), so the symbol alone is unambiguous in every universe fafnir
+loads. Ticker *reuse* is still handled by 0009's `WHERE delisted_date IS NULL`,
+which 0012 keeps.
+
+0012 also repairs databases that already forked, using the same rule as the rename
+sweep: an empty duplicate is folded into the row holding the history, and a
+duplicate that carries its own history stops the migration with both ids named,
+because merging two price histories is a human's decision.
+
 ## Consequences
 
 - The nightly job costs one extra screener pass (a few MB) and one small rename

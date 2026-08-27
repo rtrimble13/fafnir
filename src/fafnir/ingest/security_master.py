@@ -238,9 +238,10 @@ def load_securities(
 
         # Snapshot the upsert keys of everything currently listed, so a genuinely
         # new listing can be told from a refresh of one already held. This mirrors
-        # 0009's partial unique index exactly -- (source, symbol, exchange) over
-        # rows with delisted_date IS NULL -- because that index is what decides
-        # whether the upsert below inserts or updates.
+        # the partial unique index exactly -- (source, symbol) over rows with
+        # delisted_date IS NULL -- because that index is what decides whether the
+        # upsert below inserts or updates. The venue is not part of it (0012), so a
+        # company changing exchange is a refresh, not an arrival.
         known = repo.active_security_keys(db)
         new_symbols: list[str] = []
 
@@ -257,10 +258,9 @@ def load_securities(
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
-            key = (symbol, exchange or "")
-            if key not in known:
+            if symbol not in known:
                 new_symbols.append(symbol)
-                known.add(key)
+                known.add(symbol)
             sec_id = repo.upsert_security(
                 db,
                 primary_symbol=symbol,

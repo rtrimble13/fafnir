@@ -87,12 +87,19 @@ def upsert_security(
     cusip: Optional[str] = None,
     source: str = "fmp",
 ) -> int:
-    """Insert/update a security by its (source, primary_symbol, exchange) soft key.
+    """Insert/update a security by its (source, primary_symbol) soft key.
 
     The conflict arbiter is 0009's *partial* index, which covers only rows with
     ``delisted_date IS NULL``. A delisted security is therefore invisible here: a
     reused ticker inserts a new row and mints a new security_id rather than
     overwriting the dead issuer's identity and price history.
+
+    The exchange is deliberately NOT in the key (0012). It is an attribute of the
+    listing, not of the company: keying on it meant a venue transfer (NYSE ->
+    NASDAQ) failed to match and inserted a second listed row for one ticker, which
+    then captured the ticker's xref period and left the company's entire price
+    history unreachable by symbol. A transfer now updates the security that holds
+    the history, the same way a rename does.
 
     Returns the security_id.
     """
@@ -104,11 +111,16 @@ def upsert_security(
              market_cap_usd, beta, ipo_date, delisted_date, cik, isin, cusip,
              source, updated_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-        ON CONFLICT (source, primary_symbol, COALESCE(exchange_code, ''))
+        ON CONFLICT (source, primary_symbol)
             WHERE delisted_date IS NULL
         DO UPDATE SET
             company_name        = EXCLUDED.company_name,
             asset_type          = EXCLUDED.asset_type,
+            -- COALESCE so a caller without the field (enrich_profiles on a profile
+            -- that omits it) cannot blank the venue; otherwise this is what records
+            -- a transfer onto the existing security.
+            exchange_code       = COALESCE(EXCLUDED.exchange_code,
+                                           core.security.exchange_code),
             sector_id           = EXCLUDED.sector_id,
             industry_id         = EXCLUDED.industry_id,
             currency            = EXCLUDED.currency,
@@ -640,19 +652,20 @@ def unapplied_symbol_changes(db: Database, limit: int = 50) -> list[dict]:
     )
 
 
-def active_security_keys(db: Database, source: str = "fmp") -> set[tuple[str, str]]:
-    """Every listed security's upsert key, as (primary_symbol, exchange_code).
+def active_security_keys(db: Database, source: str = "fmp") -> set[str]:
+    """Every listed security's upsert key: its primary_symbol.
 
-    Matches the arbiter of 0009's partial unique index exactly, so a security-master
-    load can tell a genuinely new listing from a refresh of one it already had --
-    without a second round trip per symbol.
+    Matches the arbiter of the partial unique index exactly (0012), so a
+    security-master load can tell a genuinely new listing from a refresh of one it
+    already had -- without a second round trip per symbol. The exchange is not part
+    of it, which is what stops a venue transfer being reported (and stored) as a
+    new listing.
     """
     return {
-        (row["primary_symbol"], row["exchange_code"])
+        row["primary_symbol"]
         for row in db.fetchall(
             """
-            SELECT primary_symbol, COALESCE(exchange_code, '') AS exchange_code
-              FROM core.security
+            SELECT primary_symbol FROM core.security
              WHERE delisted_date IS NULL AND source = %s
             """,
             (source,),
