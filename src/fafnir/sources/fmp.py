@@ -24,8 +24,9 @@ correct feed. See doc/adr/0004-unadjusted-price-feed.md.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from fafnir.logging_config import get_logger
 from fafnir.sources.base import BaseSource, SourceError, payload_hash
@@ -54,11 +55,13 @@ class FMPClient(BaseSource):
     EP_INDUSTRIES = "available-industries"
     EP_SCREENER = "company-screener"
     EP_DELISTED = "delisted-companies"
+    EP_SYMBOL_CHANGE = "symbol-change"
 
     # Screener rows per request. Confirmed to return a full 5000-row page, but
     # 1000 keeps a single page small enough to retry cheaply.
     SCREENER_PAGE_SIZE = 1000
     DELISTED_PAGE_SIZE = 100
+    SYMBOL_CHANGE_PAGE_SIZE = 100
 
     # The historical-price-eod endpoints silently truncate to the most recent 5000
     # bars, ignoring how far back `from` reaches: a 1990-01-01 request for AAPL and
@@ -97,12 +100,19 @@ class FMPClient(BaseSource):
         *,
         page_size: int,
         max_pages: int,
+        key_fields: Sequence[str] = ("symbol",),
     ) -> list[dict]:
         """Accumulate an endpoint's pages until it runs out of rows.
 
-        Stops on an empty page, a short page, or a page whose first symbol
-        repeats the previous one -- that last guard catches a server that
-        ignores ``page`` and would otherwise be re-downloaded ``max_pages`` times.
+        Stops on an empty page, a short page, or a page whose first row repeats
+        the previous page's -- that last guard catches a server that ignores
+        ``page`` and would otherwise be re-downloaded ``max_pages`` times.
+
+        ``key_fields`` names the fields that identify a row on *this* endpoint.
+        It is not decoration: a payload with no ``symbol`` (the rename feed carries
+        ``oldSymbol``/``newSymbol``) would make every page's fingerprint None, the
+        repeat guard would never fire, and an endpoint that ignores ``page`` would
+        be downloaded ``max_pages`` times and its rows counted that many times over.
         """
         out: list[dict] = []
         prev_first: Optional[str] = None
@@ -112,7 +122,7 @@ class FMPClient(BaseSource):
             data, _, _ = self._call(endpoint, merged)
             if not isinstance(data, list) or not data:
                 break
-            first = data[0].get("symbol") if isinstance(data[0], dict) else None
+            first = _row_fingerprint(data[0], key_fields)
             if first is not None and first == prev_first:
                 break
             prev_first = first
@@ -162,6 +172,24 @@ class FMPClient(BaseSource):
             self.EP_DELISTED,
             page_size=self.DELISTED_PAGE_SIZE,
             max_pages=max_pages,
+        )
+
+    def symbol_changes(self, *, max_pages: int = 5) -> list[dict]:
+        """Ticker renames, newest first.
+
+        Rows carry ``date``, ``companyName``, ``oldSymbol`` and ``newSymbol``. Like
+        the delisted feed the list is global, and it carries no exchange -- so the
+        loader filters by whether fafnir tracks the *old* ticker, not by venue.
+
+        ``max_pages`` defaults low for the same reason as the delisted sweep: the
+        nightly run only needs the recent tail, and a full sweep is an explicit
+        choice.
+        """
+        return self._paged(
+            self.EP_SYMBOL_CHANGE,
+            page_size=self.SYMBOL_CHANGE_PAGE_SIZE,
+            max_pages=max_pages,
+            key_fields=("oldSymbol", "newSymbol", "date"),
         )
 
     def profile(self, symbol: str) -> Optional[dict]:
@@ -321,6 +349,21 @@ class FMPClient(BaseSource):
     def industries(self) -> list[str]:
         data, _, _ = self._call(self.EP_INDUSTRIES)
         return _flatten_names(data, "industry")
+
+
+def _row_fingerprint(row: Any, key_fields: Sequence[str]) -> Optional[str]:
+    """Identify a payload row by the fields that name it on its endpoint.
+
+    Falls back to the row's whole sorted content when it carries none of them, so
+    the pagination repeat-guard still has something to compare rather than
+    silently comparing None to None.
+    """
+    if not isinstance(row, dict):
+        return None
+    values = [str(row[f]) for f in key_fields if row.get(f) is not None]
+    if values:
+        return "|".join(values)
+    return json.dumps(row, sort_keys=True, default=str)
 
 
 def _as_date(value: Optional[str]) -> Optional[date]:

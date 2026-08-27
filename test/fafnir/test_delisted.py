@@ -60,6 +60,8 @@ def patched(monkeypatch):
     def resolve(db, symbol, source="fmp"):
         return db.known.get(symbol)
 
+    monkeypatch.setattr(mod.repo, "active_security_for_symbol", resolve)
+
     def mark(db, *, security_id, delisted_date):
         if security_id in db.already_delisted:
             return False
@@ -67,7 +69,6 @@ def patched(monkeypatch):
         db.marked.append((security_id, delisted_date))
         return True
 
-    monkeypatch.setattr(mod.repo, "resolve_security_id", resolve)
     monkeypatch.setattr(mod.repo, "mark_delisted", mark)
     return mod
 

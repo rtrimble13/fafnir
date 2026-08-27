@@ -80,12 +80,21 @@ def load_delisted(
                 # NULL delisted_date would leave it in the active unique index.
                 undated += 1
                 continue
-            sec_id = repo.resolve_security_id(db, symbol)
+            # active_security_for_symbol, NOT resolve_security_id: the read path
+            # deliberately falls back to a ticker a security used to trade under,
+            # so that `duk ph FB` still reaches Meta. Resolving that way here would
+            # be destructive -- the delisted feed reports retired tickers, so a
+            # row for FB (retired by the rename, not by a delisting) would resolve
+            # to the live META security and mark_delisted would flip it off the
+            # active universe permanently, one-way. A delisting may only ever be
+            # stamped on the security *currently* trading under that ticker.
+            sec_id = repo.active_security_for_symbol(db, symbol)
             if sec_id is None:
-                # A name fafnir never tracked. There are no bars to protect, and
-                # inserting it would only add a security with no history, so skip
-                # it -- but count it, because a large number here means the
-                # security master is running behind the delisted feed.
+                # A name fafnir never tracked, or one whose ticker has since moved
+                # to another security. There are no bars to protect, and inserting
+                # it would only add a security with no history, so skip it -- but
+                # count it, because a large number here means the security master
+                # is running behind the delisted feed.
                 continue
             if repo.mark_delisted(db, security_id=sec_id, delisted_date=when):
                 marked += 1

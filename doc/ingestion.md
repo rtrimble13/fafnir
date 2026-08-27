@@ -35,14 +35,17 @@ the Professional plan in the original `duk`.
 
 | Loader | FMP endpoint | Target table(s) | Natural key |
 |---|---|---|---|
-| `ingest securities` | `stock-list`, `etf-list` | `core.security`, `core.symbol_xref` | (source, primary_symbol, exchange) |
+| `ingest securities` | `company-screener` (`stock-list`, `etf-list` for the unfiltered universes) | `core.security`, `core.symbol_xref` | (source, primary_symbol, exchange) |
 | `ingest securities --enrich` | `profile` | `core.security`, `core.company_profile` | security_id |
+| `ingest symbol-changes` | `symbol-change` | `core.security`, `core.symbol_xref`, `core.symbol_change` | (source, old_symbol, new_symbol, change_date) |
+| `ingest delisted` | `delisted-companies` | `core.security`, `core.symbol_xref` | security_id |
 | `ingest prices` | `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
 | `ingest actions` | `splits`, `dividends` | `core.corporate_action` | (security_id, action_type, ex_date) |
 | `adjust` | (derived) | `core.adjustment_factor` | (security_id, effective_date) |
 
-> **Verify before the first production backfill:** the `splits` / `dividends`
-> stable field names (`numerator`/`denominator`, `dividend`/`adjDividend`) should
+> **Verify before the first production backfill:** the `symbol-change` payload
+> field names (`date`, `oldSymbol`, `newSymbol`, `companyName`) and the
+> `splits` / `dividends` stable field names (`numerator`/`denominator`, `dividend`/`adjDividend`) should
 > be confirmed against a live response for a known symbol (e.g. AAPL). The loader
 > already tolerates the common alternates; the endpoint paths are centralized as
 > constants in `FMPClient` for a one-line correction.
@@ -98,14 +101,85 @@ latest ex-date get factor 1.0. This is why adjusted prices are **point-in-time
 stable**: they are a deterministic function of the actions known as of a date, not a
 frozen snapshot. See [adr/0001](adr/0001-raw-prices-plus-adjustment-factors.md).
 
+## Keeping the universe in scope
+
+The security master is **upkeep, not just build**. `scripts/daily_update.sh` runs
+the three universe steps before any market data is pulled, and their order is the
+whole design:
+
+```
+symbol-changes  →  securities  →  delisted  →  prices ...
+   (renames)       (new listings)  (exits)
+```
+
+**New listings.** `ingest securities` re-reads the screener nightly, so an IPO, a
+spin-off or a new ETF enters scope on its listing day. The upsert mints a
+`security_id`; because that security has no `ops.load_watermark` row, the price
+step in the same run leaves its window unbounded and pulls the symbol's whole
+available history (§*Watermarks*). Nothing has to be scheduled per security. The
+loader reports which tickers were new — `Loaded 21412 securities (3 new)` — so the
+nightly log distinguishes a refresh from an arrival.
+
+A venue transfer (NYSE → NASDAQ) is *not* a new listing and does not fork the
+security: the exchange is an attribute of the listing, not part of identity, so the
+transfer updates the company that already holds the history (0012). Because that
+keys a listed security on `(source, symbol)` alone, each security-master update is
+checked for **company-name drift** — a name changing into something unrelated while
+the ticker stays put is what a violated identity assumption would look like. It
+raises an advisory `security_company_name_drift` flag and stores the row anyway;
+see [operations.md](operations.md#monitoring).
+
+**Renames.** A rename reaches the screener as nothing more than a new ticker, and
+that is the trap: no active row matches `(fmp, 'META', 'NASDAQ')`, so the upsert
+mints a *second* `security_id` and the company's bars, corporate actions and price
+watermark stay stranded on the FB row — which no delisting sweep will ever close,
+because a rename is not a delisting, and which is re-polled every night for bars
+that will never come. `ingest symbol-changes` therefore runs **first**, and applies
+the rename to the security that already exists:
+
+- the old ticker's `core.symbol_xref` period is closed the day before the change;
+- a new period opens for the new ticker against the **same** `security_id`;
+- `core.security.primary_symbol` moves across.
+
+One company stays one entity: joins, watermarks and backtests are unaffected, and
+`duk ph FB` still resolves — the old ticker falls through to its closed xref period
+once no live security claims it (see `resolve_security_id`).
+
+Every observed rename fafnir tracks is recorded in `core.symbol_change`, which is
+what makes the nightly sweep idempotent (the same tail is re-read every night) and
+what turns a rename that *cannot* be applied into durable evidence:
+
+| status | meaning |
+|---|---|
+| `applied` | carried onto an existing `security_id` (terminal) |
+| `conflict` | the new ticker already belongs to another **listed** security that carries history — a human decides; retried every sweep |
+| `ignored` | the old ticker belongs to a delisted issuer, so this is ticker *reuse*, not a rename (0009 already handles it) |
+
+A rename for a ticker fafnir does not track is counted and dropped, not recorded:
+the feed is global across every venue, and the audit table is not a copy of it.
+
+If the security master ran before the rename was known and minted the new ticker as
+its own row, the sweep folds that duplicate back in — but only when it is still
+empty (no bars, no actions, no factors). That fold is the one place fafnir deletes
+a security; retention exists so history is never lost, and a stub has none. A
+duplicate that *has* accumulated history is a `conflict` instead: merging two price
+histories is not a decision a loader should make silently.
+
 ## Order of operations (daily)
 
 ```
-ensure-partitions → prices → actions → adjust → refresh-marts → dq run
+ensure-partitions → symbol-changes → securities → delisted →
+prices → actions → adjust → refresh-marts → dq run
 ```
 
-Prices precede actions so dividend adjustment can value against fresh closes.
-`scripts/daily_update.sh` encodes this order.
+The universe is reconciled before any data is pulled, so prices run against what is
+actually trading today. `ingest delisted` keeps its place and its behaviour, with
+one correction the rename step forces: it resolves a feed row through
+`active_security_for_symbol`, not `resolve_security_id`. The read path deliberately
+falls back to a ticker a company used to trade under, and a delisted feed reports
+retired tickers -- so resolving that way would let a row for the retired `FB` stamp
+a one-way delisting on the live `META` security. Prices precede actions so dividend adjustment can value
+against fresh closes. `scripts/daily_update.sh` encodes this order.
 
 ## Watermarks and the endpoint string
 

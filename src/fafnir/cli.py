@@ -215,7 +215,7 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
     fmp = _fmp_client(cfg)
     universe = universe or cfg.universe
     with Database(cfg.dsn) as database:
-        n = security_master.load_securities(
+        result = security_master.load_securities(
             database, fmp, universe=universe, include_etfs=not no_etfs, limit=limit
         )
         if enrich:
@@ -228,9 +228,21 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
             ]
             security_master.enrich_profiles(database, fmp, syms)
     click.echo(
-        f"Loaded {n} securities. FMP requests: {fmp.request_count}, "
-        f"bytes: {fmp.bytes_downloaded}"
+        f"Loaded {result.total} securities ({len(result.new_symbols)} new). "
+        f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}"
     )
+    if result.new_symbols:
+        shown = ", ".join(result.new_symbols[:25])
+        more = (
+            ""
+            if len(result.new_symbols) <= 25
+            else f", +{len(result.new_symbols) - 25} more"
+        )
+        click.echo(f"New to the universe: {shown}{more}")
+        click.echo(
+            "Their price history loads on the next `fafnir ingest prices` "
+            "(no watermark yet -- the first pull is a full backfill)."
+        )
 
 
 @ingest.command("prices")
@@ -275,6 +287,40 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
         f"Loaded {n} price rows for {len(syms)} symbols. "
         f"FMP bytes: {fmp.bytes_downloaded}"
     )
+
+
+@ingest.command("symbol-changes")
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Sweep the entire rename feed instead of only its recent tail",
+)
+@click.pass_context
+def ingest_symbol_changes(ctx, full):
+    """Apply ticker renames to the securities that already hold the history.
+
+    Run this BEFORE `ingest securities`: to the screener a renamed ticker looks
+    like a new listing, and minting it as one forks the company's identity.
+    """
+    from fafnir.ingest import symbol_changes
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    with Database(cfg.dsn) as database:
+        counts = symbol_changes.load_symbol_changes(
+            database, fmp, max_pages=500 if full else 5
+        )
+    click.echo(
+        f"Applied {counts['applied']} renames "
+        f"({counts['folded']} duplicate stubs folded), "
+        f"{counts['conflict']} conflicts, {counts['skipped']} already applied, "
+        f"{counts['unknown']} not in the master. FMP bytes: {fmp.bytes_downloaded}"
+    )
+    if counts["conflict"]:
+        click.echo(
+            "Conflicts need a human: the new ticker already belongs to another "
+            "listed security with its own history. See `fafnir status`."
+        )
 
 
 @ingest.command("delisted")
@@ -417,13 +463,24 @@ def status(ctx):
         open_flags = database.fetchval(
             "SELECT count(*) FROM ops.data_quality_flag WHERE resolved_at IS NULL"
         )
+        new_listings = repo.count_recent_listings(database, days=7)
+        pending_renames = repo.count_unapplied_symbol_changes(database)
+        rename_sample = repo.unapplied_symbol_changes(database, limit=10)
     click.echo(
         f"Securities : {counts.get('securities', 0)} "
         f"(active {counts.get('active', 0)}, delisted {counts.get('delisted', 0)})"
     )
+    click.echo(f"New (7d)   : {new_listings}")
     click.echo(f"Price rows : {price_rows}  (latest {latest})")
     click.echo(f"Actions    : {actions}")
     click.echo(f"Open DQ    : {open_flags}")
+    if pending_renames:
+        click.echo(f"Renames    : {pending_renames} unapplied (need review)")
+        for row in rename_sample:
+            click.echo(
+                f"             {row['old_symbol']} -> {row['new_symbol']} "
+                f"({row['change_date']}, {row['status']})"
+            )
 
 
 if __name__ == "__main__":

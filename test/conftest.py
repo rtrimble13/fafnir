@@ -54,9 +54,9 @@ def db(migrated_dsn):
     with Database(migrated_dsn, autocommit=True) as database:
         database.execute("""
             TRUNCATE core.daily_price, core.corporate_action, core.adjustment_factor,
-                     core.symbol_xref, core.company_profile, core.security,
-                     ops.data_quality_flag, ops.ingestion_run, ops.load_watermark,
-                     landing.fmp_raw
+                     core.symbol_xref, core.symbol_change, core.company_profile,
+                     core.security, ops.data_quality_flag, ops.ingestion_run,
+                     ops.load_watermark, landing.fmp_raw
             RESTART IDENTITY CASCADE
             """)
         yield database

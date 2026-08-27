@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Any, Optional, Sequence
+from typing import Any, NamedTuple, Optional, Sequence
 
 from fafnir.db.connection import Database
 
@@ -87,12 +87,19 @@ def upsert_security(
     cusip: Optional[str] = None,
     source: str = "fmp",
 ) -> int:
-    """Insert/update a security by its (source, primary_symbol, exchange) soft key.
+    """Insert/update a security by its (source, primary_symbol) soft key.
 
     The conflict arbiter is 0009's *partial* index, which covers only rows with
     ``delisted_date IS NULL``. A delisted security is therefore invisible here: a
     reused ticker inserts a new row and mints a new security_id rather than
     overwriting the dead issuer's identity and price history.
+
+    The exchange is deliberately NOT in the key (0012). It is an attribute of the
+    listing, not of the company: keying on it meant a venue transfer (NYSE ->
+    NASDAQ) failed to match and inserted a second listed row for one ticker, which
+    then captured the ticker's xref period and left the company's entire price
+    history unreachable by symbol. A transfer now updates the security that holds
+    the history, the same way a rename does.
 
     Returns the security_id.
     """
@@ -104,11 +111,16 @@ def upsert_security(
              market_cap_usd, beta, ipo_date, delisted_date, cik, isin, cusip,
              source, updated_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-        ON CONFLICT (source, primary_symbol, COALESCE(exchange_code, ''))
+        ON CONFLICT (source, primary_symbol)
             WHERE delisted_date IS NULL
         DO UPDATE SET
             company_name        = EXCLUDED.company_name,
             asset_type          = EXCLUDED.asset_type,
+            -- COALESCE so a caller without the field (enrich_profiles on a profile
+            -- that omits it) cannot blank the venue; otherwise this is what records
+            -- a transfer onto the existing security.
+            exchange_code       = COALESCE(EXCLUDED.exchange_code,
+                                           core.security.exchange_code),
             sector_id           = EXCLUDED.sector_id,
             industry_id         = EXCLUDED.industry_id,
             currency            = EXCLUDED.currency,
@@ -213,13 +225,22 @@ def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> boo
     )
     if row is None:
         return False
+    # GREATEST, not `AND valid_from <= delisted_date`. That guard skipped any period
+    # starting after the delisting instead of closing it, which was unreachable while
+    # every period began at '1900-01-01' -- but a renamed security's current period
+    # begins on its rename date, so a delisting backdated before that rename would
+    # leave the ticker OPEN on a dead issuer. The next company to list under it then
+    # loses the resolution race: XREF_RESOLVE_SQL orders open periods by valid_from
+    # DESC, so the dead issuer's later-starting period wins and the newcomer's bars
+    # are attributed to a company that no longer exists. Clamping closes every open
+    # period while still satisfying CHECK (valid_to >= valid_from).
     db.execute(
         """
         UPDATE core.symbol_xref
-           SET valid_to = %s
-         WHERE security_id = %s AND valid_to IS NULL AND valid_from <= %s
+           SET valid_to = GREATEST(valid_from, %s::date)
+         WHERE security_id = %s AND valid_to IS NULL
         """,
-        (delisted_date, security_id, delisted_date),
+        (delisted_date, security_id),
     )
     return True
 
@@ -266,17 +287,409 @@ PRIMARY_RESOLVE_SQL = (
     "ORDER BY (source = %s) DESC, (delisted_date IS NULL) DESC, security_id ASC "
     "LIMIT 1"
 )
+# Last resort: a ticker whose period is CLOSED and which is nobody's current
+# primary_symbol -- i.e. a name a company traded under before it was renamed. Once
+# FB becomes META, "FB" is no longer open in the xref and no longer any security's
+# primary_symbol, so without this a rename would make the old ticker address
+# nothing at all and `duk ph FB` would answer "unknown symbol" about a company
+# whose history is right there. Reached only after the two queries above fail, so
+# a live owner of the ticker (reuse) and a delisted issuer still win over it.
+HISTORICAL_XREF_RESOLVE_SQL = (
+    "SELECT security_id FROM core.symbol_xref "
+    "WHERE symbol = %s AND valid_to IS NOT NULL "
+    "ORDER BY valid_to DESC, valid_from DESC LIMIT 1"
+)
 
 
 def resolve_security_id(
     db: Database, symbol: str, source: str = "fmp"
 ) -> Optional[int]:
-    """Resolve a ticker to a security_id via the current xref, falling back to primary_symbol."""
+    """Resolve a ticker to a security_id: current xref, then primary_symbol, then a
+    ticker the security used to trade under."""
     val = db.fetchval(XREF_RESOLVE_SQL, (symbol,))
     if val is not None:
         return int(val)
     val = db.fetchval(PRIMARY_RESOLVE_SQL, (symbol, source))
+    if val is not None:
+        return int(val)
+    val = db.fetchval(HISTORICAL_XREF_RESOLVE_SQL, (symbol,))
     return int(val) if val is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Symbol changes (ticker renames)
+# ---------------------------------------------------------------------------
+
+# Outcomes of apply_symbol_change. These are the values stored in
+# core.symbol_change.status (0011), plus UNKNOWN, which is deliberately *not*
+# stored: the rename feed is global across every venue, so most of its rows are
+# for tickers this warehouse has never tracked and recording them would grow an
+# audit table of other people's renames.
+CHANGE_APPLIED = "applied"
+CHANGE_CONFLICT = "conflict"
+CHANGE_IGNORED = "ignored"
+CHANGE_UNKNOWN = "unknown"
+
+# Statuses that need no further attempt. A conflict is retried on every sweep:
+# it usually means the rename feed lagged the screener, and the collision clears
+# itself once the duplicate is resolved.
+TERMINAL_CHANGE_STATUSES = (CHANGE_APPLIED, CHANGE_IGNORED)
+
+
+class SymbolChangeOutcome(NamedTuple):
+    """What :func:`apply_symbol_change` did.
+
+    ``folded_security_id`` is set when a duplicate security minted under the new
+    ticker (by a security-master load that ran before the rename was known) was
+    absorbed into the surviving one.
+    """
+
+    status: str
+    security_id: Optional[int]
+    folded_security_id: Optional[int] = None
+
+
+def active_security_for_symbol(
+    db: Database, symbol: str, source: str = "fmp"
+) -> Optional[int]:
+    """Resolve a ticker to a *currently listed* security_id, or None.
+
+    Deliberately narrower than :func:`resolve_security_id`, which falls back to
+    delisted rows so dead names stay addressable for research. A rename must never
+    be applied to a delisted issuer: a ticker that reappears under a dead company's
+    symbol is ticker *reuse*, and resurrecting that row is precisely what 0009
+    exists to prevent.
+    """
+    val = db.fetchval(
+        """
+        SELECT x.security_id
+          FROM core.symbol_xref x
+          JOIN core.security s ON s.security_id = x.security_id
+         WHERE x.symbol = %s AND x.valid_to IS NULL AND s.delisted_date IS NULL
+         ORDER BY x.is_primary DESC, x.valid_from DESC
+         LIMIT 1
+        """,
+        (symbol,),
+    )
+    if val is not None:
+        return int(val)
+    val = db.fetchval(
+        """
+        SELECT security_id FROM core.security
+         WHERE primary_symbol = %s AND delisted_date IS NULL
+         ORDER BY (source = %s) DESC, security_id ASC
+         LIMIT 1
+        """,
+        (symbol, source),
+    )
+    return int(val) if val is not None else None
+
+
+def security_has_history(db: Database, security_id: int) -> bool:
+    """True if anything irreplaceable hangs off this security_id.
+
+    "History" is the data a delete would destroy: bars, corporate actions, and the
+    factors derived from them. Attributes (name, sector, market cap) do not count
+    -- the next security-master load rewrites them from the source anyway.
+    """
+    return bool(
+        db.fetchval(
+            """
+            SELECT EXISTS (SELECT 1 FROM core.daily_price      WHERE security_id = %s)
+                OR EXISTS (SELECT 1 FROM core.corporate_action WHERE security_id = %s)
+                OR EXISTS (SELECT 1 FROM core.adjustment_factor WHERE security_id = %s)
+            """,
+            (security_id, security_id, security_id),
+        )
+    )
+
+
+def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bool:
+    """Absorb a history-free duplicate security into the one that owns the history.
+
+    The only thing this is for: the security-master load saw the new ticker before
+    the rename feed reported it, so it minted a bare row -- no bars, no actions, no
+    factors, nothing but attributes the next load rewrites. Two rows for one
+    company is a data error, and the duplicate is the one with nothing in it.
+
+    This is the *sole* place fafnir deletes a security, and it refuses unless
+    :func:`security_has_history` says the row is empty. Retaining rows is about not
+    losing history (survivorship bias); a stub has none to lose. Returns False --
+    changing nothing -- when the guard rejects the fold.
+    """
+    if victim_id == survivor_id or security_has_history(db, victim_id):
+        return False
+    # Soft references first (no FK, so nothing enforces this order but us).
+    db.execute(
+        "UPDATE ops.data_quality_flag SET security_id = %s WHERE security_id = %s",
+        (survivor_id, victim_id),
+    )
+    db.execute("DELETE FROM ops.load_watermark WHERE security_id = %s", (victim_id,))
+    # Then the real FKs.
+    db.execute(
+        "UPDATE core.symbol_change SET security_id = %s WHERE security_id = %s",
+        (survivor_id, victim_id),
+    )
+    db.execute("DELETE FROM core.symbol_xref WHERE security_id = %s", (victim_id,))
+    db.execute("DELETE FROM core.company_profile WHERE security_id = %s", (victim_id,))
+    db.execute("DELETE FROM core.security WHERE security_id = %s", (victim_id,))
+    return True
+
+
+def retarget_symbol(
+    db: Database,
+    *,
+    security_id: int,
+    old_symbol: str,
+    new_symbol: str,
+    change_date: date,
+    company_name: Optional[str] = None,
+    source: str = "fmp",
+) -> None:
+    """Move a listed security from one ticker to another, keeping its identity.
+
+    Idempotent: re-running closes an already-closed period to the same date and
+    re-opens the same xref row. The old ticker's period ends the day *before* the
+    change so the two periods are contiguous and never both open -- point-in-time
+    resolution (XREF_RESOLVE_SQL) reads only open periods, so an overlap would make
+    the ticker ambiguous on the changeover day.
+    """
+    db.execute(
+        """
+        UPDATE core.symbol_xref
+           SET valid_to = GREATEST(valid_from, %s::date - 1)
+         WHERE security_id = %s AND symbol = %s AND valid_to IS NULL
+        """,
+        (change_date, security_id, old_symbol),
+    )
+    upsert_symbol_xref(
+        db,
+        security_id=security_id,
+        symbol=new_symbol,
+        valid_from=change_date,
+        source=source,
+    )
+    db.execute(
+        """
+        UPDATE core.security
+           SET primary_symbol = %s,
+               company_name   = COALESCE(%s, company_name),
+               updated_at     = now()
+         WHERE security_id = %s AND delisted_date IS NULL
+        """,
+        (new_symbol, company_name, security_id),
+    )
+
+
+def apply_symbol_change(
+    db: Database,
+    *,
+    old_symbol: str,
+    new_symbol: str,
+    change_date: date,
+    company_name: Optional[str] = None,
+    source: str = "fmp",
+) -> SymbolChangeOutcome:
+    """Carry one ticker rename onto the security that already exists.
+
+    Without this, a rename reaches the warehouse as a *new listing*: the screener
+    reports the new ticker, no active row matches it, and the upsert mints a second
+    security_id -- stranding the company's bars, actions and price watermark on the
+    old row, which no delisting sweep will ever close because a rename is not a
+    delisting. Applying the rename to the existing security_id is what keeps one
+    company one entity across the change.
+
+    Outcomes:
+      * ``applied``  -- the rename is now reflected in core.security and the xref.
+      * ``conflict`` -- the new ticker already belongs to a different *listed*
+        security that carries history. Merging two price histories is not a
+        decision a loader should make silently, so nothing is changed.
+      * ``ignored``  -- the old ticker belongs to a delisted issuer. That is ticker
+        reuse, not a rename, and 0009 already handles it by minting a new id.
+      * ``unknown``  -- the old ticker is not in the security master at all, and
+        neither is the new one. Retryable: the security master may catch up.
+    """
+    old_symbol = (old_symbol or "").strip().upper()
+    new_symbol = (new_symbol or "").strip().upper()
+    if not old_symbol or not new_symbol or old_symbol == new_symbol:
+        return SymbolChangeOutcome(CHANGE_IGNORED, None)
+
+    security_id = active_security_for_symbol(db, old_symbol, source)
+    if security_id is None:
+        # Tell "we track this name, but it is dead" apart from "never heard of it".
+        # The first is ticker reuse and is terminal.
+        if db.fetchval(
+            "SELECT 1 FROM core.security WHERE primary_symbol = %s "
+            "AND delisted_date IS NOT NULL LIMIT 1",
+            (old_symbol,),
+        ):
+            return SymbolChangeOutcome(CHANGE_IGNORED, None)
+        # The old ticker is gone but the new one is ours: the end state this rename
+        # asks for already holds, however it got there -- an earlier sweep, or an
+        # operator resolving a conflict by hand. Saying so (rather than "unknown")
+        # is what lets a conflict leave the review queue: a non-terminal audit row
+        # can only be closed by a later sweep reaching a terminal outcome.
+        already = active_security_for_symbol(db, new_symbol, source)
+        if already is not None:
+            return SymbolChangeOutcome(CHANGE_APPLIED, already)
+        # Neither ticker is ours. Retryable: the security master may catch up.
+        return SymbolChangeOutcome(CHANGE_UNKNOWN, None)
+
+    folded: Optional[int] = None
+    holder = active_security_for_symbol(db, new_symbol, source)
+    if holder is not None and holder != security_id:
+        if not fold_empty_security(db, victim_id=holder, survivor_id=security_id):
+            return SymbolChangeOutcome(CHANGE_CONFLICT, security_id)
+        folded = holder
+
+    retarget_symbol(
+        db,
+        security_id=security_id,
+        old_symbol=old_symbol,
+        new_symbol=new_symbol,
+        change_date=change_date,
+        company_name=company_name,
+        source=source,
+    )
+    return SymbolChangeOutcome(CHANGE_APPLIED, security_id, folded)
+
+
+def symbol_change_status(
+    db: Database,
+    *,
+    old_symbol: str,
+    new_symbol: str,
+    change_date: date,
+    source: str = "fmp",
+) -> Optional[str]:
+    """Status this rename was last recorded with, or None if it is new to us."""
+    return db.fetchval(
+        """
+        SELECT status FROM core.symbol_change
+         WHERE source = %s AND old_symbol = %s AND new_symbol = %s AND change_date = %s
+        """,
+        (source, old_symbol, new_symbol, change_date),
+    )
+
+
+def record_symbol_change(
+    db: Database,
+    *,
+    old_symbol: str,
+    new_symbol: str,
+    change_date: date,
+    status: str,
+    security_id: Optional[int] = None,
+    company_name: Optional[str] = None,
+    detail: Optional[dict] = None,
+    source: str = "fmp",
+) -> None:
+    """Write the audit row for one observed rename.
+
+    The DO UPDATE is guarded so a terminal status can never be downgraded: once a
+    rename is applied, a later sweep re-reading the same feed row must not rewrite
+    it as a conflict because the ticker it now points at is legitimately taken.
+    """
+    import json
+
+    db.execute(
+        """
+        INSERT INTO core.symbol_change
+            (old_symbol, new_symbol, change_date, security_id, company_name,
+             status, detail, source, first_seen_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now(), now())
+        ON CONFLICT (source, old_symbol, new_symbol, change_date) DO UPDATE SET
+            security_id  = COALESCE(EXCLUDED.security_id, core.symbol_change.security_id),
+            company_name = COALESCE(EXCLUDED.company_name, core.symbol_change.company_name),
+            status       = EXCLUDED.status,
+            detail       = EXCLUDED.detail,
+            updated_at   = now()
+        WHERE core.symbol_change.status <> ALL(%s)
+        """,
+        (
+            old_symbol,
+            new_symbol,
+            change_date,
+            security_id,
+            company_name,
+            status,
+            json.dumps(detail, default=str) if detail is not None else None,
+            source,
+            # psycopg adapts a list to a PostgreSQL array; the public constant
+            # stays a tuple so callers cannot mutate it.
+            list(TERMINAL_CHANGE_STATUSES),
+        ),
+    )
+
+
+def count_unapplied_symbol_changes(db: Database) -> int:
+    """How many renames are awaiting a decision.
+
+    Separate from :func:`unapplied_symbol_changes` because that one returns a
+    capped page for display: reporting its length as the queue size would pin the
+    count at the limit and hide a growing backlog.
+    """
+    return (
+        db.fetchval(
+            "SELECT count(*) FROM core.symbol_change WHERE status = %s",
+            (CHANGE_CONFLICT,),
+        )
+        or 0
+    )
+
+
+def unapplied_symbol_changes(db: Database, limit: int = 50) -> list[dict]:
+    """A page of renames awaiting a decision -- the review queue for `fafnir status`."""
+    return db.fetchall(
+        """
+        SELECT old_symbol, new_symbol, change_date, status, security_id
+          FROM core.symbol_change
+         WHERE status = %s
+         ORDER BY change_date DESC
+         LIMIT %s
+        """,
+        (CHANGE_CONFLICT, limit),
+    )
+
+
+def listed_securities(db: Database, source: str = "fmp") -> dict[str, dict]:
+    """Every listed security, keyed by the symbol the upsert arbitrates on.
+
+    The key matches the partial unique index exactly (0012), so a security-master
+    load can tell a genuinely new listing from a refresh of one it already had --
+    without a second round trip per symbol. The exchange is not part of it, which
+    is what stops a venue transfer being reported (and stored) as a new listing.
+
+    The value carries the identity attributes that the same load then needs in
+    order to notice when an *update* looks like it landed on the wrong company --
+    see :func:`fafnir.ingest.security_master.check_company_name_drift`. Both uses
+    come out of this one query.
+    """
+    return {
+        row["primary_symbol"]: {
+            "security_id": row["security_id"],
+            "company_name": row["company_name"],
+        }
+        for row in db.fetchall(
+            """
+            SELECT security_id, primary_symbol, company_name FROM core.security
+             WHERE delisted_date IS NULL AND source = %s
+            """,
+            (source,),
+        )
+    }
+
+
+def count_recent_listings(db: Database, days: int = 7) -> int:
+    """Securities that entered scope in the last ``days`` days."""
+    return (
+        db.fetchval(
+            "SELECT count(*) FROM core.security "
+            "WHERE first_seen_at >= now() - make_interval(days => %s)",
+            (days,),
+        )
+        or 0
+    )
 
 
 # ---------------------------------------------------------------------------

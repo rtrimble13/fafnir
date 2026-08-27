@@ -5,11 +5,14 @@ from __future__ import annotations
 import pytest
 
 from fafnir.ingest.security_master import (
+    COMPANY_NAME_DRIFT_RATIO,
     SCREENER_EXCHANGES,
     SourceError,
     _is_us,
     _norm_exchange,
+    _normalize_company_name,
     _us_entries,
+    company_name_similarity,
 )
 
 
@@ -126,3 +129,51 @@ def test_us_entries_allows_an_empty_result_when_etfs_are_excluded():
     # Not an error: the venue answered, the rows were US, --no-etfs removed them.
     spy = {"symbol": "SPY", "exchangeShortName": "AMEX", "isEtf": True}
     assert _us_entries(_FakeFMP({"AMEX": [spy]}), include_etfs=False) == []
+
+
+# ---------------------------------------------------------------------------
+# Company-name drift: the safety net under 0012's identity key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stored,incoming",
+    [
+        # Pure styling churn between feed revisions.
+        ("Apple Inc.", "Apple Inc"),
+        ("Apple, Inc.", "Apple Inc."),
+        ("The Walt Disney Company", "Walt Disney Co"),
+        ("Alphabet Inc. Class A", "Alphabet Inc."),
+        ("JPMorgan Chase & Co.", "JPMorgan Chase and Co"),
+        # A rebrand that extends or trims the name is still one company.
+        ("Meta Platforms", "Meta Platforms, Inc."),
+        # Nothing to compare against.
+        (None, "Acme Corp"),
+        ("", "Acme Corp"),
+        ("Acme Corp", None),
+    ],
+)
+def test_company_name_similarity_has_no_opinion_on_restyling(stored, incoming):
+    assert company_name_similarity(stored, incoming) is None
+
+
+@pytest.mark.parametrize(
+    "stored,incoming",
+    [
+        ("Acme Corporation", "Zebra Industries Inc"),
+        ("Circuit City Stores, Inc.", "The Chemours Company"),
+        ("Apple Inc.", "Microsoft Corporation"),
+    ],
+)
+def test_company_name_similarity_scores_unrelated_names_below_the_threshold(
+    stored, incoming
+):
+    ratio = company_name_similarity(stored, incoming)
+    assert ratio is not None
+    assert ratio < COMPANY_NAME_DRIFT_RATIO, (stored, incoming, ratio)
+
+
+def test_noise_stripping_keeps_the_identifying_words():
+    # "co" as a standalone token is boilerplate; inside a word it is not.
+    assert _normalize_company_name("The Coca-Cola Company") == "coca cola"
+    assert _normalize_company_name("Ford Motor Co.") == "ford motor"
