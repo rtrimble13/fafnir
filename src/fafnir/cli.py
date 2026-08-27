@@ -464,7 +464,8 @@ def status(ctx):
             "SELECT count(*) FROM ops.data_quality_flag WHERE resolved_at IS NULL"
         )
         new_listings = repo.count_recent_listings(database, days=7)
-        pending_renames = repo.unapplied_symbol_changes(database)
+        pending_renames = repo.count_unapplied_symbol_changes(database)
+        rename_sample = repo.unapplied_symbol_changes(database, limit=10)
     click.echo(
         f"Securities : {counts.get('securities', 0)} "
         f"(active {counts.get('active', 0)}, delisted {counts.get('delisted', 0)})"
@@ -474,8 +475,8 @@ def status(ctx):
     click.echo(f"Actions    : {actions}")
     click.echo(f"Open DQ    : {open_flags}")
     if pending_renames:
-        click.echo(f"Renames    : {len(pending_renames)} unapplied (need review)")
-        for row in pending_renames[:10]:
+        click.echo(f"Renames    : {pending_renames} unapplied (need review)")
+        for row in rename_sample:
             click.echo(
                 f"             {row['old_symbol']} -> {row['new_symbol']} "
                 f"({row['change_date']}, {row['status']})"

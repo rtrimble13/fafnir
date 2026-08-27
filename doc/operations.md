@@ -83,10 +83,18 @@ SELECT old_symbol, new_symbol, change_date, detail FROM core.symbol_change
 ```
 
 Resolve it by deciding which `security_id` is the company: move the bars off the
-duplicate (or accept it as a separate entity), then re-run
-`fafnir ingest symbol-changes`, which retries every non-applied row. A duplicate
-that holds *no* prices, actions or factors needs no decision — the sweep folds it
-into the surviving security by itself and says so in the log.
+duplicate (or retire the stale row with a `delisted_date`), then re-run
+`fafnir ingest symbol-changes`, which retries every non-applied row. The next sweep
+is what clears the queue — it reaches a terminal outcome (`applied` if the new
+ticker is now the company's, `ignored` if the old ticker now belongs to a retired
+row) and the entry disappears from `fafnir status`. A duplicate that holds *no*
+prices, actions or factors needs no decision at all — the sweep folds it into the
+surviving security by itself and says so in the log.
+
+The `symbol_change_conflict` DQ flag is raised on the night a conflict is first
+seen, not on each nightly retry, so one unresolved rename does not inflate the
+open-flag count night after night. `core.symbol_change` is the durable queue; the
+flag is only the notification.
 
 ## Monitoring
 

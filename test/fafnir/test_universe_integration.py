@@ -517,3 +517,155 @@ def test_nightly_sweep_flags_a_conflict_for_review(db):
     assert [r["new_symbol"] for r in repo.unapplied_symbol_changes(db)] == ["META"]
     # Nothing moved: both securities keep their tickers and their history.
     assert db.fetchval("SELECT count(*) FROM core.security") == 2
+
+
+# ---------------------------------------------------------------------------
+# The rename fallback must not reach the write paths
+# ---------------------------------------------------------------------------
+
+
+def test_a_retired_ticker_cannot_delist_the_security_it_was_renamed_away_from(db):
+    """Regression: the delisted feed reports retired tickers, and FB is retired by
+    the rename. Resolving it through the read path's historical fallback would
+    stamp a one-way delisting on the live META security and drop it out of the
+    active price universe for good."""
+    from fafnir.ingest.delisted import load_delisted
+
+    sid = _mk_security(db, "FB", name="Facebook, Inc.")
+    _give_history(db, sid)
+    repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    class _DelistedFMP:
+        bytes_downloaded = 0
+
+        def delisted_companies(self, *, max_pages=5):
+            return [
+                {
+                    "symbol": "FB",
+                    "exchange": "NASDAQ",
+                    "delistedDate": CHANGE_DATE.isoformat(),
+                }
+            ]
+
+    marked, _seen = load_delisted(db, _DelistedFMP())
+
+    assert marked == 0
+    row = db.fetchone(
+        "SELECT primary_symbol, is_actively_trading, delisted_date "
+        "FROM core.security WHERE security_id = %s",
+        (sid,),
+    )
+    assert row["is_actively_trading"] is True
+    assert row["delisted_date"] is None
+    # The read path still reaches the company by its former ticker; only the
+    # write path is narrowed.
+    assert repo.resolve_security_id(db, "FB") == sid
+    assert repo.active_security_for_symbol(db, "FB") is None
+
+
+def test_delisting_still_marks_a_security_trading_under_its_own_ticker(db):
+    from fafnir.ingest.delisted import load_delisted
+
+    sid = _mk_security(db, "DEAD", exchange="NYSE")
+
+    class _DelistedFMP:
+        bytes_downloaded = 0
+
+        def delisted_companies(self, *, max_pages=5):
+            return [
+                {"symbol": "DEAD", "exchange": "NYSE", "delistedDate": "2024-06-10"}
+            ]
+
+    marked, seen = load_delisted(db, _DelistedFMP())
+
+    assert (marked, seen) == (1, 1)
+    assert db.fetchval(
+        "SELECT delisted_date FROM core.security WHERE security_id = %s", (sid,)
+    ) == dt.date(2024, 6, 10)
+
+
+# ---------------------------------------------------------------------------
+# The review queue has to be able to empty
+# ---------------------------------------------------------------------------
+
+
+def test_a_conflict_resolved_by_retiring_the_stale_row_leaves_the_queue(db):
+    """A non-terminal audit row can only be closed by a later sweep reaching a
+    terminal outcome, so every way an operator can resolve a conflict has to end
+    in one -- otherwise `fafnir status` shows it forever with nothing able to
+    clear it."""
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    fb = _mk_security(db, "FB")
+    _give_history(db, fb)
+    _give_history(db, _mk_security(db, "META"), close=200)
+    feed = _RenameFMP([{"date": "2024-06-10", "oldSymbol": "FB", "newSymbol": "META"}])
+
+    assert load_symbol_changes(db, feed)["conflict"] == 1
+    assert repo.count_unapplied_symbol_changes(db) == 1
+
+    # The operator decides the duplicate is the real Meta and retires the stale row.
+    repo.mark_delisted(db, security_id=fb, delisted_date=dt.date(2024, 6, 10))
+
+    # FB now belongs to a delisted issuer, which is terminal: nothing left to apply.
+    assert load_symbol_changes(db, feed)["ignored"] == 1
+    assert repo.count_unapplied_symbol_changes(db) == 0
+
+
+def test_a_conflict_resolved_by_merging_leaves_the_queue(db):
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    fb = _mk_security(db, "FB")
+    meta = _mk_security(db, "META")
+    _give_history(db, meta, close=200)
+    feed = _RenameFMP([{"date": "2024-06-10", "oldSymbol": "FB", "newSymbol": "META"}])
+
+    assert load_symbol_changes(db, feed)["conflict"] == 1
+
+    # The operator merges the other way: the FB row was the empty one.
+    assert repo.fold_empty_security(db, victim_id=fb, survivor_id=meta) is True
+
+    # The end state the rename asked for now holds, however it got there -- and
+    # saying so is what releases the audit row.
+    counts = load_symbol_changes(db, feed)
+    assert counts["applied"] == 1
+    assert repo.count_unapplied_symbol_changes(db) == 0
+    assert repo.unapplied_symbol_changes(db) == []
+
+
+def test_an_unresolved_conflict_is_flagged_once_not_once_a_night(db):
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    _give_history(db, _mk_security(db, "FB"))
+    _give_history(db, _mk_security(db, "META"), close=200)
+    feed = _RenameFMP([{"date": "2024-06-10", "oldSymbol": "FB", "newSymbol": "META"}])
+
+    for _ in range(3):  # three nightly sweeps, one unresolved problem
+        load_symbol_changes(db, feed)
+
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag "
+            "WHERE check_name = 'symbol_change_conflict'"
+        )
+        == 1
+    )
+    # Still in the durable queue, though -- the flag is the notification, the
+    # audit row is the state.
+    assert repo.count_unapplied_symbol_changes(db) == 1
+
+
+def test_the_queue_count_is_not_capped_by_the_display_page(db):
+    for i in range(55):
+        repo.record_symbol_change(
+            db,
+            old_symbol=f"OLD{i}",
+            new_symbol=f"NEW{i}",
+            change_date=CHANGE_DATE,
+            status=repo.CHANGE_CONFLICT,
+        )
+
+    assert repo.count_unapplied_symbol_changes(db) == 55
+    assert len(repo.unapplied_symbol_changes(db)) == 50  # a page, by design

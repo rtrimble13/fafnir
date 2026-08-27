@@ -59,7 +59,10 @@ symbol-changes  →  securities  →  delisted  →  prices → actions → adju
    today enters scope today. It reports which tickers were new. A newly minted
    security has no watermark, so the price step in the same run pulls its whole
    available history with no extra scheduling.
-3. **`fafnir ingest delisted`** is unchanged, and still runs before prices.
+3. **`fafnir ingest delisted`** keeps its place before prices. Its one change is
+   forced by the resolution fallback below: it resolves a feed row through
+   `active_security_for_symbol`, so a retired ticker can never stamp a one-way
+   delisting on the live security that ticker was renamed away from.
 
 Renames go first *because* of the trap above: run the security master first and it
 mints the duplicate before the rename can be applied to the original.
@@ -89,7 +92,11 @@ Three sub-decisions worth stating:
   xref period, after the open period and after `primary_symbol` — so a reused
   ticker still resolves to its live owner, a delisted name still resolves to itself,
   and `duk ph FB` reaches the company whose history it is. `duk.datasource.db`
-  carries the same three queries, as it must.
+  carries the same three queries, as it must. That fallback belongs to the **read**
+  path: a loader that writes a one-way flag keyed on a ticker from a global feed —
+  the delisting sweep — must resolve through `active_security_for_symbol` instead,
+  or a row for the retired `FB` would stamp a delisting on the live `META` it was
+  renamed away from, silently dropping it out of the active price universe.
 
 ## Consequences
 

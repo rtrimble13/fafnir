@@ -194,6 +194,21 @@ def test_conflicts_are_flagged_and_left_unapplied(patched):
     assert db.audit[0]["status"] == CHANGE_CONFLICT
 
 
+def test_a_known_conflict_is_not_re_flagged_every_sweep(patched):
+    # add_dq_flag is an unguarded insert and conflicts are retried by design, so
+    # the flag has to be tied to *seeing* the conflict, not to retrying it.
+    db = _FakeDB(
+        outcomes={("AAA", "BBB"): SymbolChangeOutcome(CHANGE_CONFLICT, 3)},
+        recorded={("AAA", "BBB", date(2026, 6, 9)): CHANGE_CONFLICT},
+    )
+    fmp = _FakeFMP([{"date": "2026-06-09", "oldSymbol": "AAA", "newSymbol": "BBB"}])
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert counts["conflict"] == 1  # still retried
+    assert db.flags == []  # but not re-announced
+
+
 def test_conflicts_are_retried_on_the_next_sweep(patched):
     # A conflict usually means the feed lagged the screener; it can clear itself,
     # so it must not be treated as terminal the way `applied` is.

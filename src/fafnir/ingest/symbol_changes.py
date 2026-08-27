@@ -173,9 +173,19 @@ def load_symbol_changes(
                 detail=detail,
             )
 
-            if outcome.status == repo.CHANGE_CONFLICT:
+            if (
+                outcome.status == repo.CHANGE_CONFLICT
+                and recorded != repo.CHANGE_CONFLICT
+            ):
                 # Two live securities claiming one ticker, both with history. A
                 # human decides; the flag is how they find out.
+                #
+                # Only on the night the conflict is first seen. Conflicts are
+                # retried on every sweep by design, and add_dq_flag is an
+                # unguarded insert -- flagging each retry would add an unresolved
+                # flag per night for one unresolved problem, inflating the open-DQ
+                # count until it says nothing. core.symbol_change is the durable
+                # queue; the flag is the notification.
                 repo.add_dq_flag(
                     db,
                     check_name="symbol_change_conflict",

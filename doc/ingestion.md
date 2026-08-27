@@ -164,7 +164,12 @@ prices → actions → adjust → refresh-marts → dq run
 ```
 
 The universe is reconciled before any data is pulled, so prices run against what is
-actually trading today. Prices precede actions so dividend adjustment can value
+actually trading today. `ingest delisted` keeps its place and its behaviour, with
+one correction the rename step forces: it resolves a feed row through
+`active_security_for_symbol`, not `resolve_security_id`. The read path deliberately
+falls back to a ticker a company used to trade under, and a delisted feed reports
+retired tickers -- so resolving that way would let a row for the retired `FB` stamp
+a one-way delisting on the live `META` security. Prices precede actions so dividend adjustment can value
 against fresh closes. `scripts/daily_update.sh` encodes this order.
 
 ## Watermarks and the endpoint string

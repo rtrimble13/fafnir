@@ -485,7 +485,8 @@ def apply_symbol_change(
         decision a loader should make silently, so nothing is changed.
       * ``ignored``  -- the old ticker belongs to a delisted issuer. That is ticker
         reuse, not a rename, and 0009 already handles it by minting a new id.
-      * ``unknown``  -- the old ticker is not in the security master at all.
+      * ``unknown``  -- the old ticker is not in the security master at all, and
+        neither is the new one. Retryable: the security master may catch up.
     """
     old_symbol = (old_symbol or "").strip().upper()
     new_symbol = (new_symbol or "").strip().upper()
@@ -495,14 +496,22 @@ def apply_symbol_change(
     security_id = active_security_for_symbol(db, old_symbol, source)
     if security_id is None:
         # Tell "we track this name, but it is dead" apart from "never heard of it".
-        # The first is ticker reuse and is terminal; the second may simply mean the
-        # security master has not caught up, so it stays retryable.
+        # The first is ticker reuse and is terminal.
         if db.fetchval(
             "SELECT 1 FROM core.security WHERE primary_symbol = %s "
             "AND delisted_date IS NOT NULL LIMIT 1",
             (old_symbol,),
         ):
             return SymbolChangeOutcome(CHANGE_IGNORED, None)
+        # The old ticker is gone but the new one is ours: the end state this rename
+        # asks for already holds, however it got there -- an earlier sweep, or an
+        # operator resolving a conflict by hand. Saying so (rather than "unknown")
+        # is what lets a conflict leave the review queue: a non-terminal audit row
+        # can only be closed by a later sweep reaching a terminal outcome.
+        already = active_security_for_symbol(db, new_symbol, source)
+        if already is not None:
+            return SymbolChangeOutcome(CHANGE_APPLIED, already)
+        # Neither ticker is ours. Retryable: the security master may catch up.
         return SymbolChangeOutcome(CHANGE_UNKNOWN, None)
 
     folded: Optional[int] = None
@@ -592,8 +601,24 @@ def record_symbol_change(
     )
 
 
+def count_unapplied_symbol_changes(db: Database) -> int:
+    """How many renames are awaiting a decision.
+
+    Separate from :func:`unapplied_symbol_changes` because that one returns a
+    capped page for display: reporting its length as the queue size would pin the
+    count at the limit and hide a growing backlog.
+    """
+    return (
+        db.fetchval(
+            "SELECT count(*) FROM core.symbol_change WHERE status = %s",
+            (CHANGE_CONFLICT,),
+        )
+        or 0
+    )
+
+
 def unapplied_symbol_changes(db: Database, limit: int = 50) -> list[dict]:
-    """Renames still awaiting a decision -- the review queue for `fafnir status`."""
+    """A page of renames awaiting a decision -- the review queue for `fafnir status`."""
     return db.fetchall(
         """
         SELECT old_symbol, new_symbol, change_date, status, security_id
