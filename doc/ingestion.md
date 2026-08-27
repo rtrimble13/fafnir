@@ -120,6 +120,15 @@ available history (§*Watermarks*). Nothing has to be scheduled per security. Th
 loader reports which tickers were new — `Loaded 21412 securities (3 new)` — so the
 nightly log distinguishes a refresh from an arrival.
 
+A venue transfer (NYSE → NASDAQ) is *not* a new listing and does not fork the
+security: the exchange is an attribute of the listing, not part of identity, so the
+transfer updates the company that already holds the history (0012). Because that
+keys a listed security on `(source, symbol)` alone, each security-master update is
+checked for **company-name drift** — a name changing into something unrelated while
+the ticker stays put is what a violated identity assumption would look like. It
+raises an advisory `security_company_name_drift` flag and stores the row anyway;
+see [operations.md](operations.md#monitoring).
+
 **Renames.** A rename reaches the screener as nothing more than a new ticker, and
 that is the trap: no active row matches `(fmp, 'META', 'NASDAQ')`, so the upsert
 mints a *second* `security_id` and the company's bars, corporate actions and price

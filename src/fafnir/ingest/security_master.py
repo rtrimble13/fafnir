@@ -26,6 +26,9 @@ like a new listing, and minting it as one forks the company's identity. See
 
 from __future__ import annotations
 
+import re
+import unicodedata
+from difflib import SequenceMatcher
 from math import isfinite
 from typing import Iterable, NamedTuple, Optional
 
@@ -67,6 +70,107 @@ SECURITY_NUMERIC_LIMITS = {
     "market_cap_usd": 10 ** (24 - 2),
     "beta": 10 ** (12 - 6),
 }
+
+
+# Below this similarity, an incoming company name is treated as naming a DIFFERENT
+# company rather than a restyling of the same one. 0.6 is deliberately permissive:
+# the cost of a false positive is one advisory flag a human glances at, while the
+# cost of a false negative is the failure this check exists to catch going unseen.
+COMPANY_NAME_DRIFT_RATIO = 0.6
+
+# Corporate-form and share-class boilerplate. These tokens churn between feed
+# revisions ("Apple Inc." / "Apple Inc" / "Apple, Inc.") without the company having
+# changed, so comparing them would produce noise, not signal.
+_COMPANY_NAME_NOISE = re.compile(
+    r"\b("
+    r"inc|incorporated|corp|corporation|co|company|cos|ltd|limited|llc|llp|lp|plc|"
+    r"sa|sab|nv|ag|se|spa|holding|holdings|group|trust|the|and|class|common|stock|"
+    r"share|shares|ordinary|depositary|receipt|receipts|unit|units|series|new"
+    r")\b"
+)
+
+
+def _normalize_company_name(name: Optional[str]) -> str:
+    """Reduce a vendor company name to the part that identifies the company.
+
+    Accents are folded first: FMP spells foreign names both ways ("Societe
+    Generale" / "Société Générale"), and without folding the accented characters
+    are simply dropped as punctuation, which drags an obviously-identical pair down
+    toward the drift threshold instead of leaving it well clear of it.
+    """
+    folded = unicodedata.normalize("NFKD", name or "")
+    ascii_only = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9 ]+", " ", ascii_only.casefold())
+    return " ".join(_COMPANY_NAME_NOISE.sub(" ", text).split())
+
+
+def company_name_similarity(old: Optional[str], new: Optional[str]) -> Optional[float]:
+    """How alike two company names are once styling is stripped, or None if the
+    question does not apply (either side empty, or one contains the other).
+
+    ``None`` means "no opinion", not "identical": a missing stored name gives
+    nothing to compare, and a name that merely grew or shrank ("Meta Platforms" ->
+    "Meta Platforms, Inc.") is the same company by any reading.
+    """
+    a, b = _normalize_company_name(old), _normalize_company_name(new)
+    if not a or not b or a == b or a in b or b in a:
+        return None
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def check_company_name_drift(
+    db: Database,
+    *,
+    symbol: str,
+    security_id: int,
+    stored_name: Optional[str],
+    incoming_name: Optional[str],
+    run: RunLog,
+) -> bool:
+    """Flag an update whose new company name does not look like the old one.
+
+    This is the safety net under 0012's identity key. That key assumes at most one
+    *listed* security per (source, symbol) -- true across the US national market
+    system, where a ticker is assigned to one issuer, and true of FMP's suffixed
+    foreign symbols. If the assumption were ever violated, the second company's row
+    would silently UPDATE the first's instead of inserting, and its bars would
+    attach to the wrong security_id. The tell is the company name changing into
+    something unrelated while the ticker stays put.
+
+    Advisory, not authoritative: a genuine same-ticker rebrand trips it too. So it
+    is a ``warn`` that lands in the review queue, the row is still stored, and the
+    run is NOT marked partial -- nothing here says the data is bad, only that a
+    human should look. It does not repeat nightly either: the upsert immediately
+    below stores the new name, so the next run compares like with like.
+
+    Returns True when a flag was raised.
+    """
+    ratio = company_name_similarity(stored_name, incoming_name)
+    if ratio is None or ratio >= COMPANY_NAME_DRIFT_RATIO:
+        return False
+    logger.warning(
+        "%s: company name changed from %r to %r (similarity %.2f) with no rename "
+        "to explain it -- verify this is one company, not two sharing a ticker",
+        symbol,
+        stored_name,
+        incoming_name,
+        ratio,
+    )
+    repo.add_dq_flag(
+        db,
+        check_name="security_company_name_drift",
+        severity="warn",
+        security_id=security_id,
+        table_name="core.security",
+        record_key={"symbol": symbol},
+        detail={
+            "stored_name": stored_name,
+            "incoming_name": incoming_name,
+            "similarity": round(ratio, 3),
+        },
+        ingestion_run_id=run.run_id,
+    )
+    return True
 
 
 class SecurityLoadResult(NamedTuple):
@@ -242,7 +346,7 @@ def load_securities(
         # delisted_date IS NULL -- because that index is what decides whether the
         # upsert below inserts or updates. The venue is not part of it (0012), so a
         # company changing exchange is a refresh, not an arrival.
-        known = repo.active_security_keys(db)
+        listed = repo.listed_securities(db)
         new_symbols: list[str] = []
 
         count = 0
@@ -258,13 +362,26 @@ def load_securities(
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
-            if symbol not in known:
+            company_name = entry.get("name") or entry.get("companyName")
+            previous = listed.get(symbol)
+            if previous is None:
                 new_symbols.append(symbol)
-                known.add(symbol)
+            else:
+                # An update, so there is a stored name to compare against. This is
+                # the one moment both names exist -- the upsert below overwrites
+                # the old one.
+                check_company_name_drift(
+                    db,
+                    symbol=symbol,
+                    security_id=previous["security_id"],
+                    stored_name=previous["company_name"],
+                    incoming_name=company_name,
+                    run=run,
+                )
             sec_id = repo.upsert_security(
                 db,
                 primary_symbol=symbol,
-                company_name=entry.get("name") or entry.get("companyName"),
+                company_name=company_name,
                 asset_type=asset_type,
                 exchange_code=exchange,
                 country=entry.get("country"),
@@ -275,6 +392,10 @@ def load_securities(
                 beta=nums["beta"],
             )
             repo.upsert_symbol_xref(db, security_id=sec_id, symbol=symbol)
+            # Keep the snapshot current so a symbol repeated within one run (the
+            # bulk-list universes can repeat; the screener path dedups upstream)
+            # is a refresh, not a second arrival.
+            listed[symbol] = {"security_id": sec_id, "company_name": company_name}
             count += 1
             run.rows_inserted = count
             # Batched, unlike the price and action loaders: there is no network

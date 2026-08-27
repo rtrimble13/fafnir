@@ -128,6 +128,19 @@ sweep: an empty duplicate is folded into the row holding the history, and a
 duplicate that carries its own history stops the migration with both ids named,
 because merging two price histories is a human's decision.
 
+The residual risk of that key is stated plainly: if two *listed* securities from one
+source ever did share a symbol, the second would silently UPDATE the first and its
+bars would attach to the wrong `security_id`. That risk is accepted, but not left
+silent. Every security-master update now compares the incoming company name against
+the stored one and raises an advisory `security_company_name_drift` flag when the
+two do not look like the same company, which is what such a collision would look
+like from the outside. It is deliberately a `warn` rather than an error: a genuine
+same-ticker rebrand trips it too, so it is a queue a human reads, not a load that
+fails. The alternative — keying on a vendor-independent identifier (CUSIP/ISIN/CIK)
+— remains the right long-term answer, and is blocked only by FMP serving those
+fields solely from the per-symbol `profile` endpoint rather than the bulk screener
+the nightly load uses.
+
 ## Consequences
 
 - The nightly job costs one extra screener pass (a few MB) and one small rename

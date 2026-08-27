@@ -378,16 +378,16 @@ def test_new_listing_has_no_watermark_so_its_first_pull_is_a_backfill(db):
     assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) is None
 
 
-def test_active_security_keys_ignores_delisted_rows(db):
+def test_listed_securities_ignores_delisted_rows(db):
     sid = _mk_security(db, "AAA")
     # The key is the symbol alone (0012); the venue is an attribute, so that a
     # company changing exchange is a refresh rather than a new listing.
-    assert "AAA" in repo.active_security_keys(db)
+    assert "AAA" in repo.listed_securities(db)
 
     repo.mark_delisted(db, security_id=sid, delisted_date=dt.date(2024, 1, 2))
     # A delisted row is invisible to the partial index, so the same ticker
     # listing again is genuinely new -- and must be reported as such.
-    assert "AAA" not in repo.active_security_keys(db)
+    assert "AAA" not in repo.listed_securities(db)
     assert _load(db, ["AAA"]).new_symbols == ["AAA"]
     assert db.fetchval("SELECT count(*) FROM core.security") == 2
 
@@ -807,3 +807,122 @@ def test_ticker_reuse_after_a_delisting_still_mints_a_new_security(db):
     assert db.fetchval(
         "SELECT delisted_date FROM core.security WHERE security_id = %s", (dead,)
     ) == dt.date(2024, 6, 10)
+
+
+# ---------------------------------------------------------------------------
+# The safety net under 0012's identity key
+# ---------------------------------------------------------------------------
+
+
+class _NamedFMP:
+    """Screener stub that can change a symbol's company name between runs."""
+
+    bytes_downloaded = 0
+    request_count = 0
+
+    def __init__(self, name, symbol="ABC", venue="NASDAQ"):
+        self.name = name
+        self.symbol = symbol
+        self.venue = venue
+
+    def company_screener(self, *, exchange=None, **_kw):
+        if exchange != self.venue:
+            return []
+        return [
+            {
+                "symbol": self.symbol,
+                "exchangeShortName": self.venue,
+                "name": self.name,
+                "isEtf": False,
+            }
+        ]
+
+
+def _drift_flags(db):
+    return db.fetchall(
+        "SELECT security_id, record_key, detail, severity FROM ops.data_quality_flag "
+        "WHERE check_name = 'security_company_name_drift'"
+    )
+
+
+def test_an_unrelated_company_name_on_a_held_ticker_is_flagged(db):
+    """0012 keys a listed security on (source, symbol), which assumes one issuer
+    per ticker. If that were ever violated the second company would silently
+    UPDATE the first rather than insert. The tell is the name changing into
+    something unrelated while the ticker stays put."""
+    security_master.load_securities(db, _NamedFMP("Acme Corporation"))
+    sid = repo.resolve_security_id(db, "ABC")
+    _give_history(db, sid)
+
+    security_master.load_securities(db, _NamedFMP("Zebra Industries Inc"))
+
+    flags = _drift_flags(db)
+    assert len(flags) == 1
+    assert flags[0]["security_id"] == sid
+    assert flags[0]["severity"] == "warn"
+    assert flags[0]["record_key"] == {"symbol": "ABC"}
+    assert flags[0]["detail"]["stored_name"] == "Acme Corporation"
+    assert flags[0]["detail"]["incoming_name"] == "Zebra Industries Inc"
+    # Advisory only: the row is still stored and the run is not marked partial.
+    assert (
+        db.fetchval(
+            "SELECT company_name FROM core.security WHERE security_id = %s", (sid,)
+        )
+        == "Zebra Industries Inc"
+    )
+    assert (
+        db.fetchval(
+            "SELECT status FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+        )
+        == "success"
+    )
+
+
+def test_restyling_the_same_company_name_is_not_flagged(db):
+    # The feed churns corporate-form boilerplate between revisions; that must not
+    # produce a flag a human then has to dismiss every time.
+    security_master.load_securities(db, _NamedFMP("Apple Inc."))
+    for restyled in ("Apple Inc", "Apple, Inc.", "Apple Incorporated"):
+        security_master.load_securities(db, _NamedFMP(restyled))
+
+    assert _drift_flags(db) == []
+
+
+def test_a_new_listing_is_never_flagged_for_drift(db):
+    # There is no stored name to drift from on the run that mints the security.
+    result = security_master.load_securities(db, _NamedFMP("Acme Corporation"))
+
+    assert result.new_symbols == ["ABC"]
+    assert _drift_flags(db) == []
+
+
+def test_the_drift_flag_does_not_repeat_every_night(db):
+    # add_dq_flag is an unguarded insert, so a check that kept firing would add an
+    # unresolved flag per night for one problem. The upsert stores the new name, so
+    # the next run compares like with like.
+    security_master.load_securities(db, _NamedFMP("Acme Corporation"))
+    for _ in range(3):
+        security_master.load_securities(db, _NamedFMP("Zebra Industries Inc"))
+
+    assert len(_drift_flags(db)) == 1
+
+
+def test_a_rename_does_not_trip_the_drift_check(db):
+    # The rename sweep moves company_name across with the ticker, so the next
+    # security-master run sees the name it just stored.
+    security_master.load_securities(db, _NamedFMP("Facebook, Inc.", symbol="FB"))
+    sid = repo.resolve_security_id(db, "FB")
+    repo.apply_symbol_change(
+        db,
+        old_symbol="FB",
+        new_symbol="META",
+        change_date=CHANGE_DATE,
+        company_name="Meta Platforms, Inc.",
+    )
+
+    security_master.load_securities(
+        db, _NamedFMP("Meta Platforms, Inc.", symbol="META")
+    )
+
+    assert repo.resolve_security_id(db, "META") == sid
+    assert _drift_flags(db) == []

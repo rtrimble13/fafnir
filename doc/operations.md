@@ -113,6 +113,27 @@ scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 ```
 
 Things to watch:
+- **Company-name drift** — `security_company_name_drift` flags in
+  `ops.data_quality_flag`. The security master keys a listed security on
+  `(source, symbol)` (0012), which assumes one issuer per ticker. This check is the
+  safety net under that assumption: if two listed companies ever shared a symbol,
+  the second would silently *update* the first instead of inserting, and the tell
+  is the company name changing into something unrelated while the ticker stays put.
+  ```sql
+  SELECT security_id, record_key ->> 'symbol' AS symbol,
+         detail ->> 'stored_name' AS was, detail ->> 'incoming_name' AS now,
+         detail ->> 'similarity'  AS score, detected_at
+    FROM ops.data_quality_flag
+   WHERE check_name = 'security_company_name_drift' AND resolved_at IS NULL
+   ORDER BY detected_at DESC;
+  ```
+  It is **advisory**: a genuine same-ticker rebrand (Google → Alphabet) trips it
+  too, as does a vendor switching to an abbreviation (International Business
+  Machines → IBM). Confirm the `security_id` still describes one company — the
+  price history either continues sensibly across the name change or it does not —
+  then resolve the flag. Escalate only if two different issuers really are sharing
+  the ticker, which would mean the identity assumption is wrong for your universe.
+  The flag is raised once, on the night the name changes, not nightly.
 - **Unapplied renames** — the `Renames` line in `fafnir status`. Each one is a
   company whose identity is currently split across two `security_id`s.
 - **New listings** — the `New (7d)` line. A week of zero on a working FMP key means

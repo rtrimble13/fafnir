@@ -652,20 +652,27 @@ def unapplied_symbol_changes(db: Database, limit: int = 50) -> list[dict]:
     )
 
 
-def active_security_keys(db: Database, source: str = "fmp") -> set[str]:
-    """Every listed security's upsert key: its primary_symbol.
+def listed_securities(db: Database, source: str = "fmp") -> dict[str, dict]:
+    """Every listed security, keyed by the symbol the upsert arbitrates on.
 
-    Matches the arbiter of the partial unique index exactly (0012), so a
-    security-master load can tell a genuinely new listing from a refresh of one it
-    already had -- without a second round trip per symbol. The exchange is not part
-    of it, which is what stops a venue transfer being reported (and stored) as a
-    new listing.
+    The key matches the partial unique index exactly (0012), so a security-master
+    load can tell a genuinely new listing from a refresh of one it already had --
+    without a second round trip per symbol. The exchange is not part of it, which
+    is what stops a venue transfer being reported (and stored) as a new listing.
+
+    The value carries the identity attributes that the same load then needs in
+    order to notice when an *update* looks like it landed on the wrong company --
+    see :func:`fafnir.ingest.security_master.check_company_name_drift`. Both uses
+    come out of this one query.
     """
     return {
-        row["primary_symbol"]
+        row["primary_symbol"]: {
+            "security_id": row["security_id"],
+            "company_name": row["company_name"],
+        }
         for row in db.fetchall(
             """
-            SELECT primary_symbol FROM core.security
+            SELECT security_id, primary_symbol, company_name FROM core.security
              WHERE delisted_date IS NULL AND source = %s
             """,
             (source,),
