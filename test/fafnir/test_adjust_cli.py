@@ -47,7 +47,7 @@ def test_a_handful_of_failures_still_exits_zero(runner, monkeypatch):
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {"securities": 999, "failed": 1},
+        lambda db, security_id=None: {"securities": 999, "failed": 1, "aborted": False},
     )
 
     result = _invoke(runner)
@@ -68,7 +68,11 @@ def test_a_universe_wide_failure_exits_nonzero(runner, monkeypatch):
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {"securities": 0, "failed": 21106},
+        lambda db, security_id=None: {
+            "securities": 0,
+            "failed": 21106,
+            "aborted": False,
+        },
     )
 
     result = _invoke(runner)
@@ -93,3 +97,17 @@ def test_an_unknown_symbol_is_an_error_not_the_whole_universe(runner, monkeypatc
     assert result.exit_code != 0
     assert "Unknown symbol AAPL" in result.output
     assert not called, "a mistyped ticker must not recompute the universe"
+
+
+def test_an_early_abort_exits_nonzero(runner, monkeypatch):
+    """The run stopped itself; the exit code has to say so."""
+    monkeypatch.setattr(
+        adjustments,
+        "adjust_all",
+        lambda db, security_id=None: {"securities": 0, "failed": 50, "aborted": True},
+    )
+
+    result = _invoke(runner)
+
+    assert result.exit_code != 0
+    assert "Stopped after the first 50" in result.output

@@ -259,8 +259,9 @@ fafnir dq run
 single bad security costs that security instead of the whole run. If more than 1% of
 the universe fails it exits non-zero instead — at that scale it is the schema, the
 grants or a lock, not the data, and a run that wrote no factors must not report
-success. Anything it skipped or found implausible is flagged rather than silently
-dropped:
+success. If the first 50 securities fail without a single success it stops there,
+rather than grinding through the universe writing an error flag per security.
+Anything it skipped or found implausible is flagged rather than silently dropped:
 
 ```sql
 -- securities whose recompute failed. They keep the factors from their last

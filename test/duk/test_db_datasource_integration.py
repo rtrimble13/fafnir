@@ -94,7 +94,7 @@ def test_db_price_history_raw_and_adjusted(db):
 
 
 def test_db_adjusted_volume_above_int64_does_not_crash(db):
-    # Adjusted volume can exceed int64 (the view is numeric(38,0) for that reason);
+    # Adjusted volume can exceed int64 (the view keeps it unconstrained for that reason);
     # the read must not OverflowError on astype("int64").
     repo.ensure_exchange(db, "NASDAQ", "Nasdaq", "US")
     sid = repo.upsert_security(

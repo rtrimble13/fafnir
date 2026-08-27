@@ -138,10 +138,11 @@ def price_history(
     for col in ("open", "high", "low", "close"):
         if col in df.columns:
             df[col] = df[col].astype(float)
-    # Volume stays integer to match the live path's int64 dtype (the adjusted
-    # view returns numeric(38,0), so coerce Decimal/int -> int64). Adjusted volume
-    # can legitimately exceed int64 (that's why the view is numeric(38,0)); fall
-    # back to exact Python ints (object dtype) rather than overflow-crashing.
+    # Volume stays integer to match the live path's int64 dtype (the adjusted view
+    # rounds to whole shares as unconstrained numeric, so coerce Decimal/int ->
+    # int64). Adjusted volume can legitimately exceed int64 -- a deep forward-split
+    # history back-adjusts volume by the cumulative split ratio -- so fall back to
+    # exact Python ints (object dtype) rather than overflow-crashing.
     if "volume" in df.columns:
         try:
             df["volume"] = df["volume"].astype("int64")

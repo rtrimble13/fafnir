@@ -398,6 +398,12 @@ def adjust(ctx, symbol):
         "newest corporate actions are not reflected. Flagged as 'adjustment_failed' "
         "in ops.data_quality_flag; see `fafnir status`."
     )
+    if result["aborted"]:
+        raise click.ClickException(
+            f"Stopped after the first {result['failed']} securities all failed without "
+            "a single success. Check that migrations are applied "
+            "(`fafnir db status`) and read the flags before re-running."
+        )
     attempted = result["securities"] + result["failed"]
     if result["failed"] > adjustments.SYSTEMIC_FAILURE_RATIO * attempted:
         # Not bad data at this scale -- the schema, the grants or a lock. Exiting 0

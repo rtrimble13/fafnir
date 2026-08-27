@@ -127,8 +127,58 @@ def test_adjust_all_commits_each_security_and_survives_a_bad_one(monkeypatch):
     db = _FakeDB()
     result = adj.adjust_all(db)
 
-    assert result == {"securities": 2, "failed": 1}
+    assert result == {"securities": 2, "failed": 1, "aborted": False}
     # Security 1's factors are durable even though 2 blew up after them, and 3 was
     # still computed after the failure.
     assert db.durable == ["factors:1", "flag:adjustment_failed:2", "factors:3"]
     assert db.rollbacks == 1
+
+
+def test_adjust_all_stops_once_it_is_clear_nothing_will_succeed(monkeypatch):
+    """A systemic failure is not worth 21,106 error flags.
+
+    With the migration unapplied (or a lock on the table) every security fails for
+    the same reason. Grinding through the universe writes one committed
+    `adjustment_failed` flag per security, which buries the genuine flags and
+    permanently inflates the open-flag count `fafnir status` reports.
+    """
+    monkeypatch.setattr(
+        adj.repo, "securities_with_actions", lambda db: list(range(500))
+    )
+
+    def always_fails(db, security_id):
+        raise ValueError("numeric field overflow")
+
+    monkeypatch.setattr(adj, "compute_for_security", always_fails)
+    monkeypatch.setattr(
+        adj.repo, "add_dq_flag", lambda db, **kw: db.write(f"flag:{kw['security_id']}")
+    )
+
+    db = _FakeDB()
+    result = adj.adjust_all(db)
+
+    assert result["aborted"] is True
+    assert result["failed"] == adj.EARLY_ABORT_FAILURES
+    assert len(db.durable) == adj.EARLY_ABORT_FAILURES
+
+
+def test_one_late_success_keeps_the_run_going(monkeypatch):
+    """The abort is only for a run that has not managed a single success."""
+    monkeypatch.setattr(
+        adj.repo, "securities_with_actions", lambda db: list(range(200))
+    )
+
+    def flaky(db, security_id):
+        if security_id % 2:
+            raise ValueError("bad data")
+        db.write(f"factors:{security_id}")
+
+    monkeypatch.setattr(adj, "compute_for_security", flaky)
+    monkeypatch.setattr(adj.repo, "add_dq_flag", lambda db, **kw: None)
+
+    db = _FakeDB()
+    result = adj.adjust_all(db)
+
+    assert result["aborted"] is False
+    assert result["securities"] == 100
+    assert result["failed"] == 100

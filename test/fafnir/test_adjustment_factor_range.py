@@ -188,7 +188,7 @@ def test_adjust_all_steps_over_a_security_it_cannot_compute(db, monkeypatch):
 
     result = adjustments.adjust_all(db)
 
-    assert result == {"securities": 1, "failed": 1}
+    assert result == {"securities": 1, "failed": 1, "aborted": False}
     assert _factors(db, good), "the healthy security kept its factors"
     assert not _factors(db, bad)
     assert "adjustment_failed" in _flags(db, bad)

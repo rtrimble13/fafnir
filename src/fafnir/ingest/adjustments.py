@@ -72,6 +72,13 @@ EXTREME_FACTOR = Decimal("1e12")
 # while writing nothing; below it, a few bad securities are flagged and stepped over.
 SYSTEMIC_FAILURE_RATIO = 0.01
 
+# ...and when it is systemic, the run should not grind through 21,000 securities to
+# find that out. Failing this many in a row without a single success means nothing
+# after them will succeed either, and continuing would write one committed
+# `adjustment_failed` flag per security -- burying the genuine flags and inflating
+# the open-flag count `fafnir status` reports, permanently.
+EARLY_ABORT_FAILURES = 50
+
 
 def compute_for_security(db: Database, security_id: int) -> list[dict]:
     """Compute (and persist) adjustment factors for one security. Returns the rows."""
@@ -200,7 +207,7 @@ def _flag_if_extreme(db: Database, security_id: int, factors: list[dict]) -> Non
 def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
     """Recompute factors for one security or every security with actions.
 
-    Returns ``{"securities": recomputed, "failed": failed}``.
+    Returns ``{"securities": recomputed, "failed": failed, "aborted": bool}``.
 
     One security's failure costs that security, not the run. Before this, the whole
     universe was recomputed inside a single transaction with no commit boundary, so
@@ -220,11 +227,12 @@ def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
     if security_id is not None:
         compute_for_security(db, security_id)
         db.commit()
-        return {"securities": 1, "failed": 0}
+        return {"securities": 1, "failed": 0, "aborted": False}
 
     ids = repo.securities_with_actions(db)
     done = 0
     failed = 0
+    aborted = False
     for sid in ids:
         try:
             compute_for_security(db, sid)
@@ -248,7 +256,18 @@ def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
             except Exception:  # flagging is best-effort
                 db.rollback()
                 logger.warning("Could not flag the failure for security %d", sid)
+            if done == 0 and failed >= EARLY_ABORT_FAILURES:
+                aborted = True
+                logger.error(
+                    "Stopping: the first %d securities all failed without a single "
+                    "success. That is the schema, the grants or a lock, not the data.",
+                    failed,
+                )
+                break
     logger.info(
-        "Recomputed adjustment factors for %d securities (%d failed)", done, failed
+        "Recomputed adjustment factors for %d securities (%d failed%s)",
+        done,
+        failed,
+        ", stopped early" if aborted else "",
     )
-    return {"securities": done, "failed": failed}
+    return {"securities": done, "failed": failed, "aborted": aborted}
