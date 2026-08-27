@@ -669,3 +669,34 @@ def test_the_queue_count_is_not_capped_by_the_display_page(db):
 
     assert repo.count_unapplied_symbol_changes(db) == 55
     assert len(repo.unapplied_symbol_changes(db)) == 50  # a page, by design
+
+
+def test_a_delisting_closes_a_renamed_tickers_period_even_if_backdated(db):
+    """Regression: `mark_delisted` used to skip periods starting after the
+    delisting date. That was unreachable while every period began at 1900-01-01,
+    but a rename starts one on the change date -- so a delisting backdated before
+    the rename left the ticker open on a dead issuer, and the next company to list
+    under it lost the resolution race (open periods order by valid_from DESC)."""
+    dead = _mk_security(db, "ABC", name="Old Co")
+    repo.apply_symbol_change(
+        db, old_symbol="ABC", new_symbol="XYZ", change_date=CHANGE_DATE
+    )
+    # The delisted feed reports it with a date before the rename.
+    repo.mark_delisted(
+        db, security_id=dead, delisted_date=CHANGE_DATE - dt.timedelta(days=40)
+    )
+
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.symbol_xref WHERE security_id = %s AND valid_to IS NULL",
+            (dead,),
+        )
+        == 0
+    )
+
+    # A different company lists under the freed ticker.
+    newcomer = _mk_security(db, "XYZ", name="New Co")
+    _give_history(db, newcomer)
+
+    assert repo.resolve_security_id(db, "XYZ") == newcomer
+    assert repo.active_security_for_symbol(db, "XYZ") == newcomer

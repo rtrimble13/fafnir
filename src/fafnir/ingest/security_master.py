@@ -50,6 +50,15 @@ SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
 # purely a durability boundary, not a rate limit.
 COMMIT_EVERY = 500
 
+# New listings in one nightly load beyond which the run says so loudly. A handful a
+# night is the steady state; hundreds means something structural -- most often the
+# first nightly run on a deployment built with `--limit`, where the rest of the
+# universe arrives at once. That matters because none of them has a price watermark,
+# so the very next `ingest prices` asks each for its FULL history: a screener refresh
+# costing a few MB can queue a multi-hour, multi-GB price backfill against the
+# 50 GB/month budget. Better to warn than to have it discovered in the bandwidth bill.
+LARGE_NEW_LISTING_BATCH = 100
+
 # A NUMERIC(p, s) column cannot hold a value >= 10 ** (p - s); these precisions are
 # 0010's, on core.security. FMP occasionally returns an absurd magnitude, and
 # psycopg raises NumericValueOutOfRange -- which once aborted a 21k-symbol run at
@@ -292,6 +301,15 @@ def load_securities(
                 else ""
             ),
         )
+        if len(new_symbols) >= LARGE_NEW_LISTING_BATCH:
+            logger.warning(
+                "%d securities are new to the master this run. None has a price "
+                "watermark, so the next `fafnir ingest prices` will pull FULL "
+                "history for every one of them -- expect a long run and a large "
+                "download. If this is the first nightly run on a universe built "
+                "with --limit, consider `scripts/initial_backfill.sh` instead.",
+                len(new_symbols),
+            )
         return SecurityLoadResult(count, new_symbols)
 
 

@@ -213,13 +213,22 @@ def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> boo
     )
     if row is None:
         return False
+    # GREATEST, not `AND valid_from <= delisted_date`. That guard skipped any period
+    # starting after the delisting instead of closing it, which was unreachable while
+    # every period began at '1900-01-01' -- but a renamed security's current period
+    # begins on its rename date, so a delisting backdated before that rename would
+    # leave the ticker OPEN on a dead issuer. The next company to list under it then
+    # loses the resolution race: XREF_RESOLVE_SQL orders open periods by valid_from
+    # DESC, so the dead issuer's later-starting period wins and the newcomer's bars
+    # are attributed to a company that no longer exists. Clamping closes every open
+    # period while still satisfying CHECK (valid_to >= valid_from).
     db.execute(
         """
         UPDATE core.symbol_xref
-           SET valid_to = %s
-         WHERE security_id = %s AND valid_to IS NULL AND valid_from <= %s
+           SET valid_to = GREATEST(valid_from, %s::date)
+         WHERE security_id = %s AND valid_to IS NULL
         """,
-        (delisted_date, security_id, delisted_date),
+        (delisted_date, security_id),
     )
     return True
 

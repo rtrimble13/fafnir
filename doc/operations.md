@@ -60,6 +60,15 @@ The first three steps are **universe maintenance**, and their order is load-bear
 Bandwidth: the security-master refresh is ~5 screener requests per venue-page pass
 (a few MB), once a night.
 
+> **First run after upgrading.** A deployment whose universe was built with
+> `--limit` (the README quick start uses `--limit 500`) gets the *rest* of the
+> universe on its first nightly security-master load. None of those securities has
+> a price watermark, so the next `ingest prices` pulls full history for every one —
+> a multi-hour run and a large download against the 50 GB/month budget. The loader
+> warns when a run brings in 100+ new listings. If you see that on an intentionally
+> limited universe, run `scripts/initial_backfill.sh` deliberately (it is resumable
+> and chunked) rather than letting the nightly discover it.
+
 The two universe steps are run through a `upkeep` wrapper in `daily_update.sh`: if
 one fails, the job warns and carries on to prices rather than costing the night's
 data for every symbol. Nothing is swallowed — the failure is still an
