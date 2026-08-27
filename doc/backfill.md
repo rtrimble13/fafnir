@@ -227,6 +227,56 @@ forward on its own.
 
 ---
 
+## When step 5 (adjustment factors) stops
+
+`fafnir adjust` recomputes `core.adjustment_factor` from `core.corporate_action`.
+The 2026-08-27 backfill died there with
+
+```
+psycopg.errors.NumericValueOutOfRange: numeric field overflow
+DETAIL:  A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+```
+
+A cumulative factor is the **product** of every split and dividend factor after a
+date, over a whole history — so it spans far more orders of magnitude than any one
+action. Reverse splits drive the price factor up (and volume down), forward splits
+the other way, and one long-lived penny stock with six reverse splits passes 1e10.
+`NUMERIC(20, 10)` could hold only `[1e-10, 1e10)`, so the first such security in the
+universe overflowed it. **Migration 0013** stores both factors as unconstrained
+`NUMERIC`, and `mart.v_daily_price_adjusted` no longer rounds adjusted prices to a
+fixed scale (a price back-adjusted below 5e-11 used to round to `0.0000000000`).
+
+Recovery — nothing before step 5 is lost, prices and actions are already committed:
+
+```bash
+fafnir db migrate          # applies 0013
+fafnir adjust              # step 5, resumable and no longer all-or-nothing
+fafnir db refresh-marts    # step 6
+fafnir dq run
+```
+
+`fafnir adjust` now commits per security and steps over one it cannot compute, so a
+single bad security costs that security instead of the whole run. Anything it
+skipped or found implausible is flagged rather than silently dropped:
+
+```sql
+-- securities left without factors (they read UNADJUSTED until this is resolved)
+SELECT security_id, detail FROM ops.data_quality_flag
+ WHERE check_name = 'adjustment_failed' AND resolved_at IS NULL;
+
+-- factors past a plausible band (> 1e12 or < 1e-12): almost always a mis-scaled
+-- or duplicated vendor split, so check the action history before trusting the series
+SELECT security_id, detail FROM ops.data_quality_flag
+ WHERE check_name = 'adjustment_factor_extreme' AND resolved_at IS NULL;
+
+-- the action history behind one of them
+SELECT action_type, ex_date, split_numerator, split_denominator, dividend_amount
+  FROM core.corporate_action WHERE security_id = :id ORDER BY ex_date;
+```
+
+A confirmed-bad action is corrected in `core.corporate_action` (the raw payload it
+came from is in `landing.fmp_raw`); re-run `fafnir adjust --symbol <SYM>` afterwards.
+
 ## Switching to the unadjusted price feed
 
 **Who this is for:** anyone whose warehouse was loaded before

@@ -377,8 +377,17 @@ def adjust(ctx, symbol):
     cfg = ctx.obj["config"]
     with Database(cfg.dsn) as database:
         sec_id = repo.resolve_security_id(database, symbol.upper()) if symbol else None
-        n = adjustments.adjust_all(database, security_id=sec_id)
-    click.echo(f"Recomputed adjustment factors for {n} securities.")
+        result = adjustments.adjust_all(database, security_id=sec_id)
+    click.echo(f"Recomputed adjustment factors for {result['securities']} securities.")
+    if result["failed"]:
+        # The run finished: the rest of the universe has its factors, and these
+        # securities are flagged rather than silently skipped. Exit 0 so a backfill
+        # under `set -e` still reaches its mart refresh and DQ pass.
+        click.echo(
+            f"{result['failed']} securities failed and were left without factors "
+            "(they read unadjusted). Flagged as 'adjustment_failed' in "
+            "ops.data_quality_flag; see `fafnir status`."
+        )
 
 
 # ---------------------------------------------------------------------------

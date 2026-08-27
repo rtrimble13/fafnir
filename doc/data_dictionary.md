@@ -166,8 +166,8 @@ actions load. Deterministic and point-in-time stable.
 |---|---|---|
 | `security_id` | BIGINT → core.security | |
 | `effective_date` | DATE | An ex-date boundary. |
-| `cumulative_price_factor` | NUMERIC(20,10) | Multiply RAW price by this for `trade_date < effective_date`. |
-| `cumulative_volume_factor` | NUMERIC(20,10) | Multiply RAW volume by this for `trade_date < effective_date`. |
+| `cumulative_price_factor` | NUMERIC | Multiply RAW price by this for `trade_date < effective_date`. |
+| `cumulative_volume_factor` | NUMERIC | Multiply RAW volume by this for `trade_date < effective_date`. Moves inversely to the price factor. |
 | `computed_at` | TIMESTAMPTZ | |
 
 ---
@@ -182,16 +182,20 @@ derived on read.** Point-in-time stable.
 | Column | Type | Notes |
 |---|---|---|
 | `security_id`, `trade_date` | | |
-| `open` `high` `low` `close` | NUMERIC(20,10) | Back-adjusted prices. 10 dp so a heavily back-adjusted low-priced stock does not round to zero (migration 0008). |
-| `volume` | NUMERIC(38,0) | Back-adjusted volume (post-split share terms). Rounded, not truncated; wider than BIGINT so a large back-adjustment cannot overflow on read (migration 0008). |
+| `open` `high` `low` `close` | NUMERIC | Back-adjusted prices: the exact product of the raw price and the factor, unrounded, so a deep split history can neither round one to zero nor overflow on read (migrations 0008, 0013). |
+| `volume` | NUMERIC | Back-adjusted volume (post-split share terms). Rounded to whole shares, not truncated. |
 | `close_raw` | NUMERIC(20,6) | The unadjusted close, for reference. |
-| `price_factor` / `volume_factor` | NUMERIC(20,10) | The factor applied to this row. |
+| `price_factor` / `volume_factor` | NUMERIC | The factor applied to this row. |
 
-Factors are stored at 10 decimal places, so a large cumulative split leaves a small
-rounding residue in the adjusted price — for AAPL's 112:1 the relative error is
-~3×10⁻⁹ (sub-nanodollar on a $40 close), far below a cent and immaterial for
-returns. The factor arithmetic itself is exact `Decimal`; only the stored result is
-rounded.
+Both the factor and the adjusted price are unconstrained `NUMERIC` (migration 0013).
+A cumulative factor is a *product* over a whole action history, so it spans orders of
+magnitude a declared scale cannot hold in either direction: `NUMERIC(20,10)` overflowed
+on a deep reverse-split history (which is what killed the 2026-08-27 backfill at step 5)
+and rounded a deep forward-split history to `0.0000000000`. The arithmetic is exact
+`Decimal` at 28 significant digits (`fafnir.ingest.adjustments.PRECISION`), pinned so
+the factors are reproducible everywhere; ratios that terminate stay exact, and AAPL's
+112:1 carries a relative error of ~1×10⁻²⁸. Display rounding is duk's job
+(`duk.format_utils`), which never renders a non-zero price as zero.
 
 ### `mart.security_latest` — screening snapshot (MATERIALIZED VIEW)
 **Grain:** one row per `security_id`. **Source:** `core.security` + `company_profile`

@@ -14,6 +14,7 @@ from datetime import date
 
 import pytest
 
+import fafnir.ingest.adjustments as adj
 import fafnir.ingest.daily_price as dp
 from fafnir.ingest.daily_price import load_prices
 from fafnir.ingest.runlog import RunLog
@@ -102,3 +103,32 @@ def test_a_crash_mid_loop_keeps_every_earlier_symbol(monkeypatch):
 
     assert db.durable == ["bars:AAPL", "bars:MSFT"]
     assert db.commits == 2
+
+
+def test_adjust_all_commits_each_security_and_survives_a_bad_one(monkeypatch):
+    """Step 5 had no boundary at all: `fafnir adjust` recomputed all 21,106
+    securities inside one transaction, so the first security whose factors would not
+    store both ended the backfill and discarded every factor computed before it.
+    """
+    monkeypatch.setattr(adj.repo, "securities_with_actions", lambda db: [1, 2, 3])
+
+    def flaky(db, security_id):
+        if security_id == 2:
+            raise ValueError("numeric field overflow")
+        db.write(f"factors:{security_id}")
+
+    monkeypatch.setattr(adj, "compute_for_security", flaky)
+    monkeypatch.setattr(
+        adj.repo,
+        "add_dq_flag",
+        lambda db, **kw: db.write(f"flag:{kw['check_name']}:{kw['security_id']}"),
+    )
+
+    db = _FakeDB()
+    result = adj.adjust_all(db)
+
+    assert result == {"securities": 2, "failed": 1}
+    # Security 1's factors are durable even though 2 blew up after them, and 3 was
+    # still computed after the failure.
+    assert db.durable == ["factors:1", "flag:adjustment_failed:2", "factors:3"]
+    assert db.rollbacks == 1
