@@ -10,6 +10,7 @@ upsert good bars idempotently, and advance the watermark.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional
 
 from fafnir.db import repository as repo
@@ -30,6 +31,17 @@ LEGACY_SPLIT_ADJUSTED_ENDPOINT = "historical-price-eod/full"
 # A bar quarantined this many times stops holding the watermark (it stays flagged
 # for review, but ingestion is allowed to advance past it).
 MAX_QUARANTINE_HOLDS = 5
+
+# What core.daily_price can actually store (sql/migrations/0005_daily_price.up.sql):
+# money is NUMERIC(20, 6), volume is BIGINT. Postgres rounds a value to the column's
+# scale on insert and only *then* evaluates ck_daily_price_positive, so a positive
+# but sub-resolution price -- a delisted sub-penny shell quoted at 1e-7 -- is stored
+# as 0.000000 and fails the constraint, aborting the whole batch. Asking `float(v) > 0`
+# is therefore the wrong question: a bar has to survive the column, not Python. Every
+# numeric field below is coerced to what the column would hold before it is judged.
+_MONEY_SCALE = Decimal("0.000001")  # NUMERIC(20, 6) -> 6 decimal places
+_MONEY_MAX = Decimal(10) ** 14  # NUMERIC(20, 6) -> 14 integer digits
+_VOLUME_MAX = 2**63 - 1  # BIGINT
 
 # FMP's unadjusted (and dividend-adjusted) endpoints prefix the OHLC field names
 # with "adj"; the `full` endpoint does not. The prefix is a naming convention on
@@ -60,19 +72,95 @@ def _parse_date(value) -> Optional[date]:
         return None
 
 
-def _ohlc(bar: dict, field: str):
+def _decimal(value) -> Optional[Decimal]:
+    """Parse one feed value as an exact Decimal, or None if it is not a finite number.
+
+    Goes through ``str`` so a float's binary noise is not carried into the warehouse:
+    ``Decimal(0.1)`` is 0.1000000000000000055511151231257827, ``Decimal("0.1")`` is 0.1.
+    NaN and the infinities parse but are not numbers a price column can hold, so they
+    are rejected here rather than blowing up further down.
+    """
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    try:
+        parsed = Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _as_money(value) -> Optional[Decimal]:
+    """Quantize a price to NUMERIC(20, 6), or None if the column cannot hold it.
+
+    One None covers every way a field fails to carry a usable price -- junk, zero or
+    negative, sub-resolution, or wider than the column -- because the caller that
+    needs the precise quarantine reason gets it from :func:`_reject_reason`.
+    """
+    parsed = _decimal(value)
+    if parsed is None:
+        return None
+    try:
+        rounded = parsed.quantize(_MONEY_SCALE, rounding=ROUND_HALF_UP)
+    except ArithmeticError:
+        return None  # more digits than the column could hold anyway
+    if rounded <= 0 or rounded >= _MONEY_MAX:
+        return None
+    return rounded
+
+
+def _reject_reason(value) -> str:
+    """Say why a present-but-unusable price was rejected, for the DQ review queue.
+
+    The distinction is what an operator acts on: a zero means the feed sent nothing
+    tradeable, while a sub-resolution price means the feed sent a real quote this
+    warehouse cannot represent -- different data, different remedy.
+    """
+    parsed = _decimal(value)
+    if parsed is None:
+        return "missing_or_nonnumeric_ohlc"
+    if parsed <= 0:
+        return "non_positive_price"
+    if parsed >= _MONEY_MAX:
+        return "price_out_of_range"
+    return "subresolution_price"
+
+
+def _as_volume(value) -> Optional[int]:
+    """Parse a volume as an int, truncating toward zero; None if it is not a number."""
+    parsed = _decimal(value)
+    return None if parsed is None else int(parsed)
+
+
+def _as_vwap(value) -> Optional[Decimal]:
+    """Quantize vwap to NUMERIC(20, 6), or None when absent, junk or too wide.
+
+    vwap is nullable and carries no CHECK, so only precision can break the insert.
+    An unusable one is dropped rather than failing an otherwise good bar -- unlike
+    OHLC, a missing vwap costs nothing.
+    """
+    parsed = _decimal(value)
+    if parsed is None:
+        return None
+    try:
+        rounded = parsed.quantize(_MONEY_SCALE, rounding=ROUND_HALF_UP)
+    except ArithmeticError:
+        return None
+    return None if abs(rounded) >= _MONEY_MAX else rounded
+
+
+def _ohlc(bar: dict, field: str) -> tuple[Optional[Decimal], Optional[str]]:
     """Read one OHLC field, accepting either FMP spelling (``open``/``adjOpen``).
 
-    Returns the first spelling carrying a *usable* price -- numeric and positive --
-    so a payload with `"open": 0` next to a valid `"adjOpen": 39.0` is read from the
-    field that has the price, rather than being quarantined on the strength of the
-    one that does not. Preferring the unprefixed name is only a tie-break between
-    two usable values, not a reason to discard a good one.
+    Returns ``(price, None)`` for the first spelling carrying a *storable* price --
+    one core.daily_price will hold as a positive value -- so a payload with
+    ``"open": 0`` (or ``"open": 1e-7``) next to a valid ``"adjOpen": 39.0`` is read
+    from the field that has the price, rather than being quarantined on the strength
+    of the one that does not. Preferring the unprefixed name is only a tie-break
+    between two storable values, not a reason to discard a good one.
 
-    When nothing is usable it falls back to the first value that was *present*, so
-    the caller still reports the precise reason (``non_positive_price`` for a zero,
-    ``missing_or_nonnumeric_ohlc`` for junk) instead of collapsing both into one.
-    Raises KeyError when neither spelling carries a value at all.
+    When nothing is storable it returns ``(None, reason)`` for the first value that
+    was *present*, so the caller reports the precise reason instead of collapsing
+    every failure into one. Neither spelling present is its own reason.
     """
     present = None
     for key in _OHLC_ALIASES[field]:
@@ -81,49 +169,47 @@ def _ohlc(bar: dict, field: str):
             continue
         if present is None:
             present = value
-        try:
-            if float(value) > 0:
-                return value
-        except (TypeError, ValueError):
-            continue
-    if present is not None:
-        return present
-    raise KeyError(field)
+        price = _as_money(value)
+        if price is not None:
+            return price, None
+    if present is None:
+        return None, "missing_or_nonnumeric_ohlc"
+    return None, _reject_reason(present)
 
 
 def _validate_bar(bar: dict) -> tuple[Optional[dict], Optional[str]]:
-    """Type and sanity-check a single bar. Returns (clean_row, reason_if_bad)."""
+    """Type and sanity-check a single bar. Returns (clean_row, reason_if_bad).
+
+    Prices come back as Decimal, not float: core.daily_price is exact NUMERIC, and
+    handing psycopg a float would reintroduce a coercion after validation -- exactly
+    where the sub-resolution bug lived. What is checked here is what gets stored.
+    """
     trade_date = _parse_date(bar.get("date"))
     if trade_date is None:
         return None, "unparseable_date"
-    try:
-        o = float(_ohlc(bar, "open"))
-        h = float(_ohlc(bar, "high"))
-        lo = float(_ohlc(bar, "low"))
-        c = float(_ohlc(bar, "close"))
-    except (KeyError, TypeError, ValueError):
-        return None, "missing_or_nonnumeric_ohlc"
-    vol = 0
+    prices: dict[str, Decimal] = {}
+    for field in ("open", "high", "low", "close"):
+        price, reason = _ohlc(bar, field)
+        if reason:
+            return None, reason
+        prices[field] = price
+    o, h, lo, c = prices["open"], prices["high"], prices["low"], prices["close"]
+
+    raw_volume = 0
     for key in _VOLUME_ALIASES:
         value = bar.get(key)
         if value not in (None, ""):
-            vol = value
+            raw_volume = value
             break
-    try:
-        vol = int(float(vol))
-    except (TypeError, ValueError):
+    vol = _as_volume(raw_volume)
+    if vol is None:
         return None, "nonnumeric_volume"
-    if min(o, h, lo, c) <= 0:
-        return None, "non_positive_price"
     if h < lo or h < o or h < c or lo > o or lo > c:
         return None, "cross_field_violation"
     if vol < 0:
         return None, "negative_volume"
-    vwap = bar.get("vwap")
-    try:
-        vwap = float(vwap) if vwap not in (None, "") else None
-    except (TypeError, ValueError):
-        vwap = None
+    if vol > _VOLUME_MAX:
+        return None, "volume_out_of_range"
     return {
         "trade_date": trade_date,
         "open": o,
@@ -131,7 +217,7 @@ def _validate_bar(bar: dict) -> tuple[Optional[dict], Optional[str]]:
         "low": lo,
         "close": c,
         "volume": vol,
-        "vwap": vwap,
+        "vwap": _as_vwap(bar.get("vwap")),
     }, None
 
 

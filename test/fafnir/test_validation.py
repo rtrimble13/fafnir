@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 
 from fafnir.ingest.daily_price import _validate_bar
 
@@ -20,7 +21,7 @@ def test_valid_bar():
     )
     assert reason is None
     assert row["trade_date"] == dt.date(2023, 6, 1)
-    assert row["close"] == 10.0
+    assert row["close"] == Decimal("10.0")
 
 
 def test_cross_field_violation_rejected():
@@ -97,10 +98,10 @@ def test_adj_prefixed_ohlc_is_accepted():
         }
     )
     assert reason is None
-    assert row["close"] == 39.2
-    assert row["open"] == 39.0
-    assert row["high"] == 39.5
-    assert row["low"] == 38.5
+    assert row["close"] == Decimal("39.2")
+    assert row["open"] == Decimal("39.0")
+    assert row["high"] == Decimal("39.5")
+    assert row["low"] == Decimal("38.5")
 
 
 def test_plain_names_win_when_a_payload_carries_both():
@@ -119,7 +120,7 @@ def test_plain_names_win_when_a_payload_carries_both():
         }
     )
     assert reason is None
-    assert row["close"] == 39.2
+    assert row["close"] == Decimal("39.2")
 
 
 def test_bar_with_neither_spelling_is_quarantined():
@@ -143,7 +144,7 @@ def test_null_plain_field_falls_back_to_the_adj_spelling():
         }
     )
     assert reason is None
-    assert row["close"] == 39.2
+    assert row["close"] == Decimal("39.2")
 
 
 # -- volume spellings ---------------------------------------------------------
@@ -230,7 +231,7 @@ def test_zero_in_the_preferred_spelling_falls_through_to_a_valid_one():
         }
     )
     assert reason is None
-    assert row["open"] == 39.0
+    assert row["open"] == Decimal("39.0")
 
 
 def test_junk_in_the_preferred_spelling_falls_through_to_a_valid_one():
@@ -246,7 +247,7 @@ def test_junk_in_the_preferred_spelling_falls_through_to_a_valid_one():
         }
     )
     assert reason is None
-    assert row["open"] == 39.0
+    assert row["open"] == Decimal("39.0")
 
 
 def test_an_all_zero_bar_still_reports_non_positive_price():
@@ -284,4 +285,103 @@ def test_plain_name_still_wins_when_both_spellings_are_usable():
         }
     )
     assert reason is None
-    assert row["open"] == 39.0
+    assert row["open"] == Decimal("39.0")
+
+
+# ---------------------------------------------------------------------------
+# The bar must survive the COLUMN, not just Python. core.daily_price stores money
+# as NUMERIC(20, 6) and volume as BIGINT; Postgres rounds to the column's scale on
+# insert and only then evaluates ck_daily_price_positive. Validating with
+# `float(v) > 0` let a positive-but-sub-resolution price through, which landed as
+# 0.000000 and aborted the whole batch mid-backfill.
+# ---------------------------------------------------------------------------
+
+
+def _bar(**overrides) -> dict:
+    return {
+        "date": "2023-06-01",
+        "open": 10,
+        "high": 11,
+        "low": 9,
+        "close": 10,
+        "volume": 100,
+    } | overrides
+
+
+def test_sub_resolution_price_is_quarantined_not_inserted():
+    """Regression: a sub-penny shell at 1e-7 rounds to 0.000000 in NUMERIC(20, 6)."""
+    _, reason = _validate_bar(
+        {
+            "date": "2024-08-14",
+            "open": 1e-7,
+            "high": 1e-7,
+            "low": 1e-7,
+            "close": 1e-7,
+            "volume": 3795,
+        }
+    )
+    assert reason == "subresolution_price"
+
+
+def test_sub_resolution_is_distinguished_from_a_feed_zero():
+    """Different data, different remedy -- the DQ queue must not conflate them."""
+    assert _validate_bar(_bar(open=0.0000004))[1] == "subresolution_price"
+    assert _validate_bar(_bar(open=0))[1] == "non_positive_price"
+
+
+def test_a_price_on_the_rounding_boundary_is_kept():
+    """Half a micro-dollar rounds UP, so the column holds it as positive."""
+    row, reason = _validate_bar(
+        _bar(open="0.0000005", high="0.0000005", low="0.0000005", close="0.0000005")
+    )
+    assert reason is None
+    assert row["close"] == Decimal("0.000001")
+
+
+def test_a_sub_resolution_price_does_not_shadow_a_usable_alias():
+    """The alias fallback must prefer the field that has a *storable* price."""
+    row, reason = _validate_bar(
+        _bar(open=1e-7, adjOpen=39.0, high=39.5, low=38.5, close=39.2)
+    )
+    assert reason is None
+    assert row["open"] == Decimal("39.0")
+
+
+def test_price_wider_than_the_column_is_quarantined():
+    """NUMERIC(20, 6) leaves 14 integer digits; more raised NumericValueOutOfRange."""
+    assert _validate_bar(_bar(close=1e20, high=1e20))[1] == "price_out_of_range"
+    assert _validate_bar(_bar(close=10**14, high=10**14))[1] == "price_out_of_range"
+    assert _validate_bar(_bar(close="99999999999999", high="99999999999999"))[1] is None
+
+
+def test_volume_beyond_bigint_is_quarantined():
+    assert _validate_bar(_bar(volume=2**63))[1] == "volume_out_of_range"
+    assert _validate_bar(_bar(volume=2**63 - 1))[1] is None
+
+
+def test_non_finite_values_are_quarantined_rather_than_raising():
+    """float('inf') used to escape int() as an uncaught OverflowError."""
+    assert _validate_bar(_bar(volume=float("inf")))[1] == "nonnumeric_volume"
+    assert (
+        _validate_bar(_bar(close=float("nan"), high=float("nan")))[1]
+        == "missing_or_nonnumeric_ohlc"
+    )
+
+
+def test_prices_are_exact_decimals_not_floats():
+    """core.daily_price is exact NUMERIC: no float round-trip after validation."""
+    row, reason = _validate_bar(_bar(close=0.1, low=0.05))
+    assert reason is None
+    assert isinstance(row["close"], Decimal)
+    assert row["close"] == Decimal("0.1")
+
+
+def test_an_unusable_vwap_is_dropped_without_failing_the_bar():
+    """vwap is nullable and unconstrained -- losing it must not cost the whole bar."""
+    assert _validate_bar(_bar(vwap="N/A")) == (
+        _validate_bar(_bar())[0],
+        None,
+    )
+    row, reason = _validate_bar(_bar(vwap=1e20))
+    assert reason is None
+    assert row["vwap"] is None

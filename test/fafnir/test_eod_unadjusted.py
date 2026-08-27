@@ -8,6 +8,8 @@ again, so pre-2014 AAPL would have been divided by 28 twice.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from fafnir.ingest.daily_price import ENDPOINT, _validate_bar
@@ -34,12 +36,12 @@ def _client(payload):
 
 
 def test_the_endpoint_is_the_unadjusted_one():
-    assert FMPClient.EP_EOD_FULL == "historical-price-eod/non-split-adjusted"
+    assert FMPClient.EP_EOD_RAW == "historical-price-eod/non-split-adjusted"
 
 
 def test_loader_endpoint_matches_the_client():
     # They key watermarks and lineage; a mismatch silently orphans both.
-    assert ENDPOINT == FMPClient.EP_EOD_FULL
+    assert ENDPOINT == FMPClient.EP_EOD_RAW
 
 
 def test_as_traded_prices_reach_the_canonical_fields():
@@ -60,7 +62,7 @@ def test_the_normalized_bar_validates_and_keeps_the_as_traded_close():
     row, reason = _validate_bar(bar)
 
     assert reason is None
-    assert row["close"] == 499.24
+    assert row["close"] == Decimal("499.24")
     assert row["close"] != SPLIT_ADJUSTED_CLOSE
     assert str(row["trade_date"]) == "2020-08-28"
     # This endpoint carries no vwap; absence must not fail the bar.

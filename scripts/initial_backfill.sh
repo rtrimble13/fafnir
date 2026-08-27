@@ -15,7 +15,9 @@ set -euo pipefail
 FROM_DATE="${1:-2010-01-01}"
 
 echo "==> [1/6] Security master (full universe)"
-fafnir ingest securities --enrich
+# For current db implementation, drop --enrich.  Change made in fafnir v0.5.0 to avoid unnecessary API calls and reduce load on FMP servers. 2026-08-27
+# fafnir ingest securities --enrich
+fafnir ingest securities
 
 echo "==> [2/6] Delisting sweep (full feed)"
 fafnir ingest delisted --full
