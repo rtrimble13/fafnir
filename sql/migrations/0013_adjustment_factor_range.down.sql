@@ -1,14 +1,21 @@
 -- 0013_adjustment_factor_range.down.sql
 -- Restore the NUMERIC(20, 10) factors and the 0008 view.
 --
--- Narrowing cannot represent every value the wide type accepted, so rows outside
--- [1e-10, 1e10) are DELETED first -- the ALTER would otherwise fail and leave the
--- rollback stuck. That is safe in the sense that matters here: core.adjustment_factor
--- is derived, recomputable state (`fafnir adjust` rebuilds it from
--- core.corporate_action), and those particular rows are exactly the ones the old
--- type could never have held in the first place. It is NOT lossless in the sense
--- that matters to research: the securities they belong to go back to reading
--- unadjusted through the mart, which is the pre-0013 behaviour.
+-- Narrowing cannot represent every value the wide type accepted, so the rows outside
+-- [1e-10, 1e10) have to go first -- the ALTER would otherwise fail and leave the
+-- rollback stuck. Every affected security is cleared ENTIRELY, not just its
+-- out-of-range rows: a factor set is a chain, and the mart reads it by taking the
+-- smallest effective_date greater than the bar's date. Deleting only the rows that
+-- do not fit removes the earliest boundaries -- the ones carrying the largest
+-- cumulative factors -- so old bars would silently fall through to a later, smaller
+-- factor and read UNDER-adjusted, which is worse than unadjusted because nothing
+-- about the series looks wrong. Clearing the security instead makes it read plainly
+-- unadjusted, which is the pre-0013 behaviour for exactly these securities.
+--
+-- That is safe in the sense that matters here: core.adjustment_factor is derived,
+-- recomputable state (`fafnir adjust` rebuilds it from core.corporate_action). It is
+-- NOT lossless in the sense that matters to research -- those securities lose their
+-- adjustment until the schema is rolled forward again.
 
 BEGIN;
 
@@ -16,8 +23,11 @@ BEGIN;
 DROP VIEW IF EXISTS mart.v_daily_price_adjusted;
 
 DELETE FROM core.adjustment_factor
- WHERE cumulative_price_factor  >= 1e10 OR cumulative_price_factor  < 1e-10
-    OR cumulative_volume_factor >= 1e10 OR cumulative_volume_factor < 1e-10;
+ WHERE security_id IN (
+        SELECT security_id FROM core.adjustment_factor
+         WHERE cumulative_price_factor  >= 1e10 OR cumulative_price_factor  < 1e-10
+            OR cumulative_volume_factor >= 1e10 OR cumulative_volume_factor < 1e-10
+       );
 
 ALTER TABLE core.adjustment_factor
     ALTER COLUMN cumulative_price_factor  TYPE NUMERIC(20, 10),

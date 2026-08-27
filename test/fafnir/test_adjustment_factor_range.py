@@ -192,3 +192,38 @@ def test_adjust_all_steps_over_a_security_it_cannot_compute(db, monkeypatch):
     assert _factors(db, good), "the healthy security kept its factors"
     assert not _factors(db, bad)
     assert "adjustment_failed" in _flags(db, bad)
+
+
+def test_rolling_0013_back_clears_a_security_rather_than_half_its_chain(db):
+    """The down-migration cannot leave a partial factor chain behind.
+
+    Narrowing the columns means the out-of-range rows have to go, but a factor set is
+    a chain: the mart takes the smallest effective_date greater than the bar's date.
+    Dropping only the rows that do not fit removes the EARLIEST boundaries -- the ones
+    carrying the largest cumulative factors -- so old bars fall through to a later,
+    smaller factor and read under-adjusted, with nothing about the series looking
+    wrong. Clearing the whole security instead makes it read plainly unadjusted.
+    """
+    from fafnir.db import migrate as m
+
+    sql_dir = m.find_sql_dir() / "migrations"
+    down = (sql_dir / "0013_adjustment_factor_range.down.sql").read_text()
+    up = (sql_dir / "0013_adjustment_factor_range.up.sql").read_text()
+
+    deep = _mk_security(db, "DEEP")
+    plain = _mk_security(db, "PLAIN")
+    _one_bar(db, deep, dt.date(2023, 1, 3), Decimal("0.05"))
+    _one_bar(db, plain, dt.date(2023, 1, 3), Decimal("100"))
+    _splits(db, deep, [(1, 10), (1, 50), (1, 100), (1, 200), (1, 100), (1, 20)])
+    _splits(db, plain, [(2, 1)])
+    adjustments.compute_for_security(db, deep)
+    adjustments.compute_for_security(db, plain)
+    # The deep history straddles the old ceiling: 2e10 at the front, 100 at the back.
+    assert len(_factors(db, deep)) == 6
+
+    try:
+        db.execute_script(down)
+        assert _factors(db, deep) == [], "a half-chain reads under-adjusted"
+        assert len(_factors(db, plain)) == 1, "securities that fit are untouched"
+    finally:
+        db.execute_script(up)

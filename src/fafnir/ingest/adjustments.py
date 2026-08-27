@@ -66,6 +66,12 @@ PRECISION = 28
 # 0013; the DQ flag is so a human looks at the action history.
 EXTREME_FACTOR = Decimal("1e12")
 
+# Above this share of the universe, a failed recompute is not bad data -- it is the
+# schema, the grants or a lock, and every security is failing for the same reason.
+# `fafnir adjust` exits non-zero past it so a scheduled run cannot report success
+# while writing nothing; below it, a few bad securities are flagged and stepped over.
+SYSTEMIC_FAILURE_RATIO = 0.01
+
 
 def compute_for_security(db: Database, security_id: int) -> list[dict]:
     """Compute (and persist) adjustment factors for one security. Returns the rows."""
@@ -204,6 +210,12 @@ def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
     derived, idempotent, per-security work; it commits per security, and a security
     that still fails is flagged and stepped over so the other 21,000 get their
     factors.
+
+    A stepped-over security keeps whatever factors its last successful run left --
+    the replace is DELETE + INSERT in the transaction being rolled back, so nothing
+    is destroyed. That is stale, not absent: its newest corporate actions are missing
+    from the series until the flag is worked. On a first backfill it has none, and
+    reads unadjusted.
     """
     if security_id is not None:
         compute_for_security(db, security_id)

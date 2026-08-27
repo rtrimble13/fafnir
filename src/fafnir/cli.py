@@ -376,18 +376,41 @@ def adjust(ctx, symbol):
 
     cfg = ctx.obj["config"]
     with Database(cfg.dsn) as database:
-        sec_id = repo.resolve_security_id(database, symbol.upper()) if symbol else None
+        sec_id = None
+        if symbol:
+            sec_id = repo.resolve_security_id(database, symbol.upper())
+            if sec_id is None:
+                # Without this, an unresolved symbol falls through as "all" and a
+                # mistyped ticker silently recomputes the entire universe.
+                raise click.ClickException(
+                    f"Unknown symbol {symbol.upper()}: not in the security master."
+                )
         result = adjustments.adjust_all(database, security_id=sec_id)
     click.echo(f"Recomputed adjustment factors for {result['securities']} securities.")
-    if result["failed"]:
-        # The run finished: the rest of the universe has its factors, and these
-        # securities are flagged rather than silently skipped. Exit 0 so a backfill
-        # under `set -e` still reaches its mart refresh and DQ pass.
-        click.echo(
-            f"{result['failed']} securities failed and were left without factors "
-            "(they read unadjusted). Flagged as 'adjustment_failed' in "
-            "ops.data_quality_flag; see `fafnir status`."
+    if not result["failed"]:
+        return
+
+    # A stepped-over security keeps the factors from its last successful run (none,
+    # on a first backfill), so its newest actions are missing from the series.
+    click.echo(
+        f"{result['failed']} securities failed and kept the factors from their last "
+        "successful run -- none on a first backfill, stale otherwise, so their "
+        "newest corporate actions are not reflected. Flagged as 'adjustment_failed' "
+        "in ops.data_quality_flag; see `fafnir status`."
+    )
+    attempted = result["securities"] + result["failed"]
+    if result["failed"] > adjustments.SYSTEMIC_FAILURE_RATIO * attempted:
+        # Not bad data at this scale -- the schema, the grants or a lock. Exiting 0
+        # here would let a backfill under `set -e` sail on to refresh a mart built on
+        # nothing, and a nightly cron report success while writing no factors at all.
+        raise click.ClickException(
+            f"{result['failed']} of {attempted} securities failed "
+            f"(> {adjustments.SYSTEMIC_FAILURE_RATIO:.0%}); that is systemic, not bad "
+            "data. Check that migrations are applied (`fafnir db status`) and read "
+            "the flags before re-running."
         )
+    # Otherwise a handful of bad securities: flagged, stepped over, exit 0 so a
+    # backfill still reaches its mart refresh and DQ pass.
 
 
 # ---------------------------------------------------------------------------

@@ -256,11 +256,17 @@ fafnir dq run
 ```
 
 `fafnir adjust` now commits per security and steps over one it cannot compute, so a
-single bad security costs that security instead of the whole run. Anything it
-skipped or found implausible is flagged rather than silently dropped:
+single bad security costs that security instead of the whole run. If more than 1% of
+the universe fails it exits non-zero instead — at that scale it is the schema, the
+grants or a lock, not the data, and a run that wrote no factors must not report
+success. Anything it skipped or found implausible is flagged rather than silently
+dropped:
 
 ```sql
--- securities left without factors (they read UNADJUSTED until this is resolved)
+-- securities whose recompute failed. They keep the factors from their last
+-- successful run -- NONE on a first backfill (so they read unadjusted), STALE
+-- afterwards (so their newest actions are missing). Either way, resolve before
+-- trusting the series.
 SELECT security_id, detail FROM ops.data_quality_flag
  WHERE check_name = 'adjustment_failed' AND resolved_at IS NULL;
 
