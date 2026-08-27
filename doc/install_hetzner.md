@@ -721,7 +721,8 @@ the block at the top of
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir; fafnir db migrate'
 ```
 
-Expected: `Applied: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010`. Then the seeds and
+Expected: `Applied: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012`.
+Then the seeds and
 the partition/calendar horizon:
 
 ```bash
@@ -762,7 +763,7 @@ sudo -u postgres psql -d fafnir -c "SELECT version, name, applied_at FROM meta.s
 Expected on a 1990 install, with the rolling horizon at 2028: **40** partitions
 (1990–2028 = 39 years, plus the `DEFAULT` catch-all), calendar
 `1990-01-02 → 2028-12-29` (49,115 rows = 9,823 open days × 5 exchanges), database size
-**~16 MB**, and migrations `0001`–`0010` applied.
+**~16 MB**, and migrations `0001`–`0012` applied.
 
 Now confirm the least-privilege model actually holds — this is the check that catches
 a migration run by the wrong role:
@@ -805,6 +806,7 @@ set -a; . /etc/fafnir/fafnir.env; set +a
 cd /opt/fafnir
 
 fafnir ingest securities --limit 50
+fafnir ingest symbol-changes
 fafnir ingest prices  --symbols AAPL,MSFT --from 1990-01-01
 fafnir ingest actions --symbols AAPL,MSFT
 fafnir adjust --symbol AAPL
@@ -817,6 +819,22 @@ duk -S db ph AAPL --adj --close -n 5
 date is the last trading day. If splits/dividends came back as zero, check the FMP
 field mapping before committing to a full run — see
 [ingestion.md](ingestion.md).
+
+**Read the `symbol-changes` line carefully — this is the one endpoint the smoke test
+exists to prove.** The nightly job depends on it to keep a renamed company on one
+`security_id`, and it is the newest path in the loader set. Expect something like:
+
+```
+Applied 0 renames (0 duplicate stubs folded), 0 conflicts, 0 already applied,
+37 not in the master. FMP bytes: 24196
+```
+
+`0 applied` is **success here**, not failure: the rename feed is global, and with only
+50 securities loaded almost every rename it reports belongs to a ticker this warehouse
+does not track yet. The number that matters is **`not in the master` being non-zero and
+`FMP bytes` being non-zero** — that proves the endpoint answered on your plan. If
+instead the run fails, or reports zero rows *and* zero bytes, your plan may not cover
+`stable/symbol-change`; see the row in §12.
 
 `duk` here picks up `FAFNIR_DSN` from the env file, so it reads as `fafnir_ingest`.
 That is fine for a smoke test; §11 sets up the least-privilege `fafnir_app` path that
@@ -865,6 +883,29 @@ Depth, chunking strategy, and the bandwidth math are covered in
 
 The server clock is UTC (§2.1) but the data settles on **US market time**, which moves
 with DST. A systemd timer handles that correctly; fixed-UTC cron does not.
+
+`daily_update.sh` maintains the **universe** before it loads any market data —
+renames, then new listings, then delistings — so the price step runs against what is
+actually trading that day:
+
+```
+ensure-horizon → symbol-changes → securities → delisted →
+prices → actions → adjust → refresh-marts → dq run
+```
+
+The first two steps are wrapped so a source outage warns and continues rather than
+costing the night's prices; the failure still lands as a `failed` row in
+`ops.ingestion_run`. See [ingestion.md](ingestion.md#keeping-the-universe-in-scope)
+for why the order is load-bearing.
+
+> **Finish §7 before you enable the timer.** The `--limit 50` in §6 leaves the
+> security master holding a token universe. The nightly `ingest securities` step will
+> pull the *rest* of it on its first run — and since none of those securities has a
+> price watermark, the price step that follows will backfill full history for all
+> ~21k of them in one unattended pass: many hours and several GB against the
+> 50 GB/month FMP budget, outside the `tmux` session and the resumable, chunked path
+> §7 gives you. The loader warns in the log when a run brings in 100+ new listings.
+> Run §7 first and the first timed run is an ordinary incremental update.
 
 ### 8.1 systemd timer (recommended)
 
@@ -1048,7 +1089,12 @@ journalctl -u fafnir-daily.service --since '2 days ago'
 
 What to watch, and the SQL for each, is in
 [operations.md](operations.md#monitoring): freshness, quarantine spikes, FMP bandwidth,
-failed runs. `pg_stat_statements` (enabled in §3.4) gives you the slow-query view:
+failed runs, and three signals that come from the nightly universe maintenance —
+`New (7d)` (a week of zeroes on a working key means the security-master step is not
+running), unapplied ticker renames awaiting a decision, and `security_company_name_drift`
+flags. `fafnir status` surfaces the first two directly.
+
+`pg_stat_statements` (enabled in §3.4) gives you the slow-query view:
 
 ```sql
 SELECT calls, round(mean_exec_time) AS avg_ms, round(total_exec_time) AS total_ms,
@@ -1147,6 +1193,7 @@ A `~/.pgpass` line then keeps the password out of your shell history and environ
 | `fe_sendauth: no password supplied` | `FAFNIR_DB_PASSWORD` set alongside `FAFNIR_DSN` | Use `PGPASSWORD`, `~/.pgpass`, or peer auth — see the table in §4.4 |
 | `Peer authentication failed for user "fafnir_ingest"` | The `pg_hba` peer rule landed *below* `local all all peer`, or the ident map name is wrong | §3.6 — reorder so the `fafnir_ingest` rule comes first, then reload |
 | `Could not locate sql/migrations` | Running outside the checkout | Export `FAFNIR_SQL_DIR=/opt/fafnir/sql` |
+| `ingest symbol-changes` fails, or returns zero rows **and** zero bytes | Your FMP plan may not cover `stable/symbol-change`, or the path has changed | Not fatal — the nightly warns and continues, so prices still load. Check the status code with `curl -s -o /dev/null -w '%{http_code}\n' "https://financialmodelingprep.com/stable/symbol-change?apikey=$FMP_API_KEY"` — `402` means the plan does not include it. The path is a single constant (`FMPClient.EP_SYMBOL_CHANGE`) if it needs correcting; until it works, renames are not reconciled and a renamed company will fork into a second `security_id` |
 | Calendar/partitions start at 2015, not your backfill year | `~/.fafnirrc` not found (missing `-H`/`HOME`), or seeded before setting `calendar_start_year` | §5.2; then re-run `fafnir db seed` and `fafnir db ensure-horizon` |
 | `permission denied for schema core` from `duk` | `fafnir_app` reads `mart` + `ref` only | Correct by design — use `mart.*` views, or connect as `fafnir_read` |
 | Nightly job never ran | Timer not enabled, or clock/timezone confusion | `systemctl list-timers 'fafnir-*'`; `systemd-analyze calendar '<expr>'` |
@@ -1183,7 +1230,7 @@ sudo -u postgres psql -tAc "SELECT rolsuper, rolcreaterole FROM pg_roles
 
 # --- fafnir -----------------------------------------------------------------
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
-  fafnir db status        # 0001..0010 all "applied", no DRIFT
+  fafnir db status        # 0001..0012 all "applied", no DRIFT
   fafnir status           # securities > 0, latest date = last trading day
   fafnir dq run'          # flag counts you can explain
 
