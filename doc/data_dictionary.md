@@ -56,6 +56,38 @@ makes the security upsert idempotent without keying on the ticker.
 | `source` | TEXT | |
 
 Resolves a ticker to a `security_id` at any point in time (handles renames/relists).
+A rename closes the old ticker's period the day *before* the change and opens a new
+one for the new ticker against the **same** `security_id`, so the two periods are
+contiguous and never both open. Resolution order (`resolve_security_id`, mirrored in
+`duk.datasource.db`): the open period, then `core.security.primary_symbol`, then the
+most recently closed period — so a reused ticker resolves to its live owner while a
+company's former ticker still reaches its history.
+
+### `core.symbol_change` — applied ticker renames
+**Grain:** one row per `(source, old_symbol, new_symbol, change_date)`. **Source:**
+FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `symbol_change_id` | BIGINT IDENTITY PK | |
+| `old_symbol` / `new_symbol` | TEXT NOT NULL | `CHECK (old_symbol <> new_symbol)`. |
+| `change_date` | DATE NOT NULL | Effective date; the xref period boundary. |
+| `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. |
+| `company_name` | TEXT | As reported with the rename. |
+| `status` | TEXT CHECK | `applied` / `conflict` / `ignored` — see below. |
+| `detail` | JSONB | Context, e.g. the `folded_security_id` of an absorbed duplicate. |
+| `source` | TEXT | |
+| `first_seen_at` / `updated_at` | TIMESTAMPTZ | |
+
+- `applied` — carried onto an existing `security_id` (terminal; never downgraded).
+- `conflict` — the new ticker already belongs to another **listed** security that
+  carries history. Nothing was changed; retried on every sweep and raised as a
+  `symbol_change_conflict` DQ flag.
+- `ignored` — the old ticker belongs to a delisted issuer, so this is ticker
+  *reuse*, not a rename.
+
+Renames of tickers fafnir does not track are counted but not stored — the feed is
+global across every venue.
 
 ### `core.company_profile` — descriptive attributes (current snapshot)
 **Grain:** one row per `security_id`. **Source:** FMP `profile`. **Cadence:** on

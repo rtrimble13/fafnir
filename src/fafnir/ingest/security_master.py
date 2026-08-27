@@ -8,14 +8,26 @@ The screener also supplies market cap and beta, so screening data costs nothing
 beyond the universe load (0010). :func:`enrich_profiles` is optional and adds only
 the long-form description and the identifiers, at one request per symbol.
 
-Delisted/inactive securities are never deleted; a reconciliation step (fast-follow,
-using FMP's delisted endpoint) flips ``is_actively_trading``/``delisted_date``.
+Delisted/inactive securities are never deleted; a reconciliation step
+(``fafnir ingest delisted``) flips ``is_actively_trading``/``delisted_date``.
+
+This loader is an *upkeep* step, not just a build step. ``scripts/daily_update.sh``
+runs it nightly, which is how a security that listed today (an IPO, a spin-off, a
+new ETF) enters scope: it appears in the screener, the upsert mints it, and the
+price step -- which has no watermark for it -- pulls its full available history on
+the same run. :func:`load_securities` reports which securities were new so the
+nightly log says so out loud.
+
+Renames are NOT this loader's job, and must be reconciled before it runs
+(``fafnir ingest symbol-changes``): to the screener a renamed ticker looks exactly
+like a new listing, and minting it as one forks the company's identity. See
+``fafnir/ingest/symbol_changes.py``.
 """
 
 from __future__ import annotations
 
 from math import isfinite
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
@@ -46,6 +58,18 @@ SECURITY_NUMERIC_LIMITS = {
     "market_cap_usd": 10 ** (24 - 2),
     "beta": 10 ** (12 - 6),
 }
+
+
+class SecurityLoadResult(NamedTuple):
+    """Outcome of a security-master load.
+
+    ``new_symbols`` is what makes the nightly run legible: the difference between
+    "refreshed 21,412 securities" and "refreshed 21,412 securities, 3 of them new
+    tonight" is the difference between a load you can ignore and one you can audit.
+    """
+
+    total: int
+    new_symbols: list[str]
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:
@@ -168,8 +192,12 @@ def load_securities(
     universe: str = "us-equity-etf",
     include_etfs: bool = True,
     limit: Optional[int] = None,
-) -> int:
-    """Load the security master from FMP bulk lists. Returns securities upserted."""
+) -> SecurityLoadResult:
+    """Load the security master from FMP bulk lists.
+
+    Returns the number upserted and the tickers that were not in the master
+    before this run -- new listings entering scope.
+    """
     with RunLog(
         db,
         source="fmp",
@@ -199,6 +227,14 @@ def load_securities(
                     if e.get("symbol") not in known:
                         entries.append((e, "etf", True))
 
+        # Snapshot the upsert keys of everything currently listed, so a genuinely
+        # new listing can be told from a refresh of one already held. This mirrors
+        # 0009's partial unique index exactly -- (source, symbol, exchange) over
+        # rows with delisted_date IS NULL -- because that index is what decides
+        # whether the upsert below inserts or updates.
+        known = repo.active_security_keys(db)
+        new_symbols: list[str] = []
+
         count = 0
         for entry, asset_type, is_etf in entries:
             symbol = (entry.get("symbol") or "").strip()
@@ -212,6 +248,10 @@ def load_securities(
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
+            key = (symbol, exchange or "")
+            if key not in known:
+                new_symbols.append(symbol)
+                known.add(key)
             sec_id = repo.upsert_security(
                 db,
                 primary_symbol=symbol,
@@ -237,8 +277,22 @@ def load_securities(
                 break
         run.symbols_requested = count
         run.bytes_downloaded = fmp.bytes_downloaded
-        logger.info("Loaded %d securities (universe=%s)", count, universe)
-        return count
+        logger.info(
+            "Loaded %d securities (universe=%s); %d new to the master%s",
+            count,
+            universe,
+            len(new_symbols),
+            (
+                (
+                    ": "
+                    + ", ".join(new_symbols[:20])
+                    + ("..." if len(new_symbols) > 20 else "")
+                )
+                if new_symbols
+                else ""
+            ),
+        )
+        return SecurityLoadResult(count, new_symbols)
 
 
 def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:

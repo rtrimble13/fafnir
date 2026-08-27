@@ -1,0 +1,519 @@
+"""
+Integration tests for automatic universe maintenance (needs FAFNIR_TEST_DSN).
+
+Two things have to be true for the warehouse to stay in scope on its own:
+new listings enter it, and a renamed ticker stays the *same* security rather than
+becoming a second one. Both are SQL-shaped problems (the partial unique index of
+0009, the validity periods of core.symbol_xref), so they are tested against a real
+database rather than fakes.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+
+import pytest
+
+from fafnir.db import repository as repo
+from fafnir.ingest import security_master
+from fafnir.ingest.daily_price import ENDPOINT as PRICE_ENDPOINT
+
+pytestmark = pytest.mark.integration
+
+DSN = os.environ.get("FAFNIR_TEST_DSN", "")
+
+CHANGE_DATE = dt.date(2024, 6, 10)
+
+
+def _mk_security(db, symbol, *, exchange="NASDAQ", name="Test Co"):
+    repo.ensure_exchange(db, exchange, exchange, "US")
+    sid = repo.upsert_security(
+        db,
+        primary_symbol=symbol,
+        company_name=name,
+        asset_type="equity",
+        exchange_code=exchange,
+    )
+    repo.upsert_symbol_xref(db, security_id=sid, symbol=symbol)
+    return sid
+
+
+def _give_history(db, sid, trade_date=dt.date(2024, 6, 3), close=100):
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": sid,
+                "trade_date": trade_date,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1000,
+            }
+        ],
+    )
+
+
+def _xref(db, sid):
+    return db.fetchall(
+        "SELECT symbol, valid_from, valid_to FROM core.symbol_xref "
+        "WHERE security_id = %s ORDER BY valid_from",
+        (sid,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Renames keep one company one security
+# ---------------------------------------------------------------------------
+
+
+def test_rename_keeps_history_watermark_and_identity(db):
+    sid = _mk_security(db, "FB", name="Facebook, Inc.")
+    _give_history(db, sid)
+    repo.set_watermark(db, "fmp", PRICE_ENDPOINT, dt.date(2024, 6, 3), sid)
+
+    outcome = repo.apply_symbol_change(
+        db,
+        old_symbol="FB",
+        new_symbol="META",
+        change_date=CHANGE_DATE,
+        company_name="Meta Platforms, Inc.",
+    )
+
+    assert outcome.status == repo.CHANGE_APPLIED
+    assert outcome.security_id == sid  # the whole point: no second security_id
+    # One security, now trading under the new ticker.
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    row = db.fetchone(
+        "SELECT primary_symbol, company_name FROM core.security WHERE security_id = %s",
+        (sid,),
+    )
+    assert row["primary_symbol"] == "META"
+    assert row["company_name"] == "Meta Platforms, Inc."
+    # History and the incremental watermark stay attached, so the next nightly run
+    # asks META for the tail rather than re-backfilling 15 years.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id = %s", (sid,)
+        )
+        == 1
+    )
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2024, 6, 3)
+
+
+def test_rename_closes_the_old_ticker_the_day_before_the_change(db):
+    sid = _mk_security(db, "FB")
+    repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    periods = {r["symbol"]: r for r in _xref(db, sid)}
+    # Contiguous, never both open: an overlap would make the ticker ambiguous on
+    # the changeover day, and XREF_RESOLVE_SQL reads only open periods.
+    assert periods["FB"]["valid_to"] == CHANGE_DATE - dt.timedelta(days=1)
+    assert periods["META"]["valid_from"] == CHANGE_DATE
+    assert periods["META"]["valid_to"] is None
+    # Both tickers still resolve to the one security -- the old one through the
+    # closed period (research on the pre-rename name), the new one as current.
+    assert repo.resolve_security_id(db, "META") == sid
+    assert repo.resolve_security_id(db, "FB") == sid
+
+
+def test_rename_is_idempotent(db):
+    sid = _mk_security(db, "FB")
+    first = repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+    before = _xref(db, sid)
+    second = repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    assert first.status == repo.CHANGE_APPLIED
+    # The second pass finds FB unknown (its period is closed) and META already
+    # ours, so it changes nothing -- rather than reopening the old ticker.
+    assert second.status in (repo.CHANGE_UNKNOWN, repo.CHANGE_APPLIED)
+    assert _xref(db, sid) == before
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+
+
+def test_rename_chain_applied_in_order_lands_on_the_final_ticker(db):
+    sid = _mk_security(db, "AAA")
+    repo.apply_symbol_change(
+        db, old_symbol="AAA", new_symbol="BBB", change_date=dt.date(2024, 1, 5)
+    )
+    repo.apply_symbol_change(
+        db, old_symbol="BBB", new_symbol="CCC", change_date=dt.date(2024, 3, 2)
+    )
+
+    assert (
+        db.fetchval(
+            "SELECT primary_symbol FROM core.security WHERE security_id = %s", (sid,)
+        )
+        == "CCC"
+    )
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    assert [r["symbol"] for r in _xref(db, sid)] == ["AAA", "BBB", "CCC"]
+
+
+# ---------------------------------------------------------------------------
+# Collisions with a duplicate the security master already minted
+# ---------------------------------------------------------------------------
+
+
+def test_empty_duplicate_minted_by_the_screener_is_folded_in(db):
+    # The security master ran before the rename feed caught up, so the new ticker
+    # already exists as a bare row with nothing in it.
+    sid = _mk_security(db, "FB")
+    _give_history(db, sid)
+    stub = _mk_security(db, "META")
+    repo.add_dq_flag(db, check_name="test_flag", security_id=stub)
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    assert outcome.status == repo.CHANGE_APPLIED
+    assert outcome.folded_security_id == stub
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    assert repo.resolve_security_id(db, "META") == sid
+    # The stub's annotations move to the survivor rather than dangling.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag WHERE security_id = %s", (sid,)
+        )
+        == 1
+    )
+
+
+def test_duplicate_that_carries_history_is_a_conflict_not_a_merge(db):
+    sid = _mk_security(db, "FB")
+    _give_history(db, sid)
+    other = _mk_security(db, "META")
+    _give_history(db, other, close=200)
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    # Merging two price histories is not a loader's decision.
+    assert outcome.status == repo.CHANGE_CONFLICT
+    assert db.fetchval("SELECT count(*) FROM core.security") == 2
+    assert (
+        db.fetchval(
+            "SELECT primary_symbol FROM core.security WHERE security_id = %s", (sid,)
+        )
+        == "FB"
+    )
+    assert repo.resolve_security_id(db, "META") == other
+
+
+def test_fold_refuses_a_security_that_owns_anything(db):
+    survivor = _mk_security(db, "FB")
+    victim = _mk_security(db, "META")
+    _give_history(db, victim)
+
+    assert repo.fold_empty_security(db, victim_id=victim, survivor_id=survivor) is False
+    assert db.fetchval("SELECT count(*) FROM core.security") == 2
+
+
+# ---------------------------------------------------------------------------
+# Ticker reuse is not a rename
+# ---------------------------------------------------------------------------
+
+
+def test_rename_never_resurrects_a_delisted_issuer(db):
+    # Circuit City (CC, delisted 2009) is not renamed into anything -- 0009 mints a
+    # new id for the ticker's next owner, and this step must not interfere.
+    dead = _mk_security(db, "CC", exchange="NYSE", name="Circuit City")
+    repo.mark_delisted(db, security_id=dead, delisted_date=dt.date(2009, 3, 8))
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol="CC", new_symbol="CCX", change_date=CHANGE_DATE
+    )
+
+    assert outcome.status == repo.CHANGE_IGNORED
+    row = db.fetchone(
+        "SELECT primary_symbol, delisted_date, is_actively_trading "
+        "FROM core.security WHERE security_id = %s",
+        (dead,),
+    )
+    assert row["primary_symbol"] == "CC"
+    assert row["delisted_date"] == dt.date(2009, 3, 8)
+    assert row["is_actively_trading"] is False
+
+
+def test_rename_onto_a_ticker_a_dead_issuer_used_is_allowed(db):
+    # The new ticker is only "taken" by a delisted row, which 0009's partial unique
+    # index does not cover -- so the rename must go through.
+    dead = _mk_security(db, "CCX", exchange="NYSE")
+    repo.mark_delisted(db, security_id=dead, delisted_date=dt.date(2009, 3, 8))
+    live = _mk_security(db, "AAA", exchange="NYSE")
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol="AAA", new_symbol="CCX", change_date=CHANGE_DATE
+    )
+
+    assert outcome.status == repo.CHANGE_APPLIED
+    assert repo.resolve_security_id(db, "CCX") == live  # the live one, not the dead one
+    assert db.fetchval(
+        "SELECT delisted_date FROM core.security WHERE security_id = %s", (dead,)
+    ) == dt.date(2009, 3, 8)
+
+
+def test_unknown_ticker_is_left_for_a_later_sweep(db):
+    outcome = repo.apply_symbol_change(
+        db, old_symbol="NOPE", new_symbol="NAH", change_date=CHANGE_DATE
+    )
+    assert outcome.status == repo.CHANGE_UNKNOWN
+    assert db.fetchval("SELECT count(*) FROM core.security") == 0
+
+
+# ---------------------------------------------------------------------------
+# The audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_recorded_status_is_never_downgraded_from_applied(db):
+    sid = _mk_security(db, "FB")
+    repo.record_symbol_change(
+        db,
+        old_symbol="FB",
+        new_symbol="META",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_APPLIED,
+        security_id=sid,
+    )
+    # A later sweep re-reads the same feed row; the ticker is legitimately taken
+    # now (by us), and that must not rewrite history as a conflict.
+    repo.record_symbol_change(
+        db,
+        old_symbol="FB",
+        new_symbol="META",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_CONFLICT,
+    )
+
+    assert (
+        repo.symbol_change_status(
+            db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+        )
+        == repo.CHANGE_APPLIED
+    )
+    assert db.fetchval("SELECT count(*) FROM core.symbol_change") == 1
+
+
+def test_conflicts_stay_in_the_review_queue_until_they_are_applied(db):
+    repo.record_symbol_change(
+        db,
+        old_symbol="AAA",
+        new_symbol="BBB",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_CONFLICT,
+        detail={"reason": "taken"},
+    )
+    assert [r["new_symbol"] for r in repo.unapplied_symbol_changes(db)] == ["BBB"]
+
+    sid = _mk_security(db, "AAA")
+    repo.record_symbol_change(
+        db,
+        old_symbol="AAA",
+        new_symbol="BBB",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_APPLIED,
+        security_id=sid,
+    )
+    assert repo.unapplied_symbol_changes(db) == []
+
+
+# ---------------------------------------------------------------------------
+# New listings enter scope
+# ---------------------------------------------------------------------------
+
+
+class _ScreenerFMP:
+    """Screener stub serving one venue's rows."""
+
+    bytes_downloaded = 0
+    request_count = 0
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def company_screener(self, *, exchange=None, **_kw):
+        return self.rows if exchange == "NASDAQ" else []
+
+
+def _load(db, symbols):
+    rows = [
+        {"symbol": s, "exchangeShortName": "NASDAQ", "name": f"{s} Inc", "isEtf": False}
+        for s in symbols
+    ]
+    return security_master.load_securities(db, _ScreenerFMP(rows))
+
+
+def test_security_master_reports_which_listings_are_new(db):
+    first = _load(db, ["AAA", "BBB"])
+    assert (first.total, sorted(first.new_symbols)) == (2, ["AAA", "BBB"])
+
+    # A re-run of the same universe is a refresh, not two more listings.
+    second = _load(db, ["AAA", "BBB"])
+    assert (second.total, second.new_symbols) == (2, [])
+
+    # An IPO shows up in the screener the day it lists; this is the whole point of
+    # running the security master nightly.
+    third = _load(db, ["AAA", "BBB", "IPOX"])
+    assert third.new_symbols == ["IPOX"]
+    assert repo.resolve_security_id(db, "IPOX") is not None
+    assert repo.count_recent_listings(db, days=7) == 3
+
+
+def test_new_listing_has_no_watermark_so_its_first_pull_is_a_backfill(db):
+    _load(db, ["IPOX"])
+    sid = repo.resolve_security_id(db, "IPOX")
+    # No watermark means load_symbol_prices leaves start_date None, i.e. asks for
+    # the symbol's whole available history on the first nightly run after listing.
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) is None
+
+
+def test_active_security_keys_ignores_delisted_rows(db):
+    sid = _mk_security(db, "AAA")
+    assert ("AAA", "NASDAQ") in repo.active_security_keys(db)
+
+    repo.mark_delisted(db, security_id=sid, delisted_date=dt.date(2024, 1, 2))
+    # A delisted row is invisible to 0009's partial index, so the same ticker
+    # listing again is genuinely new -- and must be reported as such.
+    assert ("AAA", "NASDAQ") not in repo.active_security_keys(db)
+    assert _load(db, ["AAA"]).new_symbols == ["AAA"]
+    assert db.fetchval("SELECT count(*) FROM core.security") == 2
+
+
+# ---------------------------------------------------------------------------
+# Resolving a ticker after it has moved
+# ---------------------------------------------------------------------------
+
+
+def test_a_reused_ticker_resolves_to_its_live_owner_not_its_former_user(db):
+    # AAA renames to BBB, then a different company lists as AAA. Both have a claim
+    # on the string "AAA"; only one of them is trading under it.
+    renamed = _mk_security(db, "AAA", name="Old Co")
+    _give_history(db, renamed)
+    repo.apply_symbol_change(
+        db, old_symbol="AAA", new_symbol="BBB", change_date=CHANGE_DATE
+    )
+    newcomer = _mk_security(db, "AAA", name="New Co")
+
+    assert repo.resolve_security_id(db, "AAA") == newcomer
+    assert repo.resolve_security_id(db, "BBB") == renamed
+
+
+def test_duk_and_the_loader_resolve_a_renamed_ticker_identically(db):
+    # The read path duplicates these queries rather than importing them, so the
+    # two copies have to be checked against each other, not just asserted about.
+    from duk.datasource.db import _resolve_security_id
+
+    sid = _mk_security(db, "FB")
+    _give_history(db, sid)
+    repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    from psycopg.rows import dict_row
+
+    with db.conn.cursor(row_factory=dict_row) as cur:
+        for symbol in ("FB", "META", "NOPE"):
+            assert _resolve_security_id(cur, symbol) == repo.resolve_security_id(
+                db, symbol
+            ), symbol
+        assert _resolve_security_id(cur, "FB") == sid
+
+
+# ---------------------------------------------------------------------------
+# The nightly sweep, end to end
+# ---------------------------------------------------------------------------
+
+
+class _RenameFMP:
+    """Rename-feed stub (no network); rows arrive newest first, as FMP sends them."""
+
+    bytes_downloaded = 0
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def symbol_changes(self, *, max_pages=5):
+        return self.rows
+
+
+def test_nightly_sweep_applies_the_rename_and_leaves_a_trail(db):
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    sid = _mk_security(db, "FB", name="Facebook, Inc.")
+    _give_history(db, sid)
+    fmp = _RenameFMP(
+        [
+            # A rename fafnir does not track (the feed is global) and the one it does.
+            {"date": "2024-06-10", "oldSymbol": "2958.HK", "newSymbol": "2959.HK"},
+            {
+                "date": "2024-06-10",
+                "oldSymbol": "FB",
+                "newSymbol": "META",
+                "companyName": "Meta Platforms, Inc.",
+            },
+        ]
+    )
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert (counts["applied"], counts["unknown"]) == (1, 1)
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    assert repo.resolve_security_id(db, "META") == sid
+    # Lineage: a run row, the raw feed, and the audit row -- only for the rename
+    # that was ours.
+    assert (
+        db.fetchval(
+            "SELECT status FROM ops.ingestion_run WHERE endpoint = 'symbol-change'"
+        )
+        == "success"
+    )
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM landing.fmp_raw WHERE endpoint = 'symbol-change'"
+        )
+        == 1
+    )
+    assert db.fetchall(
+        "SELECT old_symbol, new_symbol, status FROM core.symbol_change"
+    ) == [{"old_symbol": "FB", "new_symbol": "META", "status": "applied"}]
+
+    # A second sweep over the same feed is a no-op, not a second rename.
+    again = load_symbol_changes(db, fmp)
+    assert (again["skipped"], again["applied"]) == (1, 0)
+    assert db.fetchval("SELECT count(*) FROM core.symbol_change") == 1
+
+
+def test_nightly_sweep_flags_a_conflict_for_review(db):
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    sid = _mk_security(db, "FB")
+    _give_history(db, sid)
+    other = _mk_security(db, "META")
+    _give_history(db, other, close=200)
+
+    counts = load_symbol_changes(
+        db, _RenameFMP([{"date": "2024-06-10", "oldSymbol": "FB", "newSymbol": "META"}])
+    )
+
+    assert counts["conflict"] == 1
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag "
+            "WHERE check_name = 'symbol_change_conflict' AND resolved_at IS NULL"
+        )
+        == 1
+    )
+    assert [r["new_symbol"] for r in repo.unapplied_symbol_changes(db)] == ["META"]
+    # Nothing moved: both securities keep their tickers and their history.
+    assert db.fetchval("SELECT count(*) FROM core.security") == 2

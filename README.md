@@ -15,8 +15,9 @@ client.
   adjusted prices are *derived on read* (point-in-time stable); delisted securities
   are retained (no survivorship bias); every load is idempotent and logged.
 
-> Status: **initial release** — security master, daily OHLCV, corporate actions,
-> and the dual-mode `duk` CLI. Fundamentals and economic time series are the next
+> Status: **initial release** — self-maintaining security master (new listings and
+> ticker renames reconciled nightly), daily OHLCV, corporate actions, and the
+> dual-mode `duk` CLI. Fundamentals and economic time series are the next
 > milestones (see `doc/extending.md`).
 
 ## Architecture at a glance
@@ -72,7 +73,12 @@ duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
 ```
 
 Daily upkeep is a single cron entry running `scripts/daily_update.sh` — see
-**[doc/operations.md](doc/operations.md)**.
+**[doc/operations.md](doc/operations.md)**. It maintains the universe as well as the
+data: each night it applies ticker renames to the security that already holds the
+history (FB → META keeps one `security_id`), re-reads the screener so a security
+that listed today enters scope today, and marks what stopped trading — then loads
+prices, actions and factors. A newly listed security has no watermark, so it gets
+its full available history on the same run.
 
 ## `duk` — dual-mode data access
 

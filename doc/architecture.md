@@ -23,7 +23,7 @@ one upstream.
      │   validate + type at the boundary; quarantine failures
      ▼
  core      modeled, constrained source of truth
-     │      security, symbol_xref, company_profile,
+     │      security, symbol_xref, symbol_change, company_profile,
      │      daily_price (raw OHLCV), corporate_action, adjustment_factor
      ▼
  mart      derived read views/matviews
@@ -76,6 +76,13 @@ series is **point-in-time stable and reproducible**. See
   to `security_id` over time.
 - Delisted/inactive securities are **retained** (`delisted_date` set, never
   deleted), so backtests are free of survivorship bias.
+- The universe **maintains itself**. The nightly job re-reads the screener, so a
+  security that lists today enters scope today (and, having no watermark, gets its
+  full history on the same run). Before that it applies ticker renames to the
+  security that already holds the history, because to the screener a rename is
+  indistinguishable from a new listing — and minting it as one would fork a
+  company's identity into two `security_id`s. See
+  [adr/0005-automatic-universe-maintenance.md](adr/0005-automatic-universe-maintenance.md).
 
 ## Partitioning & TimescaleDB-readiness
 

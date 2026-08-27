@@ -40,7 +40,53 @@ crontab etc/crontab.example   # edit paths/times first
 ```
 
 The daily job performs, in order:
-`ensure-horizon → ingest prices → ingest actions → adjust → refresh-marts → dq run`.
+`ensure-horizon → ingest symbol-changes → ingest securities → ingest delisted →
+ingest prices → ingest actions → adjust → refresh-marts → dq run`.
+
+The first three steps are **universe maintenance**, and their order is load-bearing:
+
+1. **`ingest symbol-changes`** applies ticker renames to the security that already
+   holds the history (FB → META keeps one `security_id`). It runs first because to
+   the screener a renamed ticker is indistinguishable from a new listing — run the
+   security master first and it mints a *second* security for a company fafnir
+   already has, stranding its prices, corporate actions and price watermark on a
+   ticker nothing will ever close.
+2. **`ingest securities`** re-reads the screener, so a security that listed today —
+   an IPO, a spin-off, a new ETF — enters scope. It reports how many were new. A
+   new security has no price watermark, so the price step below pulls its full
+   available history on the same run; nothing else is needed.
+3. **`ingest delisted`** marks what stopped trading, before prices asks it for bars.
+
+Bandwidth: the security-master refresh is ~5 screener requests per venue-page pass
+(a few MB), once a night.
+
+The two universe steps are run through a `upkeep` wrapper in `daily_update.sh`: if
+one fails, the job warns and carries on to prices rather than costing the night's
+data for every symbol. Nothing is swallowed — the failure is still an
+`ops.ingestion_run` row with `status = 'failed'`, which is why that query is on the
+monitoring list below.
+
+### When a rename cannot be applied automatically
+
+`fafnir status` ends with a **Renames** section when a rename is waiting on a
+human. That happens when the new ticker already belongs to a *different* listed
+security that carries its own price history — two live claims on one ticker, which
+usually means fafnir was not running when the rename happened and the security
+master minted the new ticker as its own company in the meantime. The loader will
+not merge two price histories silently, so it changes nothing and raises a
+`symbol_change_conflict` DQ flag.
+
+```sql
+-- the review queue
+SELECT old_symbol, new_symbol, change_date, detail FROM core.symbol_change
+ WHERE status <> 'applied' ORDER BY change_date DESC;
+```
+
+Resolve it by deciding which `security_id` is the company: move the bars off the
+duplicate (or accept it as a separate entity), then re-run
+`fafnir ingest symbol-changes`, which retries every non-applied row. A duplicate
+that holds *no* prices, actions or factors needs no decision — the sweep folds it
+into the surviving security by itself and says so in the log.
 
 ## Monitoring
 
@@ -50,6 +96,10 @@ scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 ```
 
 Things to watch:
+- **Unapplied renames** — the `Renames` line in `fafnir status`. Each one is a
+  company whose identity is currently split across two `security_id`s.
+- **New listings** — the `New (7d)` line. A week of zero on a working FMP key means
+  the security-master step is not running, and the universe is quietly going stale.
 - **Freshness** — `fafnir status` latest date should track the last trading day.
   Stale securities raise `stale` DQ flags.
 - **Quarantine spikes** — a jump in `ops.data_quality_flag` (warn/error) on a load
