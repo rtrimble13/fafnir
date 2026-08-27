@@ -196,6 +196,12 @@ the compared window is not by itself a reason for the two to disagree.
   clears prices / actions / landing / everything, keeping migrations, partitions and
   reference data. Dry run by default; `--yes` to execute. Scope table in
   [backfill.md](backfill.md#clearing-data-for-a-reload).
+- **Adjustment factors failed** — `fafnir adjust` commits per security and flags one
+  it cannot compute (`adjustment_failed`) instead of ending the run; those securities
+  keep their previous factors (none on a first backfill, stale afterwards) until
+  fixed. Past 1% of the universe failing it exits non-zero — that is systemic — and
+  it stops early if the first 50 fail without a success. See
+  [backfill.md](backfill.md#when-step-5-adjustment-factors-stops).
 - **Schema rollback** — `fafnir db rollback --steps N` (uses the `.down.sql`).
   Never roll back in a way that drops `core.daily_price` history without a backup.
 
