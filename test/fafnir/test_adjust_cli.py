@@ -81,6 +81,63 @@ def test_a_universe_wide_failure_exits_nonzero(runner, monkeypatch):
     assert "systemic" in result.output
 
 
+def test_one_bad_security_on_a_small_warehouse_is_not_systemic(runner, monkeypatch):
+    """The ratio alone made a single failure "systemic" below 100 securities.
+
+    1% of 50 is half a security, so one bad one cleared the bar. Both scripts run
+    `fafnir adjust` unguarded under `set -euo pipefail`, so that non-zero exit
+    skipped the mart refresh and the DQ pass -- on the `--limit 50` warehouse the
+    install guide (§6) and backfill.md walk a new operator through building.
+    """
+    monkeypatch.setattr(
+        adjustments,
+        "adjust_all",
+        lambda db, security_id=None: {"securities": 49, "failed": 1, "aborted": False},
+    )
+
+    result = _invoke(runner)
+
+    assert result.exit_code == 0
+    assert "systemic" not in result.output
+    assert "kept the factors from their last successful run" in result.output
+
+
+def test_a_small_warehouse_failing_wholesale_is_still_systemic(runner, monkeypatch):
+    """The floor must not turn the guard off for small warehouses, only tune it."""
+    monkeypatch.setattr(
+        adjustments,
+        "adjust_all",
+        lambda db, security_id=None: {"securities": 5, "failed": 45, "aborted": False},
+    )
+
+    result = _invoke(runner)
+
+    assert result.exit_code != 0
+    assert "systemic" in result.output
+
+
+def test_the_ratio_still_binds_on_the_full_universe(runner, monkeypatch):
+    """Past ~2,000 securities the ratio is the binding condition, not the floor.
+
+    1% of 21,106 is 211, so 500 failures is systemic even though each one on its own
+    looks like bad data -- which is the case the ratio was written for.
+    """
+    monkeypatch.setattr(
+        adjustments,
+        "adjust_all",
+        lambda db, security_id=None: {
+            "securities": 20606,
+            "failed": 500,
+            "aborted": False,
+        },
+    )
+
+    result = _invoke(runner)
+
+    assert result.exit_code != 0
+    assert "systemic" in result.output
+
+
 def test_an_unknown_symbol_is_an_error_not_the_whole_universe(runner, monkeypatch):
     """resolve_security_id returns None for a typo, and None means 'all'."""
     monkeypatch.setattr(repo, "resolve_security_id", lambda db, symbol: None)

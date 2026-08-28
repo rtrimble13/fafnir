@@ -290,6 +290,11 @@ def load_symbol_prices(
         row, reason = _validate_bar(bar)
         if reason:
             run.rows_quarantined += 1
+            # Deliberately add_dq_flag, not add_dq_flag_once: here each detection
+            # IS the signal. count_price_quarantines counts these rows to decide
+            # when a persistently-bad bar has held the watermark long enough
+            # (MAX_QUARANTINE_HOLDS, below), so deduplicating them would freeze
+            # that counter at 1 and hold the watermark behind the bar forever.
             repo.add_dq_flag(
                 db,
                 check_name=f"price_{reason}",

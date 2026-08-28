@@ -173,20 +173,19 @@ def load_symbol_changes(
                 detail=detail,
             )
 
-            if (
-                outcome.status == repo.CHANGE_CONFLICT
-                and recorded != repo.CHANGE_CONFLICT
-            ):
+            if outcome.status == repo.CHANGE_CONFLICT:
                 # Two live securities claiming one ticker, both with history. A
                 # human decides; the flag is how they find out.
                 #
-                # Only on the night the conflict is first seen. Conflicts are
-                # retried on every sweep by design, and add_dq_flag is an
-                # unguarded insert -- flagging each retry would add an unresolved
-                # flag per night for one unresolved problem, inflating the open-DQ
-                # count until it says nothing. core.symbol_change is the durable
-                # queue; the flag is the notification.
-                repo.add_dq_flag(
+                # Once per conflict, not once per retry: conflicts are retried on
+                # every sweep by design, so a plain insert would add an unresolved
+                # flag per night for one unresolved problem. add_dq_flag_once keys
+                # on the (old, new) pair and is now the guard -- this used to be
+                # hand-rolled here off the previously recorded status, which was the
+                # only call site in the codebase that acted on the problem at all.
+                # core.symbol_change is the durable queue; the flag is the
+                # notification, and the warning goes with it.
+                if repo.add_dq_flag_once(
                     db,
                     check_name="symbol_change_conflict",
                     severity="error",
@@ -199,14 +198,14 @@ def load_symbol_changes(
                         "change_date": str(when),
                     },
                     ingestion_run_id=run.run_id,
-                )
-                logger.warning(
-                    "symbol change %s -> %s on %s conflicts with an existing "
-                    "security; left unapplied for review",
-                    old,
-                    new,
-                    when,
-                )
+                ):
+                    logger.warning(
+                        "symbol change %s -> %s on %s conflicts with an existing "
+                        "security; left unapplied for review",
+                        old,
+                        new,
+                        when,
+                    )
             elif outcome.status == repo.CHANGE_APPLIED:
                 logger.info(
                     "renamed %s -> %s (security %s) effective %s",

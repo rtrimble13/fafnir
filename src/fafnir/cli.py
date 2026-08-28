@@ -405,13 +405,22 @@ def adjust(ctx, symbol):
             "(`fafnir db status`) and read the flags before re-running."
         )
     attempted = result["securities"] + result["failed"]
-    if result["failed"] > adjustments.SYSTEMIC_FAILURE_RATIO * attempted:
+    systemic = (
+        result["failed"] >= adjustments.SYSTEMIC_FAILURE_FLOOR
+        and result["failed"] > adjustments.SYSTEMIC_FAILURE_RATIO * attempted
+    )
+    if systemic:
         # Not bad data at this scale -- the schema, the grants or a lock. Exiting 0
         # here would let a backfill under `set -e` sail on to refresh a mart built on
         # nothing, and a nightly cron report success while writing no factors at all.
+        #
+        # Both conditions, not either: the ratio is what catches it on the full
+        # universe, the floor is what stops one bad security being called systemic on
+        # a small or `--limit`-built one (see SYSTEMIC_FAILURE_FLOOR).
         raise click.ClickException(
             f"{result['failed']} of {attempted} securities failed "
-            f"(> {adjustments.SYSTEMIC_FAILURE_RATIO:.0%}); that is systemic, not bad "
+            f"(>= {adjustments.SYSTEMIC_FAILURE_FLOOR} and "
+            f"> {adjustments.SYSTEMIC_FAILURE_RATIO:.0%}); that is systemic, not bad "
             "data. Check that migrations are applied (`fafnir db status`) and read "
             "the flags before re-running."
         )

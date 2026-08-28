@@ -51,6 +51,8 @@ class _FakeDB:
         self.applied: list[tuple[str, str, date]] = []
         self.audit: list[dict] = []
         self.flags: list[str] = []
+        # (check_name, record_key) already open, so the dedupe guard can be faked.
+        self.open_flags: set[tuple] = set()
         self.commits = 0
 
     def commit(self) -> None:
@@ -89,13 +91,20 @@ def patched(monkeypatch):
     def record(db, **kw):
         db.audit.append(kw)
 
-    def flag(db, *, check_name, **kw):
+    def flag_once(db, *, check_name, record_key=None, **kw):
+        # Stands in for the real add_dq_flag_once: skips an open flag for the same
+        # condition and reports whether it wrote one.
+        key = (check_name, tuple(sorted((record_key or {}).items())))
+        if key in db.open_flags:
+            return False
+        db.open_flags.add(key)
         db.flags.append(check_name)
+        return True
 
     monkeypatch.setattr(mod.repo, "symbol_change_status", status)
     monkeypatch.setattr(mod.repo, "apply_symbol_change", apply)
     monkeypatch.setattr(mod.repo, "record_symbol_change", record)
-    monkeypatch.setattr(mod.repo, "add_dq_flag", flag)
+    monkeypatch.setattr(mod.repo, "add_dq_flag_once", flag_once)
     return mod
 
 
@@ -195,18 +204,17 @@ def test_conflicts_are_flagged_and_left_unapplied(patched):
 
 
 def test_a_known_conflict_is_not_re_flagged_every_sweep(patched):
-    # add_dq_flag is an unguarded insert and conflicts are retried by design, so
-    # the flag has to be tied to *seeing* the conflict, not to retrying it.
-    db = _FakeDB(
-        outcomes={("AAA", "BBB"): SymbolChangeOutcome(CHANGE_CONFLICT, 3)},
-        recorded={("AAA", "BBB", date(2026, 6, 9)): CHANGE_CONFLICT},
-    )
+    # Conflicts are retried by design, so the flag has to be tied to the conflict,
+    # not to the retry: one unresolved problem is one unresolved flag, however many
+    # nights it goes unresolved.
+    db = _FakeDB(outcomes={("AAA", "BBB"): SymbolChangeOutcome(CHANGE_CONFLICT, 3)})
     fmp = _FakeFMP([{"date": "2026-06-09", "oldSymbol": "AAA", "newSymbol": "BBB"}])
 
-    counts = load_symbol_changes(db, fmp)
+    for _ in range(3):
+        counts = load_symbol_changes(db, fmp)
 
-    assert counts["conflict"] == 1  # still retried
-    assert db.flags == []  # but not re-announced
+    assert counts["conflict"] == 1  # still retried on every sweep
+    assert db.flags == ["symbol_change_conflict"]  # but announced once
 
 
 def test_conflicts_are_retried_on_the_next_sweep(patched):
