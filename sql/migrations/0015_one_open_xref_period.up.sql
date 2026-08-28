@@ -3,9 +3,9 @@
 --
 -- The invariant core.symbol_xref has always assumed but never enforced: a ticker
 -- serves at most ONE security at a time. XREF_RESOLVE_SQL reads only open periods
--- and takes the one with the greatest valid_from, so a second open period for the
--- same symbol is not a second answer -- it is a row the resolver silently ignores
--- while point-in-time queries still read it.
+-- and takes the first by (is_primary DESC, valid_from DESC), so a second open period
+-- for the same symbol is not a second answer -- it is a row the resolver silently
+-- ignores while point-in-time queries still read it.
 --
 -- They exist. upsert_symbol_xref(valid_from=NULL) resolved "the period this ticker
 -- serves" from CLOSED periods only, so a ticker whose open period does not start at
@@ -40,7 +40,11 @@ WITH ranked AS (
            count(*) OVER (PARTITION BY symbol) AS open_periods
       FROM core.symbol_xref
      WHERE valid_to IS NULL
-    WINDOW w AS (PARTITION BY symbol ORDER BY valid_from DESC)
+    -- Exactly XREF_RESOLVE_SQL's ordering (and active_security_for_symbol's), so
+    -- the row kept open is the row resolution already answers with. Ranking on
+    -- valid_from alone would keep a later non-primary period instead and silently
+    -- move the ticker to a different security_id.
+    WINDOW w AS (PARTITION BY symbol ORDER BY is_primary DESC, valid_from DESC)
 )
 DELETE FROM core.symbol_xref x
  USING ranked r
@@ -55,24 +59,36 @@ DELETE FROM core.symbol_xref x
 -- 2. Anything still doubled is two DIFFERENT securities holding one ticker, which
 --    is not this bug's signature and is not ours to delete -- a security_id is an
 --    identity and the row is the record that it held the ticker. Closed instead,
---    the day before the surviving period opens, exactly as retarget_symbol and
---    mark_delisted close a period they are superseding. GREATEST keeps
---    ck valid_to >= valid_from satisfied when the two start on the same day.
+--    exactly as retarget_symbol and mark_delisted close a period they supersede.
 --
---    Resolution does not change either way: the resolver already answered with the
---    later period and still does. What changes is that the earlier claim is now
---    bounded instead of open-ended.
+--    Closed the day before whichever comes first: the surviving period, or the next
+--    superseded period along. With two rows those are the same date. With three or
+--    more they are not, and closing them all against the survivor would produce
+--    OVERLAPPING closed periods -- 1900-2023 and 2020-2023 both claiming 2020-2023 --
+--    breaking the contiguity the rest of the table maintains. LEAST ignores a NULL
+--    lead (nothing follows), so a period after the survivor still closes against it.
+--
+--    Resolution does not change: the period left open is the one the resolver
+--    already answered with (same ordering, above). What changes is that a superseded
+--    claim is bounded instead of open-ended. GREATEST covers a period that starts
+--    on or after the survivor's: it closes on its own start date rather than
+--    violating ck valid_to >= valid_from.
 -- ---------------------------------------------------------------------------
 WITH ranked AS (
     SELECT symbol, valid_from,
            first_value(valid_from) OVER w AS keep_from,
+           lead(valid_from) OVER (PARTITION BY symbol ORDER BY valid_from) AS next_from,
            count(*) OVER (PARTITION BY symbol) AS open_periods
       FROM core.symbol_xref
      WHERE valid_to IS NULL
-    WINDOW w AS (PARTITION BY symbol ORDER BY valid_from DESC)
+    -- Exactly XREF_RESOLVE_SQL's ordering (and active_security_for_symbol's), so
+    -- the row kept open is the row resolution already answers with. Ranking on
+    -- valid_from alone would keep a later non-primary period instead and silently
+    -- move the ticker to a different security_id.
+    WINDOW w AS (PARTITION BY symbol ORDER BY is_primary DESC, valid_from DESC)
 )
 UPDATE core.symbol_xref x
-   SET valid_to = GREATEST(x.valid_from, r.keep_from - 1)
+   SET valid_to = GREATEST(x.valid_from, LEAST(r.keep_from, r.next_from) - 1)
   FROM ranked r
  WHERE x.symbol     = r.symbol
    AND x.valid_from = r.valid_from

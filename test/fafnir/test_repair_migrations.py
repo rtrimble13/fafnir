@@ -39,12 +39,20 @@ def _run_migration(db, stem: str) -> None:
 def unconstrained(db):
     """Drop the two unique indexes so the corruption can be seeded at all.
 
-    Each test restores them by running the migration that creates them, which is
-    the point: the repair has to succeed on a table the constraint would reject.
+    The test body restores one of them by running the migration that creates it,
+    which is the point: the repair has to succeed on a table the constraint would
+    reject. Teardown restores BOTH -- the other one, and either one when the test
+    fails before it gets that far. The database is shared by the whole session
+    (`migrated_dsn`), so an index left dropped here is a constraint silently
+    missing from every test that runs after this file.
     """
     db.execute(f"DROP INDEX IF EXISTS {XREF_INDEX}")
     db.execute(f"DROP INDEX IF EXISTS {FLAG_INDEX}")
-    return db
+    try:
+        yield db
+    finally:
+        _run_migration(db, "0015")
+        _run_migration(db, "0016")
 
 
 def _mk_security(db, symbol, name="Test Co"):
@@ -68,10 +76,11 @@ def _xref(db):
     ]
 
 
-def _open_period(db, symbol, security_id, valid_from):
+def _open_period(db, symbol, security_id, valid_from, is_primary=True):
     db.execute(
-        "INSERT INTO core.symbol_xref (security_id, symbol, valid_from) VALUES (%s,%s,%s)",
-        (security_id, symbol, valid_from),
+        "INSERT INTO core.symbol_xref (security_id, symbol, valid_from, is_primary)"
+        " VALUES (%s,%s,%s,%s)",
+        (security_id, symbol, valid_from, is_primary),
     )
 
 
@@ -136,6 +145,58 @@ def test_0015_closes_rather_than_deletes_a_different_securitys_claim(unconstrain
     ]
     # Resolution is unchanged -- it already answered with the later period.
     assert repo.resolve_security_id(db, "DUP") == second
+
+
+def test_0015_keeps_the_period_resolution_actually_answers_with(unconstrained):
+    # The survivor has to be chosen the way the resolver chooses, which is
+    # (is_primary DESC, valid_from DESC) -- not valid_from alone. Ranking on the
+    # date would keep the later non-primary period and silently move the ticker to
+    # a different security_id, which is the one thing this migration promises not
+    # to do.
+    db = unconstrained
+    primary = _mk_security(db, "AAA", name="Primary holder")
+    other = _mk_security(db, "BBB", name="Other")
+    _open_period(db, "DUP", primary, dt.date(2020, 1, 1), is_primary=True)
+    _open_period(db, "DUP", other, dt.date(2024, 6, 10), is_primary=False)
+    before = repo.resolve_security_id(db, "DUP")
+
+    _run_migration(db, "0015")
+
+    assert before == primary, "precondition: is_primary wins over the later date"
+    assert repo.resolve_security_id(db, "DUP") == before
+    assert db.fetchall(
+        "SELECT security_id FROM core.symbol_xref WHERE symbol='DUP'"
+        " AND valid_to IS NULL"
+    ) == [{"security_id": primary}]
+
+
+def test_0015_closes_three_open_periods_without_overlapping_them(unconstrained):
+    # Each superseded period closes the day before the NEXT one starts, not the day
+    # before the survivor: closing them all against the survivor would leave
+    # 1900-2023 and 2020-2023 both claiming 2020-2023.
+    db = unconstrained
+    a = _mk_security(db, "AAA", name="A")
+    b = _mk_security(db, "BBB", name="B")
+    c = _mk_security(db, "CCC", name="C")
+    _open_period(db, "DUP", a, dt.date(1900, 1, 1))
+    _open_period(db, "DUP", b, dt.date(2020, 1, 1))
+    _open_period(db, "DUP", c, dt.date(2024, 6, 10))
+
+    _run_migration(db, "0015")
+
+    periods = _xref(db)
+    assert periods == [
+        ("DUP", dt.date(1900, 1, 1), dt.date(2019, 12, 31), a),
+        ("DUP", dt.date(2020, 1, 1), dt.date(2024, 6, 9), b),
+        ("DUP", dt.date(2024, 6, 10), None, c),
+    ]
+    # Stated as the invariant rather than just the dates: no two periods for one
+    # ticker may cover the same day.
+    assert db.fetchval("""
+            SELECT count(*) FROM core.symbol_xref x JOIN core.symbol_xref y
+              ON x.symbol = y.symbol AND x.valid_from < y.valid_from
+             WHERE COALESCE(x.valid_to, 'infinity'::date) >= y.valid_from
+            """) == 0
 
 
 def test_0015_leaves_a_healthy_warehouse_alone(unconstrained):
