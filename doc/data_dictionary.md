@@ -68,6 +68,13 @@ contiguous and never both open. Resolution order (`resolve_security_id`, mirrore
 most recently closed period — so a reused ticker resolves to its live owner while a
 company's former ticker still reaches its history.
 
+**A ticker has at most one open period**, enforced since migration 0015
+(`ux_symbol_xref_open`, unique on `symbol` where `valid_to IS NULL`). Resolution
+reads only open periods, so a second one is not a second answer — it is a row the
+resolver ignores while point-in-time queries still read it. 0015 also repaired the
+warehouses that had accumulated them: a duplicate of the same security was deleted,
+and a second security's claim was closed the day before the surviving period opens.
+
 ### `core.symbol_change` — applied ticker renames
 **Grain:** one row per `(source, old_symbol, new_symbol, change_date)`. **Source:**
 FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
@@ -250,6 +257,14 @@ persistently-bad bar has held the ingestion watermark long enough
 the watermark behind the bar forever. New writers pick a side explicitly:
 `repository.add_dq_flag_once` for a standing condition, `add_dq_flag` where each
 detection is itself the signal.
+
+Since migration 0016 the schema holds the rule too — `ux_dq_flag_open_condition`,
+unique on `(check_name, security_id, record_key)` where `resolved_at IS NULL` and the
+check is not `price_*`. It is a backstop, not the mechanism: the guard stays in the
+write path, because a constraint alone would turn a redundant flag (harmless noise)
+into an exception that aborts whatever load raised it. 0016 also collapsed the
+duplicates a running warehouse had already accumulated, keeping the earliest row of
+each condition so `detected_at` still says when the problem was first seen.
 
 ### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
 `last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a

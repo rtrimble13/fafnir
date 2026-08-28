@@ -115,7 +115,10 @@ scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 Things to watch:
 - **Open DQ is a count of problems, not of runs** — a standing condition is flagged
   once and stays one row until someone sets `resolved_at`, however many nights it
-  goes unfixed, so a rising count means new problems. The exception is `price_*`,
+  goes unfixed, so a rising count means new problems. True for data already in the
+  table as well: migration 0016 collapsed the duplicates a warehouse running before
+  0014 had accumulated, so the number did not just stop growing, it dropped to the
+  problems it always should have been counting. The exception is `price_*`,
   which repeats by design (see
   [data_dictionary.md](data_dictionary.md#opsdata_quality_flag--quarantineanomaly-queue-grain-dq_flag_id));
   filter it out when you want the count of distinct issues. Nothing sets
