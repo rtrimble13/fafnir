@@ -177,11 +177,26 @@ def upsert_symbol_xref(
 ) -> None:
     """Map a ticker to a security_id for a validity period.
 
-    ``valid_from=None`` means "start after any period this ticker has already
-    served". A reused ticker therefore opens a *new* period instead of hijacking
-    the dead issuer's row -- which, since XREF_RESOLVE_SQL only reads open
-    periods, is what keeps a delisted company's price history addressable and
-    stops the new issuer from inheriting it.
+    ``valid_from=None`` means "the period this ticker is serving now, or the next
+    one if it is free". Resolved in that order:
+
+      1. The ticker's own open period, if it has one -- this call is a re-assertion
+         of the current mapping, so it updates that row. Without this branch the
+         nightly `ingest securities` re-asserts every ticker at the 1900 fallback
+         and opens a SECOND open period for any ticker whose open period does not
+         start there -- which is every ticker `retarget_symbol` has just renamed,
+         since that opens the new ticker's period at the change date. The rename
+         boundary 0011 exists to record is then erased by the next security-master
+         run, and the ticker resolves to a period claiming validity since 1900 for
+         dates on which it did not yet exist.
+      2. The day after the last period it served, if every one is closed. A reused
+         ticker therefore opens a *new* period instead of hijacking the dead
+         issuer's row -- which, since XREF_RESOLVE_SQL only reads open periods, is
+         what keeps a delisted company's price history addressable and stops the
+         new issuer from inheriting it.
+      3. '1900-01-01' for a ticker seen for the first time.
+
+    An explicit ``valid_from`` skips all of it and addresses that period directly.
     """
     db.execute(
         """
@@ -190,6 +205,8 @@ def upsert_symbol_xref(
             %s, %s,
             COALESCE(
                 %s::date,
+                (SELECT max(valid_from) FROM core.symbol_xref
+                  WHERE symbol = %s AND valid_to IS NULL),
                 (SELECT max(valid_to) + 1 FROM core.symbol_xref
                   WHERE symbol = %s AND valid_to IS NOT NULL),
                 '1900-01-01'::date
@@ -201,7 +218,7 @@ def upsert_symbol_xref(
             is_primary  = EXCLUDED.is_primary
         WHERE core.symbol_xref.valid_to IS NULL
         """,
-        (security_id, symbol, valid_from, symbol, is_primary, source),
+        (security_id, symbol, valid_from, symbol, symbol, is_primary, source),
     )
 
 

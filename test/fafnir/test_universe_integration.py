@@ -159,6 +159,77 @@ def test_rename_chain_applied_in_order_lands_on_the_final_ticker(db):
 
 
 # ---------------------------------------------------------------------------
+# The nightly security-master run must not undo the rename it just applied
+# ---------------------------------------------------------------------------
+
+
+def _open_periods(db, symbol):
+    return db.fetchall(
+        """
+        SELECT security_id, valid_from FROM core.symbol_xref
+         WHERE symbol = %s AND valid_to IS NULL ORDER BY valid_from
+        """,
+        (symbol,),
+    )
+
+
+def test_the_security_master_does_not_reopen_a_renamed_ticker_at_1900(db):
+    # `ingest symbol-changes` and `ingest securities` run back to back every night,
+    # and the second one re-asserts every live ticker with valid_from=None. That has
+    # to land on the period the rename just opened at the change date -- not open a
+    # second one at the 1900 fallback, which would erase the boundary 0011 exists to
+    # record and leave META claiming validity for dates when it was still FB.
+    sid = _mk_security(db, "FB")
+    _give_history(db, sid)
+    repo.apply_symbol_change(
+        db, old_symbol="FB", new_symbol="META", change_date=CHANGE_DATE
+    )
+
+    for _ in range(3):  # three nightly security-master runs
+        repo.upsert_symbol_xref(db, security_id=sid, symbol="META")
+
+    assert _open_periods(db, "META") == [
+        {"security_id": sid, "valid_from": CHANGE_DATE}
+    ]
+    # The old ticker stays closed the day before the change: contiguous, never both
+    # open, so the changeover day is unambiguous.
+    assert [(r["symbol"], r["valid_from"], r["valid_to"]) for r in _xref(db, sid)] == [
+        ("FB", dt.date(1900, 1, 1), CHANGE_DATE - dt.timedelta(days=1)),
+        ("META", CHANGE_DATE, None),
+    ]
+
+
+def test_a_reused_ticker_still_opens_its_own_period(db):
+    # The re-assertion branch must not swallow the case it sits in front of: a dead
+    # issuer's ticker taken by a new company gets a NEW period, so the delisted
+    # company's history stays addressable and the newcomer does not inherit it.
+    dead = _mk_security(db, "XYZ", name="Dead Co")
+    _give_history(db, dead, trade_date=dt.date(2024, 1, 3))
+    repo.mark_delisted(db, security_id=dead, delisted_date=dt.date(2024, 3, 1))
+    newcomer = _mk_security(db, "XYZ", name="New Co")
+
+    for _ in range(3):  # first arrival, then two more nightly runs
+        repo.upsert_symbol_xref(db, security_id=newcomer, symbol="XYZ")
+
+    assert _open_periods(db, "XYZ") == [
+        {"security_id": newcomer, "valid_from": dt.date(2024, 3, 2)}
+    ]
+    assert repo.resolve_security_id(db, "XYZ") == newcomer
+
+
+def test_a_plain_relisting_run_keeps_one_open_period(db):
+    # The ordinary case: no rename, no reuse, just the same ticker every night.
+    sid = _mk_security(db, "AAA")
+
+    for _ in range(3):
+        repo.upsert_symbol_xref(db, security_id=sid, symbol="AAA")
+
+    assert _open_periods(db, "AAA") == [
+        {"security_id": sid, "valid_from": dt.date(1900, 1, 1)}
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Collisions with a duplicate the security master already minted
 # ---------------------------------------------------------------------------
 

@@ -72,6 +72,17 @@ EXTREME_FACTOR = Decimal("1e12")
 # while writing nothing; below it, a few bad securities are flagged and stepped over.
 SYSTEMIC_FAILURE_RATIO = 0.01
 
+# The ratio alone is not a test on a small warehouse. 1% of anything under 100
+# securities is less than one, so a SINGLE bad security satisfied it and `fafnir
+# adjust` exited non-zero calling one failure systemic -- under `set -euo pipefail`
+# in daily_update.sh and initial_backfill.sh that skips the mart refresh and the DQ
+# pass entirely, which is the opposite of the stepped-over-and-carry-on behaviour
+# the ratio exists to protect. Reachable on any `--limit`-built deployment, which
+# is what both the install guide (§6) and backfill.md walk a new operator through.
+# So the verdict needs an absolute floor as well: a handful of failures is bad data
+# at any scale, and past ~2,000 securities the ratio is the binding condition again.
+SYSTEMIC_FAILURE_FLOOR = 20
+
 # ...and when it is systemic, the run should not grind through 21,000 securities to
 # find that out. Failing this many in a row without a single success means nothing
 # after them will succeed either, and continuing would write one committed
