@@ -437,6 +437,34 @@ def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bo
     if victim_id == survivor_id or security_has_history(db, victim_id):
         return False
     # Soft references first (no FK, so nothing enforces this order but us).
+    #
+    # Drop the victim's open flags that the survivor already carries before
+    # repointing the rest. Folding is the one moment two securities' flags become
+    # one security's, so it is the one place a repoint can land a second open flag
+    # on a condition that already has one -- which is both the inflation 0014 set
+    # out to stop and, since 0016, a unique-index violation that would abort the
+    # rename sweep. A redundant flag is not worth failing a load over, and the
+    # survivor's row already says the same thing.
+    #
+    # price_* is excluded, as everywhere: a stub can carry those (a quarantined bar
+    # writes a flag but no price row, so security_has_history still calls it empty)
+    # and count_price_quarantines counts them to bound the watermark hold.
+    db.execute(
+        """
+        DELETE FROM ops.data_quality_flag v
+         WHERE v.security_id = %s
+           AND v.resolved_at IS NULL
+           AND v.check_name NOT LIKE 'price\\_%%'
+           AND EXISTS (
+                 SELECT 1 FROM ops.data_quality_flag s
+                  WHERE s.security_id = %s
+                    AND s.resolved_at IS NULL
+                    AND s.check_name = v.check_name
+                    AND s.record_key IS NOT DISTINCT FROM v.record_key
+           )
+        """,
+        (victim_id, survivor_id),
+    )
     db.execute(
         "UPDATE ops.data_quality_flag SET security_id = %s WHERE security_id = %s",
         (survivor_id, victim_id),
