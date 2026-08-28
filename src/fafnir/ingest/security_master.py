@@ -156,7 +156,7 @@ def check_company_name_drift(
         incoming_name,
         ratio,
     )
-    repo.add_dq_flag(
+    repo.add_dq_flag_once(
         db,
         check_name="security_company_name_drift",
         severity="warn",
@@ -286,7 +286,7 @@ def _bounded_security_numerics(
                 field,
                 value,
             )
-            repo.add_dq_flag(
+            repo.add_dq_flag_once(
                 db,
                 check_name=f"security_{field}_out_of_range",
                 security_id=sec_id,

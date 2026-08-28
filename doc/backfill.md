@@ -344,6 +344,11 @@ split-sized jumps; the check excludes moves landing on a known split ex-date, so
 what remains is usually a **missing** corporate action — worth investigating, and a
 detection capability the pre-adjusted feed did not have.
 
+The counts `dq run` prints are *new* flags. A condition already sitting unresolved in
+`ops.data_quality_flag` is not flagged again, so a second run over unchanged data
+reports zeros — that is the check working, not the check finding nothing. Query the
+table (or `fafnir status`) for the standing totals.
+
 ---
 
 ## Confirming the price feed

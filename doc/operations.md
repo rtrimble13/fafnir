@@ -113,6 +113,16 @@ scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 ```
 
 Things to watch:
+- **Open DQ is a count of problems, not of runs** — a standing condition is flagged
+  once and stays one row until someone sets `resolved_at`, however many nights it
+  goes unfixed, so a rising count means new problems. The exception is `price_*`,
+  which repeats by design (see
+  [data_dictionary.md](data_dictionary.md#opsdata_quality_flag--quarantineanomaly-queue-grain-dq_flag_id));
+  filter it out when you want the count of distinct issues. Nothing sets
+  `resolved_at` automatically — a flag you have worked stays open until you close it:
+  ```sql
+  UPDATE ops.data_quality_flag SET resolved_at = now() WHERE dq_flag_id = ...;
+  ```
 - **Company-name drift** — `security_company_name_drift` flags in
   `ops.data_quality_flag`. The security master keys a listed security on
   `(source, symbol)` (0012), which assumes one issuer per ticker. This check is the

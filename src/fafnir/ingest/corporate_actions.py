@@ -74,7 +74,7 @@ def load_actions(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:
                 num, den = _split_ratio(rec)
                 if ex_date is None or num is None:
                     run.rows_quarantined += 1
-                    repo.add_dq_flag(
+                    repo.add_dq_flag_once(
                         db,
                         check_name="split_invalid",
                         security_id=sec_id,
@@ -123,7 +123,7 @@ def load_actions(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:
                     amount = None
                 if ex_date is None or amount is None or amount < 0:
                     run.rows_quarantined += 1
-                    repo.add_dq_flag(
+                    repo.add_dq_flag_once(
                         db,
                         check_name="dividend_invalid",
                         security_id=sec_id,

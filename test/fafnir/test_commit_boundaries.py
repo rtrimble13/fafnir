@@ -120,7 +120,7 @@ def test_adjust_all_commits_each_security_and_survives_a_bad_one(monkeypatch):
     monkeypatch.setattr(adj, "compute_for_security", flaky)
     monkeypatch.setattr(
         adj.repo,
-        "add_dq_flag",
+        "add_dq_flag_once",
         lambda db, **kw: db.write(f"flag:{kw['check_name']}:{kw['security_id']}"),
     )
 
@@ -151,7 +151,9 @@ def test_adjust_all_stops_once_it_is_clear_nothing_will_succeed(monkeypatch):
 
     monkeypatch.setattr(adj, "compute_for_security", always_fails)
     monkeypatch.setattr(
-        adj.repo, "add_dq_flag", lambda db, **kw: db.write(f"flag:{kw['security_id']}")
+        adj.repo,
+        "add_dq_flag_once",
+        lambda db, **kw: db.write(f"flag:{kw['security_id']}"),
     )
 
     db = _FakeDB()
@@ -174,7 +176,7 @@ def test_one_late_success_keeps_the_run_going(monkeypatch):
         db.write(f"factors:{security_id}")
 
     monkeypatch.setattr(adj, "compute_for_security", flaky)
-    monkeypatch.setattr(adj.repo, "add_dq_flag", lambda db, **kw: None)
+    monkeypatch.setattr(adj.repo, "add_dq_flag_once", lambda db, **kw: None)
 
     db = _FakeDB()
     result = adj.adjust_all(db)

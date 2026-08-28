@@ -235,6 +235,22 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 `check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/...), `severity`
 (`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`.
 
+**One unresolved problem is one unresolved row.** The checks that write here run on
+a schedule over the same data, so a standing condition is flagged once, not once per
+run: a writer skips the insert when an unresolved flag with the same
+`(security_id, check_name, record_key)` already exists. A different `record_key` — a
+new gap date, another ex-date — is a different occurrence and is still recorded.
+That is what makes `count(*) WHERE resolved_at IS NULL` (the `Open DQ` line in
+`fafnir status`) a count of problems rather than a count of check runs.
+
+`price_*` is the deliberate exception and **does** repeat, once per re-detection:
+`daily_price` counts those rows for a `(security_id, date)` to decide when a
+persistently-bad bar has held the ingestion watermark long enough
+(`MAX_QUARANTINE_HOLDS`). Deduplicating them would freeze that counter at 1 and hold
+the watermark behind the bar forever. New writers pick a side explicitly:
+`repository.add_dq_flag_once` for a standing condition, `add_dq_flag` where each
+detection is itself the signal.
+
 ### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
 `last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
 whole-endpoint (non per-symbol) mark.

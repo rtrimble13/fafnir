@@ -110,7 +110,7 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
                 prior_close = repo.close_before(db, security_id, ex_date)
                 if prior_close is None or Decimal(prior_close) <= 0:
                     # No price to value the dividend against -> skip (factor 1) and flag.
-                    repo.add_dq_flag(
+                    repo.add_dq_flag_once(
                         db,
                         check_name="dividend_no_prior_close",
                         severity="info",
@@ -122,7 +122,7 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
                 p = Decimal(prior_close)
                 factor = (p - amount) / p
                 if factor <= 0:
-                    repo.add_dq_flag(
+                    repo.add_dq_flag_once(
                         db,
                         check_name="dividend_exceeds_price",
                         severity="warn",
@@ -189,7 +189,7 @@ def _flag_if_extreme(db: Database, security_id: int, factors: list[dict]) -> Non
         smallest,
         len(factors),
     )
-    repo.add_dq_flag(
+    repo.add_dq_flag_once(
         db,
         check_name="adjustment_factor_extreme",
         severity="warn",
@@ -244,7 +244,7 @@ def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
             db.rollback()
             logger.exception("Adjustment factors failed for security %d: %s", sid, exc)
             try:
-                repo.add_dq_flag(
+                repo.add_dq_flag_once(
                     db,
                     check_name="adjustment_failed",
                     severity="error",

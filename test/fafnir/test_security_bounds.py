@@ -24,7 +24,7 @@ from fafnir.ingest.security_master import (
 def harness(monkeypatch):
     flags: list[str] = []
     monkeypatch.setattr(
-        sm.repo, "add_dq_flag", lambda db, **kw: flags.append(kw["check_name"])
+        sm.repo, "add_dq_flag_once", lambda db, **kw: flags.append(kw["check_name"])
     )
     run = types.SimpleNamespace(rows_quarantined=0, run_id=1)
 

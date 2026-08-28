@@ -968,6 +968,14 @@ def add_dq_flag(
     detail: Optional[dict] = None,
     ingestion_run_id: Optional[int] = None,
 ) -> None:
+    """Record a data-quality flag. Every call inserts a row.
+
+    That repetition is load-bearing only where each detection is itself the
+    signal -- the price_* quarantines counted by `count_price_quarantines`.
+    For a standing condition that a scheduled job re-detects over unchanged
+    data, use `add_dq_flag_once` instead, or the open-DQ count inflates by one
+    row per run per problem.
+    """
     import json
 
     db.execute(
@@ -986,6 +994,92 @@ def add_dq_flag(
             severity,
             json.dumps(detail) if detail else None,
         ),
+    )
+
+
+def add_dq_flag_once(
+    db: Database,
+    *,
+    check_name: str,
+    severity: str = "warn",
+    security_id: Optional[int] = None,
+    table_name: Optional[str] = None,
+    record_key: Optional[dict] = None,
+    detail: Optional[dict] = None,
+    ingestion_run_id: Optional[int] = None,
+) -> bool:
+    """Flag a standing condition once per occurrence, not once per run.
+
+    Skips the insert when an unresolved flag with the same
+    (security_id, check_name, record_key) is already open. Returns True when a
+    row was written.
+
+    Use this for anything a scheduled job re-detects over unchanged data.
+    `fafnir adjust` recomputes every security with actions on every nightly run
+    and `fafnir dq run` re-scans the whole universe, so a plain insert turns one
+    unresolved problem into one new unresolved flag per night -- and the open-DQ
+    count `fafnir status` reports grows without bound while the number of actual
+    problems stays flat, until the number an operator triages on says nothing.
+
+    Use `add_dq_flag` where each detection is itself the signal rather than a
+    restatement of the same one: `count_price_quarantines` counts the price_*
+    flags for a (security_id, date) to decide when a persistently-bad bar stops
+    holding the watermark, so deduplicating those would freeze that counter at 1
+    and hold the watermark behind that bar forever.
+
+    Matching is on the record_key as a whole (jsonb equality, so key order does
+    not matter) with NULL treated as a value, not as unknown: a new gap date or a
+    different ex-date is a different occurrence and is still recorded, while a
+    keyless flag (`adjustment_failed`) dedupes per security.
+    """
+    import json
+
+    key_json = json.dumps(record_key) if record_key else None
+
+    # The nullable columns get `= %s` or `IS NULL` rather than one uniform
+    # `IS NOT DISTINCT FROM`. Both forms of this are indexable and the tidier one
+    # is not: IS NOT DISTINCT FROM cannot be an index condition, so the probe
+    # degrades to a filter over every open flag of that check_name -- and this runs
+    # once per candidate, 21,000 times on a universe-wide `fafnir adjust`. See
+    # ix_dq_flag_open_condition (migration 0014), which this predicate matches.
+    clauses = ["check_name = %s", "resolved_at IS NULL"]
+    probe: list[Any] = [check_name]
+    if security_id is None:
+        clauses.append("security_id IS NULL")
+    else:
+        clauses.append("security_id = %s")
+        probe.append(security_id)
+    if key_json is None:
+        clauses.append("record_key IS NULL")
+    else:
+        clauses.append("record_key = %s::jsonb")
+        probe.append(key_json)
+
+    return (
+        db.execute(
+            f"""
+            INSERT INTO ops.data_quality_flag
+                (ingestion_run_id, security_id, table_name, record_key, check_name,
+                 severity, detail, detected_at)
+            SELECT %s::bigint, %s::bigint, %s::text, %s::jsonb, %s::text,
+                   %s::text, %s::jsonb, now()
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag
+                WHERE {" AND ".join(clauses)}
+            )
+            """,
+            (
+                ingestion_run_id,
+                security_id,
+                table_name,
+                key_json,
+                check_name,
+                severity,
+                json.dumps(detail) if detail else None,
+                *probe,
+            ),
+        )
+        > 0
     )
 
 
