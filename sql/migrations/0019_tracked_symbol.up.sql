@@ -1,4 +1,4 @@
--- 0018_tracked_symbol.up.sql
+-- 0019_tracked_symbol.up.sql
 -- A DECLARED universe alongside the screened one (ADR 0006).
 --
 -- The universe core.security holds is a *discovered* one: `ingest securities`

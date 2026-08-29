@@ -119,19 +119,70 @@ not merge two price histories silently, so it changes nothing and raises a
 `symbol_change_conflict` DQ flag.
 
 ```sql
--- the review queue
+-- the review queue: 'conflict' only, so a dismissed feed row drops out of it
 SELECT old_symbol, new_symbol, change_date, detail FROM core.symbol_change
- WHERE status <> 'applied' ORDER BY change_date DESC;
+ WHERE status = 'conflict' ORDER BY change_date DESC;
 ```
 
-Resolve it by deciding which `security_id` is the company: move the bars off the
-duplicate (or retire the stale row with a `delisted_date`), then re-run
-`fafnir ingest symbol-changes`, which retries every non-applied row. The next sweep
-is what clears the queue — it reaches a terminal outcome (`applied` if the new
-ticker is now the company's, `ignored` if the old ticker now belongs to a retired
-row) and the entry disappears from `fafnir status`. A duplicate that holds *no*
-prices, actions or factors needs no decision at all — the sweep folds it into the
-surviving security by itself and says so in the log.
+A duplicate that holds *no* prices, actions or factors needs no decision at all —
+the sweep folds it into the surviving security by itself and says so in the log.
+Everything below is for the conflicts it cannot.
+
+**First, work out which kind you have.** The two look identical in `fafnir status`
+and need opposite treatment:
+
+```sql
+SELECT f.record_key->>'old_symbol'      AS old_sym,
+       f.record_key->>'new_symbol'      AS new_sym,
+       (f.detail->>'change_date')::date AS change_date,
+       o.cusip AS old_cusip, n.cusip AS new_cusip,
+       o.cik   AS old_cik,   n.cik   AS new_cik,
+       (SELECT max(trade_date) FROM core.daily_price WHERE security_id = o.security_id)
+                                        AS old_last_bar
+  FROM ops.data_quality_flag f
+  LEFT JOIN core.security o ON o.primary_symbol = f.record_key->>'old_symbol'
+  LEFT JOIN core.security n ON n.primary_symbol = f.record_key->>'new_symbol'
+ WHERE f.check_name = 'symbol_change_conflict' AND f.resolved_at IS NULL;
+```
+
+**Matching CUSIP/ISIN → one company, two rows.** The rename is real; a
+security-master load that ran before the rename sweep minted the new ticker as its
+own security and the price loader then filled it. Merge the duplicate into the row
+that holds the history:
+
+```bash
+fafnir security merge-rename GREE VIP --dry-run     # always first
+fafnir security merge-rename GREE VIP -m "backfill minted VIP as a duplicate"
+fafnir db refresh-marts
+```
+
+The old ticker's row survives and keeps its `security_id`; the duplicate is
+absorbed and deleted. On the overlap the survivor's bars win. It **refuses** unless
+the vendor's identifiers agree and the overlapping sessions agree on OHLC — read
+the blockers rather than reaching for `--force`. Adjustment factors are recomputed
+for you; the mart refresh is not.
+
+**Differing CUSIP/ISIN, or both tickers still trading → not a rename.** The feed
+does emit these: a pre-launch ticker shuffle among securities that all went on to
+trade concurrently, or the same change emitted in both directions. Neither can ever
+clear itself, because both securities stay live and neither gives up the ticker:
+
+```bash
+fafnir security dismiss-rename QAU SCAU \
+    -m "pre-launch ticker shuffle; both listed 2026-08-04 and still trading"
+```
+
+This changes no price data and merges nothing. It writes the terminal `dismissed`
+status (0018), which is what actually stops the nightly retry — resolving the DQ
+flag alone would not, because the sweep re-detects the conflict and re-flags it the
+same night. A dismissal requires `-m`: it is a judgement about the *feed*, and the
+next person needs to know why.
+
+Both commands close the `symbol_change_conflict` flag for you.
+
+If neither fits — you fixed the underlying state some other way — re-run
+`fafnir ingest symbol-changes`, which retries every non-terminal row and reaches
+`applied` or `ignored` on its own.
 
 The `symbol_change_conflict` DQ flag is raised on the night a conflict is first
 seen, not on each nightly retry, so one unresolved rename does not inflate the

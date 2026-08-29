@@ -42,7 +42,7 @@ beside the screened one. Three pieces; everything downstream is untouched.
 ### 1. `ref.tracked_symbol` — the declaration
 
 Operator-curated reference data, in `ref` beside the other slowly-changing dimensions.
-Migration `0018_tracked_symbol`:
+Migration `0019_tracked_symbol`:
 
 ```sql
 CREATE TABLE ref.tracked_symbol (
@@ -256,7 +256,7 @@ exactly as on an equity, and is quarantined either way.
 
 | Area | Change |
 |---|---|
-| `sql/migrations/0018_tracked_symbol.{up,down}.sql` | `ref.tracked_symbol`; seed `MUTF` venue |
+| `sql/migrations/0019_tracked_symbol.{up,down}.sql` | `ref.tracked_symbol`; seed `MUTF` venue |
 | `src/fafnir/db/repository.py` | `upsert_tracked_symbol`, `list_tracked_symbols`, `untrack_symbol`, `security_asset_type`, plus `listed_security_for_declaration` / `retarget_tracked_symbol` for the rename case above |
 | `src/fafnir/ingest/tracked.py` | new loader (`RunLog`, `land_payload`, `upsert_security`, `upsert_symbol_xref`) |
 | `src/fafnir/ingest/daily_price.py` | `nav_only` allowance in `_validate_bar` / `load_symbol_prices` |

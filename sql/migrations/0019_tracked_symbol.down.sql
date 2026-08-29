@@ -1,4 +1,4 @@
--- 0018_tracked_symbol.down.sql
+-- 0019_tracked_symbol.down.sql
 -- Drop the declared universe.
 --
 -- This LOSES the declarations -- which symbols were tracked, why, and since when.

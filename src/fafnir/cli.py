@@ -634,6 +634,373 @@ def adjust(ctx, symbol):
 
 
 # ---------------------------------------------------------------------------
+# security group -- repairs the loader deliberately will not make
+# ---------------------------------------------------------------------------
+#
+# `ingest symbol-changes` applies every rename it safely can and records the rest
+# as `conflict`, which it retries nightly. Two kinds of conflict never clear on
+# their own, and both need a person:
+#
+#   merge-rename   -- the rename is real, but a security-master load minted the new
+#                     ticker as a second security and then filled it with bars. Two
+#                     rows, one company. Merging price histories is not a decision a
+#                     loader should make silently, so it is made here.
+#   dismiss-rename -- the rename is not real. The feed reported a pre-launch ticker
+#                     shuffle, or emitted the same change in both directions. There
+#                     is nothing to apply and nothing to merge.
+#
+# Both end with the conflict reaching a terminal status, which is what actually gets
+# it out of `fafnir status` and the DQ queue. Resolving the flag alone would not:
+# the sweep re-detects the condition and re-flags it the same night.
+
+
+def _rename_change_date(database, old_symbol, new_symbol, override):
+    """The rename's effective date: the operator's, else the recorded conflict's.
+
+    Defaulting from core.symbol_change matters -- the date is what retarget_symbol
+    closes the old ticker's xref period on, and an operator retyping it from a
+    terminal is one transposed digit away from a period boundary that silently
+    disagrees with the audit row it came from.
+    """
+    from fafnir.db import repository as repo
+
+    if override is not None:
+        return override.date() if hasattr(override, "date") else override
+    row = database.fetchone(
+        """
+        SELECT change_date FROM core.symbol_change
+         WHERE old_symbol = %s AND new_symbol = %s AND status = %s
+         ORDER BY change_date DESC LIMIT 1
+        """,
+        (old_symbol, new_symbol, repo.CHANGE_CONFLICT),
+    )
+    if row is None:
+        raise click.ClickException(
+            f"No recorded conflict for {old_symbol} -> {new_symbol}, so there is no "
+            "effective date to apply. Pass --change-date if you are repairing a "
+            "rename the sweep never recorded."
+        )
+    return row["change_date"]
+
+
+def _echo_merge_plan(plan) -> None:
+    """The evidence for a merge, in the order it should be read."""
+    click.echo(
+        f"Survivor {plan.survivor_id} ({plan.survivor_symbol}): "
+        f"{plan.survivor_bars} bars"
+    )
+    click.echo(
+        f"Victim   {plan.victim_id} ({plan.victim_symbol}): "
+        f"{plan.victim_bars} bars, {plan.victim_actions} actions, "
+        f"{plan.victim_flags} flags"
+    )
+    click.echo(
+        f"Overlap  : {plan.shared_days} shared sessions, "
+        f"{plan.disagreeing_days} disagreeing on OHLC"
+    )
+    click.echo(
+        f"Would move {plan.victim_only_bars} bars the survivor does not have, "
+        f"drop {plan.shared_days} duplicated sessions, "
+        f"move {plan.victim_actions - plan.colliding_actions} actions "
+        f"({plan.colliding_actions} already held), and delete security "
+        f"{plan.victim_id}."
+    )
+    if plan.volume_only_disagreements:
+        # Reported, never blocking: a restated volume across a rename is common and
+        # costs no price accuracy. Silence here would be worse than a line of noise.
+        click.echo(
+            f"Note: {plan.volume_only_disagreements} shared sessions agree on OHLC "
+            "but differ on volume; the survivor's volume is kept."
+        )
+    for line in plan.blockers:
+        click.echo(f"BLOCKER: {line}", err=True)
+    for row in plan.disagreement_sample:
+        click.echo(
+            f"  {row['trade_date']}  close {row['survivor_close']} vs "
+            f"{row['victim_close']}",
+            err=True,
+        )
+
+
+@main.group()
+def security():
+    """Security-master repairs: merges and rename decisions a loader will not make."""
+
+
+@security.command("merge-rename")
+@click.argument("old_symbol")
+@click.argument("new_symbol")
+@click.option(
+    "--change-date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    metavar="YYYY-MM-DD",
+    help="Effective date of the rename  [default: from the recorded conflict]",
+)
+@click.option("--note", "-m", help="Why, kept on the resolved DQ flag.")
+@click.option(
+    "--by", "resolved_by", help="Who  [default: the OS user running the command]"
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Show the plan and the guards, change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Merge despite a failed guard. Read the blockers first.",
+)
+@click.pass_context
+def security_merge_rename(
+    ctx, old_symbol, new_symbol, change_date, note, resolved_by, dry_run, yes, force
+):
+    """Apply a blocked rename by merging the duplicate into the original.
+
+    \b
+      fafnir security merge-rename GREE VIP --dry-run
+      fafnir security merge-rename GREE VIP -m "backfill minted VIP as a duplicate"
+
+    For the conflict where OLD and NEW are the same instrument held as two
+    security_ids -- the shape a security-master load leaves when it runs before the
+    rename sweep. The row holding OLD survives and keeps its id; the row holding NEW
+    is absorbed and deleted.
+
+    Refuses unless the vendor's own identifiers agree (CUSIP/ISIN/CIK, where both
+    sides have them) and the overlapping sessions agree on OHLC. Run it with
+    --dry-run first: the preview is the same comparison the guard runs.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    old_symbol, new_symbol = old_symbol.strip().upper(), new_symbol.strip().upper()
+    if old_symbol == new_symbol:
+        raise click.ClickException("OLD and NEW are the same ticker.")
+    if resolved_by is None:
+        resolved_by = _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        survivor_id = repo.active_security_for_symbol(database, old_symbol)
+        if survivor_id is None:
+            raise click.ClickException(
+                f"{old_symbol} is not a listed security. A merge moves history onto "
+                "the row that already holds it; there is nothing here to merge into."
+            )
+        victim_id = repo.active_security_for_symbol(database, new_symbol)
+        if victim_id is None:
+            # No duplicate means no conflict: the ticker is free and the ordinary
+            # sweep can carry the rename. Sending the operator there is better than
+            # inventing a merge with one side.
+            raise click.ClickException(
+                f"{new_symbol} is not held by any listed security, so there is no "
+                "duplicate to merge. Run `fafnir ingest symbol-changes` -- this "
+                "rename can apply on its own."
+            )
+        if victim_id == survivor_id:
+            raise click.ClickException(
+                f"{old_symbol} and {new_symbol} already resolve to security "
+                f"{survivor_id}; the rename is applied. Run "
+                "`fafnir ingest symbol-changes` to record it as terminal."
+            )
+
+        effective = _rename_change_date(database, old_symbol, new_symbol, change_date)
+        plan = repo.compare_securities(
+            database, survivor_id=survivor_id, victim_id=victim_id
+        )
+        click.echo(f"{old_symbol} -> {new_symbol}, effective {effective}")
+        _echo_merge_plan(plan)
+
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if plan.blockers and not force:
+            raise click.ClickException(
+                "Refusing to merge -- see the blockers above. If you have read them "
+                "and this is still one instrument, re-run with --force."
+            )
+        if not yes:
+            click.confirm(
+                f"Merge security {victim_id} ({new_symbol}) into {survivor_id} "
+                f"({old_symbol}) and delete {victim_id}?",
+                abort=True,
+            )
+
+        report = repo.merge_security(
+            database, victim_id=victim_id, survivor_id=survivor_id, force=force
+        )
+        # Only now does the ticker move: the merge is about identity, the retarget
+        # is about the rename, and they carry different dates.
+        repo.retarget_symbol(
+            database,
+            security_id=survivor_id,
+            old_symbol=old_symbol,
+            new_symbol=new_symbol,
+            change_date=effective,
+        )
+        repo.record_symbol_change(
+            database,
+            old_symbol=old_symbol,
+            new_symbol=new_symbol,
+            change_date=effective,
+            status=repo.CHANGE_APPLIED,
+            security_id=survivor_id,
+            detail={
+                "old_symbol": old_symbol,
+                "new_symbol": new_symbol,
+                "merged_security_id": victim_id,
+                "merged_by": resolved_by,
+            },
+        )
+        # The survivor's corporate actions just changed, so its factors are stale by
+        # construction. Recomputing here rather than telling the operator to is the
+        # difference between a repair that finishes and one that leaves a wrong
+        # adjusted series behind whenever the follow-up step is forgotten.
+        adjustments.compute_for_security(database, survivor_id)
+
+        flag_ids = repo.open_dq_flag_ids_for_record(
+            database,
+            check_name="symbol_change_conflict",
+            record_key={"old_symbol": old_symbol, "new_symbol": new_symbol},
+        )
+        closed = []
+        if flag_ids:
+            closed = repo.resolve_dq_flags(
+                database,
+                repo.DqFilter(state="open", flag_ids=tuple(flag_ids)),
+                note=note or f"merged duplicate {victim_id} into {survivor_id}",
+                resolved_by=resolved_by,
+            )
+        database.commit()
+
+    click.echo(
+        f"Merged {report.bars_moved} bars "
+        f"({report.bars_dropped} duplicates dropped), "
+        f"{report.actions_moved} actions "
+        f"({report.actions_dropped} duplicates dropped), "
+        f"{report.flags_moved} flags "
+        f"({report.flags_dropped} duplicates dropped)."
+    )
+    click.echo(
+        f"Security {survivor_id} is now {new_symbol}; {victim_id} is gone. "
+        "Adjustment factors recomputed."
+    )
+    click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("dismiss-rename")
+@click.argument("old_symbol")
+@click.argument("new_symbol")
+@click.option(
+    "--change-date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    metavar="YYYY-MM-DD",
+    help="Dismiss only the row with this date  [default: every unapplied row for "
+    "the pair]",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why this is not a real rename. Required -- a dismissal without a reason "
+    "is the one thing nobody can audit later.",
+)
+@click.option(
+    "--by", "dismissed_by", help="Who  [default: the OS user running the command]"
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_dismiss_rename(
+    ctx, old_symbol, new_symbol, change_date, note, dismissed_by, yes
+):
+    """Record that a reported rename is not a rename, so the sweep stops retrying.
+
+    \b
+      fafnir security dismiss-rename QAU SCAU \\
+          -m "pre-launch ticker shuffle; both listed 2026-08-04 and still trading"
+      fafnir security dismiss-rename VBX USSX -m "feed emitted the change both ways"
+
+    For the conflict that can never clear itself: both tickers belong to live
+    securities that each keep trading, so no ordering of the sweep will ever free
+    the target. Without this the rename re-conflicts every night in an
+    error-severity queue.
+
+    This changes no price data and merges nothing. If the rename is real but blocked
+    by a duplicate, use `fafnir security merge-rename` instead -- reaching `applied`
+    is a different fact from deciding the feed was wrong.
+    """
+    from fafnir.db import repository as repo
+
+    old_symbol, new_symbol = old_symbol.strip().upper(), new_symbol.strip().upper()
+    if dismissed_by is None:
+        dismissed_by = _os_user()
+    effective = None
+    if change_date is not None:
+        effective = change_date.date() if hasattr(change_date, "date") else change_date
+
+    with Database(ctx.obj["config"].dsn) as database:
+        if not yes:
+            scope = f"dated {effective}" if effective else "every unapplied row"
+            click.confirm(
+                f"Dismiss the reported rename {old_symbol} -> {new_symbol} "
+                f"({scope}) as not a real rename?",
+                abort=True,
+            )
+        rows = repo.dismiss_symbol_change(
+            database,
+            old_symbol=old_symbol,
+            new_symbol=new_symbol,
+            change_date=effective,
+            note=note,
+            dismissed_by=dismissed_by,
+        )
+        if not rows:
+            # Not an error: re-running a dismissal, or dismissing something a
+            # colleague already settled, is a no-op. Say which, because "nothing
+            # happened" reads as success and a typo looks identical.
+            existing = database.fetchall(
+                """
+                SELECT change_date, status FROM core.symbol_change
+                 WHERE old_symbol = %s AND new_symbol = %s
+                 ORDER BY change_date DESC
+                """,
+                (old_symbol, new_symbol),
+            )
+            if not existing:
+                raise click.ClickException(
+                    f"No recorded rename {old_symbol} -> {new_symbol}. Check the "
+                    "spelling against `fafnir dq list --detail "
+                    "--check symbol_change_conflict`."
+                )
+            states = ", ".join(f"{r['change_date']}={r['status']}" for r in existing)
+            click.echo(
+                f"Nothing to dismiss: {old_symbol} -> {new_symbol} is already "
+                f"terminal ({states})."
+            )
+            return
+
+        flag_ids = repo.open_dq_flag_ids_for_record(
+            database,
+            check_name="symbol_change_conflict",
+            record_key={"old_symbol": old_symbol, "new_symbol": new_symbol},
+        )
+        closed = []
+        if flag_ids:
+            closed = repo.resolve_dq_flags(
+                database,
+                repo.DqFilter(state="open", flag_ids=tuple(flag_ids)),
+                note=note,
+                resolved_by=dismissed_by,
+            )
+        database.commit()
+
+    click.echo(
+        f"Dismissed {_plural(len(rows), 'rename')} "
+        f"({old_symbol} -> {new_symbol}) as {dismissed_by}."
+    )
+    click.echo(f"Resolved {_plural(len(closed), 'DQ flag')}.")
+    click.echo("The nightly sweep will not retry this rename again.")
+
+
+# ---------------------------------------------------------------------------
 # dq + status
 # ---------------------------------------------------------------------------
 @main.group()

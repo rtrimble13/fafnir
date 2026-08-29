@@ -36,7 +36,7 @@ logger = get_logger("ingest.tracked")
 
 ENDPOINT = "profile"
 
-# The venue open-end funds are recorded under (migration 0018). Not a real trading
+# The venue open-end funds are recorded under (migration 0019). Not a real trading
 # venue: it exists so a fund has a non-NULL exchange_code that is demonstrably not
 # one of SCREENER_EXCHANGES, which is what keeps the delisting sweep away from it.
 FUND_EXCHANGE = "MUTF"

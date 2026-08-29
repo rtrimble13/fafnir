@@ -512,3 +512,56 @@ def test_an_equity_one_day_behind_is_still_stale(db):
     _price_on(db, laggard, yesterday)
 
     assert checks.check_freshness(db) == 1
+
+
+# ---------------------------------------------------------------------------
+# Interaction with the rename-merge path (0018)
+# ---------------------------------------------------------------------------
+
+
+def test_a_declaration_survives_a_merge_rename_without_re_minting(db):
+    """A merge deletes the victim's security row and its xref periods outright.
+
+    That is the one way a declaration's ticker can stop resolving to anything, and
+    if `ingest tracked` then minted a fresh security it would rebuild the exact
+    duplicate the merge was run to remove -- with the fund's history left behind on
+    the survivor. This is the collision between two mechanisms that each fix a fork,
+    so it is worth pinning rather than assuming.
+    """
+    _declare(db)
+    tracked.load_tracked(db, _FakeFMP(profiles=_fund_profile()))
+    survivor = repo.resolve_security_id(db, FUND)
+    _load_nav_history(db, [_nav_bar("2026-06-01", 400.0)])
+
+    # A security-master load that ran before the rename was known mints the
+    # duplicate under the new ticker, and it takes a bar of its own.
+    victim = repo.upsert_security(
+        db, primary_symbol="VFIAY", company_name="Fund", asset_type="fund"
+    )
+    repo.upsert_symbol_xref(db, security_id=victim, symbol="VFIAY")
+    db.commit()
+
+    repo.merge_security(db, victim_id=victim, survivor_id=survivor)
+    repo.retarget_symbol(
+        db,
+        security_id=survivor,
+        old_symbol=FUND,
+        new_symbol="VFIAY",
+        change_date=dt.date(2026, 6, 10),
+    )
+    db.commit()
+
+    result = tracked.load_tracked(db, _FakeFMP(profiles=_fund_profile("VFIAY")))
+
+    assert result.minted == [], "a merged-away ticker must not mint a new security"
+    assert result.renamed == [(FUND, "VFIAY")]
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    assert repo.resolve_security_id(db, "VFIAY") == survivor
+    assert [r["symbol"] for r in repo.list_tracked_symbols(db)] == ["VFIAY"]
+    # And the fund's history is still attached to the security it belongs to.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id = %s", (survivor,)
+        )
+        == 1
+    )
