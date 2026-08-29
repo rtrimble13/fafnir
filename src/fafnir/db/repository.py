@@ -1158,6 +1158,188 @@ def listed_securities(db: Database, source: str = "fmp") -> dict[str, dict]:
     }
 
 
+def security_asset_type(db: Database, security_id: int) -> Optional[str]:
+    """The asset_type of one security, or None if it does not exist.
+
+    Exists because the price loader has to know whether it is reading exchange bars
+    or a fund NAV *before* it validates them: a NAV payload carries a close and no
+    open/high/low, which is a correct bar for a fund and a defect for an equity.
+    See :func:`fafnir.ingest.daily_price.load_symbol_prices`.
+    """
+    val = db.fetchval(
+        "SELECT asset_type FROM core.security WHERE security_id = %s", (security_id,)
+    )
+    return str(val) if val is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Declared universe (ref.tracked_symbol, migration 0019 / ADR 0006)
+# ---------------------------------------------------------------------------
+
+
+def upsert_tracked_symbol(
+    db: Database,
+    *,
+    symbol: str,
+    asset_type: str = "fund",
+    exchange_code: Optional[str] = None,
+    note: Optional[str] = None,
+    source: str = "fmp",
+) -> bool:
+    """Declare a symbol the security master must hold. Returns True if newly declared.
+
+    Re-declaring a symbol that was untracked revives it -- ``is_tracked`` back to
+    true and ``untracked_at`` cleared -- rather than erroring. Tracking is a
+    statement about the present, not an append-only log; the retirement that
+    matters (a fund that actually closed) is a ``delisted_date`` on core.security,
+    and nothing here touches that.
+
+    ``added_at`` is preserved on revival, so the row still answers "since when has
+    this been of interest" rather than resetting to the date of the last edit.
+    """
+    row = db.fetchone(
+        """
+        INSERT INTO ref.tracked_symbol
+            (source, symbol, asset_type, exchange_code, note, is_tracked, untracked_at)
+        VALUES (%s, %s, %s, %s, %s, TRUE, NULL)
+        ON CONFLICT (source, symbol) DO UPDATE SET
+            asset_type    = EXCLUDED.asset_type,
+            exchange_code = EXCLUDED.exchange_code,
+            -- COALESCE: re-declaring without a note must not erase the reason the
+            -- row was created for.
+            note          = COALESCE(EXCLUDED.note, ref.tracked_symbol.note),
+            is_tracked    = TRUE,
+            untracked_at  = NULL
+        RETURNING (xmax = 0) AS inserted
+        """,
+        (source, symbol, asset_type, exchange_code, note),
+    )
+    return bool(row and row["inserted"])
+
+
+def list_tracked_symbols(
+    db: Database, *, source: str = "fmp", tracked_only: bool = True
+) -> list[dict]:
+    """The declared universe, with each symbol's security_id once it has one.
+
+    The LEFT JOIN is the point: a declaration with a NULL security_id has not been
+    loaded yet, which is exactly what `fafnir track list` needs to show and what
+    tells an operator that `fafnir ingest tracked` has not run since they added it.
+    """
+    where = "WHERE t.source = %s" + (" AND t.is_tracked" if tracked_only else "")
+    return db.fetchall(
+        f"""
+        SELECT t.source, t.symbol, t.asset_type, t.exchange_code, t.note,
+               t.is_tracked, t.added_at, t.untracked_at,
+               s.security_id, s.company_name, s.is_actively_trading,
+               s.delisted_date
+          FROM ref.tracked_symbol t
+          LEFT JOIN core.security s
+                 ON s.source = t.source
+                AND s.primary_symbol = t.symbol
+                AND s.delisted_date IS NULL
+         {where}
+         ORDER BY t.symbol
+        """,
+        (source,),
+    )
+
+
+def listed_security_for_declaration(
+    db: Database, *, symbol: str, source: str = "fmp"
+) -> Optional[dict]:
+    """The LISTED security a declaration should load into, following renames.
+
+    Three cases, and the reason this is not just :func:`resolve_security_id`:
+
+    * The obvious one -- a listed security already carries this ticker.
+    * The ticker was renamed since it was declared. ``retarget_symbol`` closed this
+      ticker's xref period and opened one under the new name, so the declaration now
+      names a ticker no listed security carries. Minting on that would fork the
+      company's identity into two security_ids, which is precisely the failure ADR
+      0005 exists to prevent -- except that here the screener cannot rescue it,
+      because ref.tracked_symbol goes on naming the old ticker forever. So the
+      closed period is followed, and the caller renames the declaration.
+    * The ticker was *reused* by a new issuer after the old one delisted. Delisted
+      rows are excluded from both queries, so this returns nothing and the caller
+      mints a fresh security_id -- what 0009 already guarantees for the screened
+      universe.
+
+    Returns ``{security_id, primary_symbol}`` or None.
+    """
+    row = db.fetchone(
+        """
+        SELECT security_id, primary_symbol FROM core.security
+         WHERE source = %s AND primary_symbol = %s AND delisted_date IS NULL
+         LIMIT 1
+        """,
+        (source, symbol),
+    )
+    if row is not None:
+        return dict(row)
+    # Most recently closed period first: if this ticker served several securities
+    # over time, the one that had it last is the one that was renamed away from it.
+    return db.fetchone(
+        """
+        SELECT s.security_id, s.primary_symbol
+          FROM core.symbol_xref x
+          JOIN core.security s ON s.security_id = x.security_id
+         WHERE x.symbol = %s AND s.delisted_date IS NULL
+         ORDER BY x.valid_to DESC NULLS FIRST, x.valid_from DESC
+         LIMIT 1
+        """,
+        (symbol,),
+    )
+
+
+def retarget_tracked_symbol(
+    db: Database, *, old_symbol: str, new_symbol: str, source: str = "fmp"
+) -> bool:
+    """Move a declaration onto the ticker its security now trades under.
+
+    Returns True when the declaration moved. When ``new_symbol`` is already
+    declared, the old row is untracked instead of moved -- the destination
+    declaration already says everything the moved one would have, and two rows
+    pointing at one security would ask the loader to load it twice.
+    """
+    exists = db.fetchval(
+        "SELECT 1 FROM ref.tracked_symbol WHERE source = %s AND symbol = %s",
+        (source, new_symbol),
+    )
+    if exists:
+        untrack_symbol(db, symbol=old_symbol, source=source)
+        return False
+    row = db.fetchone(
+        """
+        UPDATE ref.tracked_symbol SET symbol = %s
+         WHERE source = %s AND symbol = %s
+        RETURNING symbol
+        """,
+        (new_symbol, source, old_symbol),
+    )
+    return row is not None
+
+
+def untrack_symbol(db: Database, *, symbol: str, source: str = "fmp") -> bool:
+    """Stop declaring a symbol. Returns True only if this call did it.
+
+    Idempotent and non-destructive: the row stays as the record of what was once
+    declared, and the security keeps its security_id and every bar it has. Whether
+    the security is also *retired* is a separate decision -- see
+    :func:`mark_delisted`, which is what a fund closing or merging actually is.
+    """
+    row = db.fetchone(
+        """
+        UPDATE ref.tracked_symbol
+           SET is_tracked = FALSE, untracked_at = now()
+         WHERE source = %s AND symbol = %s AND is_tracked
+        RETURNING symbol
+        """,
+        (source, symbol),
+    )
+    return row is not None
+
+
 def count_recent_listings(db: Database, days: int = 7) -> int:
     """Securities that entered scope in the last ``days`` days."""
     return (

@@ -5,6 +5,15 @@ For each symbol: resolve security_id, compute the incremental window from the
 watermark (minus an overlap to catch late corrections), fetch raw bars, land the
 raw payload, validate each bar at the boundary, quarantine bad bars (never drop),
 upsert good bars idempotently, and advance the watermark.
+
+NAV-PRICED SECURITIES. An open-end mutual fund has one price a day and no volume:
+FMP returns a bar carrying a close and no open/high/low. That shape is a correct
+bar for a fund and a defect for an equity, so the allowance is gated on the
+security's own ``asset_type`` rather than on what the payload happens to omit --
+see :data:`NAV_ASSET_TYPES` and :func:`_validate_bar`. Everything downstream is
+unchanged: the expanded row satisfies every constraint on core.daily_price as
+written, and a distribution back-adjusts through core.adjustment_factor exactly as
+a cash dividend does. See doc/adr/0006-curated-fund-universe.md.
 """
 
 from __future__ import annotations
@@ -31,6 +40,11 @@ LEGACY_SPLIT_ADJUSTED_ENDPOINT = "historical-price-eod/full"
 # A bar quarantined this many times stops holding the watermark (it stays flagged
 # for review, but ingestion is allowed to advance past it).
 MAX_QUARANTINE_HOLDS = 5
+
+# Asset types priced at a single daily NAV rather than traded through a session.
+# For these, a bar with a close and no open/high/low is the whole truth about the
+# day, not a payload with three fields missing.
+NAV_ASSET_TYPES = frozenset({"fund"})
 
 # What core.daily_price can actually store (sql/migrations/0005_daily_price.up.sql):
 # money is NUMERIC(20, 6), volume is BIGINT. Postgres rounds a value to the column's
@@ -177,21 +191,44 @@ def _ohlc(bar: dict, field: str) -> tuple[Optional[Decimal], Optional[str]]:
     return None, _reject_reason(present)
 
 
-def _validate_bar(bar: dict) -> tuple[Optional[dict], Optional[str]]:
+def _validate_bar(
+    bar: dict, *, nav_only: bool = False
+) -> tuple[Optional[dict], Optional[str]]:
     """Type and sanity-check a single bar. Returns (clean_row, reason_if_bad).
 
     Prices come back as Decimal, not float: core.daily_price is exact NUMERIC, and
     handing psycopg a float would reintroduce a coercion after validation -- exactly
     where the sub-resolution bug lived. What is checked here is what gets stored.
+
+    ``nav_only`` admits the NAV shape for a security that has no intraday session
+    (see :data:`NAV_ASSET_TYPES`): a bar carrying only a close becomes
+    ``open = high = low = close``, which is what a single daily strike actually
+    means. It is an allowance, not a repair -- a field that IS present is still read
+    and still faces the cross-field CHECKs below, so a fund bar with a genuinely
+    inconsistent high is quarantined like any other. The close itself is never
+    synthesized: without it there is no price, and the bar is rejected for every
+    asset type alike.
     """
     trade_date = _parse_date(bar.get("date"))
     if trade_date is None:
         return None, "unparseable_date"
+    # Close first, so it is available to stand in for the others under nav_only.
+    # It is also the field whose absence is fatal on any asset type: without a close
+    # there is no price, and nothing to stand in WITH.
     prices: dict[str, Decimal] = {}
-    for field in ("open", "high", "low", "close"):
+    for field in ("close", "open", "high", "low"):
         price, reason = _ohlc(bar, field)
         if reason:
-            return None, reason
+            # Only an ABSENT field is stood in for. A field that is present but
+            # unusable -- zero, negative, sub-resolution, out of range -- is bad
+            # data on a fund exactly as on an equity, and laundering it into three
+            # copies of the close would hide the very thing the quarantine exists
+            # to surface.
+            if not (
+                nav_only and field != "close" and reason == "missing_or_nonnumeric_ohlc"
+            ):
+                return None, reason
+            price = prices["close"]
         prices[field] = price
     o, h, lo, c = prices["open"], prices["high"], prices["low"], prices["close"]
 
@@ -249,6 +286,11 @@ def load_symbol_prices(
         _tally("unknown")
         return 0
 
+    # Read the asset type once per symbol, not once per bar: what shape of payload
+    # counts as a valid bar is a property of the security, and a fund's whole
+    # history goes through this loop.
+    nav_only = repo.security_asset_type(db, sec_id) in NAV_ASSET_TYPES
+
     if start_date is None:
         wm = repo.get_watermark(db, "fmp", ENDPOINT, sec_id)
         if wm is not None:
@@ -287,7 +329,7 @@ def load_symbol_prices(
     clean: list[dict] = []
     quarantined_dates: list[date] = []
     for bar in bars:
-        row, reason = _validate_bar(bar)
+        row, reason = _validate_bar(bar, nav_only=nav_only)
         if reason:
             run.rows_quarantined += 1
             # Deliberately add_dq_flag, not add_dq_flag_once: here each detection

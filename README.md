@@ -34,8 +34,8 @@ FMP / FRED / BLS / BEA
 
 Schemas: `landing` (raw immutable payloads) → `core` (security master, raw daily
 prices, corporate actions) → `mart` (adjusted prices, screening snapshot), with
-`ref` (exchanges/sectors/calendar), `ops` (ingestion runs, DQ flags, watermarks),
-and `meta` (migrations). See **[doc/architecture.md](doc/architecture.md)** and the
+`ref` (exchanges/sectors/calendar, and the declared universe), `ops` (ingestion
+runs, DQ flags, watermarks), and `meta` (migrations). See **[doc/architecture.md](doc/architecture.md)** and the
 **[data dictionary](doc/data_dictionary.md)**.
 
 ## Quick start (bare-metal Postgres)
@@ -66,12 +66,18 @@ fafnir db refresh-marts
 fafnir dq run
 fafnir status
 
-# 5. Triage what the checks flagged
+# 5. Track a mutual fund (or anything else the screener cannot reach)
+fafnir source probe-fund VFIAX                   # confirm the NAV series is raw
+fafnir track add VFIAX --note "core US equity sleeve"
+fafnir ingest tracked                            # mint it; nightly job does this too
+fafnir ingest prices --symbols VFIAX             # no watermark yet -> full history
+
+# 6. Triage what the checks flagged
 fafnir dq list                                   # open flags by check and severity
 fafnir dq list --detail --check gap --symbol AAPL
 fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
 
-# 6. Read with duk (db mode)
+# 7. Read with duk (db mode)
 duk ph AAPL --adj -S db
 duk ls --sector Technology -S db
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
@@ -81,7 +87,9 @@ Daily upkeep is a single cron entry running `scripts/daily_update.sh` — see
 **[doc/operations.md](doc/operations.md)**. It maintains the universe as well as the
 data: each night it applies ticker renames to the security that already holds the
 history (FB → META keeps one `security_id`), re-reads the screener so a security
-that listed today enters scope today, and marks what stopped trading — then loads
+that listed today enters scope today, refreshes the *declared* universe (mutual
+funds and anything else with no listing venue to be screened on), and marks what
+stopped trading — then loads
 prices, actions and factors. A newly listed security has no watermark, so it gets
 its full available history on the same run.
 

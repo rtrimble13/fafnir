@@ -56,7 +56,10 @@ def db(migrated_dsn):
             TRUNCATE core.daily_price, core.corporate_action, core.adjustment_factor,
                      core.symbol_xref, core.symbol_change, core.company_profile,
                      core.security, ops.data_quality_flag, ops.ingestion_run,
-                     ops.load_watermark, landing.fmp_raw
+                     ops.load_watermark, landing.fmp_raw,
+                     -- ref is otherwise kept (it is seeded reference data), but the
+                     -- declared universe is per-test state, not reference data.
+                     ref.tracked_symbol
             RESTART IDENTITY CASCADE
             """)
         yield database

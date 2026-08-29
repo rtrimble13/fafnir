@@ -48,6 +48,15 @@ upkeep fafnir ingest symbol-changes
 echo "==> Security master (new listings)"
 upkeep fafnir ingest securities
 
+# The declared universe (ref.tracked_symbol): mutual funds and anything else the
+# screener cannot reach, because it has no listing venue to be screened on. AFTER
+# the security master, not before -- both write on the same conflict key, and going
+# second is what makes the declared asset_type and venue the ones that stand. Same
+# upkeep treatment as the two steps above: a profile outage must not cost the
+# night's prices. See doc/adr/0006-curated-fund-universe.md.
+echo "==> Declared universe (tracked funds)"
+upkeep fafnir ingest tracked
+
 # Before prices: a name that stopped trading today should be marked before the
 # price step asks it for fresh bars. Retaining it (rather than dropping it) is
 # what keeps the accumulating history free of survivorship bias.
