@@ -351,9 +351,44 @@ the compared window is not by itself a reason for the two to disagree.
 
 ## Backups
 
-The whole warehouse is rebuildable from `landing` + the sources, but back up at
-least `core` and `landing`:
+The whole warehouse is rebuildable from `landing` + the sources, so a lost week of
+loads costs a re-run, not data. Two things are *not* rebuildable and are the real
+reason to back up at all: `ref.tracked_symbol` (the declared universe — a human's
+choices, with the reason recorded), the resolutions and notes on
+`ops.data_quality_flag` / `core.symbol_change`, and `meta.schema_migration`. FMP will
+never hand those back.
+
+**Local, nightly** — the fast restore path, unchanged:
 
 ```bash
-pg_dump -Fc -n core -n landing -n ref fafnir > fafnir_$(date +%F).dump
+pg_dump -Fc -Z6 -f /var/backups/fafnir/fafnir_$(date -u +%F).dump fafnir
+find /var/backups/fafnir -name 'fafnir_*.dump' -mtime +14 -delete
 ```
+
+**Off-site, weekly, with retention** — `scripts/backup_offsite.sh` dumps
+uncompressed and hands the bytes to `restic`, which deduplicates, compresses and
+encrypts them into any backend (Dropbox via `rclone`, Backblaze B2, a Storage Box over
+SFTP). Dumping uncompressed is deliberate: pg_dump's own compression defeats the
+deduplication that makes a long retention history affordable, because the warehouse is
+almost entirely append-only week to week. See
+[ADR 0007](adr/0007-offsite-backup-storage.md) for the reasoning and the vendor
+comparison, and [install_hetzner.md §9](install_hetzner.md#9-backups) for setup.
+
+```bash
+export FAFNIR_BACKUP_REPO=rclone:dropbox-fafnir:      # or b2:..., sftp:...
+scripts/backup_offsite.sh                # weekly: full dump, back up, forget
+scripts/backup_offsite.sh --state-only   # daily:  ref + ops + meta (tiny)
+scripts/backup_offsite.sh --prune        # monthly: reclaim space, verify 5%
+```
+
+Retention is declarative and split in two, because the large snapshots are
+reconstructible and the small ones are not:
+
+| Snapshot | Policy | Restore points |
+|---|---|---|
+| `fafnir-full` (weekly) | `--keep-last 4 --keep-weekly 8 --keep-monthly 12 --keep-yearly 2` | ~26 |
+| `fafnir-state` (daily) | `--keep-daily 14 --keep-weekly 8 --keep-monthly 24` | ~46 |
+
+`forget` unlinks; only `prune` reclaims — which is why prune is monthly, not weekly.
+It is also the step that re-reads a sample of the data, and an unverified backup is a
+hope rather than a backup.

@@ -994,8 +994,12 @@ at the top of the crontab; verify with `man 5 crontab` on your host before relyi
 
 ## 9. Backups
 
-Three independent layers. The whole warehouse is rebuildable from `landing` + the
-sources, but rebuilding costs hours and FMP bandwidth — dumps are cheaper.
+Four layers, and the point of the arrangement is that no two of them fail together.
+The whole warehouse is rebuildable from `landing` + the sources, but rebuilding costs
+hours and FMP bandwidth — dumps are cheaper. Some of it is not rebuildable at any
+price: the declared universe, the DQ resolutions and the migration ledger record
+decisions a human made, and no source will hand those back. §9.2 treats them
+separately for that reason.
 
 ### 9.1 Nightly logical dump
 
@@ -1029,14 +1033,52 @@ after the nightly load) using the same pattern as §8.1.
 
 ### 9.2 Off-server copy
 
-A dump on the same disk does not survive losing the server. Push it to a Hetzner
-**Storage Box** (SFTP/rsync/BorgBackup) or **Object Storage** (S3-compatible):
+A dump on the same disk does not survive losing the server — and a dump on a Hetzner
+Storage Box does not survive losing the Hetzner *account*, which is the failure the
+off-site copy is supposed to insure against. Run **two** off-site targets if you can:
+one in-datacentre for speed, one at an unrelated vendor for independence.
+[ADR 0007](adr/0007-offsite-backup-storage.md) evaluates the options (Storage Box, B2,
+Dropbox) and explains the choices below.
+
+`scripts/backup_offsite.sh` handles all of them — it dumps, then hands the bytes to
+`restic`, which deduplicates, compresses and encrypts client-side before upload.
 
 ```bash
-# Storage Box, key-based, from the fafnir user's crontab/timer:
-rsync -a --delete /var/backups/fafnir/ \
-  u123456@u123456.your-storagebox.de:/home/fafnir-backups/
+sudo apt install -y restic rclone
+
+# One-time: passphrase (root-only) -- ESCROW A COPY OFF THIS HOST.
+# Losing it loses every backup; restic cannot recover it for you.
+sudo install -d -m 0700 /etc/fafnir
+openssl rand -base64 48 | sudo tee /etc/fafnir/restic.pass > /dev/null
+sudo chmod 400 /etc/fafnir/restic.pass
+
+# One-time: the remote. Storage Box needs nothing extra:
+export FAFNIR_BACKUP_REPO='sftp:u123456@u123456.your-storagebox.de:/backups/fafnir'
+sudo -u fafnir -E restic init
+
+# Dropbox instead/as well: create a Dropbox app with the **App folder** permission
+# (NOT "Full Dropbox"), then `rclone config` a remote from it. The token on this
+# server can then only ever reach /Apps/<your-app>.
+rclone config                                  # -> name it dropbox-fafnir
+export FAFNIR_BACKUP_REPO='rclone:dropbox-fafnir:'
+sudo -u fafnir -E restic init
+
+sudo -u fafnir -E scripts/backup_offsite.sh    # test it now
 ```
+
+Two things not to do, both of which look reasonable and are not:
+
+- **Do not install the Dropbox desktop client here.** It is a bidirectional sync
+  agent: it pulls the whole account onto this disk, wants an interactive login, and
+  propagates a deletion made anywhere *into* the server. `rclone` against an
+  App-folder-scoped token is the whole of what is needed.
+- **Do not `rclone sync` (or `rsync --delete`) to a backup target.** Mirroring
+  deletions means a bug that empties `/var/backups/fafnir` empties the remote too.
+  Copy, and prune deliberately — which is what `restic forget`/`prune` do.
+
+Retention (the "recycle plan") is declarative and lives in the script; see
+[operations.md § Backups](operations.md#backups) for the two policies and
+`etc/crontab.example` for the three schedules (weekly full, daily state, monthly prune).
 
 ### 9.3 Hetzner server backups / snapshots
 
@@ -1239,7 +1281,8 @@ sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/faf
 
 # --- Automation & backups ---------------------------------------------------
 systemctl list-timers 'fafnir-*'                     # next elapse looks right
-ls -lh /var/backups/fafnir/                          # a dump exists
+ls -lh /var/backups/fafnir/                          # a local dump exists
+sudo -u fafnir -E restic snapshots --host fafnir --compact   # off-site copies exist
 
 # --- From your laptop, with the §11 tunnel up -------------------------------
 duk -S db ph SPY --adj -n 5                          # reads as fafnir_app

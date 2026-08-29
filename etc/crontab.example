@@ -26,3 +26,22 @@ FAFNIR_HOME=/opt/fafnir
 
 # Weekly reconciliation over a rotating sample (Sunday).
 0 6 * * 0      set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/reconcile.sh AAPL,MSFT,SPY,BRK-B >> var/fafnir/log/cron_reconcile.log 2>&1
+
+# --- Backups (see doc/adr/0007-offsite-backup-storage.md) --------------------
+# The off-site jobs need FAFNIR_BACKUP_REPO and RESTIC_PASSWORD_FILE in
+# /etc/fafnir/fafnir.env, e.g.:
+#   FAFNIR_BACKUP_REPO="rclone:dropbox-fafnir:"    # or b2:... / sftp:...
+#   RESTIC_PASSWORD_FILE="/etc/fafnir/restic.pass"
+
+# Daily state snapshot: ref + ops + meta only -- the declared universe, the DQ
+# resolutions and the migration ledger. Seconds to run, and the only copy of
+# decisions a human made; a weekly cycle is too coarse for these alone.
+15 23 * * 1-5  set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/backup_offsite.sh --state-only >> var/fafnir/log/cron_backup.log 2>&1
+
+# Weekly full warehouse (Sunday, after the reconciliation run above).
+30 6 * * 0     set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/backup_offsite.sh >> var/fafnir/log/cron_backup.log 2>&1
+
+# Monthly prune + verification. Kept off the weekly schedule deliberately: prune
+# rewrites pack files and lists the whole repository, which is the step that trips
+# Dropbox's rate limiter, and it is the only step that reads data back.
+0 8 1 * *      set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/backup_offsite.sh --prune >> var/fafnir/log/cron_backup.log 2>&1
