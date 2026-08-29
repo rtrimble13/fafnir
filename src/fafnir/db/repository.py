@@ -12,6 +12,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, NamedTuple, Optional, Sequence
 
+import psycopg
+
 from fafnir.db.connection import Database
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1145,289 @@ def count_price_quarantines(db: Database, security_id: int, date_iso: str) -> in
         )
         or 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Data-quality review queue (read + resolve)
+# ---------------------------------------------------------------------------
+#
+# `fafnir dq run` fills ops.data_quality_flag; this is how an operator gets back
+# out of it. Every function here takes the same :class:`DqFilter` and turns it into
+# SQL in one place, which is the point rather than a tidiness: `fafnir dq resolve
+# --check gap --symbol AAPL` closes exactly the rows `fafnir dq list --check gap
+# --symbol AAPL` shows. A filter that meant one thing when listing and another when
+# resolving is how a triage session closes flags nobody ever looked at.
+
+DQ_STATES = ("open", "resolved", "all")
+
+# Order severity by how much it wants attention. Alphabetically 'error' < 'info' <
+# 'warn', which puts the worst first only by accident and 'info' above 'warn'.
+_DQ_SEVERITY_RANK = "CASE severity WHEN 'error' THEN 3 WHEN 'warn' THEN 2 ELSE 1 END"
+
+
+class DqFilter(NamedTuple):
+    """Which flags a queue operation applies to.
+
+    One object, passed to every function below, so that listing, counting,
+    summarising and resolving cannot disagree about what a set of options selects.
+
+    ``state`` is about resolution: ``open`` (the default -- the queue), ``resolved``
+    (the triage record) or ``all``. ``checks`` entries are exact names or a `*` glob
+    (`price_*`). ``until`` is inclusive of the whole day.
+    """
+
+    state: str = "open"
+    checks: Sequence[str] = ()
+    severities: Sequence[str] = ()
+    security_id: Optional[int] = None
+    since: Optional[date] = None
+    until: Optional[date] = None
+    flag_ids: Sequence[int] = ()
+
+    @property
+    def is_narrowed(self) -> bool:
+        """True when something other than ``state`` restricts the set.
+
+        `fafnir dq resolve` refuses to run without this: an UPDATE under a bare
+        state filter closes the entire queue, problems nobody has looked at
+        included, and `reopen` cannot put it back because it cannot know which
+        rows were open a moment earlier.
+        """
+        return bool(
+            self.checks
+            or self.severities
+            or self.flag_ids
+            or self.security_id is not None
+            or self.since is not None
+            or self.until is not None
+        )
+
+
+def _dq_check_pattern(column: str, value: str) -> tuple[str, list[Any]]:
+    """Render one ``--check`` value as a predicate: exact match, or a `*` glob.
+
+    `price_*` is the category the docs talk about constantly (its repeats are
+    load-bearing -- see :func:`count_price_quarantines`) and `security_*` covers the
+    per-field range checks, so matching a prefix is worth supporting. The literal
+    `_` in those names is itself a LIKE wildcard, so the value is escaped before
+    `*` becomes `%`; otherwise `price_*` would also match a future `priceXfoo`.
+    """
+    if "*" not in value:
+        return f"{column} = %s", [value]
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{column} LIKE %s ESCAPE '\\'", [escaped.replace("*", "%")]
+
+
+def _dq_where(filt: DqFilter, alias: str = "") -> tuple[str, list[Any]]:
+    """Compile a :class:`DqFilter` into a WHERE clause and its parameters.
+
+    ``alias`` qualifies the column names for the one query that joins
+    (:func:`list_dq_flags`), so the joined and unjoined forms are the same
+    predicate rather than two that have to be kept in step by hand.
+    """
+    if filt.state not in DQ_STATES:
+        raise ValueError(f"state must be one of {DQ_STATES}, got {filt.state!r}")
+    q = f"{alias}." if alias else ""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if filt.state == "open":
+        clauses.append(f"{q}resolved_at IS NULL")
+    elif filt.state == "resolved":
+        clauses.append(f"{q}resolved_at IS NOT NULL")
+    if filt.checks:
+        ors: list[str] = []
+        for value in filt.checks:
+            sql, args = _dq_check_pattern(f"{q}check_name", value)
+            ors.append(sql)
+            params.extend(args)
+        clauses.append("(" + " OR ".join(ors) + ")")
+    if filt.severities:
+        clauses.append(f"{q}severity = ANY(%s)")
+        params.append(list(filt.severities))
+    if filt.security_id is not None:
+        clauses.append(f"{q}security_id = %s")
+        params.append(filt.security_id)
+    if filt.since is not None:
+        clauses.append(f"{q}detected_at >= %s")
+        params.append(filt.since)
+    if filt.until is not None:
+        # Inclusive of the whole day: `--until 2024-08-28` has to include a flag
+        # detected at 14:02 that day, which `detected_at <= %s` would drop -- the
+        # date widens to midnight.
+        clauses.append(f"{q}detected_at < (%s::date + 1)")
+        params.append(filt.until)
+    if filt.flag_ids:
+        clauses.append(f"{q}dq_flag_id = ANY(%s)")
+        params.append(list(filt.flag_ids))
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def dq_flag_totals(db: Database, filt: DqFilter = DqFilter()) -> dict:
+    """Headline numbers under a filter: flags, distinct securities and checks, and
+    the detection window.
+
+    Separate from :func:`summarize_dq_flags` because securities cannot be summed
+    across its rows -- one security with a gap and an outlier is one security, and
+    adding the per-check counts would report it as two.
+    """
+    where, params = _dq_where(filt)
+    row = db.fetchone(
+        f"""
+        SELECT count(*)                        AS flags,
+               count(DISTINCT security_id)     AS securities,
+               count(DISTINCT check_name)      AS checks,
+               min(detected_at)                AS first_detected,
+               max(detected_at)                AS last_detected
+          FROM ops.data_quality_flag
+          {where}
+        """,
+        params,
+    )
+    return row or {}
+
+
+def summarize_dq_flags(db: Database, filt: DqFilter = DqFilter()) -> list[dict]:
+    """One row per (check_name, severity): how many, over how many securities, and
+    when that condition was first and last seen.
+
+    This is the triage view. 40,000 flags is not something anyone reads, but "gap:
+    842 over 201 securities, oldest 2024-01-03" is a decision.
+    """
+    where, params = _dq_where(filt)
+    return db.fetchall(
+        f"""
+        SELECT check_name,
+               severity,
+               count(*)                    AS flags,
+               count(DISTINCT security_id) AS securities,
+               min(detected_at)            AS first_detected,
+               max(detected_at)            AS last_detected
+          FROM ops.data_quality_flag
+          {where}
+         GROUP BY check_name, severity
+         ORDER BY {_DQ_SEVERITY_RANK} DESC, flags DESC, check_name
+        """,
+        params,
+    )
+
+
+def list_dq_flags(
+    db: Database,
+    filt: DqFilter = DqFilter(),
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    newest_first: bool = True,
+) -> list[dict]:
+    """A page of individual flags, with the security's current ticker attached.
+
+    LEFT JOIN, not JOIN: ``security_id`` is a soft reference (nullable, no FK), so a
+    flag that is not about one security has none, and a flag whose security was
+    folded away has to stay listable rather than silently leaving the queue while
+    still being counted by it.
+    """
+    where, params = _dq_where(filt, alias="f")
+    direction = "DESC" if newest_first else "ASC"
+    return db.fetchall(
+        f"""
+        SELECT f.dq_flag_id, f.check_name, f.severity, f.security_id,
+               s.primary_symbol, f.table_name, f.record_key, f.detail,
+               f.detected_at, f.resolved_at, f.resolved_by, f.resolution_note,
+               f.ingestion_run_id
+          FROM ops.data_quality_flag f
+          LEFT JOIN core.security s ON s.security_id = f.security_id
+          {where}
+         ORDER BY f.detected_at {direction}, f.dq_flag_id {direction}
+         LIMIT %s OFFSET %s
+        """,
+        [*params, limit, offset],
+    )
+
+
+def resolve_dq_flags(
+    db: Database,
+    filt: DqFilter,
+    *,
+    note: Optional[str] = None,
+    resolved_by: Optional[str] = None,
+) -> list[int]:
+    """Close the flags the filter selects, stamping who and why. Returns the ids
+    actually closed.
+
+    Only open flags are touched, whatever ``filt.state`` says: resolving an already
+    resolved flag would overwrite an earlier operator's note with this one's, and
+    silently attribute their decision to you. It also lets a caller tell "already
+    closed" from "closed by me" by diffing the ids it asked for against the ids
+    returned.
+
+    Refuses a filter that narrows nothing -- see :attr:`DqFilter.is_narrowed`.
+
+    Resolving is a judgement about a condition, not a repair of it. The next
+    `fafnir dq run` re-detects a problem that is still there and flags it again,
+    because setting ``resolved_at`` frees the condition's slot in
+    ux_dq_flag_open_condition. That is the intended behaviour: a flag that comes
+    back is the check saying the problem never went away.
+    """
+    if not filt.is_narrowed:
+        raise ValueError(
+            "resolve_dq_flags needs flag ids or at least one filter; refusing to "
+            "close the whole queue"
+        )
+    where, params = _dq_where(filt._replace(state="open"))
+    rows = db.fetchall(
+        f"""
+        UPDATE ops.data_quality_flag
+           SET resolved_at = now(), resolved_by = %s, resolution_note = %s
+         {where}
+        RETURNING dq_flag_id
+        """,
+        [resolved_by, note, *params],
+    )
+    return [int(r["dq_flag_id"]) for r in rows]
+
+
+def reopen_dq_flags(
+    db: Database, flag_ids: Sequence[int]
+) -> tuple[list[int], list[int]]:
+    """Undo a resolution: back to open, provenance cleared. Returns
+    ``(reopened, conflicted)``.
+
+    The note goes with it. A "resolved because the exchange was shut" sitting on a
+    row that is open again is a decision that no longer stands, and migration 0017
+    has the schema refuse it.
+
+    Ids only, never a filter: reopening is for the resolve you regret, and a bulk
+    reopen would have to guess which of the closed rows under a filter were closed
+    by that mistake.
+
+    Each id gets its own savepoint because one of them can legitimately fail:
+    ux_dq_flag_open_condition (0016) allows one open row per condition, so a
+    condition re-flagged since it was closed has no free slot. That is the queue
+    telling you it already carries the problem -- reported as a conflict, and not
+    a reason to abandon the other ids in the same command.
+    """
+    reopened: list[int] = []
+    conflicted: list[int] = []
+    for flag_id in flag_ids:
+        try:
+            with db.conn.transaction():
+                row = db.fetchone(
+                    """
+                    UPDATE ops.data_quality_flag
+                       SET resolved_at = NULL, resolved_by = NULL,
+                           resolution_note = NULL
+                     WHERE dq_flag_id = %s AND resolved_at IS NOT NULL
+                    RETURNING dq_flag_id
+                    """,
+                    (flag_id,),
+                )
+        except psycopg.errors.UniqueViolation:
+            conflicted.append(int(flag_id))
+            continue
+        if row is not None:
+            reopened.append(int(row["dq_flag_id"]))
+    return reopened, conflicted
 
 
 # ---------------------------------------------------------------------------

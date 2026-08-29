@@ -66,7 +66,12 @@ fafnir db refresh-marts
 fafnir dq run
 fafnir status
 
-# 5. Read with duk (db mode)
+# 5. Triage what the checks flagged
+fafnir dq list                                   # open flags by check and severity
+fafnir dq list --detail --check gap --symbol AAPL
+fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
+
+# 6. Read with duk (db mode)
 duk ph AAPL --adj -S db
 duk ls --sector Technology -S db
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic

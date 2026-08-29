@@ -1092,7 +1092,9 @@ What to watch, and the SQL for each, is in
 failed runs, and three signals that come from the nightly universe maintenance —
 `New (7d)` (a week of zeroes on a working key means the security-master step is not
 running), unapplied ticker renames awaiting a decision, and `security_company_name_drift`
-flags. `fafnir status` surfaces the first two directly.
+flags. `fafnir status` surfaces the first two directly, and `fafnir dq list` reads
+the flag queue itself — with `fafnir dq resolve` to close what you have worked
+(see [operations.md](operations.md#working-the-dq-queue)).
 
 `pg_stat_statements` (enabled in §3.4) gives you the slow-query view:
 
@@ -1232,7 +1234,8 @@ sudo -u postgres psql -tAc "SELECT rolsuper, rolcreaterole FROM pg_roles
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
   fafnir db status        # 0001..0012 all "applied", no DRIFT
   fafnir status           # securities > 0, latest date = last trading day
-  fafnir dq run'          # flag counts you can explain
+  fafnir dq run           # flag counts you can explain
+  fafnir dq list'         # and the queue those counts refer to
 
 # --- Automation & backups ---------------------------------------------------
 systemctl list-timers 'fafnir-*'                     # next elapse looks right

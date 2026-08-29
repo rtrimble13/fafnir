@@ -109,6 +109,7 @@ flag is only the notification.
 
 ```bash
 fafnir status                 # securities, price rows, latest date, open DQ flags
+fafnir dq list                # the open queue, by check and severity
 scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 ```
 
@@ -121,30 +122,26 @@ Things to watch:
   problems it always should have been counting. The exception is `price_*`,
   which repeats by design (see
   [data_dictionary.md](data_dictionary.md#opsdata_quality_flag--quarantineanomaly-queue-grain-dq_flag_id));
-  filter it out when you want the count of distinct issues. Nothing sets
-  `resolved_at` automatically — a flag you have worked stays open until you close it:
-  ```sql
-  UPDATE ops.data_quality_flag SET resolved_at = now() WHERE dq_flag_id = ...;
-  ```
+  filter it out when you want the count of distinct issues (`fafnir dq list` says
+  so on the summary when `price_*` is in the table). Nothing sets `resolved_at`
+  automatically — a flag you have worked stays open until you close it, with
+  [`fafnir dq resolve`](#working-the-dq-queue).
 - **Company-name drift** — `security_company_name_drift` flags in
   `ops.data_quality_flag`. The security master keys a listed security on
   `(source, symbol)` (0012), which assumes one issuer per ticker. This check is the
   safety net under that assumption: if two listed companies ever shared a symbol,
   the second would silently *update* the first instead of inserting, and the tell
   is the company name changing into something unrelated while the ticker stays put.
-  ```sql
-  SELECT security_id, record_key ->> 'symbol' AS symbol,
-         detail ->> 'stored_name' AS was, detail ->> 'incoming_name' AS now,
-         detail ->> 'similarity'  AS score, detected_at
-    FROM ops.data_quality_flag
-   WHERE check_name = 'security_company_name_drift' AND resolved_at IS NULL
-   ORDER BY detected_at DESC;
+  ```bash
+  fafnir dq list --detail --check security_company_name_drift
   ```
+  The `detail` column carries the old name, the incoming one and the similarity
+  score that tripped it; `--json` gives them unabridged.
   It is **advisory**: a genuine same-ticker rebrand (Google → Alphabet) trips it
   too, as does a vendor switching to an abbreviation (International Business
   Machines → IBM). Confirm the `security_id` still describes one company — the
   price history either continues sensibly across the name change or it does not —
-  then resolve the flag. Escalate only if two different issuers really are sharing
+  then close it with a note saying which (`fafnir dq resolve <id> --note "..."`). Escalate only if two different issuers really are sharing
   the ticker, which would mean the identity assumption is wrong for your universe.
   The flag is raised once, on the night the name changes, not nightly.
 - **Unapplied renames** — the `Renames` line in `fafnir status`. Each one is a
@@ -173,6 +170,56 @@ Things to watch:
   SELECT * FROM ops.ingestion_run WHERE status IN ('failed','partial')
   ORDER BY started_at DESC LIMIT 20;
   ```
+
+## Working the DQ queue
+
+`fafnir dq run` writes flags; `fafnir dq list` and `fafnir dq resolve` are how they
+get worked. The two take the **same** selection options, so the workflow is to
+narrow with `list` until the page is the problem you mean, then re-run the same
+options under `resolve`.
+
+```bash
+fafnir dq list                                    # what is open, by check and severity
+fafnir dq list --detail --check gap --limit 20    # the individual gaps
+fafnir dq list -d --symbol AAPL --state all       # one security, open and resolved
+fafnir dq list --check 'price_*' --since 2024-08-01
+fafnir dq list --json                             # same rows, for a script
+```
+
+`--detail` switches from the per-check summary to the flags themselves, with the
+`record_key` and `detail` JSONB rendered inline. Trailing `*` globs a check family
+(`price_*`, `security_*`). `--state` picks the open queue (default), the resolved
+record, or both.
+
+Closing a flag records **who** and **why** — the judgement is the part `resolved_at`
+alone does not keep:
+
+```bash
+fafnir dq resolve 12841 12842 --note "exchange holiday, no bar expected"
+fafnir dq resolve --check gap --symbol AAPL --note "backfilled" --yes
+fafnir dq resolve --check outlier --since 2024-08-01 --dry-run
+fafnir dq reopen 12841                            # undo; the note goes with it
+```
+
+`--by` overrides the recorded resolver (it defaults to the OS user). `--dry-run`
+prints what would close and changes nothing. A resolve by filter asks for
+confirmation unless you pass `--yes`; a resolve by id does not.
+
+Guard rails, because this closes rows in bulk:
+- **Ids or filters, never both, never neither.** An unfiltered resolve would close
+  the entire queue — including problems nobody has looked at — and `reopen` cannot
+  put that back, because it cannot know which rows were open a moment earlier.
+- **An unknown `--symbol` is fatal.** A mistyped ticker that fell through as "no
+  security filter" would widen the command to the whole universe.
+- **An already-resolved flag is never rewritten**, so re-running a resolve is a
+  no-op rather than a silent re-attribution of someone else's decision to you. Ids
+  that did not close are reported, one line each, saying which.
+
+**Resolving is a judgement, not a repair.** Closing a flag frees that condition's
+slot in `ux_dq_flag_open_condition`, so if the problem is still in the data the next
+`fafnir dq run` flags it again — which is the check telling you it never went away,
+not a bug. Fix the data (backfill the gap, load the missing corporate action) if you
+want it to stay closed.
 
 ## Reconciliation
 
