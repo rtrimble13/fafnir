@@ -51,6 +51,15 @@ the Professional plan in the original `duk`.
 > already tolerates the common alternates; the endpoint paths are centralized as
 > constants in `FMPClient` for a one-line correction.
 
+> **`ingest actions` is the one load that is not incremental.** It has no watermark,
+> and it selects every row in `core.security` — delisted names included — so each
+> nightly run re-downloads the complete split and dividend history of ~21k symbols in
+> ~42.8k requests (~2.5 hours) to capture a few hundred changed rows. A per-symbol
+> watermark does not fix it: the per-symbol endpoints take no window, so the request
+> count, not the payload, is the cost. See
+> [adr/0007](adr/0007-incremental-corporate-actions.md) for the evaluated options and
+> the proposed market-wide calendar sweep.
+
 ## The declared universe (mutual funds)
 
 `ingest securities` builds a **discovered** universe: it re-reads `company-screener`

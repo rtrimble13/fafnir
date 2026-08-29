@@ -35,6 +35,7 @@ read through the `duk` CLI.
   - [ADR 0004 — Unadjusted price feed](adr/0004-unadjusted-price-feed.md)
   - [ADR 0005 — The universe maintains itself](adr/0005-automatic-universe-maintenance.md)
   - [ADR 0006 — A declared universe alongside the screened one (select mutual funds)](adr/0006-curated-fund-universe.md)
+  - [ADR 0007 — Corporate actions load incrementally (market-wide calendar sweep)](adr/0007-incremental-corporate-actions.md) *(proposed)*
 
 ## Reference
 
