@@ -11,6 +11,8 @@ Examples
     fafnir ingest actions --symbols AAPL && fafnir adjust
     fafnir db refresh-marts
     fafnir dq run
+    fafnir dq list --detail --check gap --symbol AAPL
+    fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
     fafnir status
 """
 
@@ -31,6 +33,20 @@ def _parse_date(value: Optional[str]) -> Optional[dt.date]:
     if not value:
         return None
     return dt.datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _os_user() -> str:
+    """Best-effort identity for `resolved_by` when `--by` is not given.
+
+    A wrong-but-plausible name is worse than none, so anything unresolvable
+    becomes "unknown" rather than a guess.
+    """
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):
+        return "unknown"
 
 
 def _split_symbols(value: Optional[str]) -> list[str]:
@@ -496,6 +512,590 @@ def dq_run(ctx, exchange, outlier_threshold):
     click.echo(f"DQ flags written: {result}")
 
 
+# ---------------------------------------------------------------------------
+# dq queue presentation
+# ---------------------------------------------------------------------------
+#
+# `fafnir dq run` writes the queue; `list` / `resolve` / `reopen` are how it is
+# worked. The rendering lives here rather than in repository.py so the SQL stays
+# one place and the terminal formatting another.
+
+
+def _terminal_width(default: int = 100) -> int:
+    """Width to fit a table into. Falls back when there is no tty (cron, pipes)."""
+    import shutil
+
+    try:
+        return max(60, shutil.get_terminal_size((default, 24)).columns)
+    except OSError:
+        return default
+
+
+def _fmt_stamp(value) -> str:
+    """A timestamp as the day it fell on -- the queue is triaged by date, and the
+    clock time costs six columns that the record_key needs more."""
+    if value is None:
+        return "-"
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+
+def _fmt_scalar(value) -> str:
+    """One JSONB leaf, short enough to sit in a table cell."""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    text = str(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _fmt_json(value) -> str:
+    """A record_key or detail object as `k=v k=v`.
+
+    The JSONB columns hold a handful of small fields (`trade_date`, `move`,
+    `prev_close`), so one flat line reads better than pretty-printed JSON and keeps
+    a flag to one row of the table. `--json` is there for the whole object.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(f"{k}={_fmt_scalar(v)}" for k, v in value.items())
+    return _fmt_scalar(value)
+
+
+def _echo_table(headers, rows, right=()):
+    """Print a plain column-aligned table, trimmed to the terminal width.
+
+    The last column is the one that gets cut: it is always the free-text one
+    (`detail`, or the resolution note), and losing its tail costs less than
+    wrapping every row of a 200-row page. A cut line ends in `...` so a truncated
+    value is never mistaken for the whole of one -- `move=0.6` and a cut
+    `move=0.62...` are different claims about the data.
+    """
+    if not rows:
+        return
+    widths = [
+        max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(len(headers))
+    ]
+    limit = _terminal_width()
+
+    def line(cells: list[str]) -> str:
+        out = []
+        for i, cell in enumerate(cells):
+            out.append(cell.rjust(widths[i]) if i in right else cell.ljust(widths[i]))
+        text = "  ".join(out).rstrip()
+        return text if len(text) <= limit else text[: limit - 3] + "..."
+
+    click.echo(line(headers))
+    click.echo(line(["-" * w for w in widths]))
+    for row in rows:
+        click.echo(line(row))
+
+
+def _echo_wrapped(text: str) -> None:
+    """A prose line (a caveat, a hint) folded to the terminal, not run off it."""
+    import textwrap
+
+    click.echo(textwrap.fill(text, width=min(_terminal_width(), 88)))
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _dq_json(payload) -> None:
+    import json
+
+    click.echo(json.dumps(payload, indent=2, default=str))
+
+
+def _dq_filter(
+    database,
+    *,
+    state="open",
+    checks=(),
+    severities=(),
+    symbol=None,
+    security_id=None,
+    since=None,
+    until=None,
+    flag_ids=(),
+):
+    """Turn the shared CLI options into one repository filter.
+
+    `--symbol` is resolved here, and an unknown one is fatal. Falling through as
+    "no security filter" would silently widen the command to the whole universe --
+    a mistyped ticker listing 40,000 flags is noise, but a mistyped ticker on
+    `dq resolve --yes` closes the entire queue.
+    """
+    from fafnir.db import repository as repo
+
+    if symbol:
+        resolved = repo.resolve_security_id(database, symbol.upper())
+        if resolved is None:
+            raise click.ClickException(
+                f"Unknown symbol {symbol.upper()}: not in the security master."
+            )
+        if security_id is not None and security_id != resolved:
+            raise click.ClickException(
+                f"--symbol {symbol.upper()} is security_id {resolved}, "
+                f"which contradicts --security-id {security_id}."
+            )
+        security_id = resolved
+    return repo.DqFilter(
+        state=state,
+        checks=tuple(checks),
+        severities=tuple(severities),
+        security_id=security_id,
+        since=since.date() if since else None,
+        until=until.date() if until else None,
+        flag_ids=tuple(flag_ids),
+    )
+
+
+def _dq_filter_options(func):
+    """The selection options `dq list` and `dq resolve` share.
+
+    Shared deliberately: the workflow is to narrow with `list` until the page is
+    the problem you mean, then re-run the same options under `resolve`. Options
+    that drifted between the two commands would make that habit dangerous.
+    """
+    for option in reversed(
+        [
+            click.option(
+                "--check",
+                "checks",
+                multiple=True,
+                metavar="NAME",
+                help="Check name, repeatable. Trailing * globs (e.g. 'price_*').",
+            ),
+            click.option(
+                "--severity",
+                "severities",
+                multiple=True,
+                type=click.Choice(["info", "warn", "error"]),
+                help="Severity, repeatable.",
+            ),
+            click.option("--symbol", help="Limit to one security, by ticker."),
+            click.option(
+                "--security-id", type=int, help="Limit to one security, by id."
+            ),
+            # click.DateTime rather than the module's _parse_date: a bad date is a
+            # usage error and should read as one ("invalid value for '--since'"),
+            # not as a strptime traceback out of the middle of a query.
+            click.option(
+                "--since",
+                type=click.DateTime(formats=["%Y-%m-%d"]),
+                metavar="YYYY-MM-DD",
+                help="Detected on or after.",
+            ),
+            click.option(
+                "--until",
+                type=click.DateTime(formats=["%Y-%m-%d"]),
+                metavar="YYYY-MM-DD",
+                help="Detected on or before (inclusive).",
+            ),
+        ]
+    ):
+        func = option(func)
+    return func
+
+
+@dq.command("list")
+@click.option(
+    "--detail",
+    "-d",
+    is_flag=True,
+    help="List individual flags instead of the per-check summary.",
+)
+@_dq_filter_options
+@click.option(
+    "--state",
+    type=click.Choice(["open", "resolved", "all"]),
+    default="open",
+    show_default=True,
+    help="Open queue, the resolved record, or both.",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1, max=5000),
+    default=50,
+    show_default=True,
+    help="Rows in --detail.",
+)
+@click.option(
+    "--offset",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Skip this many rows in --detail.",
+)
+@click.option(
+    "--oldest",
+    is_flag=True,
+    help="Oldest first in --detail (work the backlog from its front).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit rows as JSON.")
+@click.pass_context
+def dq_list(
+    ctx,
+    detail,
+    checks,
+    severities,
+    symbol,
+    security_id,
+    since,
+    until,
+    state,
+    limit,
+    offset,
+    oldest,
+    as_json,
+):
+    """Show the data-quality queue: a per-check summary, or the flags themselves.
+
+    \b
+      fafnir dq list                                  # what is open, by check
+      fafnir dq list --detail --check gap --limit 20  # the gaps themselves
+      fafnir dq list -d --symbol AAPL --state all     # one security's history
+      fafnir dq list --check 'price_*' --since 2024-08-01
+
+    The same selection options work on `fafnir dq resolve`, so a filter narrowed
+    here can be handed straight to it.
+    """
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        filt = _dq_filter(
+            database,
+            state=state,
+            checks=checks,
+            severities=severities,
+            symbol=symbol,
+            security_id=security_id,
+            since=since,
+            until=until,
+        )
+        totals = repo.dq_flag_totals(database, filt)
+        if detail:
+            rows = repo.list_dq_flags(
+                database, filt, limit=limit, offset=offset, newest_first=not oldest
+            )
+        else:
+            rows = repo.summarize_dq_flags(database, filt)
+
+    if as_json:
+        _dq_json({"totals": totals, "rows": rows})
+        return
+    if detail:
+        _echo_dq_detail(rows, totals, filt, limit=limit, offset=offset)
+    else:
+        _echo_dq_summary(rows, totals, filt)
+
+
+def _echo_dq_empty(filt) -> None:
+    """The empty queue reads differently depending on why it is empty."""
+    scope = " match this filter" if filt.is_narrowed else ""
+    click.echo(f"No {_dq_label(filt).lower()} DQ flags{scope}.")
+
+
+def _dq_label(filt) -> str:
+    return {"open": "Open", "resolved": "Resolved", "all": "All"}[filt.state]
+
+
+def _echo_dq_summary(rows, totals, filt) -> None:
+    flags = int(totals.get("flags") or 0)
+    label = _dq_label(filt)
+    if not flags:
+        _echo_dq_empty(filt)
+        return
+    click.echo(
+        f"{label} DQ flags: {flags} across {totals.get('securities') or 0} securities, "
+        f"{totals.get('checks') or 0} checks"
+    )
+    click.echo(
+        f"Detected     : {_fmt_stamp(totals.get('first_detected'))} .. "
+        f"{_fmt_stamp(totals.get('last_detected'))}"
+    )
+    click.echo()
+    _echo_table(
+        ["CHECK", "SEV", "FLAGS", "SECURITIES", "FIRST SEEN", "LAST SEEN"],
+        [
+            [
+                r["check_name"],
+                r["severity"],
+                str(r["flags"]),
+                str(r["securities"]),
+                _fmt_stamp(r["first_detected"]),
+                _fmt_stamp(r["last_detected"]),
+            ]
+            for r in rows
+        ],
+        right={2, 3},
+    )
+    click.echo()
+    if any(r["check_name"].startswith("price_") for r in rows):
+        # Everywhere else one open flag is one problem; price_* is the documented
+        # exception, and a reader comparing its count against the other checks
+        # deserves to be told before drawing a conclusion from it.
+        _echo_wrapped(
+            "Note: price_* flags repeat per re-detection by design (the repeats "
+            "bound the watermark hold on a persistently-bad bar), so their count "
+            "is not a count of distinct problems."
+        )
+    click.echo(f"Detail: fafnir dq list --detail --check {rows[0]['check_name']}")
+
+
+def _echo_dq_detail(rows, totals, filt, *, limit, offset, hints=True) -> None:
+    """The per-flag page. ``hints`` is off where the next command is not `resolve`
+    -- inside `dq resolve --dry-run`, telling the operator to run `dq resolve` is
+    noise on top of the command they already ran."""
+    flags = int(totals.get("flags") or 0)
+    label = _dq_label(filt)
+    if not rows:
+        if flags:
+            click.echo(
+                f"No rows at --offset {offset}; "
+                f"{_plural(flags, 'flag')} match ({label.lower()})."
+            )
+        else:
+            _echo_dq_empty(filt)
+        return
+    show_resolution = filt.state != "open"
+    headers = ["ID", "DETECTED", "SEV", "CHECK", "SYMBOL", "RECORD KEY", "DETAIL"]
+    if show_resolution:
+        headers[6:6] = ["RESOLVED", "BY"]
+    table = []
+    for r in rows:
+        cells = [
+            str(r["dq_flag_id"]),
+            _fmt_stamp(r["detected_at"]),
+            r["severity"],
+            r["check_name"],
+            r["primary_symbol"]
+            or (f"#{r['security_id']}" if r["security_id"] else "-"),
+            _fmt_json(r["record_key"]),
+        ]
+        if show_resolution:
+            cells += [_fmt_stamp(r["resolved_at"]), r["resolved_by"] or "-"]
+        cells.append(_fmt_json(r["detail"]))
+        table.append(cells)
+    _echo_table(headers, table, right={0})
+    click.echo()
+    shown = f"{offset + 1}-{offset + len(rows)}" if offset else str(len(rows))
+    click.echo(f"Showing {shown} of {_plural(flags, 'flag')} ({label.lower()}).")
+    if show_resolution:
+        # Grouped by note, not listed per row: one `dq resolve --check gap` writes
+        # the same sentence to every flag it closed, and repeating it 50 times
+        # buries the one flag somebody closed for a different reason.
+        by_note: dict[str, list[str]] = {}
+        for r in rows:
+            if r.get("resolution_note"):
+                by_note.setdefault(r["resolution_note"], []).append(
+                    str(r["dq_flag_id"])
+                )
+        if by_note:
+            click.echo()
+            click.echo("Notes:")
+            for text, ids in by_note.items():
+                _echo_wrapped(f"  {', '.join(ids)}: {text}")
+    if offset + len(rows) < flags:
+        click.echo(f"More      : --offset {offset + limit}")
+    if hints and filt.state == "open":
+        click.echo(
+            "Resolve   : fafnir dq resolve "
+            + " ".join(str(r["dq_flag_id"]) for r in rows[:3])
+            + ' --note "..."'
+        )
+
+
+@dq.command("resolve")
+@click.argument("flag_ids", nargs=-1, type=int, metavar="[ID]...")
+@_dq_filter_options
+@click.option(
+    "--note",
+    "-m",
+    help="Why these are being closed. Kept on the row -- write it for whoever "
+    "reads the flag next.",
+)
+@click.option(
+    "--by",
+    "resolved_by",
+    help="Who is closing them  [default: the OS user running the command]",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be closed and change nothing."
+)
+@click.option(
+    "--yes", "-y", is_flag=True, help="Skip the confirmation on a filtered resolve."
+)
+@click.pass_context
+def dq_resolve(
+    ctx,
+    flag_ids,
+    checks,
+    severities,
+    symbol,
+    security_id,
+    since,
+    until,
+    note,
+    resolved_by,
+    dry_run,
+    yes,
+):
+    """Close data-quality flags, recording who closed them and why.
+
+    \b
+      fafnir dq resolve 12841 12842 --note "exchange holiday, no bar expected"
+      fafnir dq resolve --check gap --symbol AAPL --note "backfilled" --yes
+      fafnir dq resolve --check outlier --since 2024-08-01 --dry-run
+
+    Takes explicit ids, or the same selection options as `fafnir dq list` -- run it
+    as a list first and you can see exactly what will close. One or the other, not
+    both, and never neither: an unfiltered resolve would close the whole queue.
+
+    Resolving records a judgement, it does not fix the data. If the condition is
+    still there the next `fafnir dq run` flags it again.
+    """
+    from fafnir.db import repository as repo
+
+    narrowed = bool(
+        checks or severities or symbol or since or until or security_id is not None
+    )
+    if flag_ids and narrowed:
+        raise click.ClickException(
+            "Give ids or filters, not both: the ids say exactly which rows, and a "
+            "filter alongside them can only narrow that into something you did not "
+            "list. Run `fafnir dq list` with the filters to get the ids."
+        )
+    if not flag_ids and not narrowed:
+        raise click.ClickException(
+            "Nothing selected. Pass flag ids, or narrow with --check / --symbol / "
+            "--severity / --since / --until. Refusing to close the whole queue."
+        )
+
+    if resolved_by is None:
+        resolved_by = _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        filt = _dq_filter(
+            database,
+            state="open",
+            checks=checks,
+            severities=severities,
+            symbol=symbol,
+            security_id=security_id,
+            since=since,
+            until=until,
+            flag_ids=flag_ids,
+        )
+        totals = repo.dq_flag_totals(database, filt)
+        matched = int(totals.get("flags") or 0)
+
+        if dry_run:
+            preview = repo.list_dq_flags(database, filt, limit=20)
+            _echo_dq_detail(preview, totals, filt, limit=20, offset=0, hints=False)
+            click.echo(
+                f"Dry run: {_plural(matched, 'flag')} would be closed. "
+                "Nothing changed."
+            )
+            return
+
+        if not matched:
+            # Not an error: re-running a resolve, or closing something a colleague
+            # already closed, is a no-op, and a nightly script piping into this
+            # should not die on it.
+            click.echo("Nothing to resolve: no open flags match.")
+            _warn_unclosed(database, flag_ids, closed=set())
+            return
+
+        if not flag_ids and not yes:
+            click.confirm(
+                f"Close {_plural(matched, 'open flag')} "
+                f"({totals.get('securities') or 0} securities, "
+                f"{totals.get('checks') or 0} checks)?",
+                abort=True,
+            )
+
+        closed = repo.resolve_dq_flags(
+            database, filt, note=note, resolved_by=resolved_by
+        )
+        click.echo(f"Resolved {_plural(len(closed), 'flag')} as {resolved_by}.")
+        if note:
+            click.echo(f'Note: "{note}"')
+        _warn_unclosed(database, flag_ids, closed=set(closed))
+        remaining = repo.dq_flag_totals(database, repo.DqFilter())
+        click.echo(f"Open DQ flags remaining: {remaining.get('flags') or 0}")
+
+
+def _warn_unclosed(database, flag_ids, *, closed: set) -> None:
+    """Say which requested ids did not close, and why.
+
+    "Resolved 2 flags" after asking for 4 is the kind of quiet shortfall that gets
+    read as success; the two that did not close are either a typo or a decision
+    somebody else already made, and both are worth seeing.
+    """
+    from fafnir.db import repository as repo
+
+    missing = [i for i in flag_ids if i not in closed]
+    if not missing:
+        return
+    found = repo.list_dq_flags(
+        database, repo.DqFilter(state="all", flag_ids=missing), limit=len(missing)
+    )
+    already = {int(r["dq_flag_id"]): r for r in found}
+    for flag_id in missing:
+        row = already.get(flag_id)
+        if row is None:
+            click.echo(f"  {flag_id}: no such flag.", err=True)
+        else:
+            click.echo(
+                f"  {flag_id}: already resolved {_fmt_stamp(row['resolved_at'])}"
+                f" by {row['resolved_by'] or 'unknown'}.",
+                err=True,
+            )
+
+
+@dq.command("reopen")
+@click.argument("flag_ids", nargs=-1, type=int, required=True, metavar="ID...")
+@click.pass_context
+def dq_reopen(ctx, flag_ids):
+    """Put resolved flags back in the queue (undo a `dq resolve`).
+
+    The resolution note and resolver are cleared with it -- a note explaining a
+    decision that no longer stands is worse than none.
+
+    Ids only. A flag whose condition has since been flagged afresh cannot reopen:
+    the queue holds one open row per condition, and it already has one.
+    """
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        reopened, conflicted = repo.reopen_dq_flags(database, flag_ids)
+        missing = [
+            i for i in flag_ids if i not in set(reopened) and i not in set(conflicted)
+        ]
+        click.echo(f"Reopened {_plural(len(reopened), 'flag')}.")
+        for flag_id in conflicted:
+            click.echo(
+                f"  {flag_id}: the same condition is already open on a newer flag; "
+                "left resolved.",
+                err=True,
+            )
+        if missing:
+            found = {
+                int(r["dq_flag_id"])
+                for r in repo.list_dq_flags(
+                    database,
+                    repo.DqFilter(state="all", flag_ids=missing),
+                    limit=len(missing),
+                )
+            }
+            for flag_id in missing:
+                reason = "already open" if flag_id in found else "no such flag"
+                click.echo(f"  {flag_id}: {reason}.", err=True)
+
+
 @main.command("status")
 @click.pass_context
 def status(ctx):
@@ -507,8 +1107,15 @@ def status(ctx):
         price_rows = database.fetchval("SELECT count(*) FROM core.daily_price")
         latest = database.fetchval("SELECT max(trade_date) FROM core.daily_price")
         actions = database.fetchval("SELECT count(*) FROM core.corporate_action")
-        open_flags = database.fetchval(
-            "SELECT count(*) FROM ops.data_quality_flag WHERE resolved_at IS NULL"
+        # Same count as ever -- count(*) WHERE resolved_at IS NULL -- now through
+        # the queue's own read API, plus the error-severity slice, so the line says
+        # whether the backlog contains anything that failed rather than warned.
+        open_flags = int(repo.dq_flag_totals(database).get("flags") or 0)
+        open_errors = int(
+            repo.dq_flag_totals(database, repo.DqFilter(severities=("error",))).get(
+                "flags"
+            )
+            or 0
         )
         new_listings = repo.count_recent_listings(database, days=7)
         pending_renames = repo.count_unapplied_symbol_changes(database)
@@ -520,7 +1127,12 @@ def status(ctx):
     click.echo(f"New (7d)   : {new_listings}")
     click.echo(f"Price rows : {price_rows}  (latest {latest})")
     click.echo(f"Actions    : {actions}")
-    click.echo(f"Open DQ    : {open_flags}")
+    dq_line = f"Open DQ    : {open_flags}"
+    if open_errors:
+        dq_line += f" ({open_errors} error)"
+    if open_flags:
+        dq_line += "  -- fafnir dq list"
+    click.echo(dq_line)
     if pending_renames:
         click.echo(f"Renames    : {pending_renames} unapplied (need review)")
         for row in rename_sample:

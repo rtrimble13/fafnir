@@ -240,7 +240,17 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 ### `ops.data_quality_flag` — quarantine/anomaly queue. **Grain:** `dq_flag_id`.
 `ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),
 `check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/...), `severity`
-(`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`.
+(`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`,
+`resolved_by`, `resolution_note`.
+
+Read and worked with `fafnir dq list` / `fafnir dq resolve` (see
+[operations.md](operations.md#working-the-dq-queue)). Since migration 0017 a
+resolution records **who** closed the flag and **why**: `resolved_at` alone cannot
+tell a gap that was genuinely explained from one closed to quiet the count, and the
+judgement is the part worth keeping. `ck_dq_flag_resolution_provenance` holds the
+other half of that — provenance exists only where a resolution does — so reopening a
+flag (`fafnir dq reopen`) clears the note rather than leaving a decision that no
+longer stands on an open row.
 
 **One unresolved problem is one unresolved row.** The checks that write here run on
 a schedule over the same data, so a standing condition is flagged once, not once per

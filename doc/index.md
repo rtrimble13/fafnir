@@ -21,7 +21,8 @@ read through the `duk` CLI.
 - [Ingestion](ingestion.md) — FMP endpoint→table map, idempotency, watermarks, the
   adjustment step
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,
-  reconciliation, recovery, backups
+  [working the DQ queue](operations.md#working-the-dq-queue), reconciliation,
+  recovery, backups
 - [duk CLI](duk.md) — reading the warehouse (db) vs the API (live)
 
 ## Growing it

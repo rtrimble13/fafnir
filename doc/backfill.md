@@ -346,8 +346,9 @@ detection capability the pre-adjusted feed did not have.
 
 The counts `dq run` prints are *new* flags. A condition already sitting unresolved in
 `ops.data_quality_flag` is not flagged again, so a second run over unchanged data
-reports zeros — that is the check working, not the check finding nothing. Query the
-table (or `fafnir status`) for the standing totals.
+reports zeros — that is the check working, not the check finding nothing. Use
+`fafnir dq list` (or `fafnir status`) for the standing totals, and
+`fafnir dq list --detail --check outlier` to read the ones this switch turned up.
 
 ---
 
