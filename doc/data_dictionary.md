@@ -86,8 +86,8 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
 | `change_date` | DATE NOT NULL | Effective date; the xref period boundary. |
 | `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. |
 | `company_name` | TEXT | As reported with the rename. |
-| `status` | TEXT CHECK | `applied` / `conflict` / `ignored` — see below. |
-| `detail` | JSONB | Context, e.g. the `folded_security_id` of an absorbed duplicate. |
+| `status` | TEXT CHECK | `applied` / `conflict` / `ignored` / `dismissed` — see below. |
+| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. |
 | `source` | TEXT | |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | |
 
@@ -97,6 +97,11 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
   `symbol_change_conflict` DQ flag.
 - `ignored` — the old ticker belongs to a delisted issuer, so this is ticker
   *reuse*, not a rename.
+- `dismissed` (0018) — an operator judged the reported rename not to be a rename
+  at all: a bad feed row. Terminal, so the sweep stops retrying it. Set only by
+  `fafnir security dismiss-rename`, never by a loader, and the reasoning is kept in
+  `detail`. It is **not** the way to close a rename that is real but blocked —
+  that one is merged with `fafnir security merge-rename` and reaches `applied`.
 
 Renames of tickers fafnir does not track are counted but not stored — the feed is
 global across every venue.

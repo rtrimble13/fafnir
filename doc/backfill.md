@@ -165,9 +165,17 @@ scripts/initial_backfill.sh 1990-01-01 2>&1 | tee -a var/fafnir/log/backfill.log
 # detach with Ctrl-b d
 ```
 
-`initial_backfill.sh` runs, in order: `ingest securities --enrich` → `ingest prices
---from 1990-01-01` → `ingest actions` → `adjust` → `db refresh-marts` → `dq run` →
-`status`.
+`initial_backfill.sh` runs, in order: `ingest symbol-changes` → `ingest securities`
+→ `ingest delisted --full` → `ingest prices --from 1990-01-01 --include-inactive` →
+`ingest actions` → `adjust` → `db refresh-marts` → `dq run` → `status`.
+
+The rename step comes first for the same reason it does in the nightly job: on a
+re-run the master already holds the old tickers, and a security-master load that
+goes first mints a *second* security for any company renamed since the last run.
+The sweep can fold that duplicate away while it is empty — but the very next step
+fills it with bars, and from then on the rename is a permanent `conflict` that only
+`fafnir security merge-rename` can clear. On a genuinely empty database the step
+does nothing and costs one small feed read.
 
 **If it's interrupted, just re-run the same command** — per-symbol watermarks resume
 where it left off; `ON CONFLICT` upserts converge; nothing duplicates.

@@ -347,12 +347,20 @@ def resolve_security_id(
 CHANGE_APPLIED = "applied"
 CHANGE_CONFLICT = "conflict"
 CHANGE_IGNORED = "ignored"
+CHANGE_DISMISSED = "dismissed"
 CHANGE_UNKNOWN = "unknown"
 
-# Statuses that need no further attempt. A conflict is retried on every sweep:
-# it usually means the rename feed lagged the screener, and the collision clears
-# itself once the duplicate is resolved.
-TERMINAL_CHANGE_STATUSES = (CHANGE_APPLIED, CHANGE_IGNORED)
+# Statuses that need no further attempt. A conflict is NOT one of them: it is
+# retried on every sweep because it usually means the rename feed lagged the
+# screener, and the collision clears itself once the duplicate is resolved.
+#
+# `dismissed` (0018) is here because some conflicts never clear on their own -- a
+# pre-launch ticker shuffle, or the same rename emitted in both directions, where
+# both securities are live and neither ever gives up the ticker. The sweep would
+# re-conflict those nightly forever. Membership here is what makes a dismissal
+# stick: the sweep skips the row, and record_symbol_change refuses to downgrade it
+# back to `conflict` on the next pass.
+TERMINAL_CHANGE_STATUSES = (CHANGE_APPLIED, CHANGE_IGNORED, CHANGE_DISMISSED)
 
 
 class SymbolChangeOutcome(NamedTuple):
@@ -481,6 +489,357 @@ def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bo
     db.execute("DELETE FROM core.company_profile WHERE security_id = %s", (victim_id,))
     db.execute("DELETE FROM core.security WHERE security_id = %s", (victim_id,))
     return True
+
+
+# ---------------------------------------------------------------------------
+# Merging two securities that are one company
+# ---------------------------------------------------------------------------
+#
+# fold_empty_security above is the automatic path and it handles the case the
+# loader can reason about: a duplicate with nothing in it. Everything below is the
+# manual path for the case it deliberately refuses -- both rows carry bars.
+#
+# That case is not hypothetical. It is what a security-master load produces when it
+# runs BEFORE the rename sweep: the new ticker is minted as a fresh security, the
+# price loader fills it (the vendor serves a renamed ticker's full continuous
+# history, so the duplicate arrives with bars predating the rename), and from then
+# on every sweep reports `conflict`. Six such duplicates were created on one day in
+# 2026-08 by initial_backfill.sh, which had no rename step at all.
+#
+# Merging is destructive and irreversible, so the guards are the design. Identity
+# has to be established from the vendor's own identifiers rather than inferred from
+# a ticker, and the overlapping bars have to actually agree before one side is
+# discarded.
+
+# OHLC fields compared across the overlap. Volume is reported but does not block:
+# a vendor restating volume across a rename is common and costs no price accuracy,
+# while a restated *price* means the two rows disagree about what happened.
+_MERGE_PRICE_FIELDS = ("open", "high", "low", "close")
+
+# Identifiers that establish two rows are the same instrument. CIK identifies the
+# SEC *registrant* and survives a rename, so it is necessary but not sufficient --
+# a company's warrant and its common stock share a CIK. CUSIP and ISIN identify the
+# instrument, which is the grain a merge operates on.
+_MERGE_IDENTITY_FIELDS = ("cusip", "isin", "cik")
+
+
+class MergeRefused(RuntimeError):
+    """A merge failed a guard. Carries the plan so the caller can show the evidence."""
+
+    def __init__(self, message: str, plan: "MergePlan") -> None:
+        super().__init__(message)
+        self.plan = plan
+
+
+class MergePlan(NamedTuple):
+    """What a merge would do, and every reason it should not happen.
+
+    Produced by :func:`compare_securities`, which writes nothing. The same object
+    backs `--dry-run` and the guard inside :func:`merge_security`, so the preview an
+    operator approves is the check that runs.
+    """
+
+    survivor_id: int
+    victim_id: int
+    survivor_symbol: str
+    victim_symbol: str
+    # (field, survivor_value, victim_value) where both sides are known and differ.
+    identity_mismatches: list[tuple[str, Any, Any]]
+    survivor_bars: int
+    victim_bars: int
+    shared_days: int
+    victim_only_bars: int
+    disagreeing_days: int
+    disagreement_sample: list[dict]
+    volume_only_disagreements: int
+    victim_actions: int
+    colliding_actions: int
+    victim_flags: int
+
+    @property
+    def blockers(self) -> list[str]:
+        """Why this merge must not proceed unforced, in the order worth reading."""
+        out: list[str] = []
+        for field, survivor, victim in self.identity_mismatches:
+            out.append(
+                f"{field} differs: survivor {survivor!r} vs victim {victim!r} -- "
+                f"these are not the same instrument"
+            )
+        if self.disagreeing_days:
+            out.append(
+                f"{self.disagreeing_days} of {self.shared_days} overlapping days "
+                f"disagree on OHLC -- the two rows do not tell the same story about "
+                f"those sessions"
+            )
+        return out
+
+
+def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> MergePlan:
+    """Everything a merge decision needs, without touching a row.
+
+    Split out from :func:`merge_security` so the evidence can be shown before any
+    of it is acted on -- a merge deletes a security_id, and an operator approving
+    that should be reading the same comparison the guard reads.
+    """
+    if survivor_id == victim_id:
+        raise ValueError("survivor and victim are the same security")
+
+    rows = {
+        int(r["security_id"]): r
+        for r in db.fetchall(
+            """
+            SELECT security_id, primary_symbol, cusip, isin, cik
+              FROM core.security WHERE security_id = ANY(%s)
+            """,
+            ([survivor_id, victim_id],),
+        )
+    }
+    for sid in (survivor_id, victim_id):
+        if sid not in rows:
+            raise ValueError(f"no such security: {sid}")
+    survivor, victim = rows[survivor_id], rows[victim_id]
+
+    # A NULL on either side is missing data, not evidence of difference: FMP leaves
+    # cik empty on most ETFs, and refusing on that would block the very merges this
+    # exists for. Only a populated disagreement is a mismatch.
+    mismatches = [
+        (field, survivor[field], victim[field])
+        for field in _MERGE_IDENTITY_FIELDS
+        if survivor[field] is not None
+        and victim[field] is not None
+        and str(survivor[field]).strip() != str(victim[field]).strip()
+    ]
+
+    counts = db.fetchone(
+        """
+        SELECT (SELECT count(*) FROM core.daily_price
+                 WHERE security_id = %s)          AS survivor_bars,
+               (SELECT count(*) FROM core.daily_price
+                 WHERE security_id = %s)          AS victim_bars,
+               (SELECT count(*) FROM core.corporate_action
+                 WHERE security_id = %s)          AS victim_actions,
+               (SELECT count(*) FROM ops.data_quality_flag
+                 WHERE security_id = %s)          AS victim_flags,
+               (SELECT count(*) FROM core.corporate_action v
+                 WHERE v.security_id = %s
+                   AND EXISTS (SELECT 1 FROM core.corporate_action s
+                                WHERE s.security_id = %s
+                                  AND s.action_type = v.action_type
+                                  AND s.ex_date = v.ex_date)) AS colliding_actions
+        """,
+        (survivor_id, victim_id, victim_id, victim_id, victim_id, survivor_id),
+    )
+
+    price_differs = " OR ".join(
+        f"s.{f} IS DISTINCT FROM v.{f}" for f in _MERGE_PRICE_FIELDS
+    )
+    overlap = db.fetchone(
+        f"""
+        SELECT count(*)                                            AS shared_days,
+               count(*) FILTER (WHERE {price_differs})             AS disagreeing_days,
+               count(*) FILTER (WHERE NOT ({price_differs})
+                                  AND s.volume IS DISTINCT FROM v.volume)
+                                                                   AS volume_only
+          FROM core.daily_price s
+          JOIN core.daily_price v ON v.trade_date = s.trade_date
+         WHERE s.security_id = %s AND v.security_id = %s
+        """,
+        (survivor_id, victim_id),
+    )
+
+    sample = db.fetchall(
+        f"""
+        SELECT s.trade_date,
+               s.open AS survivor_open, v.open AS victim_open,
+               s.high AS survivor_high, v.high AS victim_high,
+               s.low  AS survivor_low,  v.low  AS victim_low,
+               s.close AS survivor_close, v.close AS victim_close
+          FROM core.daily_price s
+          JOIN core.daily_price v ON v.trade_date = s.trade_date
+         WHERE s.security_id = %s AND v.security_id = %s AND ({price_differs})
+         ORDER BY s.trade_date
+         LIMIT 10
+        """,
+        (survivor_id, victim_id),
+    )
+
+    shared = int(overlap["shared_days"])
+    return MergePlan(
+        survivor_id=survivor_id,
+        victim_id=victim_id,
+        survivor_symbol=survivor["primary_symbol"],
+        victim_symbol=victim["primary_symbol"],
+        identity_mismatches=mismatches,
+        survivor_bars=int(counts["survivor_bars"]),
+        victim_bars=int(counts["victim_bars"]),
+        shared_days=shared,
+        victim_only_bars=int(counts["victim_bars"]) - shared,
+        disagreeing_days=int(overlap["disagreeing_days"]),
+        disagreement_sample=sample,
+        volume_only_disagreements=int(overlap["volume_only"]),
+        victim_actions=int(counts["victim_actions"]),
+        colliding_actions=int(counts["colliding_actions"]),
+        victim_flags=int(counts["victim_flags"]),
+    )
+
+
+class MergeReport(NamedTuple):
+    """What a completed merge actually moved."""
+
+    plan: MergePlan
+    bars_moved: int
+    bars_dropped: int
+    actions_moved: int
+    actions_dropped: int
+    flags_moved: int
+    flags_dropped: int
+
+
+def merge_security(
+    db: Database, *, victim_id: int, survivor_id: int, force: bool = False
+) -> MergeReport:
+    """Absorb one security into another when BOTH carry history.
+
+    The survivor keeps its security_id and gains everything the victim held that it
+    did not already have; the victim row is deleted. On the overlap the **survivor
+    wins** -- it is the row with the long history, and preferring the newly minted
+    duplicate's copy of a session both rows agree on would be a coin flip dressed up
+    as a rule. The guard above is what makes that safe: the overlap has to agree
+    before either copy is discarded.
+
+    This does NOT move the ticker. The caller pairs it with
+    :func:`retarget_symbol`, because the rename is a separate fact with its own
+    effective date, and a merge triggered by something other than a rename should
+    not silently move a symbol.
+
+    Adjustment factors are dropped for the victim and left stale on the survivor:
+    they are derived from the corporate actions this call just changed, so they must
+    be recomputed (``fafnir adjust --symbol ...``) rather than merged. Leaving them
+    stale is visible and fixable; merging two derived series would not be.
+
+    ``force`` overrides the guards and is for the case an operator has looked at the
+    evidence and decided anyway -- it is not a retry.
+    """
+    plan = compare_securities(db, survivor_id=survivor_id, victim_id=victim_id)
+    if not force and plan.blockers:
+        raise MergeRefused(
+            "refusing to merge: " + "; ".join(plan.blockers),
+            plan,
+        )
+
+    # Bars first. ON CONFLICT DO NOTHING is the survivor-wins rule: a session both
+    # rows hold keeps the survivor's copy, and the guard has already established
+    # the two copies say the same thing.
+    bars_moved = db.execute(
+        """
+        INSERT INTO core.daily_price
+            (security_id, trade_date, open, high, low, close, volume, vwap,
+             source, ingestion_run_id, loaded_at)
+        SELECT %s, trade_date, open, high, low, close, volume, vwap,
+               source, ingestion_run_id, loaded_at
+          FROM core.daily_price WHERE security_id = %s
+        ON CONFLICT (security_id, trade_date) DO NOTHING
+        """,
+        (survivor_id, victim_id),
+    )
+    db.execute("DELETE FROM core.daily_price WHERE security_id = %s", (victim_id,))
+
+    # Corporate actions carry UNIQUE (security_id, action_type, ex_date), so the
+    # victim's duplicates of actions the survivor already has must go before the
+    # repoint rather than aborting it.
+    actions_dropped = db.execute(
+        """
+        DELETE FROM core.corporate_action v
+         WHERE v.security_id = %s
+           AND EXISTS (SELECT 1 FROM core.corporate_action s
+                        WHERE s.security_id = %s
+                          AND s.action_type = v.action_type
+                          AND s.ex_date = v.ex_date)
+        """,
+        (victim_id, survivor_id),
+    )
+    actions_moved = db.execute(
+        "UPDATE core.corporate_action SET security_id = %s WHERE security_id = %s",
+        (survivor_id, victim_id),
+    )
+
+    # Derived from the actions just moved -- recomputed, never merged.
+    db.execute(
+        "DELETE FROM core.adjustment_factor WHERE security_id = %s", (victim_id,)
+    )
+
+    # Same rule as fold_empty_security: drop the victim's open flags the survivor
+    # already carries before repointing the rest, or the repoint lands a second open
+    # flag on a condition that already has one -- a ux_dq_flag_open_condition (0016)
+    # violation that would abort the whole merge. price_* is excluded because its
+    # repeats are load-bearing (count_price_quarantines bounds the watermark on
+    # them).
+    flags_dropped = db.execute(
+        """
+        DELETE FROM ops.data_quality_flag v
+         WHERE v.security_id = %s
+           AND v.resolved_at IS NULL
+           AND v.check_name NOT LIKE 'price\\_%%'
+           AND EXISTS (
+                 SELECT 1 FROM ops.data_quality_flag s
+                  WHERE s.security_id = %s
+                    AND s.resolved_at IS NULL
+                    AND s.check_name = v.check_name
+                    AND s.record_key IS NOT DISTINCT FROM v.record_key
+           )
+        """,
+        (victim_id, survivor_id),
+    )
+    flags_moved = db.execute(
+        "UPDATE ops.data_quality_flag SET security_id = %s WHERE security_id = %s",
+        (survivor_id, victim_id),
+    )
+
+    # The victim's watermark is usually the *fresher* of the two -- it is the row the
+    # daily load has been feeding since the duplicate was minted. Taking the later
+    # date per endpoint stops the next incremental load from re-fetching a tail the
+    # survivor now already holds. GREATEST ignores NULLs, so an endpoint only one
+    # side has is carried across intact.
+    db.execute(
+        """
+        INSERT INTO ops.load_watermark
+            (source, endpoint, security_id, last_loaded_date, last_run_at)
+        SELECT source, endpoint, %s, last_loaded_date, last_run_at
+          FROM ops.load_watermark WHERE security_id = %s
+        ON CONFLICT (source, endpoint, security_id) DO UPDATE
+           SET last_loaded_date = GREATEST(ops.load_watermark.last_loaded_date,
+                                           EXCLUDED.last_loaded_date),
+               last_run_at      = GREATEST(ops.load_watermark.last_run_at,
+                                           EXCLUDED.last_run_at),
+               updated_at       = now()
+        """,
+        (survivor_id, victim_id),
+    )
+    db.execute("DELETE FROM ops.load_watermark WHERE security_id = %s", (victim_id,))
+
+    # Then the remaining real FKs.
+    db.execute(
+        "UPDATE core.symbol_change SET security_id = %s WHERE security_id = %s",
+        (survivor_id, victim_id),
+    )
+    # The victim's xref rows are dropped rather than repointed: the ticker they name
+    # is the one the caller is about to open a fresh period for against the
+    # survivor, with the rename's own effective date. Keeping them would leave two
+    # open periods for one symbol and make point-in-time resolution ambiguous.
+    db.execute("DELETE FROM core.symbol_xref WHERE security_id = %s", (victim_id,))
+    # Attributes only; the next security-master load rewrites the survivor's.
+    db.execute("DELETE FROM core.company_profile WHERE security_id = %s", (victim_id,))
+    db.execute("DELETE FROM core.security WHERE security_id = %s", (victim_id,))
+
+    return MergeReport(
+        plan=plan,
+        bars_moved=bars_moved,
+        bars_dropped=plan.victim_bars - bars_moved,
+        actions_moved=actions_moved,
+        actions_dropped=actions_dropped,
+        flags_moved=flags_moved,
+        flags_dropped=flags_dropped,
+    )
 
 
 def retarget_symbol(
@@ -664,6 +1023,78 @@ def record_symbol_change(
             source,
             # psycopg adapts a list to a PostgreSQL array; the public constant
             # stays a tuple so callers cannot mutate it.
+            list(TERMINAL_CHANGE_STATUSES),
+        ),
+    )
+
+
+def dismiss_symbol_change(
+    db: Database,
+    *,
+    old_symbol: str,
+    new_symbol: str,
+    change_date: Optional[date] = None,
+    note: str,
+    dismissed_by: str,
+    source: str = "fmp",
+) -> list[dict]:
+    """Record that a reported rename is not a rename, so the sweep stops retrying it.
+
+    Some conflicts can never clear themselves. `apply_symbol_change` refuses when
+    the target ticker is held by a live security with its own history, which is the
+    right call -- but when the feed row is simply wrong, that refusal repeats every
+    night and the rename sits in an `error`-severity queue forever. The two families
+    seen in production: a pre-launch ticker shuffle among securities that all went
+    on to trade concurrently, and the same rename emitted in both directions.
+
+    This is a judgement about the *feed*, not about the data. A rename that is real
+    but blocked by a duplicate needs :func:`merge_security` instead, which reaches
+    `applied` -- the point of keeping the two paths separate is that `dismissed`
+    must never become the convenient way to silence a rename that should have been
+    carried out.
+
+    Only a non-terminal row can be dismissed, so this cannot overwrite an `applied`
+    or `ignored` decision. ``change_date`` narrows to one feed row; omitted, it
+    dismisses every unapplied row for the pair, which is what an operator looking at
+    one bad ticker actually means. Returns the rows dismissed -- empty when nothing
+    matched, which the caller reports rather than treating as success.
+    """
+    import json
+
+    old_symbol = (old_symbol or "").strip().upper()
+    new_symbol = (new_symbol or "").strip().upper()
+    provenance = json.dumps(
+        {
+            "dismissed_by": dismissed_by,
+            "dismissed_note": note,
+        }
+    )
+    return db.fetchall(
+        """
+        UPDATE core.symbol_change
+           SET status     = %s,
+               -- COALESCE, not `detail ||`: detail is nullable, and NULL || jsonb
+               -- is NULL, which would silently drop the provenance this write
+               -- exists to keep.
+               detail     = COALESCE(detail, '{}'::jsonb)
+                            || %s::jsonb
+                            || jsonb_build_object('dismissed_at', now()::text),
+               updated_at = now()
+         WHERE source     = %s
+           AND old_symbol = %s
+           AND new_symbol = %s
+           AND (%s::date IS NULL OR change_date = %s::date)
+           AND status <> ALL(%s)
+     RETURNING old_symbol, new_symbol, change_date, status, security_id
+        """,
+        (
+            CHANGE_DISMISSED,
+            provenance,
+            source,
+            old_symbol,
+            new_symbol,
+            change_date,
+            change_date,
             list(TERMINAL_CHANGE_STATUSES),
         ),
     )
@@ -1343,6 +1774,33 @@ def list_dq_flags(
         """,
         [*params, limit, offset],
     )
+
+
+def open_dq_flag_ids_for_record(
+    db: Database, *, check_name: str, record_key: dict
+) -> list[int]:
+    """Open flags for one exact condition, by the key the check wrote.
+
+    The DqFilter selection options (`--check`, `--symbol`, dates) cannot address a
+    single condition, because a record_key is the check's own private shape. A
+    command that has just repaired one specific condition needs to close that
+    flag and no other, so it resolves by id and gets the ids from here.
+
+    Matched on the record_key as a whole (jsonb equality, so key order does not
+    matter), the same way :func:`add_dq_flag_once` decides a condition is already
+    queued -- one predicate for "is this flagged" and "which flag is it".
+    """
+    import json
+
+    rows = db.fetchall(
+        """
+        SELECT dq_flag_id FROM ops.data_quality_flag
+         WHERE check_name = %s AND record_key = %s::jsonb AND resolved_at IS NULL
+         ORDER BY dq_flag_id
+        """,
+        (check_name, json.dumps(record_key)),
+    )
+    return [int(r["dq_flag_id"]) for r in rows]
 
 
 def resolve_dq_flags(

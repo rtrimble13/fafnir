@@ -9,6 +9,7 @@ import pytest
 from fafnir.db.repository import (
     CHANGE_APPLIED,
     CHANGE_CONFLICT,
+    CHANGE_DISMISSED,
     CHANGE_IGNORED,
     CHANGE_UNKNOWN,
     SymbolChangeOutcome,
@@ -227,6 +228,26 @@ def test_conflicts_are_retried_on_the_next_sweep(patched):
     fmp = _FakeFMP([{"date": "2026-06-09", "oldSymbol": "AAA", "newSymbol": "BBB"}])
 
     assert load_symbol_changes(db, fmp)["applied"] == 1
+
+
+def test_a_dismissed_rename_is_not_retried(patched):
+    # The counterpart to the retry above. A conflict is retried because it can clear
+    # itself; some never can -- a pre-launch ticker shuffle, or the same change
+    # emitted in both directions, where both securities stay live and neither ever
+    # gives up the ticker. `dismissed` (0018) is the operator saying so, and it only
+    # works if the sweep treats it as terminal: otherwise the rename re-conflicts and
+    # re-flags on the very next run, which is the whole thing being fixed.
+    db = _FakeDB(
+        outcomes={("VBX", "USSX"): SymbolChangeOutcome(CHANGE_CONFLICT, 3)},
+        recorded={("VBX", "USSX", date(2026, 6, 9)): CHANGE_DISMISSED},
+    )
+    fmp = _FakeFMP([{"date": "2026-06-09", "oldSymbol": "VBX", "newSymbol": "USSX"}])
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert (counts["skipped"], counts["conflict"]) == (1, 0)
+    assert db.applied == []
+    assert db.flags == []
 
 
 def test_ticker_reuse_by_a_dead_issuer_is_ignored_not_applied(patched):
