@@ -37,6 +37,7 @@ the Professional plan in the original `duk`.
 |---|---|---|---|
 | `ingest securities` | `company-screener` (`stock-list`, `etf-list` for the unfiltered universes) | `core.security`, `core.symbol_xref` | (source, primary_symbol, exchange) |
 | `ingest securities --enrich` | `profile` | `core.security`, `core.company_profile` | security_id |
+| `ingest tracked` | `profile` | `core.security`, `core.symbol_xref`, `core.company_profile` | (source, primary_symbol) |
 | `ingest symbol-changes` | `symbol-change` | `core.security`, `core.symbol_xref`, `core.symbol_change` | (source, old_symbol, new_symbol, change_date) |
 | `ingest delisted` | `delisted-companies` | `core.security`, `core.symbol_xref` | security_id |
 | `ingest prices` | `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
@@ -49,6 +50,73 @@ the Professional plan in the original `duk`.
 > be confirmed against a live response for a known symbol (e.g. AAPL). The loader
 > already tolerates the common alternates; the endpoint paths are centralized as
 > constants in `FMPClient` for a one-line correction.
+
+## The declared universe (mutual funds)
+
+`ingest securities` builds a **discovered** universe: it re-reads `company-screener`
+per venue and keeps what carries a US exchange. An open-end mutual fund has no venue
+— it is struck at NAV once a day rather than traded — so it is not in the screener at
+all, and nothing the nightly job does will ever mint it.
+
+`ref.tracked_symbol` is the **declared** universe: the operator's list of symbols the
+security master must hold anyway. `ingest tracked` turns each declaration into a
+`security_id` via one `profile` request, and from that point nothing downstream knows
+the difference — prices, actions, factors, marts and `duk` all key off
+`core.security`.
+
+```bash
+fafnir source probe-fund VFIAX          # FIRST: is the NAV series raw? (3 requests)
+fafnir track add VFIAX --note "core US equity sleeve"
+fafnir ingest tracked                   # mints it; also runs nightly
+fafnir ingest prices --symbols VFIAX    # no watermark yet -> full history
+fafnir ingest actions --symbols VFIAX && fafnir adjust
+duk ph VFIAX --adj -S db
+```
+
+Order in the nightly job is `securities → tracked → delisted`. Tracked runs *after*
+the security master because both write through `repo.upsert_security` on the same
+conflict key: going second is what makes the declared `asset_type` and venue the ones
+that stand for a symbol that appears in both universes.
+
+Three things follow from the fund grain, and each is handled where it arises:
+
+- **NAV bars.** A fund payload carries a close and no open/high/low. `_validate_bar`
+  expands it to `open = high = low = close` **only** when the security's `asset_type`
+  is in `NAV_ASSET_TYPES` — for an equity a missing OHLC field is still a defect and
+  still quarantines. A field that is *present but unusable* (zero, sub-resolution) is
+  quarantined on either.
+- **Evening NAV.** Fund NAV is struck at 4pm ET and posted that evening, later than
+  equity EOD, so a nightly run timed for equities finds funds a day behind.
+  `check_freshness` gives `NAV_LAGGING_ASSET_TYPES` one **trading day** of slack —
+  without it the queue would grow by one row per fund per night forever, since the
+  flag's `record_key` is the security's own last date and changes daily.
+- **Distributions.** Income dividends and capital-gain distributions both drop NAV by
+  the distributed amount on the ex-date — arithmetically identical to a cash dividend
+  — so they load as `action_type = 'dividend'`. No new action type, no change to the
+  adjustment math, no change to the mart view.
+
+**`fafnir source probe-fund <SYMBOL>` before declaring any fund.** ADR 0001 and 0004
+rest on the price feed being genuinely unadjusted, and that is verified for equities,
+not for funds. The probe measures NAV across the *largest* distribution on record
+(biggest, not most recent — only a large one clears that day's market move):
+
+| Verdict | Means | Do |
+|---|---|---|
+| `nav_raw_confirmed` | NAV fell by about the distribution | Declare the fund; the design works as written. |
+| `nav_already_adjusted` | NAV did not fall at all | **Stop.** The feed has reinvested distributions; loading them as corporate actions would adjust every one twice. |
+| `ratio_mismatch` | NAV moved, but by neither the distribution nor nothing | Investigate — the distribution record or the NAV series is not what it claims. |
+| `no_price_history` | The endpoint serves no bars for this symbol | Widen `--window`; if still empty, this feed cannot price the fund. |
+| `inconclusive` | No distribution, or none material enough to separate the two | Probe a fund with a December capital gain. |
+
+The command exits non-zero on anything but a pass or `inconclusive`, so it can gate a
+script. It costs 3 requests and writes nothing.
+
+**Retiring a fund.** The delisted feed does not carry funds (and `MUTF` is outside
+`SCREENER_EXCHANGES`, so the sweep cannot reach them). `fafnir track rm VFIAX` stops
+the pulls; `fafnir track rm VFIAX --closed 2027-03-31` also retires the security the
+ordinary way — `delisted_date` stamped, ticker period closed, every bar retained. Use
+`--closed` when the fund actually closed or merged: an untracked-but-active security
+is flagged stale by `dq run` every night.
 
 ## Why the *unadjusted* price endpoint
 

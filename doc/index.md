@@ -34,7 +34,7 @@ read through the `duk` CLI.
   - [ADR 0003 — Postgres now, TimescaleDB later](adr/0003-postgres-now-timescale-later.md)
   - [ADR 0004 — Unadjusted price feed](adr/0004-unadjusted-price-feed.md)
   - [ADR 0005 — The universe maintains itself](adr/0005-automatic-universe-maintenance.md)
-  - [ADR 0006 — A declared universe alongside the screened one (select mutual funds)](adr/0006-curated-fund-universe.md) *(proposed)*
+  - [ADR 0006 — A declared universe alongside the screened one (select mutual funds)](adr/0006-curated-fund-universe.md)
 
 ## Reference
 

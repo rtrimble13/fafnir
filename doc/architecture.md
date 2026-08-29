@@ -32,7 +32,8 @@ one upstream.
 
 Cross-cutting schemas:
 
-- **ref** — exchanges, sectors, industries, trading calendar (gap detection).
+- **ref** — exchanges, sectors, industries, trading calendar (gap detection),
+  and `tracked_symbol`, the declared universe.
 - **ops** — `ingestion_run` (lineage), `data_quality_flag` (quarantine/anomalies),
   `load_watermark` (incremental high-water marks).
 - **meta** — `schema_migration` bookkeeping.
@@ -76,9 +77,14 @@ series is **point-in-time stable and reproducible**. See
   to `security_id` over time.
 - Delisted/inactive securities are **retained** (`delisted_date` set, never
   deleted), so backtests are free of survivorship bias.
-- The universe **maintains itself**. The nightly job re-reads the screener, so a
-  security that lists today enters scope today (and, having no watermark, gets its
-  full history on the same run). Before that it applies ticker renames to the
+- The universe has two halves. The **discovered** one maintains itself: the nightly
+  job re-reads the screener, so a security that lists today enters scope today (and,
+  having no watermark, gets its full history on the same run). The **declared** one
+  (`ref.tracked_symbol`) covers what no screener returns — an open-end mutual fund
+  has no listing venue, so it is not screenable and must be declared. Both write
+  through the same upsert on the same key, so a symbol in both converges on one
+  `security_id`. See
+  [adr/0006-curated-fund-universe.md](adr/0006-curated-fund-universe.md). Before that it applies ticker renames to the
   security that already holds the history, because to the screener a rename is
   indistinguishable from a new listing — and minting it as one would fork a
   company's identity into two `security_id`s. See
@@ -107,6 +113,8 @@ production. Every query is parameterized.
 
 ```
  ref.exchange ─┐         ┌─ ref.sector
+               │         │
+ ref.tracked_symbol ─────┤   (declared universe: funds and other unscreenable names)
                │         │
         core.security ───┼─ ref.industry
           │   │   │      │

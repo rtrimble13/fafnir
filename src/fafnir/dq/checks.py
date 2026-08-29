@@ -29,6 +29,20 @@ logger = get_logger("dq")
 
 DEFAULT_OUTLIER_THRESHOLD = 0.5  # 50% close-to-close move flags for review
 
+# Asset types whose price is published after the equity close, and how many trading
+# days behind the market they are allowed to sit before that counts as stale.
+#
+# An open-end fund strikes NAV at 4pm ET and the vendor posts it that evening, so a
+# nightly run timed for equities routinely finds a fund one day behind. Without this
+# allowance check_freshness flags every fund every night on a record_key (its own
+# last_date) that changes daily -- so add_dq_flag_once cannot dedupe it, and the
+# queue grows by one row per fund per night forever. That unbounded growth is the
+# exact failure the once-per-occurrence rule exists to prevent, reintroduced by a
+# security whose price is simply published later. Delaying the whole nightly job for
+# a handful of symbols would be the more expensive fix.
+NAV_LAGGING_ASSET_TYPES = ("fund",)
+NAV_LAG_TRADING_DAYS = 1
+
 
 def check_gaps(
     db: Database, exchange_code: str = "NASDAQ", limit_securities: int = 0
@@ -150,20 +164,44 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     Keyed on the security's own last loaded date, so a security that stays stale
     is flagged once; one that takes a bar and then falls behind again is a new
     occurrence and is flagged again.
+
+    Securities priced at a NAV struck after the equity close get
+    :data:`NAV_LAG_TRADING_DAYS` of slack, measured in trading days off the
+    calendar rather than calendar days -- a Monday-morning run must not treat the
+    weekend as three days of lateness. See :data:`NAV_LAGGING_ASSET_TYPES`.
     """
     row = db.fetchone(
         """
         WITH market_latest AS (
             SELECT max(trade_date) AS d FROM core.daily_price
         ),
+        allowance AS (
+            -- The oldest last_date a NAV-priced security may carry and still be
+            -- considered current: NAV_LAG_TRADING_DAYS open sessions back from the
+            -- market's latest date.
+            SELECT COALESCE(
+                (SELECT min(c.trade_date)
+                   FROM (SELECT trade_date
+                           FROM ref.trading_calendar
+                          WHERE exchange_code = %s AND is_open
+                            AND trade_date <= (SELECT d FROM market_latest)
+                          ORDER BY trade_date DESC
+                          LIMIT %s) c),
+                (SELECT d FROM market_latest)
+            ) AS d
+        ),
         detected AS (
             SELECT s.security_id, max(p.trade_date) AS last_date, ml.d AS market_date
             FROM core.security s
             JOIN core.daily_price p ON p.security_id = s.security_id
             CROSS JOIN market_latest ml
+            CROSS JOIN allowance al
             WHERE s.is_actively_trading
-            GROUP BY s.security_id, ml.d
-            HAVING max(p.trade_date) < ml.d
+            GROUP BY s.security_id, s.asset_type, ml.d, al.d
+            HAVING max(p.trade_date) < CASE
+                       WHEN s.asset_type = ANY(%s::text[]) THEN al.d
+                       ELSE ml.d
+                   END
         ),
         written AS (
             INSERT INTO ops.data_quality_flag
@@ -187,6 +225,7 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
         SELECT (SELECT count(*) FROM detected) AS detected,
                (SELECT count(*) FROM written)  AS flagged
         """,
+        (exchange_code, NAV_LAG_TRADING_DAYS + 1, list(NAV_LAGGING_ASSET_TYPES)),
     )
     logger.info(
         "freshness check: %d stale securities, %d newly flagged",

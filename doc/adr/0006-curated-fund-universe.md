@@ -1,6 +1,6 @@
 # ADR 0006: A declared universe alongside the screened one (select mutual funds)
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-29
 - Extends: [ADR 0005](0005-automatic-universe-maintenance.md),
   [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md)
@@ -230,17 +230,39 @@ and `is_fund` is already a column. The dimension was built for this; nothing to 
   fund, an index proxy — anything with an FMP symbol and no screener row — is one
   `fafnir track add` away.
 
+## Implementation
+
+Landed as described, with two clarifications the code forced:
+
+**Following a rename.** `ref.tracked_symbol` names a ticker forever, and
+`ingest symbol-changes` can rename the security underneath it. Upserting on the
+stale ticker would mint a second `security_id` and strand the fund's bars,
+watermark and actions on the first — the fork ADR 0005 exists to prevent, except
+that here the screener cannot rescue it, because the declaration goes on naming the
+old ticker. So `ingest tracked` resolves identity *before* it fetches: it follows a
+closed xref period to the listed security that used to carry the ticker and moves
+the declaration onto the current one. A ticker *reused* by a new issuer after the
+old one delisted is excluded (delisted rows are not followed) and mints fresh, as
+0009 already guarantees for the screened universe.
+
+**Close is validated first.** The NAV allowance stands the close in for a missing
+open/high/low, so the close has to be known before the other three are judged.
+`_validate_bar` therefore evaluates `close, open, high, low` rather than
+`open, high, low, close`. Only an *absent* field is stood in for — a present but
+unusable one (zero, negative, sub-resolution, out of range) is bad data on a fund
+exactly as on an equity, and is quarantined either way.
+
 ## Implementation checklist
 
 | Area | Change |
 |---|---|
 | `sql/migrations/0018_tracked_symbol.{up,down}.sql` | `ref.tracked_symbol`; seed `MUTF` venue |
-| `src/fafnir/db/repository.py` | `upsert_tracked_symbol`, `list_tracked_symbols`, `untrack_symbol`, `security_asset_type` |
+| `src/fafnir/db/repository.py` | `upsert_tracked_symbol`, `list_tracked_symbols`, `untrack_symbol`, `security_asset_type`, plus `listed_security_for_declaration` / `retarget_tracked_symbol` for the rename case above |
 | `src/fafnir/ingest/tracked.py` | new loader (`RunLog`, `land_payload`, `upsert_security`, `upsert_symbol_xref`) |
 | `src/fafnir/ingest/daily_price.py` | `nav_only` allowance in `_validate_bar` / `load_symbol_prices` |
 | `src/fafnir/dq/checks.py` | one-business-day freshness allowance for `asset_type = 'fund'` |
 | `src/fafnir/sources/probe.py` | fund NAV raw-vs-total-return probe |
-| `src/fafnir/cli.py` | `fafnir track add\|list\|rm`; `fafnir ingest tracked` |
+| `src/fafnir/cli.py` | `fafnir track add\|list\|rm`; `fafnir ingest tracked`; `fafnir source probe-fund` |
 | `scripts/daily_update.sh`, `scripts/initial_backfill.sh` | `ingest tracked` after `ingest securities` |
 | Docs | data dictionary (`ref.tracked_symbol`), ingestion (endpoint map), architecture (ERD + universe section), README |
 

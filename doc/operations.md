@@ -40,10 +40,10 @@ crontab etc/crontab.example   # edit paths/times first
 ```
 
 The daily job performs, in order:
-`ensure-horizon → ingest symbol-changes → ingest securities → ingest delisted →
-ingest prices → ingest actions → adjust → refresh-marts → dq run`.
+`ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked →
+ingest delisted → ingest prices → ingest actions → adjust → refresh-marts → dq run`.
 
-The first three steps are **universe maintenance**, and their order is load-bearing:
+The first four steps are **universe maintenance**, and their order is load-bearing:
 
 1. **`ingest symbol-changes`** applies ticker renames to the security that already
    holds the history (FB → META keeps one `security_id`). It runs first because to
@@ -55,10 +55,43 @@ The first three steps are **universe maintenance**, and their order is load-bear
    an IPO, a spin-off, a new ETF — enters scope. It reports how many were new. A
    new security has no price watermark, so the price step below pulls its full
    available history on the same run; nothing else is needed.
-3. **`ingest delisted`** marks what stopped trading, before prices asks it for bars.
+3. **`ingest tracked`** refreshes the *declared* universe — `ref.tracked_symbol`,
+   the symbols no screener returns because they have no listing venue (mutual funds,
+   principally). It runs *after* the security master, not before: both write through
+   the same upsert on the same key, and going second is what makes the declared
+   `asset_type` and venue the ones that stand for a symbol that appears in both.
+4. **`ingest delisted`** marks what stopped trading, before prices asks it for bars.
+   Funds are recorded on the `MUTF` pseudo-venue, which is deliberately outside
+   `SCREENER_EXCHANGES`, so this sweep cannot reach them — retiring a fund is
+   `fafnir track rm <SYMBOL> --closed <date>`.
 
 Bandwidth: the security-master refresh is ~5 screener requests per venue-page pass
-(a few MB), once a night.
+(a few MB), once a night. The declared universe costs one `profile` request per
+tracked symbol, plus the usual price/splits/dividends calls — about four requests a
+night per fund, which is noise against the budget.
+
+### Tracking a mutual fund
+
+```bash
+fafnir source probe-fund VFIAX        # FIRST -- confirm the NAV series is raw
+fafnir track add VFIAX --note "core US equity sleeve"
+fafnir ingest tracked                 # mints it (the nightly job also does this)
+fafnir ingest prices --symbols VFIAX  # no watermark yet -> full history
+fafnir ingest actions --symbols VFIAX && fafnir adjust
+fafnir track list                     # what is declared, and whether it is loaded
+```
+
+`probe-fund` is not optional ceremony. `core.daily_price` is defined as raw and
+fafnir's own factors are the only adjustment in the system; that is verified for
+equities and not for funds. The probe measures NAV across the largest distribution
+on record — a raw series drops by about the distributed amount, an
+already-reinvested one does not. If it does not drop, loading fund distributions as
+corporate actions would adjust every one of them twice.
+
+To stop tracking one, say which kind of stopping it is. `fafnir track rm VFIAX`
+halts the pulls and leaves the security active — so `dq run` will flag it stale
+every night. `fafnir track rm VFIAX --closed 2027-03-31` retires it the ordinary
+way: `delisted_date` stamped, ticker period closed, every bar kept.
 
 > **First run after upgrading.** A deployment whose universe was built with
 > `--limit` (the README quick start uses `--limit 500`) gets the *rest* of the
@@ -69,7 +102,7 @@ Bandwidth: the security-master refresh is ~5 screener requests per venue-page pa
 > limited universe, run `scripts/initial_backfill.sh` deliberately (it is resumable
 > and chunked) rather than letting the nightly discover it.
 
-The two universe steps are run through a `upkeep` wrapper in `daily_update.sh`: if
+The three universe steps are run through a `upkeep` wrapper in `daily_update.sh`: if
 one fails, the job warns and carries on to prices rather than costing the night's
 data for every symbol. Nothing is swallowed — the failure is still an
 `ops.ingestion_run` row with `status = 'failed'`, which is why that query is on the

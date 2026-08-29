@@ -132,6 +132,14 @@ day closes. Range-partitioned by `trade_date` (yearly).
 Because these are the prices as traded, the series contains split-sized jumps. That
 is correct: a 4:1 split shows a ~75% drop with no gap in the data.
 
+**NAV-priced securities** (`asset_type = 'fund'`) share this table and this grain. A
+fund is struck once a day and does not trade, so its bar carries
+`open = high = low = close = NAV` and `volume = 0`. That is the whole truth about the
+day, not three missing fields: the price loader expands a NAV-only payload for a
+fund and still quarantines one for an equity. Distributions back-adjust through
+`core.adjustment_factor` exactly as cash dividends do, so `mart.v_daily_price_adjusted`
+returns a total-return NAV series with no special case.
+
 | Column | Type | Notes |
 |---|---|---|
 | `security_id` | BIGINT → core.security | |
@@ -218,7 +226,30 @@ is_fund, market_cap_usd, beta, last_trade_date, last_close, last_volume`.
 
 ### `ref.exchange` — **Grain:** `exchange_code`.
 `exchange_code` (PK), `exchange_name`, `country`, `timezone` (IANA), `is_active`,
-`created_at`, `updated_at`.
+`created_at`, `updated_at`. `MUTF` is a pseudo-venue for open-end mutual funds,
+which are struck at NAV and have no trading venue; it is deliberately not one of
+`SCREENER_EXCHANGES`, which is what keeps the delisting sweep away from funds.
+
+### `ref.tracked_symbol` — declared universe. **Grain:** `(source, symbol)`.
+**Source:** the operator (`fafnir track add`). **Cadence:** on demand; read nightly
+by `fafnir ingest tracked`.
+
+The symbols the security master must hold *regardless of the screener*. The nightly
+universe is discovered from `company-screener`, which only returns exchange-listed
+securities — a mutual fund has no venue and never appears there. This table is how
+one is declared. The grain is deliberately the same soft key `upsert_security`
+conflicts on, so a declared symbol and a screened one converge on one `security_id`
+rather than forking. See [ADR 0006](adr/0006-curated-fund-universe.md).
+
+| Column | Type | Notes |
+|---|---|---|
+| `source` | TEXT | Feed the symbol is declared against (default `fmp`). |
+| `symbol` | TEXT | The ticker. Kept in step with `core.security.primary_symbol` — `ingest tracked` follows a rename rather than minting a second security. |
+| `asset_type` | TEXT CHECK | `equity`/`etf`/`fund`/`other`. **Authoritative over the vendor profile**: the price loader reads it to decide whether a NAV-shaped bar is valid. |
+| `exchange_code` | TEXT → ref.exchange | Venue to record. `MUTF` for open-end funds. |
+| `note` | TEXT | Why this symbol is tracked — the one thing a hand-inserted `core.security` row could never carry. |
+| `is_tracked` | BOOLEAN | FALSE stops the nightly pulls. It does **not** delist; retiring a security is `mark_delisted`'s job and history is retained either way. |
+| `added_at` / `untracked_at` | TIMESTAMPTZ | Preserved across a re-declaration, so the row still answers "since when". |
 
 ### `ref.sector` / `ref.industry` — FMP taxonomy.
 `sector_id`/`industry_id` (IDENTITY PK), `*_name` (UNIQUE), `created_at`.

@@ -8,6 +8,8 @@ Examples
     fafnir db seed
     fafnir ingest securities --limit 500
     fafnir ingest prices --symbols AAPL,MSFT --from 2023-01-01
+    fafnir source probe-fund VFIAX && fafnir track add VFIAX --note "core sleeve"
+    fafnir ingest tracked
     fafnir ingest actions --symbols AAPL && fafnir adjust
     fafnir db refresh-marts
     fafnir dq run
@@ -261,6 +263,41 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
         )
 
 
+@ingest.command("tracked")
+@click.pass_context
+def ingest_tracked(ctx):
+    """Load the declared universe (ref.tracked_symbol) into the security master.
+
+    The screener cannot reach a mutual fund -- it has no listing venue -- so this is
+    how a declared symbol becomes a security_id. Run it AFTER `ingest securities`:
+    both write on the same conflict key, and running second is what makes the
+    declared asset_type and venue the ones that stand.
+    """
+    from fafnir.ingest import tracked
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    with Database(cfg.dsn) as database:
+        result = tracked.load_tracked(database, fmp)
+    click.echo(
+        f"Loaded {result.total} declared securities ({len(result.minted)} newly "
+        f"minted). FMP bytes: {fmp.bytes_downloaded}"
+    )
+    if result.minted:
+        click.echo(f"New to the master: {', '.join(result.minted)}")
+        click.echo(
+            "Their price history loads on the next `fafnir ingest prices` "
+            "(no watermark yet -- the first pull is a full backfill)."
+        )
+    for old, new in result.renamed:
+        click.echo(f"Followed a rename: {old} -> {new} (declaration updated).")
+    if result.missing:
+        click.echo(
+            f"Unknown to FMP: {', '.join(result.missing)} -- check the ticker; "
+            "flagged in the DQ queue as tracked_symbol_unknown_to_source."
+        )
+
+
 @ingest.command("prices")
 @click.option("--symbols", help="Comma-separated symbols (default: all securities)")
 @click.option("--from", "from_date", help="Start date YYYY-MM-DD (else incremental)")
@@ -382,6 +419,158 @@ def ingest_actions(ctx, symbols):
     click.echo(f"Loaded {n} corporate actions for {len(syms)} symbols.")
 
 
+@main.group()
+def track():
+    """Declare the symbols the security master must hold regardless of the screener.
+
+    The nightly universe comes from FMP's company screener, which only returns
+    exchange-listed securities. An open-end mutual fund has no venue and never
+    appears there, so it has to be declared. See ADR 0006.
+    """
+
+
+@track.command("add")
+@click.argument("symbol")
+@click.option(
+    "--asset-type",
+    type=click.Choice(["fund", "etf", "equity", "other"]),
+    default="fund",
+    show_default=True,
+    help="What this symbol is. Authoritative over the vendor profile.",
+)
+@click.option(
+    "--exchange",
+    default=None,
+    help="Venue to record [default: MUTF for a fund, none otherwise]",
+)
+@click.option("--note", default=None, help="Why this symbol is tracked")
+@click.pass_context
+def track_add(ctx, symbol, asset_type, exchange, note):
+    """Declare SYMBOL. Loads on the next `fafnir ingest tracked`."""
+    from fafnir.db import repository as repo
+    from fafnir.ingest.tracked import FUND_EXCHANGE
+
+    symbol = symbol.strip().upper()
+    if exchange is None and asset_type == "fund":
+        exchange = FUND_EXCHANGE
+    with Database(ctx.obj["config"].dsn) as database:
+        added = repo.upsert_tracked_symbol(
+            database,
+            symbol=symbol,
+            asset_type=asset_type,
+            exchange_code=exchange.upper() if exchange else None,
+            note=note,
+        )
+        database.commit()
+    click.echo(
+        f"{'Declared' if added else 'Re-declared'} {symbol} as {asset_type}"
+        + (f" on {exchange}" if exchange else "")
+        + "."
+    )
+    click.echo(
+        "Run `fafnir ingest tracked` to mint it, then `fafnir ingest prices "
+        f"--symbols {symbol}` for its history (or let the nightly job do both)."
+    )
+
+
+@track.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Include untracked symbols")
+@click.pass_context
+def track_list(ctx, show_all):
+    """Show the declared universe and whether each symbol has been loaded."""
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = repo.list_tracked_symbols(database, tracked_only=not show_all)
+    if not rows:
+        click.echo(
+            'Nothing declared. `fafnir track add VFIAX --note "..."` adds a symbol '
+            "the screener cannot reach."
+        )
+        return
+    table = [
+        (
+            row["symbol"],
+            row["asset_type"],
+            row["exchange_code"] or "-",
+            "yes" if row["security_id"] else "NOT LOADED",
+            "" if row["is_tracked"] else "untracked",
+            (row["note"] or "")[:40],
+        )
+        for row in rows
+    ]
+    _echo_table(
+        ("symbol", "type", "venue", "loaded", "state", "note"),
+        table,
+    )
+    if any(not row["security_id"] for row in rows):
+        click.echo(
+            "\nSome declarations have no security yet -- run `fafnir ingest tracked`."
+        )
+
+
+@track.command("rm")
+@click.argument("symbol")
+@click.option(
+    "--closed",
+    "closed_on",
+    default=None,
+    help="The date the fund actually closed or merged, YYYY-MM-DD. Retires the "
+    "security as well as the declaration.",
+)
+@click.pass_context
+def track_rm(ctx, symbol, closed_on):
+    """Stop declaring SYMBOL. History is always retained.
+
+    Two different things are called "removing a fund", and they need saying apart:
+
+    \b
+      no --closed : stop loading it. The security stays active, so the freshness
+                    check will flag it stale every night from here on.
+      --closed D  : it stopped existing on D. Retires the security the ordinary
+                    way -- delisted_date stamped, ticker period closed, every bar
+                    kept -- so nothing goes on expecting a price.
+    """
+    from fafnir.db import repository as repo
+
+    symbol = symbol.strip().upper()
+    closed = _parse_date(closed_on)
+    with Database(ctx.obj["config"].dsn) as database:
+        untracked = repo.untrack_symbol(database, symbol=symbol)
+        sec_id = repo.active_security_for_symbol(database, symbol)
+        retired = False
+        if closed is not None:
+            if sec_id is None:
+                raise click.ClickException(
+                    f"{symbol} has no listed security to retire. Drop --closed to "
+                    "just stop tracking it."
+                )
+            retired = repo.mark_delisted(
+                database, security_id=sec_id, delisted_date=closed
+            )
+        database.commit()
+    if not untracked:
+        click.echo(f"{symbol} was not being tracked.")
+    elif sec_id is None:
+        # Declared but never minted: there is no security and so no history to
+        # reassure anyone about, and nothing for the freshness check to flag.
+        click.echo(f"Stopped tracking {symbol}. It had not been loaded yet.")
+    else:
+        click.echo(f"Stopped tracking {symbol}. Its history is retained.")
+    if closed is not None:
+        click.echo(
+            f"Retired {symbol} as of {closed}."
+            if retired
+            else f"{symbol} was already retired; delisted_date left as it was."
+        )
+    elif untracked and sec_id is not None:
+        click.echo(
+            "The security is still marked actively trading, so `fafnir dq run` will "
+            "flag it stale. Re-run with --closed <date> if it actually stopped "
+            "existing."
+        )
+
+
 @main.command("adjust")
 @click.option("--symbol", help="Recompute one symbol only (default: all with actions)")
 @click.pass_context
@@ -489,6 +678,41 @@ def source_probe_prices(ctx, symbol, on_date):
     if report["verdict"] not in passing or report["volume_verdict"] not in vol_passing:
         raise click.ClickException(
             "Price feed check FAILED -- do not backfill until this is resolved."
+        )
+
+
+@source.command("probe-fund")
+@click.argument("symbol")
+@click.option(
+    "--window",
+    "window_days",
+    default=10,
+    show_default=True,
+    type=int,
+    help="Days either side of the ex-date to look for a bar",
+)
+@click.pass_context
+def source_probe_fund(ctx, symbol, window_days):
+    """Confirm a fund's NAV series is RAW before declaring funds.
+
+    `probe-prices` settles the same question for equities using splits. Funds rarely
+    split, so this asks it of distributions instead: a raw NAV drops by the
+    distributed amount on the ex-date, an already-reinvested one does not. If it
+    does not drop, loading fund distributions into core.corporate_action would
+    adjust every one of them twice.
+
+    Costs 3 requests and writes nothing. Run it before `fafnir track add`.
+    """
+    from fafnir.sources import probe
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    report = probe.probe_fund_nav(fmp, symbol.upper(), window_days=window_days)
+    click.echo(probe.format_fund_report(report))
+    if report["verdict"] not in ("nav_raw_confirmed", "inconclusive"):
+        raise click.ClickException(
+            "Fund NAV check FAILED -- do not declare funds until this is resolved. "
+            "See doc/adr/0006-curated-fund-universe.md."
         )
 
 

@@ -416,3 +416,299 @@ def format_report(report: dict[str, Any]) -> str:
         f"  {report['volume_detail']}",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Fund NAV probe (ADR 0006)
+# ---------------------------------------------------------------------------
+#
+# ADR 0001 and ADR 0004 rest on one precondition: the feed behind core.daily_price
+# is genuinely unadjusted, because fafnir's own factors are the only adjustment in
+# the system. `probe_prices` verifies that for equities using splits. Funds rarely
+# split, so the same question has to be asked of DISTRIBUTIONS instead:
+#
+#   * A raw NAV series DROPS by the distributed amount on the ex-date. fafnir's
+#     dividend factor then back-adjusts it, exactly as for a cash dividend, and the
+#     adjusted series is a total-return series.
+#   * An already-reinvested NAV series does NOT drop. Loading distributions as
+#     corporate actions on top of it would adjust every one of them twice -- ADR
+#     0004's failure reproduced on a new asset class, and this time with no split
+#     ratio to make it obvious.
+#
+# The test is the same arithmetic as the equity probe, read the other way round:
+#
+#     nav_before - nav_after  ~=  distribution   (raw)
+#     nav_before - nav_after  ~=  0              (already adjusted)
+#
+# Costs 3 requests (prices, dividends, splits) and writes nothing.
+
+# How much of the distribution must show up in the NAV drop to call the series raw.
+# Wide on purpose: the drop is the distribution PLUS that day's market move, and a
+# fund can move a percent of NAV on its own. The two hypotheses being separated are
+# "the whole distribution" and "none of it", so the band only has to exclude the
+# midpoint -- a narrow band would report ratio_mismatch on ordinary market noise.
+NAV_DROP_MIN_SHARE = Decimal("0.5")
+NAV_DROP_MAX_SHARE = Decimal("1.5")
+
+# How close to zero the drop must be to call the series already-reinvested. This is
+# deliberately NOT "anything below NAV_DROP_MIN_SHARE": a NAV that fell by 40% of the
+# distribution is neither hypothesis, and reporting it as already-adjusted would name
+# the wrong cause and print the wrong remedy. Anything between the two bands is a
+# mismatch -- a question, not an answer.
+NAV_NO_DROP_MAX_SHARE = Decimal("0.15")
+
+# A distribution smaller than this share of NAV cannot be told from a normal day's
+# move, whichever hypothesis is true.
+NAV_MIN_MATERIAL_SHARE = Decimal("0.005")  # 0.5% of NAV
+
+# Named rather than inlined so the guidance in a failing report stays correct if
+# the price endpoint ever moves.
+NAV_ENDPOINT = "historical-price-eod/non-split-adjusted"
+
+
+def _largest_distribution(
+    dividends: list[dict],
+) -> tuple[Optional[date], Optional[Decimal]]:
+    """The biggest cash distribution on record, with its ex-date.
+
+    Biggest, not most recent: the probe needs a distribution large enough that the
+    NAV drop it causes stands clear of that day's market move, and for a fund that
+    is almost always a December capital-gain distribution rather than a monthly
+    income one.
+    """
+    best_date: Optional[date] = None
+    best_amount: Optional[Decimal] = None
+    for rec in dividends:
+        when = _bar_date(rec)
+        amount = _decimal(rec.get("dividend"))
+        if amount is None:
+            amount = _decimal(rec.get("adjDividend"))
+        if when is None or amount is None or amount <= 0:
+            continue
+        if best_amount is None or amount > best_amount:
+            best_date, best_amount = when, amount
+    return best_date, best_amount
+
+
+def probe_fund_nav(fmp, symbol: str, window_days: int = 10) -> dict[str, Any]:
+    """Decide whether a fund's NAV series is raw or already distribution-adjusted.
+
+    Returns a report dict; ``verdict`` is one of:
+      ``nav_raw_confirmed``   -- NAV drops by about the distribution. Load
+                                 distributions as corporate actions; the design in
+                                 ADR 0006 is correct as written.
+      ``nav_already_adjusted``-- NAV does not drop across the ex-date. Do NOT load
+                                 distributions for funds; fafnir would adjust each
+                                 of them twice.
+      ``ratio_mismatch``      -- NAV moved, but not by the distribution. The feed or
+                                 the distribution record disagrees with the other.
+      ``no_price_history``    -- the unadjusted endpoint serves no bars for this
+                                 symbol at all, which is itself the answer to
+                                 whether a fund can be ingested this way.
+      ``inconclusive``        -- no distributions on record, none material enough to
+                                 separate the hypotheses, or a missing bar either
+                                 side of the ex-date.
+    """
+    dividends = fmp.dividends(symbol)
+    splits = fmp.splits(symbol)
+    ex_date, amount = _largest_distribution(dividends)
+
+    report: dict[str, Any] = {
+        "symbol": symbol,
+        "ex_date": ex_date,
+        "distribution": amount,
+        "distributions_on_record": len(dividends),
+        "splits_on_record": len(splits),
+        "nav_before": None,
+        "nav_before_date": None,
+        "nav_after": None,
+        "nav_after_date": None,
+        "nav_drop": None,
+        "drop_share": None,
+        "bars_returned": 0,
+        "ohlc_spelling": None,
+        "loader_accepts_as_fund": False,
+        "loader_accepts_as_equity": False,
+        "quarantine_reason": None,
+        "verdict": "inconclusive",
+        "detail": "",
+    }
+
+    if ex_date is None or amount is None:
+        # Still worth pulling bars: "does this endpoint serve funds at all" is
+        # question 1 of the three, and it is answerable without a distribution.
+        bars = fmp.eod_raw(
+            symbol,
+            from_date=(date.today() - timedelta(days=window_days * 3)).isoformat(),
+            to_date=date.today().isoformat(),
+        )
+        _describe_nav_bars(report, bars)
+        if not bars:
+            report["verdict"] = "no_price_history"
+            report["detail"] = (
+                f"{NAV_ENDPOINT} returned no bars for {symbol}. A fund "
+                "cannot be ingested from this endpoint -- find one that serves NAV "
+                "before declaring funds in ref.tracked_symbol."
+            )
+        else:
+            report["detail"] = (
+                f"No cash distributions on record for {symbol}, so nothing "
+                "distinguishes a raw NAV series from an already-reinvested one. "
+                "Probe a fund that pays a December capital gain."
+            )
+        return report
+
+    bars = fmp.eod_raw(
+        symbol,
+        from_date=(ex_date - timedelta(days=window_days)).isoformat(),
+        to_date=(ex_date + timedelta(days=window_days)).isoformat(),
+    )
+    _describe_nav_bars(report, bars)
+
+    if not bars:
+        report["verdict"] = "no_price_history"
+        report["detail"] = (
+            f"{NAV_ENDPOINT} returned no bars for {symbol} around {ex_date}. Either "
+            "it does not serve this fund, or the window misses its history -- try a "
+            "wider --window before concluding the endpoint cannot be used."
+        )
+        return report
+
+    # The last bar strictly before the ex-date, and the bar on/after it: the drop
+    # this measures is the one the adjustment factor would divide into.
+    before_pairs = [
+        (when, bar) for bar in bars if (when := _bar_date(bar)) and when < ex_date
+    ]
+    after_bar = _bar_on_or_after(bars, ex_date)
+    before_bar = (
+        max(before_pairs, key=lambda pair: pair[0])[1] if before_pairs else None
+    )
+
+    if before_bar is None or after_bar is None:
+        report["detail"] = (
+            f"No bar on one side of {ex_date}, so there is no drop to measure. "
+            "Widen --window or pick another distribution."
+        )
+        return report
+
+    nav_before = _close_of(before_bar)
+    nav_after = _close_of(after_bar)
+    report["nav_before"], report["nav_before_date"] = nav_before, _bar_date(before_bar)
+    report["nav_after"], report["nav_after_date"] = nav_after, _bar_date(after_bar)
+
+    if nav_before is None or nav_after is None or nav_before <= 0:
+        report["detail"] = "A bar either side of the ex-date carried no usable NAV."
+        return report
+
+    if amount / nav_before < NAV_MIN_MATERIAL_SHARE:
+        report["detail"] = (
+            f"The largest distribution on record ({amount}) is only "
+            f"{amount / nav_before:.4%} of NAV -- smaller than a normal day's move, "
+            "so it cannot separate a raw series from an adjusted one. Probe a fund "
+            "with a larger capital-gain distribution."
+        )
+        report["verdict"] = "inconclusive"
+        return report
+
+    drop = nav_before - nav_after
+    share = drop / amount
+    report["nav_drop"] = drop
+    report["drop_share"] = share
+
+    if NAV_DROP_MIN_SHARE <= share <= NAV_DROP_MAX_SHARE:
+        report["verdict"] = "nav_raw_confirmed"
+        report["detail"] = (
+            f"NAV fell {drop} across the {ex_date} ex-date against a distribution "
+            f"of {amount} ({share:.2f}x). The series is raw, so fafnir's dividend "
+            "factors are the only adjustment applied and the adjusted series is a "
+            "total-return series."
+        )
+    elif abs(share) <= NAV_NO_DROP_MAX_SHARE:
+        report["verdict"] = "nav_already_adjusted"
+        report["detail"] = (
+            f"NAV moved {drop} across the {ex_date} ex-date against a distribution "
+            f"of {amount} -- it did not drop. The feed has already reinvested "
+            "distributions. Do NOT load fund distributions into "
+            "core.corporate_action: fafnir would adjust every one of them twice."
+        )
+    else:
+        report["verdict"] = "ratio_mismatch"
+        report["detail"] = (
+            f"NAV moved {drop} against a distribution of {amount} ({share:.2f}x) -- "
+            "too little to be the whole distribution and too much to be none of it, "
+            "so this says neither. Either the distribution record is incomplete or "
+            "the NAV series means something other than a raw strike. Investigate "
+            "before declaring funds."
+        )
+    return report
+
+
+def _describe_nav_bars(report: dict[str, Any], bars: list[dict]) -> None:
+    """Record what the payload looks like and whether the loader would take it.
+
+    Both answers matter and they are different questions: a NAV payload carrying
+    only a close is accepted for a fund and quarantined for an equity, which is
+    exactly the asset-type gate in ``daily_price._validate_bar``. Showing both says
+    whether the gate is doing the work, or whether the payload never needed it.
+    """
+    report["bars_returned"] = len(bars)
+    if not bars:
+        return
+    sample = bars[-1]
+    plain = [f for f in _OHLC_ALIASES if f in sample]
+    prefixed = [f for f, keys in _OHLC_ALIASES.items() if keys[1] in sample]
+    if len(plain) == 4:
+        report["ohlc_spelling"] = "open/high/low/close"
+    elif len(prefixed) == 4:
+        report["ohlc_spelling"] = "adjOpen/adjHigh/adjLow/adjClose"
+    elif plain or prefixed:
+        report["ohlc_spelling"] = "close only" if set(plain) <= {"close"} else "mixed"
+    else:
+        report["ohlc_spelling"] = "unrecognized"
+    as_fund, _ = _validate_bar(sample, nav_only=True)
+    as_equity, reason = _validate_bar(sample)
+    report["loader_accepts_as_fund"] = as_fund is not None
+    report["loader_accepts_as_equity"] = as_equity is not None
+    report["quarantine_reason"] = reason
+
+
+def format_fund_report(report: dict[str, Any]) -> str:
+    """Render a fund NAV probe report for the terminal."""
+    ok = {"nav_raw_confirmed": "PASS", "inconclusive": "INCONCLUSIVE"}
+    status = ok.get(report["verdict"], "FAIL")
+    return "\n".join(
+        [
+            f"FMP fund NAV probe: {report['symbol']}",
+            "",
+            "Coverage",
+            f"  bars returned        : {report['bars_returned']}",
+            f"  OHLC spelling        : {report['ohlc_spelling'] or '(no bar)'}",
+            f"  loader accepts (fund): {report['loader_accepts_as_fund']}",
+            f"  ... as an equity     : {report['loader_accepts_as_equity']}"
+            + (
+                f"  (would quarantine: {report['quarantine_reason']})"
+                if report["quarantine_reason"]
+                else ""
+            ),
+            f"  distributions        : {report['distributions_on_record']}",
+            f"  splits               : {report['splits_on_record']}",
+            "",
+            "Distribution cross-check",
+            f"  ex-date              : {report['ex_date'] or '(none on record)'}",
+            f"  distribution         : {report['distribution']}",
+            f"  NAV before ({report['nav_before_date'] or 'n/a'}) : "
+            f"{report['nav_before']}",
+            f"  NAV after  ({report['nav_after_date'] or 'n/a'}) : "
+            f"{report['nav_after']}",
+            f"  NAV drop             : {report['nav_drop']}",
+            "  drop / distribution  : "
+            + (
+                f"{report['drop_share']:.2f}x"
+                if report["drop_share"] is not None
+                else "n/a"
+            ),
+            "",
+            f"  {status}: {report['verdict']}",
+            f"  {report['detail']}",
+        ]
+    )
