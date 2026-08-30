@@ -219,12 +219,18 @@ def _scale_collapse_detail(bar: dict, row: dict) -> Optional[dict]:
     high, low = max(source), min(source)
     if high == low:
         return None
+    # Rendered fixed-point, not with str(). Decimal.__str__ switches to scientific
+    # notation below 1e-6 -- which is precisely the range this check reports on -- so
+    # str() would write "8.01E-7" for the source high next to a "scale" of "0.000001",
+    # and the operator reading the flag would be comparing two numbers written in
+    # different notations to judge whether the range mattered. format(x, "f") keeps
+    # every field in one notation and leaves the value exact.
     return {
-        "source_high": str(high),
-        "source_low": str(low),
-        "source_range": str(high - low),
-        "stored": str(row["close"]),
-        "scale": str(_MONEY_SCALE),
+        "source_high": format(high, "f"),
+        "source_low": format(low, "f"),
+        "source_range": format(high - low, "f"),
+        "stored": format(row["close"], "f"),
+        "scale": format(_MONEY_SCALE, "f"),
     }
 
 

@@ -72,7 +72,7 @@ So the lever is not "ask for less per symbol". It is **stop asking per symbol.**
 | 2 | Payload-hash short-circuit | ~16,000 | same day | small | none (no API saving) |
 | 3 | Per-symbol windowed pull | ~16,000 | same day | small | no API saving |
 | 4 | Rotating 1/N refresh | ~16,000/N | up to N days late | small | wrong adjusted prices for N days |
-| 5 | **Market-wide calendar sweep + watermark** | **~2 + first-loads** | same day | medium | vendor coverage (verifiable) |
+| 5 | **Market-wide calendar sweep + watermark** | **~4 + first-loads** | same day | medium | vendor coverage (verifiable) |
 | 6 | Price-jump-triggered pull | small | same day | large | circular, unreliable |
 | 7 | Bulk endpoints | 1–2 | same day | small | plan availability unknown |
 
@@ -241,7 +241,7 @@ price. It is option 4's mechanism used for what it is good at.
 
 | | today | after |
 |---|---|---|
-| Requests/night | ~42,800 | ~2 sweep + ~540 reconciliation + first-loads + funds |
+| Requests/night | ~42,800 | ~4 sweep (2 pages x 2 endpoints) + ~540 reconciliation + first-loads + funds |
 | Wall clock | ~2.5 h | **< 3 min** |
 | `landing.fmp_raw` rows/night | ~42,800 | ~2 + reconciliation |
 | Securities recomputed by `adjust` | all with actions | those that changed |
@@ -306,6 +306,69 @@ one wearing a different flag. So the upsert carries a `WHERE ... IS DISTINCT FRO
 suppresses a no-op write, and `ingestion_run_id` / `loaded_at` are now stamped only when
 the row actually moves. `core.corporate_action.ingestion_run_id` therefore means "the run
 that last changed this action" rather than "the run that last looked at it".
+
+## Postscript: the probe earned its keep on the first run (2026-08-30)
+
+`fafnir source probe-actions` failed on its first live run, reporting KO's 2026-06-15
+and SPY's 2026-06-18 dividends as `calendar_incomplete` — events the per-symbol feed
+had and the calendar did not. Read literally that is the verdict that stops this whole
+decision. It was wrong, and how it was wrong is worth keeping.
+
+**It was a truncated response, not a coverage gap.** Both missing events sat in the
+oldest three weeks of the requested window; AAPL, in the *same* 80-day slice but with
+an August ex-date, matched fine. So what separated found from missing was the **date**,
+not the security — and a real coverage gap is a property of the security. KO is a NYSE
+mega-cap common stock; AAPL and MSFT are too, and they matched. No coverage story
+divides those three.
+
+Measured directly against the feed:
+
+```
+from=2026-06-01 to=2026-08-19   4000 rows   earliest returned 2026-07-30
+from=2026-06-01 to=2026-06-30   4000 rows   earliest returned 2026-06-23
+from=2026-06-15 to=2026-06-15    904 rows   KO present
+```
+
+**A calendar response carries at most 4000 rows and drops the oldest to fit**, with
+nothing in the payload saying so — an 80-day request came back holding 21 days, a
+30-day request came back holding 8. `limit=20000` still returned 4000, so the cap is
+not a default to raise. `page=1` returned a *different* 4000 rows covering an older
+range, so the endpoint paginates backwards through time.
+
+Three things follow.
+
+**The fix is paging, not a smaller chunk.** Event density swings about 2.5× across the
+year — ~190/day across late July and August, ~500/day at the June quarter-end where
+ex-dates cluster. Any fixed day-count narrow enough for the dense weeks is wasteful
+for the rest of the year, and any count chosen for the average silently loses data
+four times a year. Paging is self-tuning; a day count is a guess that fails quietly
+when it is wrong. `FMPClient._paged` already existed for the screener and now serves
+the calendars too, keyed on `(symbol, date)` — a symbol-only fingerprint would call
+page 1 a repeat of page 0 and stop after one page, reintroducing the same loss.
+
+**The original ADR's request estimate was optimistic.** The nightly window is ~9 days
+at ~500 events/day, so the sweep costs 2 pages per endpoint rather than 1. Four
+requests instead of two, against ~16,000 — the conclusion is unchanged, the arithmetic
+was wrong.
+
+**The nightly path was affected, not just the probe.** This was first written up as a
+probe-only problem on the grounds that a 9-day window was nowhere near the cap. At
+4000 rows and ~500 events/day it is over it. The sweep would have truncated its own
+overlap window every night, advanced the watermark to today regardless, and never
+re-read the dropped days — losing real events until the monthly reconciliation
+happened to catch them.
+
+**What was actually missing was a check.** `eod_raw` warns when a response comes back
+at its row limit, for precisely this reason, and `_actions_calendar` — written
+directly below it — did not. That single omission is why a client-side truncation
+presented as a vendor coverage gap. The probe now separates them: when every missing
+event predates the earliest row the calendar returned at all, and the response was
+large enough for its span to mean anything, the verdict is `calendar_truncated` and
+says to fix the client rather than to draw conclusions about the feed.
+
+The gate worked. An unverified switch would have shipped a warehouse that silently
+dropped corporate actions, and the first symptom would have been a wrong adjusted
+price noticed months later.
 
 ## Before adopting: probe the feed
 

@@ -80,10 +80,26 @@ class FMPClient(BaseSource):
 
     # The calendar endpoints document a maximum 3-month span between `from` and
     # `to`. 80 days leaves headroom under the shortest reading of "3 months"
-    # (Dec 1 - Feb 28 is 89) without needing a calendar-aware calculation. A
-    # nightly sweep asks for one short window and costs one request per endpoint;
-    # only a catch-up after an outage pays for extra slices.
+    # (Dec 1 - Feb 28 is 89) without needing a calendar-aware calculation.
     ACTIONS_CHUNK_DAYS = 80
+
+    # ...but the span is not the binding limit. Measured against the live feed on
+    # 2026-08-30, a calendar request returns at most 4000 rows and drops the OLDEST
+    # to fit -- the same silent truncation as historical-price-eod, and `limit` does
+    # not raise it (limit=20000 still returned 4000). Asking for June 1-30 came back
+    # holding June 23-30 only, so KO's June 15 dividend looked like a coverage gap in
+    # the feed when it was really a truncated response.
+    #
+    # `page` DOES work and walks backwards in time, so the fix is to paginate rather
+    # than to guess a day count: event density swings ~2.5x across the year (~190/day
+    # in August against ~500/day at the June quarter-end, when ex-dates cluster), and
+    # any fixed window narrow enough for the dense weeks is wasteful the rest of the
+    # time. Paging is self-tuning; a day count is a guess that silently loses data
+    # when it is wrong.
+    ACTIONS_MAX_ROWS = 4000
+    # 4000 rows/page: at the observed worst-case density a full 80-day chunk is ~12
+    # pages, so 50 is comfortable headroom that still bounds a runaway.
+    ACTIONS_MAX_PAGES = 50
 
     def __init__(self, api_key: str, rate_per_min: int = 280, **kwargs):
         if not api_key:
@@ -114,12 +130,21 @@ class FMPClient(BaseSource):
         page_size: int,
         max_pages: int,
         key_fields: Sequence[str] = ("symbol",),
+        warn_if_truncated: bool = False,
     ) -> list[dict]:
         """Accumulate an endpoint's pages until it runs out of rows.
 
         Stops on an empty page, a short page, or a page whose first row repeats
         the previous page's -- that last guard catches a server that ignores
         ``page`` and would otherwise be re-downloaded ``max_pages`` times.
+
+        ``warn_if_truncated`` says whether running out of ``max_pages`` while the
+        last page was still full is a problem worth saying out loud. For a caller
+        that wants the complete set (the action calendars) it is: the rows beyond
+        the last page are simply missing, with nothing in the payload to say so.
+        For a caller deliberately reading only a recent tail (`delisted_companies`
+        with its default ``max_pages=5``) hitting the bound is the normal case and
+        a warning every night would be noise.
 
         ``key_fields`` names the fields that identify a row on *this* endpoint.
         It is not decoration: a payload with no ``symbol`` (the rename feed carries
@@ -142,6 +167,15 @@ class FMPClient(BaseSource):
             out.extend(data)
             if len(data) < page_size:
                 break
+        else:
+            if warn_if_truncated:
+                logger.warning(
+                    "%s: stopped at the %d-page bound with a full final page -- "
+                    "rows beyond it were not read and the payload gives no hint. "
+                    "Narrow the window or raise max_pages.",
+                    endpoint,
+                    max_pages,
+                )
         return out
 
     def company_screener(
@@ -359,10 +393,22 @@ class FMPClient(BaseSource):
     ) -> list[dict]:
         """Every symbol's events on one calendar endpoint, over an arbitrary window.
 
-        Slices the window into ``ACTIONS_CHUNK_DAYS`` pieces and stitches them,
-        because the endpoint caps the span between ``from`` and ``to``. Rows are
-        deduplicated on (symbol, date) so a vendor-side boundary repeat between two
-        slices does not become two events for one ex-date.
+        Two bounds have to be respected, and only one of them is documented.
+
+        The documented one is the 3-month span between ``from`` and ``to``, handled
+        by slicing the window into ``ACTIONS_CHUNK_DAYS`` pieces.
+
+        The undocumented one is a 4000-row ceiling per response, which silently drops
+        the OLDEST rows to fit -- so a request for a window returns a *shorter* window
+        with nothing in the payload saying so, and the events at the front of it look
+        exactly like events the vendor does not carry. Each slice is therefore read
+        with ``page``, which walks backwards through the rows, until a short page says
+        the slice is exhausted.
+
+        Rows are deduplicated on (symbol, date): pages tile the row space rather than
+        the date space, so consecutive pages routinely share a boundary *day* (page 0
+        holding part of it and page 1 the rest) and slices can repeat one vendor-side.
+        Keying on the event rather than the page is what makes both harmless.
         """
         if to_date < from_date:
             return []
@@ -372,22 +418,26 @@ class FMPClient(BaseSource):
             window_end = min(
                 cursor + timedelta(days=self.ACTIONS_CHUNK_DAYS - 1), to_date
             )
-            data, _, _ = self._call(
+            rows = self._paged(
                 endpoint,
                 {"from": cursor.isoformat(), "to": window_end.isoformat()},
+                page_size=self.ACTIONS_MAX_ROWS,
+                max_pages=self.ACTIONS_MAX_PAGES,
+                # A calendar row is identified by its symbol AND its date: one symbol
+                # appears on many dates, so a symbol-only fingerprint would call the
+                # second page a repeat of the first and stop after one page.
+                key_fields=("symbol", "date"),
+                warn_if_truncated=True,
             )
-            if isinstance(data, dict) and "historical" in data:
-                data = data["historical"]
-            if isinstance(data, list):
-                for row in data:
-                    if not isinstance(row, dict):
-                        continue
-                    key = (
-                        str(row.get("symbol") or ""),
-                        str(row.get("date") or "")[:10],
-                    )
-                    if key[0] and key[1]:
-                        by_key[key] = row
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                key = (
+                    str(row.get("symbol") or ""),
+                    str(row.get("date") or "")[:10],
+                )
+                if key[0] and key[1]:
+                    by_key[key] = row
             cursor = window_end + timedelta(days=1)
         return [by_key[k] for k in sorted(by_key)]
 

@@ -757,6 +757,48 @@ def _in_window(keys: set, start: date, end: date) -> set:
     return {k for k in keys if start <= k[1] <= end}
 
 
+# Below this many calendar rows, "the calendar starts late" is not evidence of
+# anything. These feeds are market-wide: any real window containing ex-dates comes
+# back with hundreds to thousands of rows across thousands of symbols, so a short
+# coverage window is a property of the RESPONSE. A handful of rows is a feed that
+# returned almost nothing, and why it did is a question this heuristic cannot answer
+# -- so it declines to guess rather than blaming a cut-off.
+MIN_ROWS_TO_JUDGE_TRUNCATION = 100
+
+
+def _truncation_cutoff(report: dict[str, Any]) -> Optional[date]:
+    """The date a cut-off response starts at, or None if this is not one.
+
+    A truncated response and a genuine coverage gap look identical per symbol -- the
+    event is on the per-symbol feed and not on the calendar either way. What tells
+    them apart is whether the misses line up by DATE or by SECURITY: a row cap drops
+    the oldest rows for every symbol at once, so every missing event sits before the
+    earliest date the calendar returned at all, while a real gap leaves misses
+    scattered among events the calendar did carry from the same period.
+
+    Three conditions, and all of them are load-bearing:
+
+    * every miss predates the earliest row returned -- otherwise the calendar plainly
+      did reach that period and simply lacks these securities;
+    * the calendar's earliest row is later than the window start -- otherwise nothing
+      was cut off at all;
+    * the response was big enough for its span to mean something
+      (:data:`MIN_ROWS_TO_JUDGE_TRUNCATION`).
+
+    Without the third, a calendar holding one event trivially satisfies the first,
+    and every genuine single-symbol coverage gap would be reported as a client bug.
+    """
+    earliest = report.get("calendar_earliest")
+    missing = report.get("missing_keys") or []
+    if earliest is None or not missing:
+        return None
+    if report.get("calendar_events", 0) < MIN_ROWS_TO_JUDGE_TRUNCATION:
+        return None
+    if earliest <= report["window_from"]:
+        return None  # the calendar reached the start of the window; nothing was cut
+    return earliest if all(key[1] < earliest for key in missing) else None
+
+
 def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
     """Check the market-wide action calendars against the per-symbol endpoints.
 
@@ -768,6 +810,11 @@ def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
       ``calendar_incomplete`` -- the calendar omits events the per-symbol feed has.
                                 **Stop.** Keep the per-symbol path for the affected
                                 asset type; the sweep would silently lose them.
+      ``calendar_truncated``  -- every missing event predates the earliest row the
+                                calendar returned at all, i.e. the response was cut
+                                off rather than the feed being short on those
+                                symbols. A client bug, not a vendor gap; fix the
+                                paging and re-probe.
       ``field_mismatch``      -- the same events, but different values or a payload
                                 whose fields the transform does not read. Fix the
                                 transform, then re-probe.
@@ -782,6 +829,11 @@ def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
     start = end - timedelta(days=days)
 
     calendar: dict[str, set] = {}
+    # The earliest ex-date any calendar row carried. If the response was truncated,
+    # this lands well after `start` and every event before it is missing for every
+    # symbol at once -- which is what tells a client-side cut-off apart from a feed
+    # that genuinely does not carry some securities.
+    calendar_earliest: Optional[date] = None
     for kind, rows in (
         ("split", fmp.splits_calendar(start, end)),
         ("dividend", fmp.dividends_calendar(start, end)),
@@ -791,6 +843,8 @@ def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
             key = _action_key(rec, kind)
             if sym and key is not None:
                 calendar.setdefault(sym, set()).add(key)
+                if calendar_earliest is None or key[1] < calendar_earliest:
+                    calendar_earliest = key[1]
 
     report: dict[str, Any] = {
         "symbols": symbols,
@@ -798,7 +852,9 @@ def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
         "window_to": end,
         "calendar_symbols": len(calendar),
         "calendar_events": sum(len(v) for v in calendar.values()),
+        "calendar_earliest": calendar_earliest,
         "per_symbol": [],
+        "missing_keys": [],
         "missing_total": 0,
         "extra_total": 0,
         "matched_total": 0,
@@ -836,6 +892,7 @@ def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
                 "extra_on_calendar": [f"{k[0]} {k[1]} {k[2]}" for k in extra],
             }
         )
+        report["missing_keys"].extend(missing)
         report["missing_total"] += len(missing)
         report["extra_total"] += len(extra)
         report["matched_total"] += len(direct & from_calendar)
@@ -849,7 +906,18 @@ def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
         )
         return report
 
-    if report["missing_total"]:
+    truncated_before = _truncation_cutoff(report)
+    if truncated_before is not None:
+        report["verdict"] = "calendar_truncated"
+        report["detail"] = (
+            f"The calendar returned nothing before {truncated_before}, though "
+            f"{report['window_from']} was requested, and every missing event falls "
+            "in that gap. That is a cut-off response, not a feed that lacks these "
+            "securities -- the endpoint caps rows per response and drops the oldest "
+            "to fit. Fix the paging in FMPClient._actions_calendar and re-probe; do "
+            "not conclude anything about coverage from this run."
+        )
+    elif report["missing_total"]:
         report["verdict"] = "calendar_incomplete"
         report["detail"] = (
             f"{report['missing_total']} event(s) are on the per-symbol feed and not "
@@ -883,11 +951,15 @@ def format_actions_report(report: dict[str, Any]) -> str:
     """Render a corporate-actions coverage probe for the terminal."""
     ok = {"calendar_complete": "PASS", "no_events": "INCONCLUSIVE"}
     status = ok.get(report["verdict"], "FAIL")
+    earliest = report.get("calendar_earliest")
+    covered = f"{earliest} .. {report['window_to']}" if earliest else "(nothing)"
     lines = [
         f"FMP corporate-actions coverage probe: "
         f"{report['window_from']} .. {report['window_to']}",
         f"  calendar feeds: {report['calendar_events']} events across "
         f"{report['calendar_symbols']} symbols",
+        f"  calendar covered: {covered}"
+        + ("" if not earliest or earliest <= report["window_from"] else "   <-- SHORT"),
         "",
     ]
     for row in report["per_symbol"]:
