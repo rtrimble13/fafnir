@@ -1221,6 +1221,13 @@ def source_probe_actions(ctx, symbols, days):
     report = probe.probe_actions(fmp, syms, days=days)
     click.echo(probe.format_actions_report(report))
     click.echo(f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}")
+    if report["verdict"] == "calendar_truncated":
+        raise click.ClickException(
+            "The calendar response was TRUNCATED, so this run says nothing about "
+            "coverage -- the missing events all predate the earliest row the feed "
+            "returned. This is a client-side paging fault, not a vendor gap. Fix "
+            "FMPClient._actions_calendar and re-probe."
+        )
     if report["verdict"] not in ("calendar_complete", "no_events"):
         raise click.ClickException(
             'Calendar coverage check FAILED -- keep `actions_mode = "symbol"`. '

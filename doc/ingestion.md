@@ -164,8 +164,8 @@ run with `--mode`.
 | Mode | Requests per night | What it does |
 |---|---|---|
 | `symbol` | ~2 × active universe | Full split + dividend history for every security. |
-| `calendar` | ~2 + first-loads | One market-wide sweep since the watermark. |
-| `auto` | ~2 + first-loads + funds | `calendar`, plus per-symbol for what it cannot cover. |
+| `calendar` | ~4 + first-loads | One market-wide sweep since the watermark. |
+| `auto` | ~4 + first-loads + funds | `calendar`, plus per-symbol for what it cannot cover. |
 
 **Why a watermark alone was not the fix.** The price watermark works because
 `historical-price-eod` takes `from`/`to`: the request count is one per symbol either
@@ -194,6 +194,17 @@ Four things follow, and each is handled where it arises:
 - **Delisted securities are skipped**, as they are for prices: a security that stopped
   trading can never have another corporate action. `--include-inactive` for backfills.
 
+**The calendars have two limits and only one is documented.** The documented one is
+the 3-month span between `from` and `to`. The one that actually bites is a **4000-row
+ceiling per response, which drops the oldest rows to fit** and says nothing about it —
+a 30-day request measured on 2026-08-30 came back holding 8 days. `limit` does not
+lift it; `page` walks backwards through the rows, so `_actions_calendar` pages each
+slice until a short page. Density swings ~2.5× over the year (ex-dates cluster at
+quarter-ends), which is why this is paged rather than chunked to some day count: a
+count tuned for August loses data in June, silently. This is the same failure mode
+`historical-price-eod` has — see ADR 0007's postscript, and the `eod_raw` warning that
+`_actions_calendar` originally lacked.
+
 **`fafnir source probe-actions` before switching to `auto`.** The sweep is only sound
 if the calendar carries the same events the per-symbol feeds do, and if it does not the
 failure is silent — a missing dividend is not an error, it is an adjusted series that is
@@ -203,6 +214,7 @@ quietly wrong. The probe pulls a sample both ways and diffs them:
 |---|---|---|
 | `calendar_complete` | every event matched | Set `actions_mode = "auto"`. |
 | `calendar_incomplete` | the calendar omits events | **Stop.** Keep `symbol` for that asset type. |
+| `calendar_truncated` | every miss predates the earliest row returned | A client paging fault, not a vendor gap. Fix and re-probe; conclude nothing about coverage. |
 | `field_mismatch` | same ex-dates, different values | Fix the transform, re-probe. |
 | `no_events` | nothing went ex in the window | Widen `--days`, or probe a payer. |
 
