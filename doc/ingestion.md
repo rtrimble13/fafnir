@@ -41,7 +41,7 @@ the Professional plan in the original `duk`.
 | `ingest symbol-changes` | `symbol-change` | `core.security`, `core.symbol_xref`, `core.symbol_change` | (source, old_symbol, new_symbol, change_date) |
 | `ingest delisted` | `delisted-companies` | `core.security`, `core.symbol_xref` | security_id |
 | `ingest prices` | `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
-| `ingest actions` | `splits`, `dividends` | `core.corporate_action` | (security_id, action_type, ex_date) |
+| `ingest actions` | `splits`, `dividends`; `splits-calendar`, `dividends-calendar` | `core.corporate_action` | (security_id, action_type, ex_date) |
 | `adjust` | (derived) | `core.adjustment_factor` | (security_id, effective_date) |
 
 > **Verify before the first production backfill:** the `symbol-change` payload
@@ -50,6 +50,7 @@ the Professional plan in the original `duk`.
 > be confirmed against a live response for a known symbol (e.g. AAPL). The loader
 > already tolerates the common alternates; the endpoint paths are centralized as
 > constants in `FMPClient` for a one-line correction.
+
 
 ## The declared universe (mutual funds)
 
@@ -155,12 +156,79 @@ Two details follow from the endpoint choice:
 
 Full rationale and the migration consequences: [adr/0004](adr/0004-unadjusted-price-feed.md).
 
+## Corporate actions
+
+`ingest actions` has three modes, set by `[general] actions_mode` and overridable per
+run with `--mode`.
+
+| Mode | Requests per night | What it does |
+|---|---|---|
+| `symbol` | ~2 × active universe | Full split + dividend history for every security. |
+| `calendar` | ~2 + first-loads | One market-wide sweep since the watermark. |
+| `auto` | ~2 + first-loads + funds | `calendar`, plus per-symbol for what it cannot cover. |
+
+**Why a watermark alone was not the fix.** The price watermark works because
+`historical-price-eod` takes `from`/`to`: the request count is one per symbol either
+way, and the watermark shrinks the payload. Corporate actions invert that — the payload
+is tiny and the request count is the cost, so narrowing 42,800 small payloads still
+costs 42,800 requests. The natural grain of "what happened since I last looked?" is the
+date, not the security, which is what the calendar endpoints are. See
+[adr/0007](adr/0007-incremental-corporate-actions.md).
+
+Four things follow, and each is handled where it arises:
+
+- **A future ex-date is never stored.** Both the calendar and the per-symbol
+  `dividends` endpoint return dividends that have been *declared* and have not gone ex.
+  Storing one would give the security an `adjustment_factor` whose `effective_date` is
+  in the future, and the adjusted view applies to a price at date *t* the factor at the
+  smallest `effective_date` greater than *t* — so today's close would be back-adjusted
+  for a dividend that has not happened. The window stops at today and the transform
+  drops anything past it.
+- **No watermark → full history, once.** A security minted last night has nothing for
+  the sweep's window to add to, so it gets the per-symbol pull on the run that mints it
+  — the same rule the price loader uses. The watermark is stamped with the run date,
+  not the last ex-date, or a security that has never paid anything would never get one.
+- **Funds stay per-symbol.** A declared fund has no listing venue (ADR 0006), so an
+  exchange calendar is not assumed to carry its distributions. A few dozen requests a
+  night is cheap next to a coverage gap.
+- **Delisted securities are skipped**, as they are for prices: a security that stopped
+  trading can never have another corporate action. `--include-inactive` for backfills.
+
+**`fafnir source probe-actions` before switching to `auto`.** The sweep is only sound
+if the calendar carries the same events the per-symbol feeds do, and if it does not the
+failure is silent — a missing dividend is not an error, it is an adjusted series that is
+quietly wrong. The probe pulls a sample both ways and diffs them:
+
+| Verdict | Means | Do |
+|---|---|---|
+| `calendar_complete` | every event matched | Set `actions_mode = "auto"`. |
+| `calendar_incomplete` | the calendar omits events | **Stop.** Keep `symbol` for that asset type. |
+| `field_mismatch` | same ex-dates, different values | Fix the transform, re-probe. |
+| `no_events` | nothing went ex in the window | Widen `--days`, or probe a payer. |
+
+Costs `2 + 2N` requests and writes nothing; exits non-zero on anything but a pass.
+
+**The reconciliation is the safety net.** Each night `actions_reconcile_buckets`
+(default 30) means 1/30th of the universe is re-pulled the old way and diffed against
+what is stored — every security checked monthly, at ~1.3% of a full refresh. A
+difference is repaired *and* raised as `corporate_action_drift`, so a vendor coverage
+gap surfaces on a schedule rather than when someone eventually notices a wrong price.
+Only ex-dates older than `actions_overlap_days` are judged: the two feeds do not update
+in lockstep, and flagging inside that window would file a row for every security that
+just went ex, every night.
+
 ## The adjustment step
 
 `fafnir adjust` recomputes `core.adjustment_factor` from `core.corporate_action`:
 
 - split num:den → price × (den/num), volume × (num/den) for prior dates;
 - cash dividend D vs prior close P → price × ((P−D)/P) for prior dates.
+
+`fafnir adjust --changed` recomputes only the securities the last corporate-actions
+run actually changed — a few hundred on a normal night, against every security in the
+warehouse that has ever had an action. That is what `daily_update.sh` runs; bare
+`fafnir adjust` stays the backfill path and the way to rebuild after a change to the
+factor logic itself.
 
 Cumulative factors are built from latest ex-date backwards. The adjusted view picks,
 for each `trade_date`, the factor at the smallest `effective_date` greater than that
@@ -237,7 +305,7 @@ histories is not a decision a loader should make silently.
 
 ```
 ensure-partitions → symbol-changes → securities → delisted →
-prices → actions → adjust → refresh-marts → dq run
+prices → actions → adjust --changed → refresh-marts → dq run
 ```
 
 The universe is reconciled before any data is pulled, so prices run against what is
@@ -248,6 +316,12 @@ falls back to a ticker a company used to trade under, and a delisted feed report
 retired tickers -- so resolving that way would let a row for the retired `FB` stamp
 a one-way delisting on the live `META` security. Prices precede actions so dividend adjustment can value
 against fresh closes. `scripts/daily_update.sh` encodes this order.
+
+Within `ingest actions` the order matters for the same kind of reason: first-loads,
+then the calendar sweep, then the reconciliation. First-loads go first because a
+security with no history has nothing for the sweep's window to add to. The
+reconciliation goes last so that anything the sweep was going to pick up tonight
+already has been — otherwise every event it found would look like drift.
 
 ## Watermarks and the endpoint string
 
@@ -260,3 +334,16 @@ unbounded request, and an unbounded request is capped at 5000 bars (~19.8 years)
 under the retired `historical-price-eod/full` endpoint, directing the operator to a
 re-backfill instead. If you ever change a loader's endpoint again, plan the
 watermark migration at the same time.
+
+The `security_id` half of that key carries meaning too. It is `0` by default, and
+migration 0004 comments that as "whole-endpoint (non per-symbol)" — a watermark for a
+feed that is not fetched one security at a time. Corporate actions use both halves:
+
+| Key | Means |
+|---|---|
+| `('fmp', 'corporate-actions', <id>)` | this security's full history has been pulled |
+| `('fmp', 'corporate-actions-calendar', 0)` | the market-wide calendar has been read through this date |
+
+The per-security row is a *presence* flag as much as a date — its absence is what puts
+a newly minted security on the full-history path — so it is stamped with the run date
+rather than the security's last ex-date.

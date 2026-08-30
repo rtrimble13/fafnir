@@ -161,7 +161,10 @@ Constraints reject impossible bars: `high>=low,open,close`; `low<=open,close`;
 
 ### `core.corporate_action` — splits & cash dividends
 **Grain:** `(security_id, action_type, ex_date)`. **Source:** FMP `splits` /
-`dividends`. **Cadence:** daily.
+`dividends` (per security) or `splits-calendar` / `dividends-calendar` (market-wide),
+per `actions_mode`. **Cadence:** daily. Never holds an `ex_date` in the future — a
+declared-but-not-yet-ex event would back-adjust prices for something that has not
+happened (ADR 0007).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -174,8 +177,8 @@ Constraints reject impossible bars: `high>=low,open,close`; `low<=open,close`;
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. |
 | `currency` | TEXT | |
 | `source` | TEXT | |
-| `ingestion_run_id` | BIGINT → ops.ingestion_run | |
-| `loaded_at` | TIMESTAMPTZ | |
+| `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. |
+| `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 
 ### `core.adjustment_factor` — derived back-adjustment factors
 **Grain:** `(security_id, effective_date)`. **Source:** derived from
@@ -316,6 +319,17 @@ each condition so `detected_at` still says when the problem was first seen.
 `last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
 whole-endpoint (non per-symbol) mark.
 
+| Endpoint | `security_id` | `last_loaded_date` means |
+|---|---|---|
+| `historical-price-eod/non-split-adjusted` | the security | bars are loaded through this date |
+| `corporate-actions` | the security | its full action history has been pulled, as of this date |
+| `corporate-actions-calendar` | `0` | the market-wide calendars have been read through this date |
+
+The `corporate-actions` row is a presence flag as much as a date: its *absence* is what
+puts a newly minted security on the full-history path, so it is stamped with the run
+date rather than the security's last ex-date (a security that has never paid anything
+must still stop being re-pulled).
+
 ---
 
 ## Schema: `landing`
@@ -343,6 +357,8 @@ field whose meaning is later questioned.
 | `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
 | `splits` | `core.corporate_action` (split) | (security_id, split, ex_date) |
 | `dividends` | `core.corporate_action` (dividend) | (security_id, dividend, ex_date) |
+| `splits-calendar` | `core.corporate_action` (split) | (security_id, split, ex_date) |
+| `dividends-calendar` | `core.corporate_action` (dividend) | (security_id, dividend, ex_date) |
 | `available-sectors` / `available-industries` | `ref.sector` / `ref.industry` | name |
 | (derived) | `core.adjustment_factor`, `mart.*` | — |
 

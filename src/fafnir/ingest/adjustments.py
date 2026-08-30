@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from decimal import Context, Decimal, localcontext
-from typing import Optional
+from typing import Iterable, Optional
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
@@ -215,8 +215,19 @@ def _flag_if_extreme(db: Database, security_id: int, factors: list[dict]) -> Non
     )
 
 
-def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
-    """Recompute factors for one security or every security with actions.
+def adjust_all(
+    db: Database,
+    security_id: Optional[int] = None,
+    security_ids: Optional[Iterable[int]] = None,
+) -> dict:
+    """Recompute factors for one security, a named set, or every security with actions.
+
+    ``security_ids`` is the incremental path: a corporate-actions run knows exactly
+    which securities it changed (`fafnir adjust --changed`), and recomputing those is
+    a few hundred securities on a normal night instead of every security in the
+    warehouse that has ever had an action. An empty set is a real answer -- nothing
+    changed, so nothing needs recomputing -- and is not the same as ``None``, which
+    means "recompute everything".
 
     Returns ``{"securities": recomputed, "failed": failed, "aborted": bool}``.
 
@@ -240,7 +251,11 @@ def adjust_all(db: Database, security_id: Optional[int] = None) -> dict:
         db.commit()
         return {"securities": 1, "failed": 0, "aborted": False}
 
-    ids = repo.securities_with_actions(db)
+    ids = (
+        repo.securities_with_actions(db)
+        if security_ids is None
+        else sorted(security_ids)
+    )
     done = 0
     failed = 0
     aborted = False

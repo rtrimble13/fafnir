@@ -42,6 +42,23 @@ request_rate_per_min = 280
 # corrections / re-adjustments.
 overlap_days = 5
 
+# Corporate actions (ADR 0007).
+#   actions_mode  : "symbol"   -- one splits + one dividends request per security,
+#                                full history each night (the original behaviour);
+#                   "calendar" -- one market-wide splits-calendar + dividends-calendar
+#                                sweep against a watermark, plus a full pull for any
+#                                security that has never had one;
+#                   "auto"     -- calendar, and per-symbol for what the calendar
+#                                cannot be trusted to cover (funds). Recommended,
+#                                once `fafnir source probe-actions` passes on your key.
+#   actions_overlap_days      : re-sweep window, to absorb amended dividends.
+#   actions_reconcile_buckets : reconcile 1/N of the universe per night against the
+#                               per-symbol feed (0 disables). 30 = every security
+#                               checked monthly.
+actions_mode = "symbol"
+actions_overlap_days = 7
+actions_reconcile_buckets = 30
+
 # Trading-calendar / partition horizon.
 #   calendar_start_year : earliest year to build (set to your backfill start, e.g. 1990).
 #   calendar_end_year   : minimum/initial horizon. The nightly `fafnir db ensure-horizon`

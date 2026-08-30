@@ -1429,9 +1429,24 @@ def upsert_corporate_action(
     declaration_date: Optional[date] = None,
     ingestion_run_id: Optional[int] = None,
     source: str = "fmp",
-) -> None:
-    db.execute(
-        """
+) -> bool:
+    """Upsert one corporate action. Returns True if the row was new or CHANGED.
+
+    The return value is not decoration: it is the changed-set that lets `fafnir
+    adjust --changed` recompute the few securities whose actions actually moved
+    instead of every security that has ever had one. So the DO UPDATE carries a
+    WHERE that suppresses a no-op write -- re-loading an unchanged history now
+    reports 0 rows and leaves `loaded_at` / `ingestion_run_id` alone, which is what
+    makes "this run touched these securities" a true statement rather than "this
+    run looked at these securities". A row is compared on its mutable columns only;
+    the three identity columns are the conflict key and cannot differ.
+
+    ``ingestion_run_id`` is updated too (it was not before), so it names the run
+    that last *changed* the row -- the question anyone reading lineage is asking.
+    """
+    return (
+        db.execute(
+            """
         INSERT INTO core.corporate_action
             (security_id, action_type, ex_date, record_date, payment_date,
              declaration_date, split_numerator, split_denominator, dividend_amount,
@@ -1445,22 +1460,40 @@ def upsert_corporate_action(
             split_denominator = EXCLUDED.split_denominator,
             dividend_amount = EXCLUDED.dividend_amount,
             currency = EXCLUDED.currency,
+            ingestion_run_id = EXCLUDED.ingestion_run_id,
             loaded_at = now()
+        WHERE (core.corporate_action.record_date,
+               core.corporate_action.payment_date,
+               core.corporate_action.declaration_date,
+               core.corporate_action.split_numerator,
+               core.corporate_action.split_denominator,
+               core.corporate_action.dividend_amount,
+               core.corporate_action.currency)
+              IS DISTINCT FROM
+              (EXCLUDED.record_date,
+               EXCLUDED.payment_date,
+               EXCLUDED.declaration_date,
+               EXCLUDED.split_numerator,
+               EXCLUDED.split_denominator,
+               EXCLUDED.dividend_amount,
+               EXCLUDED.currency)
         """,
-        (
-            security_id,
-            action_type,
-            ex_date,
-            record_date,
-            payment_date,
-            declaration_date,
-            split_numerator,
-            split_denominator,
-            dividend_amount,
-            currency,
-            source,
-            ingestion_run_id,
-        ),
+            (
+                security_id,
+                action_type,
+                ex_date,
+                record_date,
+                payment_date,
+                declaration_date,
+                split_numerator,
+                split_denominator,
+                dividend_amount,
+                currency,
+                source,
+                ingestion_run_id,
+            ),
+        )
+        > 0
     )
 
 
@@ -1529,6 +1562,152 @@ def securities_with_actions(db: Database) -> list[int]:
         "SELECT DISTINCT security_id FROM core.corporate_action ORDER BY security_id"
     )
     return [int(r["security_id"]) for r in rows]
+
+
+def securities_changed_by_run(db: Database, ingestion_run_id: int) -> list[int]:
+    """Securities whose corporate actions were inserted or changed by one run.
+
+    Pairs with :func:`upsert_corporate_action`, which stamps ``ingestion_run_id``
+    only on a row it actually wrote. This is what `fafnir adjust --changed`
+    recomputes: on a normal night a few hundred securities instead of every
+    security in the warehouse that has ever had an action.
+    """
+    rows = db.fetchall(
+        """
+        SELECT DISTINCT security_id FROM core.corporate_action
+        WHERE ingestion_run_id = %s
+        ORDER BY security_id
+        """,
+        (ingestion_run_id,),
+    )
+    return [int(r["security_id"]) for r in rows]
+
+
+def latest_run_id(db: Database, source: str, endpoint: str) -> Optional[int]:
+    """The most recent ingestion run for a source/endpoint, whatever its status.
+
+    Deliberately not restricted to ``status = 'success'``: a run that ended
+    'partial' (something was quarantined) still wrote the rows it validated, and
+    those securities still need their factors recomputed.
+    """
+    val = db.fetchval(
+        """
+        SELECT ingestion_run_id FROM ops.ingestion_run
+        WHERE source = %s AND endpoint = %s
+        ORDER BY ingestion_run_id DESC LIMIT 1
+        """,
+        (source, endpoint),
+    )
+    return int(val) if val is not None else None
+
+
+def securities_without_actions_watermark(
+    db: Database, endpoint: str, *, source: str = "fmp", include_inactive: bool = False
+) -> list[dict]:
+    """Securities that have never had a full corporate-actions pull.
+
+    The calendar sweep only ever looks forward from its own watermark, so a security
+    minted after that watermark was set -- an IPO, or a fund declared under ADR 0006
+    -- would carry no history at all. These are the ones that still need the
+    per-symbol full pull, and the absence of a watermark row is the whole test. Same
+    rule the price loader already uses: no watermark, full history, once.
+    """
+    where = "" if include_inactive else "AND s.is_actively_trading "
+    rows = db.fetchall(
+        f"""
+        SELECT s.security_id, s.primary_symbol
+          FROM core.security s
+          LEFT JOIN ops.load_watermark w
+                 ON w.security_id = s.security_id
+                AND w.source = %s
+                AND w.endpoint = %s
+         WHERE w.security_id IS NULL
+           {where}
+         ORDER BY s.security_id
+        """,
+        (source, endpoint),
+    )
+    return [
+        {"security_id": int(r["security_id"]), "symbol": r["primary_symbol"]}
+        for r in rows
+    ]
+
+
+def universe_securities(db: Database, *, include_inactive: bool = False) -> list[dict]:
+    """The securities a nightly load should touch, as {security_id, symbol}.
+
+    Excludes delisted names by default, for the reason the price loader already
+    excludes them (`fafnir ingest prices`): a security that has stopped trading will
+    never have another bar -- and never another corporate action either -- so
+    re-polling it spends requests forever on a history that cannot change. A backfill
+    passes ``include_inactive`` because a universe of only the survivors is exactly
+    what makes a history survivorship-biased.
+    """
+    where = "WHERE is_actively_trading " if not include_inactive else ""
+    rows = db.fetchall(f"""
+        SELECT security_id, primary_symbol FROM core.security
+        {where}
+        ORDER BY security_id
+        """)
+    return [
+        {"security_id": int(r["security_id"]), "symbol": r["primary_symbol"]}
+        for r in rows
+    ]
+
+
+def securities_by_asset_type(
+    db: Database, asset_types: Sequence[str], *, include_inactive: bool = False
+) -> list[dict]:
+    """Active securities of the given asset types, as {security_id, symbol}.
+
+    Used to keep the declared fund universe on the per-symbol pull: a fund has no
+    listing venue, so an exchange-oriented calendar feed cannot be assumed to carry
+    its distributions (ADR 0006, ADR 0007).
+    """
+    if not asset_types:
+        return []
+    where = "" if include_inactive else "AND is_actively_trading "
+    rows = db.fetchall(
+        f"""
+        SELECT security_id, primary_symbol FROM core.security
+         WHERE asset_type = ANY(%s)
+           {where}
+         ORDER BY security_id
+        """,
+        (list(asset_types),),
+    )
+    return [
+        {"security_id": int(r["security_id"]), "symbol": r["primary_symbol"]}
+        for r in rows
+    ]
+
+
+def actions_reconciliation_slice(
+    db: Database, *, buckets: int, bucket: int, include_inactive: bool = False
+) -> list[dict]:
+    """One deterministic 1/``buckets`` slice of the universe, as {security_id, symbol}.
+
+    Sliced on ``security_id % buckets`` rather than sampled at random so that every
+    security is reached exactly once per full cycle. A random sample of the same size
+    leaves a long tail that is never checked -- and the point of the reconciliation is
+    a bound on how stale any security's actions can be, which randomness cannot give.
+    """
+    if buckets < 1:
+        raise ValueError("buckets must be >= 1")
+    where = "" if include_inactive else "AND is_actively_trading "
+    rows = db.fetchall(
+        f"""
+        SELECT security_id, primary_symbol FROM core.security
+         WHERE security_id %% %s = %s
+           {where}
+         ORDER BY security_id
+        """,
+        (buckets, bucket % buckets),
+    )
+    return [
+        {"security_id": int(r["security_id"]), "symbol": r["primary_symbol"]}
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

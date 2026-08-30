@@ -6,8 +6,14 @@
 -- is read from whatever that commit leaves behind -- which differs per endpoint:
 --
 --   profile                                  -> core.company_profile.loaded_at
---   corporate-actions                        -> core.corporate_action.loaded_at
+--   corporate-actions                        -> ops.load_watermark.updated_at
 --   historical-price-eod/non-split-adjusted  -> ops.load_watermark.updated_at
+--
+-- Corporate actions read the watermark rather than core.corporate_action.loaded_at:
+-- since ADR 0007 an upsert that changes nothing leaves loaded_at alone (that is what
+-- makes `fafnir adjust --changed` a small set), so a resumed backfill would show a
+-- security as not done merely because its history had not moved. The watermark is
+-- written once per security either way, which is exactly the "done" being counted.
 --
 -- `done` is NULL for any other endpoint: that step has no per-symbol trail, so
 -- there is nothing to count. NULL means "no signal", never "stuck at zero" --
@@ -40,8 +46,10 @@ WITH run AS (
             SELECT count(*) FROM core.company_profile p
             WHERE p.loaded_at >= run.started_at)
         WHEN 'corporate-actions' THEN (
-            SELECT count(DISTINCT a.security_id) FROM core.corporate_action a
-            WHERE a.loaded_at >= run.started_at)
+            SELECT count(*) FROM ops.load_watermark w
+            WHERE w.endpoint = 'corporate-actions'
+              AND w.security_id > 0          -- 0 is the market-wide sweep, not a security
+              AND w.updated_at >= run.started_at)
         WHEN 'historical-price-eod/non-split-adjusted' THEN (
             SELECT count(*) FROM ops.load_watermark w
             WHERE w.endpoint = run.endpoint AND w.updated_at >= run.started_at)
