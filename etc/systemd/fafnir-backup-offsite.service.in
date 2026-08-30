@@ -1,0 +1,28 @@
+[Unit]
+Description=fafnir off-server backup copy
+Documentation=file://@FAFNIR_HOME@/doc/install_hetzner.md
+After=network-online.target fafnir-dump.service
+Wants=network-online.target
+# A dump on the same disk does not survive losing the server, so this unit is
+# the one that makes the backup a backup. It is deliberately ordered after the
+# dump: if both are queued, the copy sees the night's file.
+
+[Service]
+Type=oneshot
+User=@FAFNIR_USER@
+Group=@FAFNIR_GROUP@
+WorkingDirectory=@FAFNIR_HOME@
+EnvironmentFile=@ENV_FILE@
+Environment=FAFNIR_BACKUP_DIR=@BACKUP_DIR@
+Environment=FAFNIR_BACKUP_REMOTE=@BACKUP_REMOTE@
+ExecStart=@FAFNIR_HOME@/scripts/backup_offsite.sh
+StandardOutput=append:@LOG_DIR@/backup.log
+StandardError=append:@LOG_DIR@/backup.log
+TimeoutStartSec=4h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# read-only, not tmpfs: rsync-over-ssh has to read the service user's ~/.ssh
+# key and known_hosts. It must never need to *write* them -- accept the remote
+# host key once, by hand, before enabling this timer.
+ProtectHome=read-only

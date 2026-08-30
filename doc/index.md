@@ -41,5 +41,6 @@ read through the `duk` CLI.
 
 - Configuration template: [`etc/fafnirrc`](../etc/fafnirrc)
 - Cron schedule: [`etc/crontab.example`](../etc/crontab.example)
+- systemd unit templates: [`etc/systemd/`](../etc/systemd/)
 - Migrations: [`sql/migrations/`](../sql/migrations/)
 - Batch scripts: [`scripts/`](../scripts/)

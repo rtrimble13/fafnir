@@ -83,8 +83,10 @@ duk ls --sector Technology -S db
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
 ```
 
-Daily upkeep is a single cron entry running `scripts/daily_update.sh` — see
-**[doc/operations.md](doc/operations.md)**. It maintains the universe as well as the
+Daily upkeep is a single scheduled job running `scripts/daily_update.sh` — see
+**[doc/operations.md](doc/operations.md)**, and `scripts/install_timers.sh` for
+the systemd timers (nightly update, DQ sweep, weekly reconciliation, logical dump,
+off-server copy). It maintains the universe as well as the
 data: each night it applies ticker renames to the security that already holds the
 history (FB → META keeps one `security_id`), re-reads the screener so a security
 that listed today enters scope today, refreshes the *declared* universe (mutual

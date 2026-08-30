@@ -909,6 +909,20 @@ for why the order is load-bearing.
 
 ### 8.1 systemd timer (recommended)
 
+[`scripts/install_timers.sh`](../scripts/install_timers.sh) installs every timer
+in this section and §9 from the templates in
+[`etc/systemd/`](../etc/systemd/) — it substitutes your paths, runs
+`systemd-analyze verify`, and enables them:
+
+```bash
+sudo scripts/install_timers.sh --dry-run     # print the units, install nothing
+sudo scripts/install_timers.sh daily         # just the nightly update
+sudo scripts/install_timers.sh               # all five (see §9 for the backup two)
+```
+
+The rest of this section is what that script writes, and why. Do it by hand if
+you would rather see every line land:
+
 ```bash
 sudo tee /etc/systemd/system/fafnir-daily.service > /dev/null <<'UNIT'
 [Unit]
@@ -969,9 +983,23 @@ sudo systemctl status fafnir-daily.service
 tail -40 /var/log/fafnir/daily.log
 ```
 
-Add the DQ sweep and weekly reconciliation from
-[`etc/crontab.example`](../etc/crontab.example) the same way if you want them as
-separate units.
+The DQ sweep and the weekly reconciliation get the same treatment — they are the
+`dq` and `reconcile` jobs of `install_timers.sh` (Mon–Fri 23:00 ET and Sun 06:00 ET
+by default), built from `etc/systemd/fafnir-dq.*` and `etc/systemd/fafnir-reconcile.*`.
+[`etc/crontab.example`](../etc/crontab.example) is the cron equivalent.
+
+To change a schedule afterwards, use a drop-in rather than editing the generated
+unit — the next `install_timers.sh` run overwrites it:
+
+```bash
+sudo systemctl edit fafnir-daily.timer
+# [Timer]
+# OnCalendar=
+# OnCalendar=Mon..Fri 23:15 America/New_York
+```
+
+The empty `OnCalendar=` first is required: timer settings are additive, so
+without it the job runs at **both** times.
 
 ### 8.2 cron alternative
 
@@ -999,20 +1027,20 @@ sources, but rebuilding costs hours and FMP bandwidth — dumps are cheaper.
 
 ### 9.1 Nightly logical dump
 
+[`scripts/backup_dump.sh`](../scripts/backup_dump.sh) is the dump: whole-database,
+custom-format, 14-day retention.
+
 ```bash
 sudo install -d -o fafnir -g fafnir -m 0750 /var/backups/fafnir
-sudo tee /usr/local/bin/fafnir-dump > /dev/null <<'EOF'
-#!/usr/bin/env bash
-# Whole-database custom-format dump, 14-day retention.
-set -euo pipefail
-OUT="/var/backups/fafnir/fafnir_$(date -u +%F).dump"
-pg_dump -h /var/run/postgresql -U fafnir_ingest -d fafnir -Fc -Z6 -f "$OUT"
-find /var/backups/fafnir -name 'fafnir_*.dump' -mtime +14 -delete
-echo "wrote $OUT ($(du -h "$OUT" | cut -f1))"
-EOF
-sudo chmod 755 /usr/local/bin/fafnir-dump
-sudo -u fafnir /usr/local/bin/fafnir-dump      # test it now
+sudo -u fafnir /opt/fafnir/scripts/backup_dump.sh          # test it now
+sudo -u fafnir /opt/fafnir/scripts/backup_dump.sh --globals  # + role definitions
 ```
+
+It writes to `<name>.dump.partial` and renames only after `pg_restore -l` reads
+the finished archive back. Without that, a dump killed by a full disk or a unit
+timeout leaves a truncated file that looks exactly like a good one to the
+retention sweep and to the off-site copy — and a truncated custom-format dump is
+not partially restorable, it is unrestorable.
 
 Dump **all** schemas, not just `core`/`landing`. It is tempting to skip `mart` because
 it is derived and `meta` because it is only bookkeeping, but a restore without them is
@@ -1024,8 +1052,9 @@ re-applying every migration, and without the `mart` views there is nothing for
 Role definitions live outside a database dump. Recreate them with §3.5 on a new host,
 or capture them with `sudo -u postgres pg_dumpall --globals-only > globals.sql`.
 
-Schedule the dump with a second timer (`OnCalendar=Mon..Sat 04:00 America/New_York`,
-after the nightly load) using the same pattern as §8.1.
+Schedule it with `sudo scripts/install_timers.sh dump` — a second timer at
+`Mon..Sat 04:00 America/New_York`, after the nightly load, built the same way
+as §8.1.
 
 ### 9.2 Off-server copy
 
@@ -1033,10 +1062,26 @@ A dump on the same disk does not survive losing the server. Push it to a Hetzner
 **Storage Box** (SFTP/rsync/BorgBackup) or **Object Storage** (S3-compatible):
 
 ```bash
-# Storage Box, key-based, from the fafnir user's crontab/timer:
-rsync -a --delete /var/backups/fafnir/ \
-  u123456@u123456.your-storagebox.de:/home/fafnir-backups/
+# Storage Box, key-based. Accept the host key and prove the key works ONCE, by
+# hand -- the timer runs with ProtectHome=read-only and ssh BatchMode=yes, so it
+# can neither answer a prompt nor write ~/.ssh/known_hosts.
+sudo -u fafnir -H ssh-keygen -t ed25519 -N '' -f ~fafnir/.ssh/id_ed25519
+sudo -u fafnir -H ssh-copy-id -s u123456@u123456.your-storagebox.de   # -s: Storage Box
+sudo -u fafnir -H FAFNIR_BACKUP_REMOTE=u123456@u123456.your-storagebox.de:/home/fafnir-backups/ \
+  /opt/fafnir/scripts/backup_offsite.sh --dry-run
+
+# Then schedule it (Mon..Sat 04:45 America/New_York, ordered after the dump):
+sudo FAFNIR_BACKUP_REMOTE=u123456@u123456.your-storagebox.de:/home/fafnir-backups/ \
+  scripts/install_timers.sh offsite
 ```
+
+[`scripts/backup_offsite.sh`](../scripts/backup_offsite.sh) mirrors with
+`--delete`, so the remote matches local retention — and it refuses to run when
+the local directory holds no dumps. That is the case worth guarding: if tonight's
+dump failed and the retention sweep has since emptied the directory, a mirroring
+rsync would faithfully propagate "nothing" and erase the off-site copy, exactly
+when the local one is already gone. Pass `--no-mirror` to let the remote keep a
+longer history instead.
 
 ### 9.3 Hetzner server backups / snapshots
 
@@ -1076,6 +1121,19 @@ partition count to match the live database.
 
 ## 10. Monitoring
 
+[`scripts/monitor.sh`](../scripts/monitor.sh) runs every check below in one pass
+and exits non-zero if any of them tripped, so it also works as the body of an
+alerting job:
+
+```bash
+sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh          # all sections
+sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh disk timers backups
+sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh --quiet  # only what tripped
+```
+
+It sources `/etc/fafnir/fafnir.env` itself when `FAFNIR_DSN` is not already set.
+The individual commands, if you want them one at a time:
+
 ```bash
 # Health, from the service user's environment
 sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; fafnir status'
@@ -1104,10 +1162,21 @@ SELECT calls, round(mean_exec_time) AS avg_ms, round(total_exec_time) AS total_m
 FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;
 ```
 
-Add log rotation so `/var/log/fafnir` cannot fill the disk:
+Add log rotation so `/var/log/fafnir` cannot fill the disk — on a small instance
+that is the same filesystem Postgres writes to, so an unrotated `daily.log`
+eventually stops the database, not just the logging.
+[`scripts/install_logrotate.sh`](../scripts/install_logrotate.sh) writes the
+config and dry-runs `logrotate` over it:
 
 ```bash
-sudo tee /etc/logrotate.d/fafnir > /dev/null <<'EOF'
+sudo scripts/install_logrotate.sh                              # weekly, keep 8
+sudo scripts/install_logrotate.sh --frequency daily --rotate 14 --size 100M
+scripts/install_logrotate.sh --dry-run                         # just print it
+```
+
+What it writes:
+
+```
 /var/log/fafnir/*.log {
     weekly
     rotate 8
@@ -1116,10 +1185,15 @@ sudo tee /etc/logrotate.d/fafnir > /dev/null <<'EOF'
     missingok
     notifempty
     create 0640 fafnir adm
+    su fafnir adm
 }
-EOF
-sudo logrotate --debug /etc/logrotate.d/fafnir     # dry run
 ```
+
+The `su` line is not optional here: logrotate refuses to touch a directory that
+is not owned by root unless it is told whose privileges to drop to, and §4.1
+creates this one `fafnir:adm`. `create`, not `copytruncate`, because the units
+open their log fresh on each start (`StandardOutput=append:`) — no long-lived
+writer holds a stale descriptor across the rotation.
 
 Hetzner also shows CPU / traffic / disk graphs per server in the console, and can send
 you alerts on them.
@@ -1238,8 +1312,10 @@ sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/faf
   fafnir dq list'         # and the queue those counts refer to
 
 # --- Automation & backups ---------------------------------------------------
-systemctl list-timers 'fafnir-*'                     # next elapse looks right
+systemctl list-timers 'fafnir-*'                     # 5 timers, next elapse looks right
 ls -lh /var/backups/fafnir/                          # a dump exists
+ls /etc/logrotate.d/fafnir                           # rotation installed (§10)
+sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh     # every §10 check; exits 0 when clean
 
 # --- From your laptop, with the §11 tunnel up -------------------------------
 duk -S db ph SPY --adj -n 5                          # reads as fafnir_app

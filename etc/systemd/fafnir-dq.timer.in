@@ -1,0 +1,11 @@
+[Unit]
+Description=Sweep fafnir for gaps, outliers and stale securities
+
+[Timer]
+Unit=fafnir-dq.service
+OnCalendar=@ONCALENDAR@
+Persistent=true
+RandomizedDelaySec=@RANDOMIZED_DELAY@
+
+[Install]
+WantedBy=timers.target
