@@ -272,6 +272,21 @@ Things to watch:
   A load where *every* bar quarantines as `price_missing_or_nonnumeric_ohlc` points
   at FMP renaming the OHLC fields; the loader accepts `open…close` and
   `adjOpen…adjClose`, so a third spelling would need adding to `_OHLC_ALIASES`.
+- **Flattened bars** — `price_scale_collapse` counts bars whose OHLC the money
+  column's scale crushed to one value. `core.daily_price` money is `NUMERIC(20, 6)`
+  and `ROUND_HALF_UP` puts the quarantine cliff at **5e-7**, so a security quoted
+  between roughly 5e-7 and 1.5e-6 is not rejected — it is stored with
+  `open = high = low = close`, and downstream that is indistinguishable from a
+  genuine no-trade day. Returns and volatility computed over a run of them are
+  fictional rather than merely wrong. The flag records the source high/low it lost,
+  because `core.daily_price` no longer has them:
+  ```bash
+  fafnir dq list --detail --check price_scale_collapse
+  ```
+  A security with a long run of these cannot be represented at this scale. Widening
+  the column is a full rewrite of every `core.daily_price` partition; excluding the
+  security is cheaper and keeps the warehouse honest about what it holds. Resolving
+  the flag does neither — it is the measurement, not the decision.
 - **Price levels, not just counts** — a wrongly-adjusted feed is internally
   consistent and passes every structural check. The deep-history spot check in
   [backfill.md §7](backfill.md#7-verify) is the one that catches it; it is worth

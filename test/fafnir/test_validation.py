@@ -385,3 +385,125 @@ def test_an_unusable_vwap_is_dropped_without_failing_the_bar():
     row, reason = _validate_bar(_bar(vwap=1e20))
     assert reason is None
     assert row["vwap"] is None
+
+
+# ---------------------------------------------------------------------------
+# The quiet half of the resolution problem
+# ---------------------------------------------------------------------------
+#
+# _reject_reason catches a price BELOW what the money column can hold and the bar is
+# quarantined, loudly. ROUND_HALF_UP at six places puts that cliff at 5e-7 -- so a
+# security quoted just above it passes every check and is stored with
+# open = high = low = close, its real intraday range replaced by a zero-range
+# session that nothing downstream can tell from a genuine no-trade day.
+#
+# The numbers below are real bars from the production warehouse (HIND 2016-10-31,
+# ORIG 2011-09-19, PPCB 2026-08-28, ELOX 2024-08-05), which is the only reason it
+# was found at all: `price_subresolution_price` was flagging the narrow band either
+# side of it while this band went by silently.
+
+
+def _collapse(bar):
+    from fafnir.ingest.daily_price import _scale_collapse_detail
+
+    row, reason = _validate_bar(bar)
+    assert reason is None, f"expected a stored bar, got price_{reason}"
+    return _scale_collapse_detail(bar, row)
+
+
+def test_a_flattened_bar_is_detected():
+    detail = _collapse(
+        {
+            "date": "2016-10-31",
+            "open": "0.000000788",
+            "high": "0.000000801",
+            "low": "0.000000732",
+            "close": "0.000000733",
+            "volume": "0",
+        }
+    )
+    assert detail is not None
+    assert detail["stored"] == "0.000001"
+    assert Decimal(detail["source_range"]) > 0
+
+
+def test_the_detail_carries_the_range_the_column_lost():
+    # The whole point of the flag: the source values are gone from core.daily_price
+    # once the bar is stored, so an operator cannot otherwise tell how much was lost.
+    detail = _collapse(
+        {
+            "date": "2011-09-19",
+            "open": "0.000001626087",
+            "high": "0.000001733696",
+            "low": "0.000001517391",
+            "close": "0.000001680435",
+            "volume": "84640000",
+        }
+    )
+    assert detail["source_high"] == "0.000001733696"
+    assert detail["source_low"] == "0.000001517391"
+    assert detail["stored"] == "0.000002"
+
+
+def test_an_ordinary_bar_is_not_flagged():
+    assert (
+        _collapse(
+            {
+                "date": "2026-08-28",
+                "open": "1.93",
+                "high": "1.94",
+                "low": "1.31",
+                "close": "1.35",
+                "volume": "4056907",
+            }
+        )
+        is None
+    )
+
+
+def test_a_genuinely_flat_session_is_not_flagged():
+    # A halted or one-trade session is flat at the source. The test is that a range
+    # EXISTED and the column lost it -- not that the stored bar is flat, which would
+    # flag every no-trade day in the warehouse.
+    assert (
+        _collapse(
+            {
+                "date": "2024-08-05",
+                "open": "0.06363636",
+                "high": "0.06363636",
+                "low": "0.06363636",
+                "close": "0.06363636",
+                "volume": "0",
+            }
+        )
+        is None
+    )
+    assert (
+        _collapse(
+            {
+                "date": "2024-08-05",
+                "open": "12.5",
+                "high": "12.5",
+                "low": "12.5",
+                "close": "12.5",
+                "volume": "10",
+            }
+        )
+        is None
+    )
+
+
+def test_a_quarantined_bar_never_reaches_the_collapse_check():
+    # Below the cliff the bar is rejected outright, so the two conditions partition
+    # the problem rather than double-reporting the same bar.
+    row, reason = _validate_bar(
+        {
+            "date": "2024-08-05",
+            "open": "0.0000001",
+            "high": "0.0000001",
+            "low": "0.0000001",
+            "close": "0.0000001",
+            "volume": "1",
+        }
+    )
+    assert row is None and reason == "subresolution_price"

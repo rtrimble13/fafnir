@@ -307,6 +307,15 @@ the watermark behind the bar forever. New writers pick a side explicitly:
 `repository.add_dq_flag_once` for a standing condition, `add_dq_flag` where each
 detection is itself the signal.
 
+`price_*` is the family an operator globs for, not a promise that every member is a
+quarantine. `price_scale_collapse` shares the prefix but describes a bar that **was**
+stored, so it is written with `add_dq_flag_once` (one row per corrupted bar, not one
+per nightly overlap) and `repository.count_price_quarantines` excludes it by name via
+`NON_QUARANTINE_PRICE_CHECKS`. Counting it would let a stored-but-corrupted bar spend
+the watermark budget of a *rejected* bar on the same date and release ingestion past
+one nobody had looked at. Anything added to that family later has to make the same
+choice explicitly.
+
 Since migration 0016 the schema holds the rule too — `ux_dq_flag_open_condition`,
 unique on `(check_name, security_id, record_key)` where `resolved_at IS NULL` and the
 check is not `price_*`. It is a backstop, not the mechanism: the guard stays in the

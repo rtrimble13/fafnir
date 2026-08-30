@@ -103,3 +103,79 @@ def test_fund_is_the_nav_asset_type():
         "an ETF trades through a session and has real OHLCV -- admitting the NAV "
         "shape for it would silence a genuinely broken payload"
     )
+
+
+# ---------------------------------------------------------------------------
+# NAV expansion vs. price_scale_collapse
+# ---------------------------------------------------------------------------
+#
+# Both features put open = high = low = close into core.daily_price, and they
+# landed independently. One is correct (a fund strikes one price a day, so there
+# never was a range) and one is corruption (the money column's scale crushed a real
+# range). price_scale_collapse tells them apart by reading the SOURCE bar: a NAV
+# payload carries no open/high/low to compare, so it cannot evidence the range the
+# check requires.
+#
+# That is quiet coupling. Teaching _source_price to fall back to the close would
+# turn every fund bar in the warehouse into a flag overnight, and nothing else in
+# either feature would fail. These are the tests that would.
+
+
+def test_a_nav_bar_is_not_a_scale_collapse():
+    from fafnir.ingest.daily_price import _scale_collapse_detail
+
+    bar = {"date": "2024-03-01", "close": "18.42"}
+    row, reason = _validate_bar(bar, nav_only=True)
+    assert reason is None
+    assert row["open"] == row["high"] == row["low"] == row["close"]
+    assert _scale_collapse_detail(bar, row) is None
+
+
+def test_a_nav_bar_priced_in_the_flattened_band_is_still_not_a_collapse():
+    # The overlap that matters: a fund quoted inside the band where the column
+    # genuinely does destroy ranges. It is still not a collapse, because a NAV bar
+    # had no range to destroy.
+    from fafnir.ingest.daily_price import _scale_collapse_detail
+
+    bar = {"date": "2024-03-01", "close": "0.000000733"}
+    row, reason = _validate_bar(bar, nav_only=True)
+    assert reason is None
+    assert str(row["close"]) == "0.000001"
+    assert _scale_collapse_detail(bar, row) is None
+
+
+def test_an_equity_in_the_same_band_is_still_a_collapse():
+    # The other side of the guard: gating on the source bar must not have made the
+    # check unreachable for the securities it was written for.
+    from fafnir.ingest.daily_price import _scale_collapse_detail
+
+    bar = {
+        "date": "2016-10-31",
+        "open": "0.000000788",
+        "high": "0.000000801",
+        "low": "0.000000732",
+        "close": "0.000000733",
+        "volume": "0",
+    }
+    row, reason = _validate_bar(bar)
+    assert reason is None
+    assert _scale_collapse_detail(bar, row) is not None
+
+
+def test_a_fund_bar_that_does_carry_a_range_is_judged_on_it():
+    # nav_only is an allowance, not an override: a fund payload that DOES carry
+    # open/high/low is read from those fields, so the collapse check applies to it
+    # exactly as it would to an equity.
+    from fafnir.ingest.daily_price import _scale_collapse_detail
+
+    bar = {
+        "date": "2016-10-31",
+        "open": "0.000000788",
+        "high": "0.000000801",
+        "low": "0.000000732",
+        "close": "0.000000733",
+        "volume": "0",
+    }
+    row, reason = _validate_bar(bar, nav_only=True)
+    assert reason is None
+    assert _scale_collapse_detail(bar, row) is not None

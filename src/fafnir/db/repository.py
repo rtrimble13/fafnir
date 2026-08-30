@@ -1922,18 +1922,34 @@ def add_dq_flag_once(
     )
 
 
+# `price_*` is the family an operator globs for, not a promise that every member is
+# a quarantine. These ones describe a bar that WAS stored, so they must not be
+# counted as attempts to store it -- see count_price_quarantines, whose count is a
+# budget that releases the watermark once it is spent. A stored-but-corrupted bar
+# buying down a rejected bar's budget would let ingestion walk past a bar nobody had
+# actually looked at.
+NON_QUARANTINE_PRICE_CHECKS = ("price_scale_collapse",)
+
+
 def count_price_quarantines(db: Database, security_id: int, date_iso: str) -> int:
-    """How many times a given trade_date has been quarantined for this security
-    (price_* checks). Used to bound the watermark hold on a persistently-bad bar."""
+    """How many times a given trade_date has been *quarantined* for this security.
+
+    Used to bound the watermark hold on a persistently-bad bar, so it counts
+    attempts to store a bar that failed -- the repeats of the `price_<reason>` flags
+    the loader writes on rejection. :data:`NON_QUARANTINE_PRICE_CHECKS` is excluded:
+    those share the prefix but describe a bar that was written, and one of those on
+    the same date would otherwise spend a rejected bar's budget for it.
+    """
     return int(
         db.fetchval(
             """
             SELECT count(*) FROM ops.data_quality_flag
             WHERE security_id = %s
               AND check_name LIKE 'price\\_%%'
+              AND check_name <> ALL(%s)
               AND record_key->>'date' = %s
             """,
-            (security_id, date_iso),
+            (security_id, list(NON_QUARANTINE_PRICE_CHECKS), date_iso),
         )
         or 0
     )

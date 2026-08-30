@@ -46,6 +46,20 @@ MAX_QUARANTINE_HOLDS = 5
 # day, not a payload with three fields missing.
 NAV_ASSET_TYPES = frozenset({"fund"})
 
+# A stored bar whose OHLC the money column's scale flattened to one value. It shares
+# the `price_` prefix because that is the family an operator globs for
+# (`fafnir dq list --check 'price_*'`), but it is NOT a quarantine: the bar was
+# written. repository.count_price_quarantines excludes it by name for that reason --
+# counting it would let a corrupted-but-stored bar buy down the watermark budget of a
+# rejected one. See repository.NON_QUARANTINE_PRICE_CHECKS, which must list it.
+#
+# NOT to be confused with the NAV shape above, which also stores
+# open = high = low = close. That one is correct and must never be flagged: a fund
+# strikes one price a day, and there was no range to lose. _scale_collapse_detail
+# tells them apart by reading the SOURCE bar -- a NAV payload has no open/high/low
+# to compare, so it cannot show the range this check requires evidence of.
+SCALE_COLLAPSE_CHECK = "price_scale_collapse"
+
 # What core.daily_price can actually store (sql/migrations/0005_daily_price.up.sql):
 # money is NUMERIC(20, 6), volume is BIGINT. Postgres rounds a value to the column's
 # scale on insert and only *then* evaluates ck_daily_price_positive, so a positive
@@ -160,6 +174,58 @@ def _as_vwap(value) -> Optional[Decimal]:
     except ArithmeticError:
         return None
     return None if abs(rounded) >= _MONEY_MAX else rounded
+
+
+def _source_price(bar: dict, field: str) -> Optional[Decimal]:
+    """The raw Decimal :func:`_ohlc` would take for this field, before quantizing.
+
+    Mirrors _ohlc's alias rule exactly -- first spelling carrying a *storable* price
+    -- so the two never disagree about which of ``open`` / ``adjOpen`` the bar was
+    read from. What differs is only that this returns the source value rather than
+    the value rounded to the column, which is the whole point: the difference between
+    them is the information the column threw away.
+    """
+    for key in _OHLC_ALIASES[field]:
+        value = bar.get(key)
+        if value in (None, ""):
+            continue
+        if _as_money(value) is not None:
+            return _decimal(value)
+    return None
+
+
+def _scale_collapse_detail(bar: dict, row: dict) -> Optional[dict]:
+    """Evidence that quantizing flattened a bar that had a real range, else None.
+
+    The loud failure -- a price below the column's resolution -- is quarantined by
+    ``_reject_reason`` and never stored. This is the quiet one either side of it: a
+    bar whose OHLC all round to the *same* storable value. ROUND_HALF_UP at 6 places
+    puts the rejection cliff at 5e-7, so a security quoted between roughly 5e-7 and
+    1.5e-6 passes every check and lands in core.daily_price with
+    ``open = high = low = close`` -- a real intraday range silently replaced by a
+    zero-range session. Nothing downstream can tell that from a genuine no-trade day,
+    and close-to-close returns computed over a run of them are not wrong so much as
+    fictional.
+
+    A bar whose *source* high and low are already equal is a real flat session and is
+    not flagged: the test is that the range existed and the column lost it, not that
+    the stored bar is flat.
+    """
+    if len({row["open"], row["high"], row["low"], row["close"]}) != 1:
+        return None
+    source = [_source_price(bar, f) for f in ("open", "high", "low", "close")]
+    if any(v is None for v in source):
+        return None
+    high, low = max(source), min(source)
+    if high == low:
+        return None
+    return {
+        "source_high": str(high),
+        "source_low": str(low),
+        "source_range": str(high - low),
+        "stored": str(row["close"]),
+        "scale": str(_MONEY_SCALE),
+    }
 
 
 def _ohlc(bar: dict, field: str) -> tuple[Optional[Decimal], Optional[str]]:
@@ -355,6 +421,29 @@ def load_symbol_prices(
         row["security_id"] = sec_id
         clean.append(row)
 
+        # The bar stores, so it is not a quarantine -- but it may store wrong. See
+        # _scale_collapse_detail: a real range flattened to one value by the money
+        # column's scale passes every check above and is indistinguishable
+        # downstream from a genuine no-trade session.
+        #
+        # add_dq_flag_once, unlike the quarantine flag above: this condition is a
+        # property of a stored bar, not of an attempt to store one, so re-reading
+        # the same bar on the next overlap must not add a second row. Nothing counts
+        # its repeats the way count_price_quarantines counts the quarantine flags'
+        # -- which is exactly why that function now excludes this check by name.
+        collapse = _scale_collapse_detail(bar, row)
+        if collapse is not None:
+            repo.add_dq_flag_once(
+                db,
+                check_name=SCALE_COLLAPSE_CHECK,
+                severity="warn",
+                security_id=sec_id,
+                table_name="core.daily_price",
+                record_key={"symbol": symbol, "date": str(bar.get("date"))},
+                detail=collapse,
+                ingestion_run_id=run.run_id,
+            )
+
     written = repo.upsert_daily_prices(db, clean, ingestion_run_id=run.run_id)
 
     # Advance the watermark only up to the latest *contiguous* clean date: never
@@ -379,6 +468,33 @@ def load_symbol_prices(
         safe_dates = clean_dates
     if safe_dates:
         repo.set_watermark(db, "fmp", ENDPOINT, max(safe_dates), sec_id)
+    elif quarantined_dates and not holding:
+        # Nothing in the window survived validation, and every bad bar has spent its
+        # MAX_QUARANTINE_HOLDS budget. Without this branch the watermark is never
+        # written at all: `safe_dates` is derived from `clean_dates`, so a symbol
+        # with no storable bar anywhere in its history takes the `else` above, gets
+        # an empty list, and skips the write -- leaving get_watermark returning None,
+        # which sends the next run back to `from_date=None` and re-pulls the entire
+        # history. The budget above cannot save it, because exhausting the budget
+        # only widens an already-empty set.
+        #
+        # That is not hypothetical: a security quoted below the 1e-6 the money
+        # column can hold has EVERY bar rejected, so it was re-fetched and re-flagged
+        # in full every night, spending the bandwidth and writing one
+        # price_subresolution_price flag per bar per run without bound.
+        #
+        # Advancing to the last bar seen is the same trade the budget already makes
+        # -- the bars stay flagged for review, ingestion just stops re-litigating
+        # them. `overlap_days` still re-reads the recent tail, so a genuine upstream
+        # correction inside that window is picked up.
+        logger.warning(
+            "%s: no storable bars in the window and every quarantined date has "
+            "spent its budget; advancing the watermark to %s so the history is not "
+            "re-pulled nightly. The bars stay flagged for review.",
+            symbol,
+            max(quarantined_dates),
+        )
+        repo.set_watermark(db, "fmp", ENDPOINT, max(quarantined_dates), sec_id)
 
     run.rows_inserted += written
     return written

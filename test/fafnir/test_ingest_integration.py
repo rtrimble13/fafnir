@@ -421,6 +421,232 @@ def test_watermark_releases_after_quarantine_budget(db):
     assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 5)
 
 
+class _RecordingFMP(_FakeFMP):
+    """_FakeFMP that remembers the window each call asked for.
+
+    The window is the whole point of the test below: a symbol whose watermark is
+    never written asks for `from_date=None` -- its entire history -- on every single
+    run, and that is the difference between one flag per bar and one flag per bar
+    per night forever.
+    """
+
+    def __init__(self, bars):
+        super().__init__(bars)
+        self.windows: list = []
+
+    def eod_raw(self, symbol, from_date=None, to_date=None):
+        self.windows.append(from_date)
+        return super().eod_raw(symbol, from_date, to_date)
+
+
+def _subresolution_bars(*days):
+    """Bars quoted below the 1e-6 core.daily_price can hold -- every one rejected."""
+    return [
+        {
+            "date": d,
+            "open": "0.0000001",
+            "high": "0.0000001",
+            "low": "0.0000001",
+            "close": "0.0000001",
+            "volume": 1,
+        }
+        for d in days
+    ]
+
+
+def test_a_history_with_no_storable_bar_stops_being_re_pulled(db):
+    # The production shape behind 3,783 price_subresolution_price flags over 8
+    # securities in three nights. Every bar is below the money column's resolution,
+    # so `clean` is empty -- and `safe_dates` is derived from `clean`, so the
+    # watermark was never written at all. get_watermark then returns None, the next
+    # run asks for the full history again, and every bar is re-flagged. The
+    # quarantine budget cannot break the loop, because exhausting it only widens an
+    # already-empty set.
+    from fafnir.ingest.daily_price import MAX_QUARANTINE_HOLDS
+
+    sid = _mk_security(db, "SUBP")
+    fmp = _RecordingFMP(_subresolution_bars("2023-06-01", "2023-06-02", "2023-06-05"))
+
+    for _ in range(MAX_QUARANTINE_HOLDS):
+        with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+            load_symbol_prices(db, fmp, "SUBP", run=run)
+
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 5)
+    # ...and the next run asks for a window instead of the whole history again.
+    with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+        load_symbol_prices(db, fmp, "SUBP", run=run)
+    assert fmp.windows[-1] is not None
+    assert fmp.windows[:MAX_QUARANTINE_HOLDS] == [None] * MAX_QUARANTINE_HOLDS
+
+
+def test_an_unstorable_history_still_holds_the_line_while_in_budget(db):
+    # The release is bounded, not immediate: the bars are re-read while there is any
+    # chance the feed corrects them, which is the same trade the budget already makes
+    # for a single bad bar among good ones.
+    from fafnir.ingest.daily_price import MAX_QUARANTINE_HOLDS
+
+    sid = _mk_security(db, "SUBP")
+    fmp = _RecordingFMP(_subresolution_bars("2023-06-01", "2023-06-02"))
+    for _ in range(MAX_QUARANTINE_HOLDS - 1):
+        with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+            load_symbol_prices(db, fmp, "SUBP", run=run)
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) is None
+
+
+def test_the_unstorable_bars_stay_flagged_after_the_watermark_moves(db):
+    # Advancing the watermark is about ingestion, not about the verdict: the bars
+    # were never stored and the operator still has to decide what to do about the
+    # security. Losing the flags here would turn a bounded loop into a silent drop.
+    from fafnir.ingest.daily_price import MAX_QUARANTINE_HOLDS
+
+    sid = _mk_security(db, "SUBP")
+    fmp = _RecordingFMP(_subresolution_bars("2023-06-01", "2023-06-02"))
+    for _ in range(MAX_QUARANTINE_HOLDS):
+        with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+            load_symbol_prices(db, fmp, "SUBP", run=run)
+
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 2)
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag WHERE security_id = %s "
+            "AND check_name = 'price_subresolution_price' AND resolved_at IS NULL",
+            (sid,),
+        )
+        > 0
+    )
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id = %s", (sid,)
+        )
+        == 0
+    ), "an unstorable bar must never reach core.daily_price"
+
+
+def test_a_clean_bar_still_beats_a_quarantined_one_for_the_watermark(db):
+    # Regression guard on the new branch: it must only fire when there is nothing
+    # storable at all. With one good bar the ordinary rule still applies -- the
+    # watermark sits at the last clean date, not at the later bad one.
+    sid = _mk_security(db, "MIXED")
+    bars = [
+        {
+            "date": "2023-06-01",
+            "open": 10,
+            "high": 10,
+            "low": 10,
+            "close": 10,
+            "volume": 1,
+        }
+    ] + _subresolution_bars("2023-06-02")
+    with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+        load_symbol_prices(db, _FakeFMP(bars), "MIXED", run=run)
+    assert repo.get_watermark(db, "fmp", PRICE_ENDPOINT, sid) == dt.date(2023, 6, 1)
+
+
+def _flattened_bars(*days):
+    """Bars quoted just ABOVE the 5e-7 rejection cliff.
+
+    Real HIND numbers. Every field rounds to 0.000001, so the bar is stored with a
+    zero range and passes every existing check -- the condition price_scale_collapse
+    exists to make visible.
+    """
+    return [
+        {
+            "date": d,
+            "open": "0.000000788",
+            "high": "0.000000801",
+            "low": "0.000000732",
+            "close": "0.000000733",
+            "volume": 1,
+        }
+        for d in days
+    ]
+
+
+def test_a_flattened_bar_is_stored_and_flagged(db):
+    sid = _mk_security(db, "HIND")
+    with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+        load_symbol_prices(db, _FakeFMP(_flattened_bars("2023-06-01")), "HIND", run=run)
+
+    # Stored, not quarantined -- that is what makes it quiet.
+    stored = db.fetchone(
+        "SELECT open, high, low, close FROM core.daily_price WHERE security_id = %s",
+        (sid,),
+    )
+    assert stored is not None
+    assert len({stored["open"], stored["high"], stored["low"], stored["close"]}) == 1
+
+    flag = db.fetchone(
+        "SELECT severity, detail FROM ops.data_quality_flag WHERE security_id = %s "
+        "AND check_name = 'price_scale_collapse'",
+        (sid,),
+    )
+    assert flag is not None
+    assert flag["severity"] == "warn"
+    assert flag["detail"]["source_high"] == "0.000000801"
+
+
+def test_the_collapse_flag_is_written_once_not_once_per_overlap(db):
+    # Unlike the quarantine flags, nothing counts this one's repeats, and the daily
+    # overlap re-reads the same bars every run. add_dq_flag_once is what keeps one
+    # corrupted bar to one row instead of one row per night.
+    sid = _mk_security(db, "HIND")
+    bars = _flattened_bars("2023-06-01", "2023-06-02")
+    for _ in range(3):
+        with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+            load_symbol_prices(
+                db,
+                _FakeFMP(bars),
+                "HIND",
+                run=run,
+                start_date=dt.date(2023, 6, 1),
+                end_date=dt.date(2023, 6, 2),
+            )
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag WHERE security_id = %s "
+            "AND check_name = 'price_scale_collapse'",
+            (sid,),
+        )
+        == 2
+    )
+
+
+def test_a_collapse_flag_does_not_spend_a_quarantine_budget(db):
+    # price_scale_collapse shares the `price_` prefix an operator globs for, but it
+    # describes a bar that WAS stored. Counting it as a quarantine would let a
+    # corrupted-but-stored bar buy down the watermark budget of a rejected one on the
+    # same date, releasing ingestion past a bar nobody had looked at.
+    sid = _mk_security(db, "HIND")
+    repo.add_dq_flag(
+        db,
+        check_name="price_scale_collapse",
+        severity="warn",
+        security_id=sid,
+        record_key={"symbol": "HIND", "date": "2023-06-01"},
+    )
+    assert repo.count_price_quarantines(db, sid, "2023-06-01") == 0
+
+    repo.add_dq_flag(
+        db,
+        check_name="price_subresolution_price",
+        severity="warn",
+        security_id=sid,
+        record_key={"symbol": "HIND", "date": "2023-06-01"},
+    )
+    assert repo.count_price_quarantines(db, sid, "2023-06-01") == 1
+
+
+def test_the_collapse_flag_is_reachable_by_the_price_glob(db):
+    # `fafnir dq list --check 'price_*'` is the documented way an operator finds this
+    # family, and sharing the prefix is the reason the exclusion above had to be by
+    # name rather than by pattern.
+    _mk_security(db, "HIND")
+    with RunLog(db, source="fmp", endpoint=PRICE_ENDPOINT, params={}) as run:
+        load_symbol_prices(db, _FakeFMP(_flattened_bars("2023-06-01")), "HIND", run=run)
+    rows = repo.list_dq_flags(db, repo.DqFilter(checks=("price_*",)), limit=10)
+    assert any(r["check_name"] == "price_scale_collapse" for r in rows)
+
+
 # -- the split-adjusted feed regression ---------------------------------------
 #
 # fafnir's factors are the ONLY adjustment applied to core.daily_price, so the feed
