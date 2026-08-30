@@ -411,6 +411,37 @@ def _collapse(bar):
     return _scale_collapse_detail(bar, row)
 
 
+def test_every_detail_field_is_written_in_the_same_notation():
+    """A flag an operator has to squint at is a flag that does not get worked.
+
+    Decimal.__str__ switches to scientific notation below 1e-6, which is exactly the
+    band this check reports on. Rendering with str() therefore wrote a source_high of
+    "8.01E-7" beside a scale of "0.000001" -- the two numbers the operator is being
+    asked to compare, in two different notations, one of them off by a factor the eye
+    does not supply. Every field is fixed-point.
+    """
+    detail = _collapse(
+        {
+            "date": "2016-10-31",
+            "open": "0.000000788",
+            "high": "0.000000801",
+            "low": "0.000000732",
+            "close": "0.000000733",
+            "volume": "0",
+        }
+    )
+    assert detail is not None
+    assert detail["source_high"] == "0.000000801"
+    assert detail["source_low"] == "0.000000732"
+    for field, rendered in detail.items():
+        assert "E" not in rendered.upper(), f"{field} is in scientific notation"
+    # Fixed-point, but still exact -- not rounded for display. If it were, the range
+    # this flag exists to report would be the first casualty.
+    assert Decimal(detail["source_range"]) == Decimal(detail["source_high"]) - Decimal(
+        detail["source_low"]
+    )
+
+
 def test_a_flattened_bar_is_detected():
     detail = _collapse(
         {
