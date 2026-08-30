@@ -1061,19 +1061,50 @@ as §8.1.
 A dump on the same disk does not survive losing the server. Push it to a Hetzner
 **Storage Box** (SFTP/rsync/BorgBackup) or **Object Storage** (S3-compatible):
 
-```bash
-# Storage Box, key-based. Accept the host key and prove the key works ONCE, by
-# hand -- the timer runs with ProtectHome=read-only and ssh BatchMode=yes, so it
-# can neither answer a prompt nor write ~/.ssh/known_hosts.
-sudo -u fafnir -H ssh-keygen -t ed25519 -N '' -f ~fafnir/.ssh/id_ed25519
-sudo -u fafnir -H ssh-copy-id -s u123456@u123456.your-storagebox.de   # -s: Storage Box
-sudo -u fafnir -H FAFNIR_BACKUP_REMOTE=u123456@u123456.your-storagebox.de:/home/fafnir-backups/ \
-  /opt/fafnir/scripts/backup_offsite.sh --dry-run
+> ### `u123456` is a placeholder
+> Substitute the Storage Box username from the Hetzner console. Hetzner has
+> wildcard DNS on `*.your-storagebox.de`, so the literal example **resolves** and
+> fails later, at host-key or authentication, rather than at DNS — which makes it
+> look like a configuration problem rather than a copy-paste one.
 
-# Then schedule it (Mon..Sat 04:45 America/New_York, ordered after the dump):
+> ### Use port 23, not 22
+> A Storage Box answers on both, with different services: `22` is `mod_sftp`
+> (SFTP only) and `23` is real OpenSSH. rsync works by executing an rsync process
+> on the far end, so it needs the shell on **23**; on 22 it fails after a
+> successful handshake with nothing useful in the message. The two ports also
+> present different host keys, so `known_hosts` entries are port-qualified
+> (`[host]:23`). `backup_offsite.sh` defaults to 23 for any `*.your-storagebox.de`
+> destination.
+
+The timer runs with `ProtectHome=read-only` and ssh `BatchMode=yes`, so it can
+neither answer a prompt nor write `known_hosts`. Do the trust-on-first-use step
+by hand, once, as the service user — the **host key first**, because
+`ssh-copy-id` needs it too:
+
+```bash
+# 1. A key for the service user (-H so HOME is /var/lib/fafnir, not root's).
+sudo -u fafnir -H ssh-keygen -t ed25519 -N '' -f ~fafnir/.ssh/id_ed25519
+
+# 2. Trust the host key. This prints the fingerprints first -- compare them
+#    against the Hetzner console before accepting.
+sudo -u fafnir -H /opt/fafnir/scripts/backup_offsite.sh \
+  --remote u123456@u123456.your-storagebox.de:/home/fafnir-backups/ \
+  --accept-host-key --dry-run
+
+# 3. Install the public key on the box, then re-run the dry run: it should list
+#    the dumps rather than fail.
+sudo -u fafnir -H ssh-copy-id -s -p 23 u123456@u123456.your-storagebox.de
+sudo -u fafnir -H /opt/fafnir/scripts/backup_offsite.sh \
+  --remote u123456@u123456.your-storagebox.de:/home/fafnir-backups/ --dry-run
+
+# 4. Schedule it (Mon..Sat 04:45 America/New_York, ordered after the dump).
 sudo FAFNIR_BACKUP_REMOTE=u123456@u123456.your-storagebox.de:/home/fafnir-backups/ \
   scripts/install_timers.sh offsite
 ```
+
+`rsync` reports every ssh-layer failure as the same opaque exit 255;
+`backup_offsite.sh` catches it and lists the four causes that actually produce
+it (untrusted host key, missing public key, wrong port, placeholder username).
 
 [`scripts/backup_offsite.sh`](../scripts/backup_offsite.sh) mirrors with
 `--delete`, so the remote matches local retention — and it refuses to run when
