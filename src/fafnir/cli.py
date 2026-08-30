@@ -11,6 +11,8 @@ Examples
     fafnir source probe-fund VFIAX && fafnir track add VFIAX --note "core sleeve"
     fafnir ingest tracked
     fafnir ingest actions --symbols AAPL && fafnir adjust
+    fafnir source probe-actions && fafnir ingest actions --mode auto
+    fafnir adjust --changed
     fafnir db refresh-marts
     fafnir dq run
     fafnir dq list --detail --check gap --symbol AAPL
@@ -400,23 +402,92 @@ def ingest_delisted(ctx, full):
 
 
 @ingest.command("actions")
-@click.option("--symbols", help="Comma-separated symbols (default: all securities)")
+@click.option("--symbols", help="Comma-separated symbols (always pulled per symbol)")
+@click.option(
+    "--mode",
+    type=click.Choice(["symbol", "calendar", "auto"]),
+    default=None,
+    help="How to fetch [default: general.actions_mode, initially 'symbol']. "
+    "symbol = full history per security every run; calendar = market-wide "
+    "splits-calendar/dividends-calendar sweep against a watermark; auto = "
+    "calendar, plus per-symbol for what it cannot cover (funds).",
+)
+@click.option(
+    "--include-inactive",
+    is_flag=True,
+    help="Also pull delisted securities. A delisted security can never have "
+    "another corporate action, so the nightly job leaves them out.",
+)
+@click.option(
+    "--reconcile-buckets",
+    type=int,
+    default=None,
+    help="Reconcile 1/N of the universe per run against the per-symbol feed "
+    "(0 disables) [default: general.actions_reconcile_buckets].",
+)
+@click.option("--as-of", help="Treat this date as today (YYYY-MM-DD). Testing/replay.")
 @click.pass_context
-def ingest_actions(ctx, symbols):
-    """Load corporate actions (splits + dividends)."""
+def ingest_actions(ctx, symbols, mode, include_inactive, reconcile_buckets, as_of):
+    """Load corporate actions (splits + dividends).
+
+    Incremental by default once `general.actions_mode` is switched to `auto`: one
+    market-wide calendar sweep against a watermark instead of a full history pull
+    per security. See doc/adr/0007-incremental-corporate-actions.md, and run
+    `fafnir source probe-actions` before switching.
+    """
     from fafnir.ingest import corporate_actions
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
+    mode = mode or cfg.actions_mode
+    buckets = (
+        cfg.actions_reconcile_buckets
+        if reconcile_buckets is None
+        else reconcile_buckets
+    )
     with Database(cfg.dsn) as database:
-        syms = _split_symbols(symbols) or [
-            r["primary_symbol"]
-            for r in database.fetchall(
-                "SELECT primary_symbol FROM core.security ORDER BY security_id"
-            )
-        ]
-        n = corporate_actions.load_actions(database, fmp, syms)
-    click.echo(f"Loaded {n} corporate actions for {len(syms)} symbols.")
+        result = corporate_actions.run_actions(
+            database,
+            fmp,
+            mode=mode,
+            symbols=_split_symbols(symbols),
+            as_of=_parse_date(as_of),
+            overlap_days=cfg.actions_overlap_days,
+            reconcile_buckets=buckets,
+            include_inactive=include_inactive,
+        )
+    click.echo(
+        f"Loaded {result.upserted} corporate actions "
+        f"({result.changed} new or changed, across "
+        f"{len(result.changed_security_ids)} securities). "
+        f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}"
+    )
+    if result.mode != "symbol":
+        click.echo(
+            f"Calendar sweep: {result.calendar_rows} rows "
+            f"({result.unresolved_rows} for symbols outside this universe). "
+            f"Per-symbol pulls: {result.symbols_pulled} "
+            f"({result.first_loaded} with no prior history)."
+        )
+    if result.future_skipped:
+        click.echo(
+            f"{result.future_skipped} declared action(s) had not gone ex yet and "
+            "were not stored -- they load on their ex-date."
+        )
+    if result.reconciled:
+        click.echo(
+            f"Reconciled {result.reconciled} securities against the per-symbol "
+            f"feed; {result.drift} disagreed."
+        )
+    if result.drift:
+        click.echo(
+            "Drift means the calendar sweep missed something. The rows were "
+            "repaired; the securities are flagged as 'corporate_action_drift' in "
+            "ops.data_quality_flag. See `fafnir dq list --check "
+            "corporate_action_drift --detail`."
+        )
+    if result.changed_security_ids:
+        click.echo("Recompute their factors with `fafnir adjust --changed`.")
 
 
 @main.group()
@@ -573,15 +644,26 @@ def track_rm(ctx, symbol, closed_on):
 
 @main.command("adjust")
 @click.option("--symbol", help="Recompute one symbol only (default: all with actions)")
+@click.option(
+    "--changed",
+    is_flag=True,
+    help="Recompute only the securities the last corporate-actions run changed. "
+    "This is the nightly path: a few hundred securities instead of every one "
+    "that has ever had an action.",
+)
 @click.pass_context
-def adjust(ctx, symbol):
+def adjust(ctx, symbol, changed):
     """Recompute adjustment factors from corporate actions."""
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
+    from fafnir.ingest.corporate_actions import ENDPOINT as ACTIONS_ENDPOINT
 
     cfg = ctx.obj["config"]
+    if symbol and changed:
+        raise click.ClickException("--symbol and --changed are mutually exclusive.")
     with Database(cfg.dsn) as database:
         sec_id = None
+        sec_ids = None
         if symbol:
             sec_id = repo.resolve_security_id(database, symbol.upper())
             if sec_id is None:
@@ -590,7 +672,26 @@ def adjust(ctx, symbol):
                 raise click.ClickException(
                     f"Unknown symbol {symbol.upper()}: not in the security master."
                 )
-        result = adjustments.adjust_all(database, security_id=sec_id)
+        elif changed:
+            run_id = repo.latest_run_id(database, "fmp", ACTIONS_ENDPOINT)
+            if run_id is None:
+                # Falling through to "all" here would turn a cheap nightly step into
+                # a full recompute the first time the order of the job changed.
+                raise click.ClickException(
+                    "No corporate-actions run has been recorded, so there is no "
+                    "changed set to recompute. Run `fafnir ingest actions` first, "
+                    "or use `fafnir adjust` with no flags for a full recompute."
+                )
+            sec_ids = repo.securities_changed_by_run(database, run_id)
+            if not sec_ids:
+                click.echo(
+                    f"No corporate actions changed in run {run_id}; "
+                    "no factors to recompute."
+                )
+                return
+        result = adjustments.adjust_all(
+            database, security_id=sec_id, security_ids=sec_ids
+        )
     click.echo(f"Recomputed adjustment factors for {result['securities']} securities.")
     if not result["failed"]:
         return
@@ -1080,6 +1181,50 @@ def source_probe_fund(ctx, symbol, window_days):
         raise click.ClickException(
             "Fund NAV check FAILED -- do not declare funds until this is resolved. "
             "See doc/adr/0006-curated-fund-universe.md."
+        )
+
+
+@source.command("probe-actions")
+@click.option(
+    "--symbols",
+    default="AAPL,MSFT,KO,SPY",
+    show_default=True,
+    help="Comma-separated symbols to compare. Include a reliable dividend payer.",
+)
+@click.option(
+    "--days",
+    default=90,
+    show_default=True,
+    type=int,
+    help="Window to compare, ending today",
+)
+@click.pass_context
+def source_probe_actions(ctx, symbols, days):
+    """Confirm the market-wide action calendars match the per-symbol feeds.
+
+    Gate for `actions_mode = "auto"`. The calendar sweep replaces two requests per
+    security with two requests for the whole market, which is only sound if the
+    calendar carries the same events -- and if it does not, the failure is silent: a
+    missing dividend is not an error, it is an adjusted price series that is quietly
+    wrong. This pulls a sample both ways and diffs them.
+
+    Costs 2 + 2N requests and writes nothing. Probe a fund separately if you hold
+    any; a fund has no listing venue and the calendar is not assumed to reach it.
+    """
+    from fafnir.sources import probe
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    syms = _split_symbols(symbols) or []
+    if not syms:
+        raise click.ClickException("--symbols must name at least one symbol.")
+    report = probe.probe_actions(fmp, syms, days=days)
+    click.echo(probe.format_actions_report(report))
+    click.echo(f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}")
+    if report["verdict"] not in ("calendar_complete", "no_events"):
+        raise click.ClickException(
+            'Calendar coverage check FAILED -- keep `actions_mode = "symbol"`. '
+            "See doc/adr/0007-incremental-corporate-actions.md."
         )
 
 

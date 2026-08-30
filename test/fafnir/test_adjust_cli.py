@@ -47,7 +47,11 @@ def test_a_handful_of_failures_still_exits_zero(runner, monkeypatch):
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {"securities": 999, "failed": 1, "aborted": False},
+        lambda db, security_id=None, security_ids=None: {
+            "securities": 999,
+            "failed": 1,
+            "aborted": False,
+        },
     )
 
     result = _invoke(runner)
@@ -68,7 +72,7 @@ def test_a_universe_wide_failure_exits_nonzero(runner, monkeypatch):
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {
+        lambda db, security_id=None, security_ids=None: {
             "securities": 0,
             "failed": 21106,
             "aborted": False,
@@ -92,7 +96,11 @@ def test_one_bad_security_on_a_small_warehouse_is_not_systemic(runner, monkeypat
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {"securities": 49, "failed": 1, "aborted": False},
+        lambda db, security_id=None, security_ids=None: {
+            "securities": 49,
+            "failed": 1,
+            "aborted": False,
+        },
     )
 
     result = _invoke(runner)
@@ -107,7 +115,11 @@ def test_a_small_warehouse_failing_wholesale_is_still_systemic(runner, monkeypat
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {"securities": 5, "failed": 45, "aborted": False},
+        lambda db, security_id=None, security_ids=None: {
+            "securities": 5,
+            "failed": 45,
+            "aborted": False,
+        },
     )
 
     result = _invoke(runner)
@@ -125,7 +137,7 @@ def test_the_ratio_still_binds_on_the_full_universe(runner, monkeypatch):
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {
+        lambda db, security_id=None, security_ids=None: {
             "securities": 20606,
             "failed": 500,
             "aborted": False,
@@ -145,7 +157,7 @@ def test_an_unknown_symbol_is_an_error_not_the_whole_universe(runner, monkeypatc
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: called.append(security_id)
+        lambda db, security_id=None, security_ids=None: called.append(security_id)
         or {"securities": 0, "failed": 0},
     )
 
@@ -161,7 +173,11 @@ def test_an_early_abort_exits_nonzero(runner, monkeypatch):
     monkeypatch.setattr(
         adjustments,
         "adjust_all",
-        lambda db, security_id=None: {"securities": 0, "failed": 50, "aborted": True},
+        lambda db, security_id=None, security_ids=None: {
+            "securities": 0,
+            "failed": 50,
+            "aborted": True,
+        },
     )
 
     result = _invoke(runner)

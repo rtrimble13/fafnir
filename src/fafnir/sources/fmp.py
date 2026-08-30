@@ -51,6 +51,12 @@ class FMPClient(BaseSource):
     EP_EOD_SPLIT_ADJUSTED = "historical-price-eod/full"
     EP_SPLITS = "splits"
     EP_DIVIDENDS = "dividends"
+    # Market-wide corporate-action calendars: one request returns every symbol's
+    # events in a date window, which is the whole point (ADR 0007). The per-symbol
+    # endpoints above take no window, so a watermark cannot narrow them -- the cost
+    # of that path is the request count, not the payload.
+    EP_SPLITS_CALENDAR = "splits-calendar"
+    EP_DIVIDENDS_CALENDAR = "dividends-calendar"
     EP_SECTORS = "available-sectors"
     EP_INDUSTRIES = "available-industries"
     EP_SCREENER = "company-screener"
@@ -71,6 +77,13 @@ class FMPClient(BaseSource):
     # 1990-to-now backfill.
     EOD_MAX_ROWS = 5000
     EOD_CHUNK_DAYS = 5475
+
+    # The calendar endpoints document a maximum 3-month span between `from` and
+    # `to`. 80 days leaves headroom under the shortest reading of "3 months"
+    # (Dec 1 - Feb 28 is 89) without needing a calendar-aware calculation. A
+    # nightly sweep asks for one short window and costs one request per endpoint;
+    # only a catch-up after an outage pays for extra slices.
+    ACTIONS_CHUNK_DAYS = 80
 
     def __init__(self, api_key: str, rate_per_min: int = 280, **kwargs):
         if not api_key:
@@ -340,6 +353,56 @@ class FMPClient(BaseSource):
         if isinstance(data, dict) and "historical" in data:
             return data["historical"]
         return data if isinstance(data, list) else []
+
+    def _actions_calendar(
+        self, endpoint: str, from_date: date, to_date: date
+    ) -> list[dict]:
+        """Every symbol's events on one calendar endpoint, over an arbitrary window.
+
+        Slices the window into ``ACTIONS_CHUNK_DAYS`` pieces and stitches them,
+        because the endpoint caps the span between ``from`` and ``to``. Rows are
+        deduplicated on (symbol, date) so a vendor-side boundary repeat between two
+        slices does not become two events for one ex-date.
+        """
+        if to_date < from_date:
+            return []
+        by_key: dict[tuple[str, str], dict] = {}
+        cursor = from_date
+        while cursor <= to_date:
+            window_end = min(
+                cursor + timedelta(days=self.ACTIONS_CHUNK_DAYS - 1), to_date
+            )
+            data, _, _ = self._call(
+                endpoint,
+                {"from": cursor.isoformat(), "to": window_end.isoformat()},
+            )
+            if isinstance(data, dict) and "historical" in data:
+                data = data["historical"]
+            if isinstance(data, list):
+                for row in data:
+                    if not isinstance(row, dict):
+                        continue
+                    key = (
+                        str(row.get("symbol") or ""),
+                        str(row.get("date") or "")[:10],
+                    )
+                    if key[0] and key[1]:
+                        by_key[key] = row
+            cursor = window_end + timedelta(days=1)
+        return [by_key[k] for k in sorted(by_key)]
+
+    def splits_calendar(self, from_date: date, to_date: date) -> list[dict]:
+        """Every split going ex in the window, across the whole market."""
+        return self._actions_calendar(self.EP_SPLITS_CALENDAR, from_date, to_date)
+
+    def dividends_calendar(self, from_date: date, to_date: date) -> list[dict]:
+        """Every dividend going ex in the window, across the whole market.
+
+        Note that a row appears here when the dividend is **declared**, so a window
+        reaching into the future returns events that have not gone ex yet. The
+        caller must not store those -- see ``fafnir.ingest.corporate_actions``.
+        """
+        return self._actions_calendar(self.EP_DIVIDENDS_CALENDAR, from_date, to_date)
 
     # -- taxonomy -----------------------------------------------------------
     def sectors(self) -> list[str]:

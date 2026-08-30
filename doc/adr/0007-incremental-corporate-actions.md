@@ -1,7 +1,8 @@
 # ADR 0007: Corporate actions load incrementally (market-wide calendar sweep)
 
-- Status: Proposed
+- Status: Accepted (implemented; **adoption gated** — see *Implementation status*)
 - Date: 2026-08-29
+- Implemented: 2026-08-30
 - Depends on: [ADR 0001](0001-raw-prices-plus-adjustment-factors.md),
   [ADR 0004](0004-unadjusted-price-feed.md),
   [ADR 0006](0006-curated-fund-universe.md)
@@ -245,6 +246,67 @@ price. It is option 4's mechanism used for what it is good at.
 | `landing.fmp_raw` rows/night | ~42,800 | ~2 + reconciliation |
 | Securities recomputed by `adjust` | all with actions | those that changed |
 
+## Implementation status
+
+All of it is built and tested. What is **not** done is the switch, because it cannot
+be: adoption is gated on `fafnir source probe-actions` passing against a live API key,
+which only the operator has.
+
+| Piece | Where |
+|---|---|
+| `splits-calendar` / `dividends-calendar`, window-chunked | `FMPClient.splits_calendar` / `.dividends_calendar` |
+| Sweep, first-load, funds, reconciliation, mode dispatch | `fafnir.ingest.corporate_actions` |
+| Whole-endpoint + per-security watermarks | `ops.load_watermark` as-is — **no migration** |
+| Future-ex-date guard | `corporate_actions._within_horizon` |
+| Changed-set | `repo.upsert_corporate_action` returns whether it wrote |
+| Scoped recompute | `fafnir adjust --changed` |
+| Adoption gate | `fafnir source probe-actions` |
+| Config | `[general] actions_mode`, `actions_overlap_days`, `actions_reconcile_buckets` |
+
+`actions_mode` ships as `"symbol"` — the pre-ADR behaviour, minus the delisted names
+(below). To adopt:
+
+```bash
+fafnir source probe-actions                 # gate; writes nothing, exits non-zero on fail
+fafnir source probe-fund <YOUR FUND>        # only if you hold funds
+# then in ~/.fafnirrc:  [general]  actions_mode = "auto"
+```
+
+`scripts/daily_update.sh` and `scripts/initial_backfill.sh` are already wired for both
+modes; nothing about them changes when the flag flips.
+
+### Three things the implementation settled that the proposal left open
+
+**The future-ex-date guard was already needed.** The hazard was written up as something
+the *calendar* introduces. It is not: the per-symbol `dividends` endpoint returns
+declared-but-not-yet-ex rows too, so the original loader has been able to store a future
+ex-date all along. Putting the clamp in the shared transform rather than in the sweep
+fixes the existing path as well.
+
+**The reconciliation repairs as well as reports.** The proposal said "diff rather than
+blindly upsert", to keep a coverage gap from being papered over. Shipped: it does both.
+The `corporate_action_drift` flag is the evidence and it names the security; leaving
+known-wrong data in place to make a point would be the worse trade, and "quarantine the
+anomaly, fix the data" is what the rest of the system already does.
+
+**Only settled events are judged for drift.** The first end-to-end run flagged an event
+as `withdrawn_by_source` that had merely not reached both feeds yet. The two do not
+update in lockstep, so comparing a same-night ex-date reports drift for every security
+that just went ex, every night — the queue-degrades-into-a-log failure that
+`add_dq_flag_once` and migration 0016 exist to prevent. Drift is therefore only reported
+for ex-dates older than `actions_overlap_days`; anything newer is still repaired, just
+not called a discrepancy.
+
+### How the changed-set is computed
+
+`fafnir adjust --changed` needs "this run changed these securities" to be a true
+statement, and an unconditional `ON CONFLICT DO UPDATE` rewrites every row it touches —
+which would make the changed set the whole universe and the incremental recompute a full
+one wearing a different flag. So the upsert carries a `WHERE ... IS DISTINCT FROM` that
+suppresses a no-op write, and `ingestion_run_id` / `loaded_at` are now stamped only when
+the row actually moves. `core.corporate_action.ingestion_run_id` therefore means "the run
+that last changed this action" rather than "the run that last looked at it".
+
 ## Before adopting: probe the feed
 
 This repository does not adopt an endpoint on the strength of its documentation — see
@@ -303,12 +365,17 @@ Professional plan, and whether a bulk splits/dividends download (option 7) is av
 
 ## Rollout
 
-1. `probe-actions` on a sample spanning equity, ETF and fund. **Gate.**
-2. Ship the active-only symbol list plus `--include-inactive` (option 1) — independent of
-   everything above, ~60% off tonight.
-3. Add the calendar client methods and the probe.
-4. Add the sweep behind `fafnir ingest actions --mode symbol|calendar|auto`, defaulting to
-   `symbol`. Run both nightly for a week and diff.
-5. Flip the default to `auto`, add the reconciliation rotation, update
-   `scripts/daily_update.sh` and `doc/ingestion.md`.
-6. Then scope `fafnir adjust` to the changed set.
+- [x] Active-only symbol list plus `--include-inactive` — independent of everything
+      else, and in effect now: ~60% off the nightly cost with no behaviour to verify,
+      because a delisted security cannot have another corporate action.
+- [x] Calendar client methods, window-chunked under the 3-month cap.
+- [x] The sweep, first-load, fund and reconciliation paths behind
+      `fafnir ingest actions --mode symbol|calendar|auto`, defaulting to `symbol`.
+- [x] `fafnir source probe-actions`, exiting non-zero so it can gate a script.
+- [x] `fafnir adjust --changed`, and `daily_update.sh` using it.
+- [ ] **Operator:** run `probe-actions` against a live key. If it passes, set
+      `actions_mode = "auto"`. If it does not, the verdict says which asset type to
+      keep on the per-symbol path — do not flip.
+- [ ] **Operator:** watch `corporate_action_drift` for the first month. An empty queue
+      after a full reconciliation cycle is the evidence that the sweep is complete;
+      that is the point at which this decision is confirmed rather than merely made.

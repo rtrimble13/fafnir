@@ -712,3 +712,197 @@ def format_fund_report(report: dict[str, Any]) -> str:
             f"  {report['detail']}",
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# Corporate-actions coverage probe (ADR 0007)
+# ---------------------------------------------------------------------------
+#
+# The market-wide calendar sweep rests on one assumption: that
+# `splits-calendar` / `dividends-calendar` carry the same events, with the same
+# values, that the per-symbol `splits` / `dividends` endpoints do. If they do not,
+# the failure is silent -- a missing dividend is not an error, it is an adjusted
+# price series that is quietly wrong, and nothing in the warehouse would say so.
+#
+# fafnir does not adopt an endpoint on the strength of its documentation (see
+# probe_prices and probe_fund_nav above). This is the same gate for the same
+# reason, and it writes nothing.
+
+
+def _action_key(rec: dict, kind: str) -> Optional[tuple]:
+    """Identify one action for comparison: (kind, ex_date, the values that matter).
+
+    Values are compared as Decimals, not floats or strings, so that 2 and 2.000000
+    are the same split and 0.24 and 0.2400 the same dividend -- a spurious mismatch
+    would fail the probe for a formatting difference and stall the rollout.
+    """
+    when = _bar_date(rec)
+    if when is None:
+        return None
+    if kind == "split":
+        num = _decimal(rec.get("numerator", rec.get("splitTo")))
+        den = _decimal(rec.get("denominator", rec.get("splitFrom")))
+        if num is None or den is None or not num or not den:
+            return None
+        return ("split", when, num / den)
+    amount = _decimal(rec.get("dividend"))
+    if amount is None:
+        amount = _decimal(rec.get("adjDividend"))
+    if amount is None:
+        return None
+    return ("dividend", when, amount)
+
+
+def _in_window(keys: set, start: date, end: date) -> set:
+    return {k for k in keys if start <= k[1] <= end}
+
+
+def probe_actions(fmp, symbols: list[str], days: int = 90) -> dict[str, Any]:
+    """Check the market-wide action calendars against the per-symbol endpoints.
+
+    Pulls each symbol both ways over the same window and diffs the events. Returns a
+    report dict; ``verdict`` is one of:
+
+      ``calendar_complete``   -- every per-symbol event in the window appears on the
+                                calendar with equal values. Adopt the sweep.
+      ``calendar_incomplete`` -- the calendar omits events the per-symbol feed has.
+                                **Stop.** Keep the per-symbol path for the affected
+                                asset type; the sweep would silently lose them.
+      ``field_mismatch``      -- the same events, but different values or a payload
+                                whose fields the transform does not read. Fix the
+                                transform, then re-probe.
+      ``no_events``           -- nothing went ex in the window, so the two feeds
+                                cannot be told apart. Widen --days or pick a payer.
+
+    Costs ``2 + 2N`` requests and writes nothing. Note that the calendar is fetched
+    to ``today`` even though the loader stores nothing past the ex-date: the probe is
+    asking what the feed contains, not what fafnir would keep.
+    """
+    end = date.today()
+    start = end - timedelta(days=days)
+
+    calendar: dict[str, set] = {}
+    for kind, rows in (
+        ("split", fmp.splits_calendar(start, end)),
+        ("dividend", fmp.dividends_calendar(start, end)),
+    ):
+        for rec in rows:
+            sym = str(rec.get("symbol") or "").strip().upper()
+            key = _action_key(rec, kind)
+            if sym and key is not None:
+                calendar.setdefault(sym, set()).add(key)
+
+    report: dict[str, Any] = {
+        "symbols": symbols,
+        "window_from": start,
+        "window_to": end,
+        "calendar_symbols": len(calendar),
+        "calendar_events": sum(len(v) for v in calendar.values()),
+        "per_symbol": [],
+        "missing_total": 0,
+        "extra_total": 0,
+        "matched_total": 0,
+        "verdict": "no_events",
+        "detail": "",
+    }
+
+    for symbol in symbols:
+        symbol = symbol.strip().upper()
+        direct: set = set()
+        for kind, rows in (
+            ("split", fmp.splits(symbol)),
+            ("dividend", fmp.dividends(symbol)),
+        ):
+            for rec in rows:
+                key = _action_key(rec, kind)
+                if key is not None:
+                    direct.add(key)
+        direct = _in_window(direct, start, end)
+        from_calendar = _in_window(calendar.get(symbol, set()), start, end)
+
+        # Missing is the finding that stops the rollout: an event the per-symbol feed
+        # knows about and the calendar does not is an event the sweep would never
+        # load. Extra is the reverse and is informational -- the calendar carrying
+        # more than the per-symbol endpoint costs nothing.
+        missing = sorted(direct - from_calendar)
+        extra = sorted(from_calendar - direct)
+        report["per_symbol"].append(
+            {
+                "symbol": symbol,
+                "per_symbol_events": len(direct),
+                "calendar_events": len(from_calendar),
+                "matched": len(direct & from_calendar),
+                "missing_from_calendar": [f"{k[0]} {k[1]} {k[2]}" for k in missing],
+                "extra_on_calendar": [f"{k[0]} {k[1]} {k[2]}" for k in extra],
+            }
+        )
+        report["missing_total"] += len(missing)
+        report["extra_total"] += len(extra)
+        report["matched_total"] += len(direct & from_calendar)
+
+    total_direct = sum(r["per_symbol_events"] for r in report["per_symbol"])
+    if total_direct == 0 and report["calendar_events"] == 0:
+        report["detail"] = (
+            f"No splits or dividends on either feed for {', '.join(symbols)} in the "
+            f"last {days} days, so the two cannot be compared. Widen --days, or "
+            "probe a reliable dividend payer (KO, JNJ, SPY)."
+        )
+        return report
+
+    if report["missing_total"]:
+        report["verdict"] = "calendar_incomplete"
+        report["detail"] = (
+            f"{report['missing_total']} event(s) are on the per-symbol feed and not "
+            "on the calendar. The sweep would lose them silently, and every adjusted "
+            "price before the missing ex-date would be wrong. Keep "
+            '`actions_mode = "symbol"` for the affected asset type.'
+        )
+    elif total_direct and report["matched_total"] < total_direct:
+        report["verdict"] = "field_mismatch"
+        report["detail"] = (
+            "The calendar carries the same ex-dates with different values. Reconcile "
+            "the field names in fafnir.ingest.corporate_actions before adopting."
+        )
+    elif report["matched_total"]:
+        report["verdict"] = "calendar_complete"
+        report["detail"] = (
+            f"All {report['matched_total']} event(s) matched. Set "
+            '`actions_mode = "auto"` in [general]. Funds stay on the per-symbol '
+            "path regardless -- they have no listing venue, so this probe cannot "
+            "speak for them unless you probed one."
+        )
+    else:
+        report["detail"] = (
+            "The calendar returned events but the per-symbol feed had none in the "
+            "window, so there is nothing to verify against. Widen --days."
+        )
+    return report
+
+
+def format_actions_report(report: dict[str, Any]) -> str:
+    """Render a corporate-actions coverage probe for the terminal."""
+    ok = {"calendar_complete": "PASS", "no_events": "INCONCLUSIVE"}
+    status = ok.get(report["verdict"], "FAIL")
+    lines = [
+        f"FMP corporate-actions coverage probe: "
+        f"{report['window_from']} .. {report['window_to']}",
+        f"  calendar feeds: {report['calendar_events']} events across "
+        f"{report['calendar_symbols']} symbols",
+        "",
+    ]
+    for row in report["per_symbol"]:
+        lines.append(
+            f"  {row['symbol']:<8} per-symbol {row['per_symbol_events']:>3}"
+            f"   calendar {row['calendar_events']:>3}"
+            f"   matched {row['matched']:>3}"
+        )
+        for missed in row["missing_from_calendar"]:
+            lines.append(f"      MISSING from calendar: {missed}")
+        for extra in row["extra_on_calendar"]:
+            lines.append(f"      only on calendar     : {extra}")
+    lines += [
+        "",
+        f"  {status}: {report['verdict']}",
+        f"  {report['detail']}",
+    ]
+    return "\n".join(lines)

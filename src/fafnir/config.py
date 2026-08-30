@@ -132,6 +132,36 @@ class FafnirConfig:
         return int(self._get("general", "overlap_days", 5))
 
     @property
+    def actions_overlap_days(self) -> int:
+        """Re-sweep window (days) on the corporate-actions calendar.
+
+        Wider than ``overlap_days`` because a dividend is amended later than a price
+        is corrected: the declared amount, the record date and the payment date can
+        all move after the event first appears on the feed.
+        """
+        return int(self._get("general", "actions_overlap_days", 7))
+
+    @property
+    def actions_mode(self) -> str:
+        """How `fafnir ingest actions` fetches: ``symbol``, ``calendar`` or ``auto``.
+
+        Defaults to ``symbol`` -- the pre-ADR-0007 behaviour -- because adopting the
+        market-wide calendar is gated on `fafnir source probe-actions` passing
+        against a live key, which only the operator has. Flip to ``auto`` once it does.
+        """
+        value = str(self._get("general", "actions_mode", "symbol")).strip().lower()
+        return value if value in ("symbol", "calendar", "auto") else "symbol"
+
+    @property
+    def actions_reconcile_buckets(self) -> int:
+        """Reconcile 1/N of the universe per night against the per-symbol feed.
+
+        0 disables the rotation. The default 30 reaches every security monthly at
+        roughly 1.3% of a full nightly refresh.
+        """
+        return max(0, int(self._get("general", "actions_reconcile_buckets", 30)))
+
+    @property
     def calendar_start_year(self) -> int:
         return int(self._get("general", "calendar_start_year", 2015))
 

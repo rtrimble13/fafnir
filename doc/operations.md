@@ -68,7 +68,9 @@ The first four steps are **universe maintenance**, and their order is load-beari
 Bandwidth: the security-master refresh is ~5 screener requests per venue-page pass
 (a few MB), once a night. The declared universe costs one `profile` request per
 tracked symbol, plus the usual price/splits/dividends calls — about four requests a
-night per fund, which is noise against the budget.
+night per fund, which is noise against the budget. Requests, not bytes, are the
+constraint on the nightly window; see *Switching corporate actions to the incremental
+path* below for the step that dominates it.
 
 ### Tracking a mutual fund
 
@@ -77,7 +79,7 @@ fafnir source probe-fund VFIAX        # FIRST -- confirm the NAV series is raw
 fafnir track add VFIAX --note "core US equity sleeve"
 fafnir ingest tracked                 # mints it (the nightly job also does this)
 fafnir ingest prices --symbols VFIAX  # no watermark yet -> full history
-fafnir ingest actions --symbols VFIAX && fafnir adjust
+fafnir ingest actions --symbols VFIAX && fafnir adjust --symbol VFIAX
 fafnir track list                     # what is declared, and whether it is loaded
 ```
 
@@ -92,6 +94,37 @@ To stop tracking one, say which kind of stopping it is. `fafnir track rm VFIAX`
 halts the pulls and leaves the security active — so `dq run` will flag it stale
 every night. `fafnir track rm VFIAX --closed 2027-03-31` retires it the ordinary
 way: `delisted_date` stamped, ticker period closed, every bar kept.
+
+### Switching corporate actions to the incremental path
+
+`ingest actions` ships in `symbol` mode: a full split and dividend history for every
+active security, every night. That is ~16,000 requests and about an hour of the nightly
+window to capture a few hundred changed rows, and the only reason it is still the
+default is that the alternative has to be verified against your own API key first.
+
+```bash
+fafnir source probe-actions                  # 2 + 2N requests, writes nothing
+fafnir source probe-fund <YOUR FUND>         # only if you hold funds
+```
+
+On `calendar_complete`, set `actions_mode = "auto"` in `[general]`. The nightly job then
+costs ~2 requests plus a first-load for anything newly minted and a 1/30 reconciliation
+slice, and `daily_update.sh` needs no edit. On any other verdict, leave it alone — the
+verdict names what is missing, and a sweep that silently drops a dividend is worse than
+an hour of requests.
+
+For the first month, watch the reconciliation:
+
+```sql
+SELECT security_id, record_key, detail FROM ops.data_quality_flag
+WHERE check_name = 'corporate_action_drift' AND resolved_at IS NULL;
+```
+
+An empty queue after a full 30-night cycle means every security has been checked against
+the per-symbol feed and the sweep agreed. That is the evidence the switch was right;
+until then it is only a reasonable bet. Rows in it name the securities where the calendar
+missed something — the data is already repaired, the flag is telling you the sweep cannot
+be trusted for that asset type.
 
 > **First run after upgrading.** A deployment whose universe was built with
 > `--limit` (the README quick start uses `--limit 500`) gets the *rest* of the
@@ -310,6 +343,14 @@ want it to stay closed.
 `scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the
 warehouse to catch silent drift (re-adjustments, late corrections). Run weekly over
 a rotating sample. It reports differences; it does not auto-overwrite.
+
+Corporate actions have their own automatic version of this, and it is not optional
+housekeeping: in `calendar`/`auto` mode it is the only thing that can detect a gap in
+the market-wide feed. `ingest actions` reconciles 1/`actions_reconcile_buckets` of the
+universe against the per-symbol endpoints on every run, repairs what it finds and
+raises `corporate_action_drift`. Setting the bucket count to 0 turns that off and
+leaves the sweep unverified — do that only while running in `symbol` mode, where there
+is nothing to verify.
 
 It compares **raw** closes, and both sides are unadjusted — `core.daily_price` on one
 side, FMP's `historical-price-eod/non-split-adjusted` on the other — so a split in

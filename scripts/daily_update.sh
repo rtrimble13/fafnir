@@ -66,11 +66,21 @@ fafnir ingest delisted
 echo "==> Incremental prices (active universe)"
 fafnir ingest prices
 
+# Incremental once `actions_mode` is "auto" in the config: one market-wide calendar
+# sweep against a watermark, a full pull only for securities that have never had one,
+# and a 1/30 slice reconciled against the per-symbol feed so a vendor coverage gap
+# surfaces on a schedule rather than as a quietly wrong adjusted price. Until then it
+# is the original full refresh, minus the delisted names it could never learn anything
+# new about. Gate the switch on `fafnir source probe-actions`. See ADR 0007.
 echo "==> Corporate actions"
 fafnir ingest actions
 
-echo "==> Recompute adjustment factors"
-fafnir adjust
+# Only the securities whose actions actually moved tonight. A full recompute walks
+# every security that has ever had an action and re-queries a prior close per dividend
+# -- a second full refresh chained onto the first. `fafnir adjust` with no flags stays
+# the backfill path and the way to rebuild after a schema or factor-logic change.
+echo "==> Recompute adjustment factors (changed securities only)"
+fafnir adjust --changed
 
 echo "==> Refresh marts"
 fafnir db refresh-marts

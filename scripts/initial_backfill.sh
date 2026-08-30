@@ -52,8 +52,13 @@ fafnir ingest delisted --full
 echo "==> [5/8] Daily prices from ${FROM_DATE} (resumable via watermarks)"
 fafnir ingest prices --from "${FROM_DATE}" --include-inactive
 
-echo "==> [6/8] Corporate actions"
-fafnir ingest actions
+# Explicitly per-symbol and explicitly including delisted names. This is the run that
+# mints the per-security corporate-actions watermarks the nightly calendar sweep then
+# relies on -- a security with no watermark is one the sweep knows nothing about and
+# would pull in full every night. --include-inactive for the same reason the price step
+# above uses it: a history containing only the survivors overstates every backtest.
+echo "==> [6/8] Corporate actions (full history, all securities)"
+fafnir ingest actions --mode symbol --include-inactive
 
 echo "==> [7/8] Recompute adjustment factors"
 fafnir adjust
