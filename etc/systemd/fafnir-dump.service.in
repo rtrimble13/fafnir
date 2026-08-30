@@ -1,0 +1,28 @@
+[Unit]
+Description=fafnir nightly logical dump (pg_dump -Fc)
+Documentation=file://@FAFNIR_HOME@/doc/install_hetzner.md
+After=postgresql.service
+Wants=postgresql.service
+# Never dump halfway through a load: if the daily update is still running when
+# this fires, systemd queues this job until it finishes rather than interleaving.
+After=fafnir-daily.service
+
+[Service]
+Type=oneshot
+User=@FAFNIR_USER@
+Group=@FAFNIR_GROUP@
+WorkingDirectory=@FAFNIR_HOME@
+EnvironmentFile=@ENV_FILE@
+Environment=FAFNIR_BACKUP_DIR=@BACKUP_DIR@
+Environment=FAFNIR_BACKUP_RETAIN_DAYS=@BACKUP_RETAIN_DAYS@
+ExecStart=@FAFNIR_HOME@/scripts/backup_dump.sh
+StandardOutput=append:@LOG_DIR@/backup.log
+StandardError=append:@LOG_DIR@/backup.log
+TimeoutStartSec=4h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# ProtectSystem=full leaves /var writable, but say so explicitly: the dump
+# directory is the one thing this unit must be able to write.
+ReadWritePaths=@BACKUP_DIR@

@@ -1,0 +1,20 @@
+[Unit]
+Description=fafnir data-quality sweep
+Documentation=file://@FAFNIR_HOME@/doc/operations.md
+After=postgresql.service fafnir-daily.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=@FAFNIR_USER@
+Group=@FAFNIR_GROUP@
+WorkingDirectory=@FAFNIR_HOME@
+EnvironmentFile=@ENV_FILE@
+ExecStart=@FAFNIR_HOME@/scripts/run_dq_checks.sh @DQ_EXCHANGE@
+StandardOutput=append:@LOG_DIR@/dq.log
+StandardError=append:@LOG_DIR@/dq.log
+TimeoutStartSec=2h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

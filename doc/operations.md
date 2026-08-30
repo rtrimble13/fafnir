@@ -162,7 +162,15 @@ flag is only the notification.
 fafnir status                 # securities, price rows, latest date, open DQ flags
 fafnir dq list                # the open queue, by check and severity
 scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
+scripts/monitor.sh            # all of the below in one pass; non-zero if any tripped
 ```
+
+`scripts/monitor.sh` exists because the checks in this section are spread across
+the fafnir CLI, the OS and psql, which makes them easy to half-do at 8am. It runs
+the lot — status, the DQ queue, disk, timers, journal, backup age, failed runs,
+FMP bandwidth, `pg_stat_statements` — and reports; it changes nothing. Narrow it
+with section names (`scripts/monitor.sh disk timers backups`) or `--quiet` to see
+only what tripped.
 
 Things to watch:
 - **Open DQ is a count of problems, not of runs** — a standing condition is flagged
@@ -318,9 +326,20 @@ the compared window is not by itself a reason for the two to disagree.
 
 ## Backups
 
-The whole warehouse is rebuildable from `landing` + the sources, but back up at
-least `core` and `landing`:
+The whole warehouse is rebuildable from `landing` + the sources, but rebuilding
+costs hours and FMP bandwidth. Dumps are cheaper:
 
 ```bash
-pg_dump -Fc -n core -n landing -n ref fafnir > fafnir_$(date +%F).dump
+scripts/backup_dump.sh              # whole database, custom format, 14-day retention
+scripts/backup_dump.sh --globals    # + role definitions (needs a superuser connection)
+scripts/backup_offsite.sh           # push the dump directory off the server
 ```
+
+Dump **every** schema, not a hand-picked subset. Skipping `mart` because it is
+derived and `meta` because it is only bookkeeping gives you a restore that is not
+a working warehouse: `meta.schema_migration` is what stops `fafnir db migrate`
+re-applying every migration on the restored copy, and without the `mart` views
+there is nothing for `fafnir db refresh-marts` to refresh.
+
+Scheduling both, and practising the restore, are in
+[install_hetzner.md §9](install_hetzner.md#9-backups).

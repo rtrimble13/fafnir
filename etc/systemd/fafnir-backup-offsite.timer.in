@@ -1,0 +1,11 @@
+[Unit]
+Description=Push the fafnir dump directory off the server
+
+[Timer]
+Unit=fafnir-backup-offsite.service
+OnCalendar=@ONCALENDAR@
+Persistent=true
+RandomizedDelaySec=@RANDOMIZED_DELAY@
+
+[Install]
+WantedBy=timers.target

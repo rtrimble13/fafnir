@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the fafnir daily update after US settlement
+
+[Timer]
+Unit=fafnir-daily.service
+# Market time, not host time: the timezone suffix keeps this at 22:30 ET across
+# both DST changes while the host clock stays UTC.
+OnCalendar=@ONCALENDAR@
+# Run a missed occurrence once the machine is back (reboot, maintenance window).
+Persistent=true
+RandomizedDelaySec=@RANDOMIZED_DELAY@
+
+[Install]
+WantedBy=timers.target

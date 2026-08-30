@@ -1,0 +1,22 @@
+[Unit]
+Description=fafnir daily incremental update
+Documentation=file://@FAFNIR_HOME@/doc/install_hetzner.md
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=@FAFNIR_USER@
+Group=@FAFNIR_GROUP@
+WorkingDirectory=@FAFNIR_HOME@
+EnvironmentFile=@ENV_FILE@
+ExecStart=@FAFNIR_HOME@/scripts/daily_update.sh
+StandardOutput=append:@LOG_DIR@/daily.log
+StandardError=append:@LOG_DIR@/daily.log
+# A first run against a universe that has never been backfilled can take hours.
+# The default 90s would kill it mid-load.
+TimeoutStartSec=6h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

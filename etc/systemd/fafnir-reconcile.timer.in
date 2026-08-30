@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-pull a sample of symbols weekly and diff against the warehouse
+
+[Timer]
+Unit=fafnir-reconcile.service
+OnCalendar=@ONCALENDAR@
+Persistent=true
+RandomizedDelaySec=@RANDOMIZED_DELAY@
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=fafnir weekly reconciliation against the live feed
+Documentation=file://@FAFNIR_HOME@/doc/operations.md
+After=postgresql.service network-online.target
+Wants=postgresql.service network-online.target
+
+[Service]
+Type=oneshot
+User=@FAFNIR_USER@
+Group=@FAFNIR_GROUP@
+WorkingDirectory=@FAFNIR_HOME@
+EnvironmentFile=@ENV_FILE@
+ExecStart=@FAFNIR_HOME@/scripts/reconcile.sh @RECONCILE_SYMBOLS@
+StandardOutput=append:@LOG_DIR@/reconcile.log
+StandardError=append:@LOG_DIR@/reconcile.log
+TimeoutStartSec=1h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

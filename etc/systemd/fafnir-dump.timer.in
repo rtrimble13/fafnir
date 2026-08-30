@@ -1,0 +1,12 @@
+[Unit]
+Description=Take a nightly logical dump of the fafnir database
+
+[Timer]
+Unit=fafnir-dump.service
+# Early morning ET, after the previous evening's load has settled.
+OnCalendar=@ONCALENDAR@
+Persistent=true
+RandomizedDelaySec=@RANDOMIZED_DELAY@
+
+[Install]
+WantedBy=timers.target
