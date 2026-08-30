@@ -660,6 +660,12 @@ FAFNIR_DSN="host=/var/run/postgresql port=5432 dbname=fafnir user=fafnir_ingest"
 FMP_API_KEY="your_fmp_pro_key"
 FAFNIR_SQL_DIR="/opt/fafnir/sql"
 PATH="/opt/fafnir/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Off-server backup destination (§9.2). Optional, but scripts/install_timers.sh
+# reads it from here -- sudo scrubs the environment, so the env file is the
+# reliable place to set it. The ':/path' suffix is NOT optional: without a colon
+# rsync treats the whole string as a local directory name.
+FAFNIR_BACKUP_REMOTE="u123456@u123456.your-storagebox.de:/home/fafnir-backups/"
 ENV
 sudo chgrp fafnir /etc/fafnir/fafnir.env
 sudo chmod 640 /etc/fafnir/fafnir.env
@@ -671,6 +677,12 @@ Why each line matters:
   the cwd. Setting it explicitly makes `fafnir db migrate` work from any directory.
 - **`PATH`** — cron gives you `/usr/bin:/bin` only, so the venv must be prepended or
   `fafnir: command not found` is all you get.
+- **`FAFNIR_BACKUP_REMOTE`** — needs the `:/path` suffix. rsync decides a
+  destination is remote by looking for a colon; `u123456@u123456.your-storagebox.de`
+  without one is a *local relative path*, so the nightly copy would create a
+  directory of that literal name under the unit's `WorkingDirectory`, exit 0, and
+  never leave the server. `install_timers.sh` and `backup_offsite.sh` both refuse
+  a destination shaped that way.
 - Quoting the DSN is required: the cron/`systemd` recipes source this file with
   `set -a; . /etc/fafnir/fafnir.env`, and an unquoted DSN containing spaces breaks.
 

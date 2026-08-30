@@ -93,6 +93,29 @@ if [[ -z "${REMOTE}" ]]; then
     echo "  e.g. u123456@u123456.your-storagebox.de:/home/fafnir-backups/" >&2
     exit 2
 fi
+# rsync only treats a destination as remote if it contains a colon. Without one,
+# "u123456@u123456.your-storagebox.de" is a LOCAL RELATIVE PATH: rsync would
+# cheerfully create a directory of that literal name in the working directory,
+# copy the dumps into it, and exit 0. The backup would report success every night
+# and never leave the server -- which you would discover only after losing it.
+if [[ "${REMOTE}" != *:* ]]; then
+    # An absolute path is an unambiguous, deliberate local destination -- a
+    # mounted volume, or a test. Anything else without a colon is a mistyped
+    # remote, and that one is dangerous rather than merely wrong.
+    if [[ "${REMOTE}" == /* ]]; then
+        echo "==> NOTE: ${REMOTE} is a local path. This copy does not leave the server;"
+        echo "    it only protects you from losing the database, not the machine."
+    else
+        echo "ERROR: the destination has no ':path', so rsync would treat it as a LOCAL" >&2
+        echo "       directory name and the backup would never leave this server --" >&2
+        echo "       silently, exiting 0 every night, until you needed it." >&2
+        echo "         got:      ${REMOTE}" >&2
+        echo "         expected: ${REMOTE}:/home/fafnir-backups/" >&2
+        echo "       (a remote destination is user@host:/path -- the colon is what" >&2
+        echo "        makes it remote; pass an absolute path for a deliberate local copy)" >&2
+        exit 2
+    fi
+fi
 if [[ ! -d "${BACKUP_DIR}" ]]; then
     echo "ERROR: ${BACKUP_DIR} does not exist -- run scripts/backup_dump.sh first." >&2
     exit 1

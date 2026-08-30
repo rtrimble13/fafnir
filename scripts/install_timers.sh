@@ -33,18 +33,46 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-FAFNIR_HOME="${FAFNIR_HOME:-/opt/fafnir}"
-FAFNIR_USER="${FAFNIR_USER:-fafnir}"
-FAFNIR_GROUP="${FAFNIR_GROUP:-fafnir}"
 ENV_FILE="${FAFNIR_ENV_FILE:-/etc/fafnir/fafnir.env}"
-LOG_DIR="${FAFNIR_LOG_DIR:-/var/log/fafnir}"
-BACKUP_DIR="${FAFNIR_BACKUP_DIR:-/var/backups/fafnir}"
-BACKUP_RETAIN_DAYS="${FAFNIR_BACKUP_RETAIN_DAYS:-14}"
-BACKUP_REMOTE="${FAFNIR_BACKUP_REMOTE:-}"
-DQ_EXCHANGE="${FAFNIR_DQ_EXCHANGE:-NASDAQ}"
-RECONCILE_SYMBOLS="${FAFNIR_RECONCILE_SYMBOLS:-AAPL,MSFT,SPY,BRK-B}"
 
-UNIT_DIR="${FAFNIR_UNIT_DIR:-/etc/systemd/system}"
+# /etc/fafnir/fafnir.env is this deployment's config file -- §4.4 puts the DSN and
+# the API key there, so it is also where an operator will naturally put
+# FAFNIR_BACKUP_REMOTE. Read it for defaults. Without this the script sees only
+# its own environment, and `sudo` scrubs that, so a value set in the env file
+# would be silently ignored and the offsite preflight would fail with the value
+# sitting right there in the file it just validated.
+#
+# Read into an array from a SUBSHELL rather than sourcing here: the env file sets
+# PATH (§4.4 prepends the venv), and adopting a PATH built for the fafnir CLI
+# would change how this script resolves systemctl and install.
+declare -A ENVFILE=()
+CONFIG_KEYS=(FAFNIR_HOME FAFNIR_USER FAFNIR_GROUP FAFNIR_LOG_DIR FAFNIR_BACKUP_DIR
+             FAFNIR_BACKUP_RETAIN_DAYS FAFNIR_BACKUP_REMOTE FAFNIR_DQ_EXCHANGE
+             FAFNIR_RECONCILE_SYMBOLS FAFNIR_UNIT_DIR)
+if [[ -r "${ENV_FILE}" ]]; then
+    while IFS='=' read -r _k _v; do
+        [[ -n "${_k}" && -n "${_v}" ]] && ENVFILE["${_k}"]="${_v}"
+    done < <(
+        set -a; . "${ENV_FILE}" >/dev/null 2>&1; set +a
+        for _k in "${CONFIG_KEYS[@]}"; do printf '%s=%s\n' "${_k}" "${!_k-}"; done
+    )
+fi
+# Caller's environment wins over the env file, which wins over the built-in
+# default. sudo already scrubs the environment, so anything still set here was
+# passed deliberately.
+envdef() { printf '%s' "${ENVFILE[$1]:-}"; }
+
+FAFNIR_HOME="${FAFNIR_HOME:-$(envdef FAFNIR_HOME)}"; FAFNIR_HOME="${FAFNIR_HOME:-/opt/fafnir}"
+FAFNIR_USER="${FAFNIR_USER:-$(envdef FAFNIR_USER)}"; FAFNIR_USER="${FAFNIR_USER:-fafnir}"
+FAFNIR_GROUP="${FAFNIR_GROUP:-$(envdef FAFNIR_GROUP)}"; FAFNIR_GROUP="${FAFNIR_GROUP:-fafnir}"
+LOG_DIR="${FAFNIR_LOG_DIR:-$(envdef FAFNIR_LOG_DIR)}"; LOG_DIR="${LOG_DIR:-/var/log/fafnir}"
+BACKUP_DIR="${FAFNIR_BACKUP_DIR:-$(envdef FAFNIR_BACKUP_DIR)}"; BACKUP_DIR="${BACKUP_DIR:-/var/backups/fafnir}"
+BACKUP_RETAIN_DAYS="${FAFNIR_BACKUP_RETAIN_DAYS:-$(envdef FAFNIR_BACKUP_RETAIN_DAYS)}"; BACKUP_RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-14}"
+BACKUP_REMOTE="${FAFNIR_BACKUP_REMOTE:-$(envdef FAFNIR_BACKUP_REMOTE)}"
+DQ_EXCHANGE="${FAFNIR_DQ_EXCHANGE:-$(envdef FAFNIR_DQ_EXCHANGE)}"; DQ_EXCHANGE="${DQ_EXCHANGE:-NASDAQ}"
+RECONCILE_SYMBOLS="${FAFNIR_RECONCILE_SYMBOLS:-$(envdef FAFNIR_RECONCILE_SYMBOLS)}"; RECONCILE_SYMBOLS="${RECONCILE_SYMBOLS:-AAPL,MSFT,SPY,BRK-B}"
+
+UNIT_DIR="${FAFNIR_UNIT_DIR:-$(envdef FAFNIR_UNIT_DIR)}"; UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 TEMPLATE_DIR="${REPO_ROOT}/etc/systemd"
 
 # unit name -> default OnCalendar / RandomizedDelaySec
@@ -225,8 +253,28 @@ done
 
 # The offsite job with no destination would install cleanly and then fail every
 # night, which is the worst kind of backup: one you believe in.
-if [[ " ${SELECTED[*]} " == *" offsite "* && -z "${BACKUP_REMOTE}" ]]; then
-    check "the offsite job needs FAFNIR_BACKUP_REMOTE (see scripts/backup_offsite.sh)" false
+if [[ " ${SELECTED[*]} " == *" offsite "* ]]; then
+    if [[ -z "${BACKUP_REMOTE}" ]]; then
+        echo "!!  the offsite job needs FAFNIR_BACKUP_REMOTE. Add it to ${ENV_FILE}:" >&2
+        echo "      FAFNIR_BACKUP_REMOTE=\"u123456@u123456.your-storagebox.de:/home/fafnir-backups/\"" >&2
+        echo "    or pass it on the command line:" >&2
+        echo "      sudo FAFNIR_BACKUP_REMOTE=... $0 offsite" >&2
+        PROBLEMS=$((PROBLEMS + 1))
+    elif [[ "${BACKUP_REMOTE}" != *:* ]]; then
+        # rsync only treats a destination as remote if it contains a colon.
+        # Without one, "u123456@u123456.your-storagebox.de" is a LOCAL RELATIVE
+        # PATH: rsync would create a directory of that literal name under the
+        # unit's WorkingDirectory, exit 0, and the backup would never leave the
+        # server. Catching it here rather than discovering it after a disk loss.
+        echo "!!  FAFNIR_BACKUP_REMOTE has no ':path' -- rsync would read it as a" >&2
+        echo "    LOCAL directory name and the backup would never leave this server." >&2
+        echo "      got:      ${BACKUP_REMOTE}" >&2
+        echo "      expected: ${BACKUP_REMOTE}:/home/fafnir-backups/" >&2
+        PROBLEMS=$((PROBLEMS + 1))
+    else
+        [[ -n "$(envdef FAFNIR_BACKUP_REMOTE)" && -z "${FAFNIR_BACKUP_REMOTE:-}" ]] && \
+            echo "    offsite destination from ${ENV_FILE}: ${BACKUP_REMOTE}"
+    fi
 fi
 if [[ " ${SELECTED[*]} " == *" dump "* && ! -d "${BACKUP_DIR}" ]]; then
     echo "    ${BACKUP_DIR} does not exist -- creating it."
