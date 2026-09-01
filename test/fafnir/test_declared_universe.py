@@ -381,10 +381,10 @@ def test_the_delisting_sweep_cannot_reach_a_fund(db):
                 }
             ]
 
-    marked, seen = delisted.load_delisted(db, _DelistedFMP())
+    result = delisted.load_delisted(db, _DelistedFMP())
     db.commit()
 
-    assert (marked, seen) == (0, 0)
+    assert (result.marked, result.seen) == (0, 0)
     row = db.fetchone(
         "SELECT is_actively_trading, delisted_date FROM core.security "
         "WHERE security_id = %s",

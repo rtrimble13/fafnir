@@ -269,6 +269,21 @@ Things to watch:
   then close it with a note saying which (`fafnir dq resolve <id> --note "..."`). Escalate only if two different issuers really are sharing
   the ticker, which would mean the identity assumption is wrong for your universe.
   The flag is raised once, on the night the name changes, not nightly.
+- **Delisted ticker reuse** — `delisted_ticker_reuse` flags in
+  `ops.data_quality_flag`, raised by `ingest delisted` on a deep sweep. The feed
+  reported a ticker as delisted on a date *before* the security currently holding
+  that ticker last traded — Circuit City's `CC` retired in 2009, Chemours has held
+  it since 2015 — so the row is about the ticker's previous owner. Marking on
+  ticker alone would retire the live company on a stranger's date, one-way, and
+  drop it out of the price universe for good; the loader refuses and flags instead.
+  ```bash
+  fafnir dq list --detail --check delisted_ticker_reuse
+  ```
+  Each flag is a **dead issuer this warehouse does not have**, and `--backfill`
+  cannot mint it (the live company holds the ticker). Nothing is broken and nothing
+  needs fixing in the warehouse — resolve with a note, and treat the count as part
+  of the survivorship gap that only a vendor with real delisted history closes.
+  Only reachable with `--full`: the nightly tail does not go back far enough.
 - **Unapplied renames** — the `Renames` line in `fafnir status`. Each one is a
   company whose identity is currently split across two `security_id`s.
 - **New listings** — the `New (7d)` line. A week of zero on a working FMP key means

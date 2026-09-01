@@ -39,7 +39,8 @@ the Professional plan in the original `duk`.
 | `ingest securities --enrich` | `profile` | `core.security`, `core.company_profile` | security_id |
 | `ingest tracked` | `profile` | `core.security`, `core.symbol_xref`, `core.company_profile` | (source, primary_symbol) |
 | `ingest symbol-changes` | `symbol-change` | `core.security`, `core.symbol_xref`, `core.symbol_change` | (source, old_symbol, new_symbol, change_date) |
-| `ingest delisted` | `delisted-companies` | `core.security`, `core.symbol_xref` | security_id |
+| `ingest delisted` | `delisted-companies` | `core.security`, `core.symbol_xref`, `landing.fmp_raw` | security_id |
+| `ingest delisted --backfill` | `delisted-companies` | `core.security`, `core.symbol_xref` (mints) | (source, primary_symbol) |
 | `ingest prices` | `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
 | `ingest actions` | `splits`, `dividends`; `splits-calendar`, `dividends-calendar` | `core.corporate_action` | (security_id, action_type, ex_date) |
 | `adjust` | (derived) | `core.adjustment_factor` | (security_id, effective_date) |
@@ -312,6 +313,83 @@ empty (no bars, no actions, no factors). That fold is the one place fafnir delet
 a security; retention exists so history is never lost, and a stub has none. A
 duplicate that *has* accumulated history is a `conflict` instead: merging two price
 histories is not a decision a loader should make silently.
+
+**Exits.** `ingest delisted` stamps `delisted_date`, flips `is_actively_trading`
+off and closes the ticker's open xref period, so a later issuer reusing the ticker
+mints a fresh `security_id` instead of inheriting a dead company's bars. Nothing is
+ever deleted. The whole feed is landed in `landing.fmp_raw` before it is
+interpreted — in hindsight, "what did the vendor offer that night" is exactly the
+question a survivorship audit asks, and by then the feed has rolled forward.
+
+### The survivorship backfill
+
+The nightly sweep only *marks* names the master already holds. A company that
+stopped trading before this warehouse's first `ingest securities` run was never in
+the screener, so it has no `security_id`, and a feed row for it matches nothing —
+which is why `duk -S db ph ABMD` answers "No data found" rather than returning a
+dead company's history.
+
+`--backfill` inverts that judgement: it mints a security for every on-venue feed
+row whose ticker the master has never seen, retired on arrival. Measure before you
+spend anything:
+
+```bash
+fafnir source audit-delisted -o /tmp/delisted.csv   # writes nothing to the DB
+fafnir ingest delisted --full --backfill
+fafnir ingest prices --include-inactive             # minted rows are inactive from birth
+fafnir adjust && fafnir db refresh-marts
+```
+
+The audit is the important half. It reports **feed depth** (nothing before its
+oldest `delistedDate` is recoverable from this vendor at any price), a **venue
+histogram** with the rows that normalized outside our universe listed separately,
+and how many names a backfill would actually mint.
+
+Three holes remain, and the audit sizes each one:
+
+| Hole | Shows up as | Fix |
+|---|---|---|
+| Feed depth — FMP's delisted list is newest-first and shallow | `oldest` in the audit | A vendor with real delisted history |
+| No EOD bars for long-dead tickers | Minted securities with zero rows in `core.daily_price` | Same |
+| Ticker reuse — the dead issuer's ticker now belongs to a live company | `reused` in the audit | Manual, per name |
+
+That last one is a deliberate refusal, not an oversight. Minting Circuit City's `CC`
+while Chemours holds it means writing past 0009's active-only unique index *and*
+0015's one-open-period index, both of which exist to keep a live company's identity
+and price history separate from a dead one's. The count is reported so the hole is
+visible; the loader does not guess.
+
+**The reuse guard.** A deep sweep is the first thing that reads delistings from
+years back, and it exposed a hazard the nightly tail never could: resolving a feed
+row on ticker alone would stamp *Chemours* with Circuit City's 2009 delisting —
+`is_actively_trading` off, ticker period closed, silently out of the price universe
+for good, one-way. So before marking anything, the security holding the ticker is
+checked for a bar after the reported date (`repository.security_traded_after`): a
+company that stopped trading on D has none, so one that does is not the company the
+row describes. Those rows raise
+[`delisted_ticker_reuse`](operations.md#monitoring) and are counted as `reused`.
+Each one is a dead issuer this warehouse does not hold and `--backfill` cannot
+mint — part of the survivorship gap, not a defect to repair.
+
+A minted security has a name, a venue and a delisting date, but bars only if FMP
+still serves them. That fixes point-in-time **universe** queries
+(`WHERE delisted_date IS NULL OR delisted_date > $asof`) and does nothing for
+returns. Check which you got:
+
+```sql
+SELECT count(*) FILTER (WHERE dp.security_id IS NULL) AS minted_without_bars
+  FROM core.security s
+  LEFT JOIN LATERAL (SELECT 1 FROM core.daily_price WHERE security_id = s.security_id LIMIT 1) dp ON TRUE
+ WHERE s.delisted_date IS NOT NULL;
+```
+
+**Venue names.** The delisted feed carries `exchange`, and unlike the screener's
+`exchangeShortName` it is not guaranteed to be the short code — a tier name
+("NASDAQ Capital Market") or a full legal name normalizes to itself, falls outside
+`SCREENER_EXCHANGES`, and the row is dropped before anything looks at it.
+`security_master._EXCHANGE_ALIASES` maps the known long forms by **exact** match
+(never a prefix rule, which would admit "NASDAQ Dubai"). If the audit's dropped-venue
+histogram shows a US venue, that is a missing alias, not a vendor limit.
 
 ## Order of operations (daily)
 

@@ -622,9 +622,9 @@ def test_a_retired_ticker_cannot_delist_the_security_it_was_renamed_away_from(db
                 }
             ]
 
-    marked, _seen = load_delisted(db, _DelistedFMP())
+    result = load_delisted(db, _DelistedFMP())
 
-    assert marked == 0
+    assert result.marked == 0
     row = db.fetchone(
         "SELECT primary_symbol, is_actively_trading, delisted_date "
         "FROM core.security WHERE security_id = %s",
@@ -651,9 +651,9 @@ def test_delisting_still_marks_a_security_trading_under_its_own_ticker(db):
                 {"symbol": "DEAD", "exchange": "NYSE", "delistedDate": "2024-06-10"}
             ]
 
-    marked, seen = load_delisted(db, _DelistedFMP())
+    result = load_delisted(db, _DelistedFMP())
 
-    assert (marked, seen) == (1, 1)
+    assert (result.marked, result.seen) == (1, 1)
     assert db.fetchval(
         "SELECT delisted_date FROM core.security WHERE security_id = %s", (sid,)
     ) == dt.date(2024, 6, 10)
@@ -997,3 +997,209 @@ def test_a_rename_does_not_trip_the_drift_check(db):
 
     assert repo.resolve_security_id(db, "META") == sid
     assert _drift_flags(db) == []
+
+
+# ---------------------------------------------------------------------------
+# The survivorship backfill mints against real constraints
+# ---------------------------------------------------------------------------
+
+
+class _BackfillFMP:
+    """A delisted feed for names the master has never held."""
+
+    bytes_downloaded = 0
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def delisted_companies(self, *, max_pages=5):
+        return self.rows
+
+
+def _feed_row(symbol, *, exchange="NASDAQ", delisted="2009-01-16", ipo=None):
+    row = {
+        "symbol": symbol,
+        "companyName": f"{symbol} Inc",
+        "exchange": exchange,
+        "delistedDate": delisted,
+    }
+    if ipo:
+        row["ipoDate"] = ipo
+    return row
+
+
+def test_backfill_mints_a_delisted_security_that_resolves_and_is_retired(db):
+    """The mint sequence writes through 0009's partial unique index, opens an xref
+    period and then closes it -- three constraints the unit tests can only mock.
+    What it has to produce is a security `duk` can reach by ticker and that no
+    nightly job will ever poll again."""
+    from fafnir.ingest.delisted import load_delisted
+
+    result = load_delisted(
+        db,
+        _BackfillFMP([_feed_row("ABMD", delisted="2022-12-22", ipo="1987-07-30")]),
+        backfill=True,
+    )
+    db.commit()
+
+    assert (result.minted, result.marked, result.unmatched) == (1, 0, 1)
+    sid = repo.resolve_security_id(db, "ABMD")
+    assert sid is not None
+    row = db.fetchone(
+        "SELECT company_name, is_actively_trading, delisted_date, ipo_date, "
+        "exchange_code, asset_type FROM core.security WHERE security_id = %s",
+        (sid,),
+    )
+    assert row["is_actively_trading"] is False
+    assert row["delisted_date"] == dt.date(2022, 12, 22)
+    assert row["ipo_date"] == dt.date(1987, 7, 30)
+    assert row["company_name"] == "ABMD Inc"
+    assert row["asset_type"] == "equity"
+    # Retired the ordinary way: the ticker period is closed at the delisting, so
+    # the ticker is free for a future issuer and 0015's one-open-period index is
+    # satisfied.
+    periods = _xref(db, sid)
+    assert len(periods) == 1
+    assert periods[0]["valid_to"] == dt.date(2022, 12, 22)
+    # Nothing active is left behind for the nightly price run or `dq run` freshness.
+    assert repo.active_security_for_symbol(db, "ABMD") is None
+
+
+def test_backfill_is_idempotent_against_the_database(db):
+    # A second sweep must not mint a duplicate. The guard is resolve_security_id
+    # finding the row this sweep created -- which only works because a delisted row
+    # is still that ticker's primary_symbol.
+    from fafnir.ingest.delisted import load_delisted
+
+    rows = [_feed_row("GHOST")]
+    assert load_delisted(db, _BackfillFMP(rows), backfill=True).minted == 1
+    db.commit()
+    assert load_delisted(db, _BackfillFMP(rows), backfill=True).minted == 0
+    db.commit()
+
+    assert (
+        db.fetchval("SELECT count(*) FROM core.security WHERE primary_symbol = 'GHOST'")
+        == 1
+    )
+
+
+def test_a_deep_sweep_does_not_retire_a_live_company_on_a_reused_ticker(db):
+    """CC was Circuit City until 2009 and is Chemours now. The feed still reports
+    the 2009 delisting, and a --full sweep reaches it. Resolving on ticker alone
+    stamps that date on the LIVE company: is_actively_trading off, delisted_date
+    2009, xref period closed, and Chemours silently leaves the price universe for
+    good. Its 2024 bar is the disproof, and the loader has to use it."""
+    from fafnir.ingest.delisted import REUSE_CHECK, load_delisted
+
+    live = _mk_security(db, "CC", exchange="NYSE", name="The Chemours Company")
+    _give_history(db, live, trade_date=dt.date(2024, 6, 3))
+
+    result = load_delisted(
+        db,
+        _BackfillFMP([_feed_row("CC", exchange="NYSE", delisted="2009-01-16")]),
+        max_pages=500,
+    )
+    db.commit()
+
+    assert (result.marked, result.reused) == (0, 1)
+    row = db.fetchone(
+        "SELECT company_name, is_actively_trading, delisted_date "
+        "FROM core.security WHERE security_id = %s",
+        (live,),
+    )
+    assert row["company_name"] == "The Chemours Company"
+    assert row["is_actively_trading"] is True
+    assert row["delisted_date"] is None
+    # Still listed, still in the nightly price universe, ticker period still open.
+    assert repo.active_security_for_symbol(db, "CC") == live
+    assert _xref(db, live)[0]["valid_to"] is None
+    # And the operator is told, because the dead issuer that row belongs to is a
+    # name this warehouse is missing.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag WHERE check_name = %s",
+            (REUSE_CHECK,),
+        )
+        == 1
+    )
+
+
+def test_the_reuse_guard_does_not_block_an_ordinary_delisting(db):
+    """The guard rests on positive evidence of later trading, so a company whose
+    bars stop at the delisting is still retired normally."""
+    from fafnir.ingest.delisted import load_delisted
+
+    sid = _mk_security(db, "DEAD", exchange="NYSE")
+    _give_history(db, sid, trade_date=dt.date(2024, 6, 3))
+
+    result = load_delisted(
+        db,
+        _BackfillFMP([_feed_row("DEAD", exchange="NYSE", delisted="2024-06-03")]),
+        max_pages=500,
+    )
+    db.commit()
+
+    assert (result.marked, result.reused) == (1, 0)
+    assert db.fetchval(
+        "SELECT delisted_date FROM core.security WHERE security_id = %s", (sid,)
+    ) == dt.date(2024, 6, 3)
+
+
+def test_backfilled_securities_are_outside_the_nightly_price_universe(db):
+    """A minted name has no bars and never will get another one, so re-polling it
+    would burn requests forever. It has to be reachable only through the explicit
+    --include-inactive path."""
+    from fafnir.ingest.delisted import load_delisted
+
+    _mk_security(db, "LIVE", exchange="NYSE")
+    load_delisted(db, _BackfillFMP([_feed_row("DEADCO")]), backfill=True)
+    db.commit()
+
+    active = {s["symbol"] for s in repo.universe_securities(db)}
+    everything = {
+        s["symbol"] for s in repo.universe_securities(db, include_inactive=True)
+    }
+
+    assert "DEADCO" not in active
+    assert {"LIVE", "DEADCO"} <= everything
+
+
+def test_the_delisted_feed_is_landed_for_later_audit(db):
+    from fafnir.ingest.delisted import ENDPOINT, load_delisted
+
+    load_delisted(db, _BackfillFMP([_feed_row("ABMD")]), max_pages=500)
+    db.commit()
+
+    landed = db.fetchone(
+        "SELECT endpoint, params, payload FROM landing.fmp_raw "
+        "WHERE endpoint = %s ORDER BY raw_id DESC LIMIT 1",
+        (ENDPOINT,),
+    )
+    assert landed is not None
+    assert landed["params"]["max_pages"] == 500
+    assert landed["payload"][0]["symbol"] == "ABMD"
+
+
+def test_the_audit_counts_without_writing_anything(db):
+    from fafnir.ingest.delisted import audit_delisted
+
+    _mk_security(db, "LIVE", exchange="NYSE")
+    before = db.fetchval("SELECT count(*) FROM core.security")
+
+    report = audit_delisted(
+        db,
+        _BackfillFMP(
+            [
+                _feed_row("LIVE", exchange="NYSE", delisted="2024-01-02"),
+                _feed_row("GHOST", delisted="2001-06-01"),
+                _feed_row("2958.HK", exchange="HKSE"),
+            ]
+        ),
+    )
+
+    assert (report["held"], report["mintable"], report["out_of_scope"]) == (1, 1, 1)
+    assert report["oldest"] == "2001-06-01"
+    # Read-only: no securities, no run row, no landed payload.
+    assert db.fetchval("SELECT count(*) FROM core.security") == before
+    assert db.fetchval("SELECT count(*) FROM ops.ingestion_run") == 0
+    assert db.fetchval("SELECT count(*) FROM landing.fmp_raw") == 0

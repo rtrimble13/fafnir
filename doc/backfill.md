@@ -10,9 +10,11 @@ with an FMP **Professional** key.
 > for the load itself.
 
 > **Scope:** `ingest securities` loads the *active* universe (FMP `stock-list` +
-> `etf-list`). Retaining *delisted* names (survivorship-bias-free) needs the
-> delisted endpoint — a documented fast-follow. So this backfill covers active
-> securities.
+> `etf-list`), so this backfill covers active securities. To also recover names that
+> stopped trading before this warehouse existed, run `fafnir source audit-delisted`
+> and then `fafnir ingest delisted --full --backfill` — see
+> [ingestion.md](ingestion.md#the-survivorship-backfill) for what that can and
+> cannot reach.
 
 ---
 
@@ -497,6 +499,8 @@ Watch the monthly bandwidth gauge (query in §6) and pause as you approach the c
 - **Resumable** — kill/re-run freely; watermarks + `ON CONFLICT` upserts converge.
 - **Least privilege** — point `duk`/apps at `fafnir_app` (mart read-only); only
   `fafnir_ingest` writes.
-- **Active-only** — delisted retention (survivorship-bias-free) is a fast-follow.
+- **Active-only by default** — `ingest delisted --full --backfill` recovers the
+  delisted names FMP still serves; its ceiling is the vendor's feed depth, which
+  `fafnir source audit-delisted` measures against your own warehouse.
 - **Adjusted prices cost no storage** — they're derived on read
   (`mart.v_daily_price_adjusted`).

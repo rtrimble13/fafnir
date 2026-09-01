@@ -185,10 +185,43 @@ class SecurityLoadResult(NamedTuple):
     new_symbols: list[str]
 
 
+# Long-form venue names that mean one of our short codes.
+#
+# The screener answers `exchangeShortName` ("NASDAQ"); the delisted feed carries
+# only `exchange`, and there it is not guaranteed to be the short code -- a tier
+# name ("NASDAQ Capital Market") or the venue's full legal name normalizes to
+# itself, falls outside SCREENER_EXCHANGES, and the whole row is dropped before
+# anything looks at it. That is a silent coverage hole in the one loader whose job
+# is to prevent survivorship bias, so the aliases are mapped explicitly.
+#
+# EXACT keys, never substring matching: `_is_us` relies on equality so that
+# "NASDAQ DUBAI" and "CBOE EUROPE" stay out, and a `startswith("NASDAQ")` rule
+# would admit both. Extend this table from the venue histogram that
+# `fafnir source audit-delisted` prints -- it lists every venue string the feed
+# actually used and which ones normalized outside our universe.
+_EXCHANGE_ALIASES = {
+    "NEW YORK STOCK EXCHANGE": "NYSE",
+    "NEW YORK STOCK EXCHANGE ARCA": "NYSE",
+    "NYSE ARCA": "NYSE",
+    "NYSE AMERICAN": "AMEX",
+    "AMERICAN STOCK EXCHANGE": "AMEX",
+    "NASDAQ STOCK MARKET": "NASDAQ",
+    "NASDAQ STOCK EXCHANGE": "NASDAQ",
+    "NASDAQ GLOBAL SELECT": "NASDAQ",
+    "NASDAQ GLOBAL SELECT MARKET": "NASDAQ",
+    "NASDAQ GLOBAL MARKET": "NASDAQ",
+    "NASDAQ CAPITAL MARKET": "NASDAQ",
+    "CBOE BZX": "BATS",
+    "CBOE BZX EXCHANGE": "BATS",
+    "CBOE US": "CBOE",
+}
+
+
 def _norm_exchange(entry: dict) -> Optional[str]:
     code = (
         (entry.get("exchangeShortName") or entry.get("exchange") or "").upper().strip()
     )
+    code = _EXCHANGE_ALIASES.get(code, code)
     if code in {"NYSEAMERICAN", "AMEX"}:
         return "AMEX"
     if code in {"NASDAQ", "NYSE", "BATS", "CBOE", "OTC"}:

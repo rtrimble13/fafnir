@@ -412,6 +412,70 @@ def active_security_for_symbol(
     return int(val) if val is not None else None
 
 
+class SymbolCoverage(NamedTuple):
+    """Bulk answers to the two questions a coverage audit asks of every ticker.
+
+    ``listed`` -- a security is trading under this ticker now. Set-membership
+    equivalent of :func:`active_security_for_symbol` returning non-None.
+
+    ``known`` -- the master has heard of this ticker at all: it is some security's
+    primary symbol (listed or delisted) or appears anywhere in the xref. Equivalent
+    to :func:`resolve_security_id` returning non-None.
+
+    Sets, not per-symbol queries, because the caller asks these of every row in a
+    50,000-row feed: two queries total instead of 100,000 round trips. The trade is
+    that this cannot say *which* security_id answered, so it is for counting
+    coverage, never for deciding what to write -- the loaders keep using the
+    single-symbol resolvers, which are the canonical ones.
+    """
+
+    listed: set[str]
+    known: set[str]
+
+
+def symbol_coverage_index(db: Database) -> SymbolCoverage:
+    """Every ticker the master holds, split into listed-now and known-ever."""
+    listed = {r["symbol"] for r in db.fetchall("""
+            SELECT x.symbol
+              FROM core.symbol_xref x
+              JOIN core.security s ON s.security_id = x.security_id
+             WHERE x.valid_to IS NULL AND s.delisted_date IS NULL
+            UNION
+            SELECT primary_symbol FROM core.security WHERE delisted_date IS NULL
+            """)}
+    known = {r["symbol"] for r in db.fetchall("""
+            SELECT primary_symbol AS symbol FROM core.security
+            UNION
+            SELECT symbol FROM core.symbol_xref
+            """)}
+    return SymbolCoverage(listed=listed, known=known)
+
+
+def security_traded_after(db: Database, security_id: int, after: date) -> bool:
+    """True if this security has a bar strictly after ``after``.
+
+    The evidence that a delisting date belongs to a *different* company than the
+    one currently holding the ticker. A security that stopped trading on D has no
+    bar after D, so a security that does cannot be the one that delisted then --
+    the ticker was reused, and the feed row is about its previous holder.
+
+    Bars rather than ``ipo_date``: the screener leaves ipo_date NULL often enough
+    that a guard resting on it would pass exactly when it is needed most, and a bar
+    is the warehouse's own record of trading rather than a vendor attribute.
+    """
+    return bool(
+        db.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM core.daily_price
+                 WHERE security_id = %s AND trade_date > %s
+            )
+            """,
+            (security_id, after),
+        )
+    )
+
+
 def security_has_history(db: Database, security_id: int) -> bool:
     """True if anything irreplaceable hangs off this security_id.
 

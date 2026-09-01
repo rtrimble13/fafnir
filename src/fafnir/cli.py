@@ -384,21 +384,57 @@ def ingest_symbol_changes(ctx, full):
     is_flag=True,
     help="Sweep the entire delisted feed instead of only its recent tail",
 )
+@click.option(
+    "--backfill",
+    is_flag=True,
+    help="Also MINT securities for feed rows the master has never held, retired "
+    "on arrival. The nightly sweep only marks names it already has; this is how "
+    "a warehouse that started after a company died gets the company back. "
+    "Pair with --full.",
+)
 @click.pass_context
-def ingest_delisted(ctx, full):
+def ingest_delisted(ctx, full, backfill):
     """Mark securities that have stopped trading (survivorship-bias guard)."""
     from fafnir.ingest import delisted
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
+    if backfill and not full:
+        click.echo(
+            "Note: --backfill without --full only sees the feed's recent tail, "
+            "which is the part you most likely already hold."
+        )
     with Database(cfg.dsn) as database:
-        marked, seen = delisted.load_delisted(
-            database, fmp, max_pages=500 if full else 5
+        result = delisted.load_delisted(
+            database, fmp, max_pages=500 if full else 5, backfill=backfill
         )
     click.echo(
-        f"Marked {marked} newly delisted securities ({seen} feed rows on our venues). "
-        f"FMP bytes: {fmp.bytes_downloaded}"
+        f"Marked {result.marked} newly delisted securities "
+        f"({result.seen} feed rows on our venues). FMP bytes: {fmp.bytes_downloaded}"
     )
+    if backfill:
+        click.echo(f"Minted {result.minted} securities for names never held.")
+        if result.minted:
+            click.echo(
+                "They are inactive from birth, so the ordinary price run skips "
+                "them. Pull their bars with `fafnir ingest prices "
+                "--include-inactive`, then `fafnir adjust && fafnir db "
+                "refresh-marts`."
+            )
+    if result.unmintable:
+        click.echo(
+            f"{result.unmintable} feed rows matched no listed security but their "
+            "tickers are already known (a stamped delisting, or a live company's "
+            "retired alias) -- see `fafnir source audit-delisted`."
+        )
+    if result.reused:
+        click.echo(
+            f"Refused {result.reused} rows as ticker reuse: the security holding "
+            "the ticker traded after the reported delisting, so the row is about "
+            "its previous owner. Flagged as `delisted_ticker_reuse`."
+        )
+    if result.undated:
+        click.echo(f"{result.undated} rows carried no usable delistedDate.")
 
 
 @ingest.command("actions")
@@ -1182,6 +1218,56 @@ def source_probe_fund(ctx, symbol, window_days):
             "Fund NAV check FAILED -- do not declare funds until this is resolved. "
             "See doc/adr/0006-curated-fund-universe.md."
         )
+
+
+@source.command("audit-delisted")
+@click.option(
+    "--max-pages",
+    default=500,
+    show_default=True,
+    type=int,
+    help="How deep to page the delisted feed (100 rows per page)",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write the per-row classification to a CSV",
+)
+@click.pass_context
+def source_audit_delisted(ctx, max_pages, output):
+    """Measure the delisted feed against this warehouse. Writes nothing.
+
+    Answers what a survivorship-bias backfill is actually worth here: how far back
+    the vendor's delisted list reaches, how many of its rows this warehouse is
+    dropping on venue normalization, and how many names `ingest delisted
+    --backfill` would add. Run it before spending requests on the backfill.
+    """
+    import csv
+
+    from fafnir.ingest import delisted
+
+    cfg = ctx.obj["config"]
+    fmp = _fmp_client(cfg)
+    with Database(cfg.dsn) as database:
+        report = delisted.audit_delisted(database, fmp, max_pages=max_pages)
+    click.echo(delisted.format_audit_report(report))
+
+    if output:
+        fields = [
+            "symbol",
+            "company",
+            "raw_exchange",
+            "norm_exchange",
+            "delisted_date",
+            "ipo_date",
+            "status",
+        ]
+        with open(output, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(report["rows"])
+        click.echo(f"\nWrote {len(report['rows'])} rows to {output}")
 
 
 @source.command("probe-actions")
