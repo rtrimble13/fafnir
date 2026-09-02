@@ -220,6 +220,79 @@ the factors are reproducible everywhere; ratios that terminate stay exact, and A
 112:1 carries a relative error of ~1×10⁻²⁸. Display rounding is duk's job
 (`duk.format_utils`), which never renders a non-zero price as zero.
 
+### `mart.v_daily_price_raw` — unadjusted OHLCV (VIEW)
+**Grain:** `(security_id, trade_date)`. **Source:** `core.daily_price`.
+**Adjustment status:** **RAW — as traded**; a split shows as a real jump.
+
+Columns: `security_id, trade_date, open, high, low, close, volume, vwap`. Lineage
+columns (`source`, `ingestion_run_id`, `loaded_at`) are deliberately not exposed —
+they are operational, not market data.
+
+Added by migration 0020 so the unadjusted series has a `mart` name too. The explicit
+name is the point: a client cannot read unadjusted prices while believing they are
+adjusted. Partition pruning survives the view — a `security_id` + date-range query
+plans identically to the same query against `core.daily_price`.
+
+### `mart.v_symbol_lookup` — ticker → `security_id` (VIEW)
+**Grain:** `(symbol, valid_from)`. **Source:** `core.symbol_xref` (passthrough).
+
+Columns: `symbol, security_id, is_primary, valid_from, valid_to`. `NULL valid_to` =
+currently valid. Deliberately **not** a resolver: the ladder (live ticker → primary
+symbol → a ticker the security used to trade under) lives in the client, stated once
+in `fafnir.db.repository` and copied once in `duk.datasource.db`. Its second rung
+reads `mart.v_security_profile`, which is why resolution reads two views.
+
+### `mart.v_security_profile` — descriptive profile (VIEW)
+**Grain:** one row per `security_id`. **Source:** `core.security` + `ref.exchange` +
+`ref.sector` + `ref.industry` + `core.company_profile`. Read live, unlike
+`security_latest`.
+
+Adds over `security_latest`: `exchange_name`, `cik`/`isin`/`cusip`, `ipo_date`,
+`delisted_date`, `source`, `first_seen_at`, `updated_at`, `description`. As with
+`security_latest`, `market_cap_usd` and `beta` are a company-screener snapshot
+refreshed with the security master — **not** history; do not use them in a backtest.
+
+### `mart.v_security_price_coverage` — what is held per security (VIEW)
+**Grain:** one row per `security_id` with prices. **Source:** `core.daily_price`.
+
+Columns: `first_trade_date, last_trade_date, bar_count, distinct_years,
+calendar_span_days, min_close, max_close, zero_volume_bars`. Raw-series facts only.
+Trailing returns, volatility and drawdown belong to the *adjusted* series and are
+computed by the client (`duk.return_utils`), not here.
+
+### `mart.v_security_action_summary` — corporate actions per security (VIEW)
+**Grain:** one row per `security_id` with corporate actions. **Source:**
+`core.corporate_action` + `core.adjustment_factor`.
+
+Columns: `split_count`, `first_split_date`, `last_split_date`,
+`last_split_numerator`/`_denominator`, `dividend_count`, `first_dividend_date`,
+`last_dividend_date`, `last_dividend_amount`, `last_dividend_currency`,
+`ttm_dividend_amount`, `adjustment_factor_rows`, `latest_factor_effective_date`.
+
+`ttm_dividend_amount` is the 365 days ending at **the security's own latest
+ex-date**, not at `now()` — so the row does not change with the clock, and a
+delisted security reports what it last paid rather than zero.
+
+References no *numeric* column of `core.adjustment_factor` (only `COUNT(*)` and
+`MAX(effective_date)`) on purpose: migration 0013 had to drop
+`mart.v_daily_price_adjusted` to re-type those columns, and a second dependent view
+would double that cost next time. A client wanting back-adjustment depth reads
+`price_factor` from `mart.v_daily_price_adjusted`.
+
+### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
+**Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
+
+Columns: `dq_flag_id, security_id, check_name, severity, table_name, record_key,
+detected_at`.
+
+The only relation exposing `ops` outside `fafnir_ingest`, and a deliberately narrow
+one ([ADR 0009](adr/0009-mart-is-the-read-seam.md)). Open flags only; `record_key`
+(dates and tickers) is included so a reader can name the offending bar; `detail` is
+excluded because `adjustment_failed` writes a raw Python exception string into it.
+`resolved_by`/`resolution_note` are kept off by the `resolved_at IS NULL` filter —
+**that safety is in the `WHERE` clause**, so widening this view to resolved flags
+means excluding those columns explicitly. Full triage stays with `fafnir dq list`.
+
 ### `mart.security_latest` — screening snapshot (MATERIALIZED VIEW)
 **Grain:** one row per `security_id`. **Source:** `core.security` + `company_profile`
 + latest `daily_price`. **Cadence:** refreshed on schedule (`fafnir db refresh-marts`).

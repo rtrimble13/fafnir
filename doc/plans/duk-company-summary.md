@@ -1,6 +1,7 @@
 # Plan: a per-company summary for `duk ls`
 
-- Status: **proposed** (not implemented)
+- Status: **phase 1 implemented** (migration 0020, `mart` seam, ADR 0009);
+  phases 2-3 (`ls QUERY` itself) not started
 - Scope: `duk -S db ls <TICKER>` / `duk -S db ls "<company name>"`
 - Touches: `sql/migrations/0020_*`, `src/duk/datasource/db.py`, `src/duk/cli.py`,
   new `src/duk/company_summary.py`, `doc/duk.md`, `doc/data_dictionary.md`, tests
@@ -220,7 +221,7 @@ The install doc already half-knows: its troubleshooting table carries
 views, or connect as `fafnir_read`"*, while §11 and the §12 acceptance checklist both
 still instruct `duk -S db ph SPY --adj -n 5  # reads as fafnir_app`.
 
-**Decided: close it here.** `mart` becomes the complete read seam for `duk`, and the
+**Decided, and done in phase 1.** `mart` becomes the complete read seam for `duk`, and the
 role model becomes true as documented rather than aspirational.
 [ADR 0008 §4](../adr/0008-remote-duk-access-and-mcp.md) records the decision and the
 alternative that was rejected. Two consequences for this plan:
@@ -243,6 +244,26 @@ mechanism), and adding a `mart` view grants every `mart` reader whatever it sele
 
 Correcting install §11/§12, which today instruct `duk -S db ph SPY --adj` as
 `fafnir_app`, is part of phase 1: the commands they name become true.
+
+### What phase 1 landed
+
+Six views in `sql/migrations/0020_company_summary_marts.up.sql`, `duk.datasource.db`
+naming no `core` relation, ADR 0009, and four tests. Two things came out of building
+it that the plan had not anticipated:
+
+- **`v_security_action_summary` cannot select `cumulative_price_factor`.** The first
+  draft did, and broke `test_rolling_0013_back_clears_a_security_rather_than_half_its_chain`:
+  migration 0013 re-types that column and has to drop `mart.v_daily_price_adjusted`
+  to do it, so a second dependent view doubles the cost of every future change to
+  it. The field is gone; a client wanting back-adjustment depth reads `price_factor`
+  from the adjusted view, where the dependency already exists. `earliest_cumulative_price_factor`
+  is therefore **not** in the summary contract.
+- **The guard that matters most is the unit test.** `test_mart_read_seam.py`
+  asserts `duk.datasource.db` names no `core`/`ops` relation *without needing a
+  database*, so it fires on every run. The privilege test is stronger but needs a
+  DSN whose role can create roles and databases — and the breakage this plan fixes
+  survived precisely because the check that would have caught it needed a database
+  nobody had configured.
 
 ## Code changes
 
@@ -424,7 +445,7 @@ displayed number always matches the statements shown next to it.
 
 | Phase | Deliverable | Independently mergeable |
 |---|---|---|
-| 1 | migration 0020 + ADR 0009 + migration/privilege tests; `duk.datasource.db` moved onto `mart` throughout (`_resolve_security_id` → `v_symbol_lookup`, raw `price_history` → `v_daily_price_raw`); install §11/§12 and `duk.md` corrected | yes — and worth shipping on its own: it fixes `duk -S db ph` for `fafnir_app` |
+| 1 | ✅ **done** — migration 0020 (six views) + [ADR 0009](../adr/0009-mart-is-the-read-seam.md) + privilege/parity tests; `duk.datasource.db` moved onto `mart` throughout; install §11/§12, `duk.md` and the data dictionary corrected | shipped — it fixes `duk -S db ph` for `fafnir_app` |
 | 2 | `resolve_company` / `company_summary` in `datasource/db.py`; `company_summary.py` assembly + rendering; unit tests | yes — library-only |
 | 3 | `ls QUERY` CLI wiring, output formats, docs, CLI + integration tests | yes — ships the feature |
 | 4 | fundamentals section goes live when `mart.v_security_fundamentals_latest` exists | later milestone, no duk change |

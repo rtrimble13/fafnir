@@ -291,8 +291,11 @@ def upsert_company_profile(
 
 
 # Canonical security-id resolution. The duk db datasource
-# (duk/datasource/db.py::_resolve_security_id) MUST use these identical queries so
-# the loader and the read path always resolve the same ticker to the same id.
+# (duk/datasource/db.py::_resolve_security_id) MUST match these predicates and this
+# ordering, so the loader and the read path always resolve the same ticker to the
+# same id. It reads the equivalent `mart` views rather than these core relations --
+# duk connects as a mart-only role (ADR 0008) -- so the relation names differ there
+# and nothing else does. Change the ladder here and that copy needs the same change.
 XREF_RESOLVE_SQL = (
     "SELECT security_id FROM core.symbol_xref "
     "WHERE symbol = %s AND valid_to IS NULL "

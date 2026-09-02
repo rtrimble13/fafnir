@@ -782,7 +782,8 @@ a migration run by the wrong role:
 
 ```bash
 for role in fafnir_read fafnir_app; do
-  for tbl in ref.exchange mart.security_latest mart.v_daily_price_adjusted core.daily_price; do
+  for tbl in ref.exchange mart.security_latest mart.v_daily_price_raw \
+             mart.v_daily_price_adjusted mart.v_symbol_lookup core.daily_price; do
     printf '%-12s %-30s ' "$role" "$tbl"
     sudo -u postgres env PGOPTIONS="-c role=$role" \
       psql -d fafnir -tAc "SELECT count(*) FROM $tbl;" 2>&1 | head -1
@@ -793,17 +794,25 @@ done
 ```
 fafnir_read  ref.exchange                   5
 fafnir_read  mart.security_latest           0
+fafnir_read  mart.v_daily_price_raw         0
 fafnir_read  mart.v_daily_price_adjusted    0
+fafnir_read  mart.v_symbol_lookup           0
 fafnir_read  core.daily_price               0
 fafnir_app   ref.exchange                   5
 fafnir_app   mart.security_latest           0
+fafnir_app   mart.v_daily_price_raw         0
 fafnir_app   mart.v_daily_price_adjusted    0
+fafnir_app   mart.v_symbol_lookup           0
 fafnir_app   core.daily_price               ERROR:  permission denied for schema core
 ```
 
-`fafnir_read` must read all four. `fafnir_app` must read `ref` and `mart` but be
+`fafnir_read` must read all six. `fafnir_app` must read `ref` and `mart` but be
 **denied** on `core.daily_price` (`permission denied for schema core`) — that is
-correct, not a bug.
+correct, not a bug: it is the pair of results that shows the seam is real.
+`mart.v_daily_price_raw` returns the *same rows* as `core.daily_price` while the
+table itself stays out of reach, which is what a definer-rights view buys
+([ADR 0009](adr/0009-mart-is-the-read-seam.md)). If `fafnir_app` could read both,
+the views would be decoration.
 
 ---
 
@@ -1268,16 +1277,6 @@ duk -S db ph AAPL --adj --close -n 10
 duk -S db ls --sector Technology -n 10
 ```
 
-> **Known gap — `ph` does not work as `fafnir_app` yet.** `duk` resolves a ticker
-> against `core.symbol_xref`, and `fafnir_app` has no `USAGE` on `core`, so the `ph`
-> line above fails with `permission denied for schema core` before it reaches a
-> price (with *and* without `--adj`). The `ls` line works — it is pure `mart`. Until
-> this is fixed, use `fafnir_read` for `ph` from a laptop:
-> `user=fafnir_read` + its password. The fix — two `mart` views, after which
-> `fafnir_app` serves every `duk` read and this note goes away — is
-> [ADR 0008 §4](adr/0008-remote-duk-access-and-mcp.md), scheduled in the
-> [company-summary plan](plans/duk-company-summary.md).
-
 Or put it in `~/.dukrc` on the laptop — see [duk.md](duk.md#configuration). Note that
 `duk` takes a **full DSN only** (`FAFNIR_DSN`, or `[database].dsn` in `~/.dukrc`); it
 does not assemble one from the `host`/`port`/`dbname`/`user` parts that `~/.fafnirrc`
@@ -1324,7 +1323,7 @@ A `~/.pgpass` line then keeps the password out of your shell history and environ
 | `Could not locate sql/migrations` | Running outside the checkout | Export `FAFNIR_SQL_DIR=/opt/fafnir/sql` |
 | `ingest symbol-changes` fails, or returns zero rows **and** zero bytes | Your FMP plan may not cover `stable/symbol-change`, or the path has changed | Not fatal — the nightly warns and continues, so prices still load. Check the status code with `curl -s -o /dev/null -w '%{http_code}\n' "https://financialmodelingprep.com/stable/symbol-change?apikey=$FMP_API_KEY"` — `402` means the plan does not include it. The path is a single constant (`FMPClient.EP_SYMBOL_CHANGE`) if it needs correcting; until it works, renames are not reconciled and a renamed company will fork into a second `security_id` |
 | Calendar/partitions start at 2015, not your backfill year | `~/.fafnirrc` not found (missing `-H`/`HOME`), or seeded before setting `calendar_start_year` | §5.2; then re-run `fafnir db seed` and `fafnir db ensure-horizon` |
-| `permission denied for schema core` from `duk` | `fafnir_app` reads `mart` + `ref` only | Correct by design — use `mart.*` views, or connect as `fafnir_read` |
+| `permission denied for schema core` from `duk` | A `duk` older than migration 0020, which still read `core` for symbol resolution and raw prices | Upgrade `duk` and apply `0020` ([ADR 0009](adr/0009-mart-is-the-read-seam.md)); from 0020 on, `fafnir_app` serves every `duk` read |
 | Nightly job never ran | Timer not enabled, or clock/timezone confusion | `systemctl list-timers 'fafnir-*'`; `systemd-analyze calendar '<expr>'` |
 | Postgres won't start after a config edit | Bad value in the drop-in | `journalctl -u postgresql@16-main -n 50`; `sudo -u postgres psql -c "SELECT * FROM pg_file_settings WHERE error IS NOT NULL;"` |
 | Server stuck at boot after adding a Volume | `fstab` entry without `nofail` | Console → **Rescue**, fix `/etc/fstab` (§3.2) |
@@ -1371,8 +1370,7 @@ ls /etc/logrotate.d/fafnir                           # rotation installed (§10)
 sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh     # every §10 check; exits 0 when clean
 
 # --- From your laptop, with the §11 tunnel up -------------------------------
-duk -S db ph SPY --adj -n 5                          # see the §11 known gap:
-                                                     # needs fafnir_read for now
+duk -S db ph SPY --adj -n 5                          # reads as fafnir_app
 ```
 
 Steady-state operation, reconciliation, and recovery from here on:

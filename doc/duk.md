@@ -37,6 +37,9 @@ log_level = "info"
 ```
 
 For db mode, point `duk` at the least-privilege `fafnir_app` role (mart read-only).
+Every relation `duk` reads is a `mart` (or `ref`) one, so that role is sufficient --
+see [ADR 0009](adr/0009-mart-is-the-read-seam.md). It was not before migration 0020,
+when symbol resolution still read `core`.
 
 ## Commands
 
@@ -45,7 +48,7 @@ For db mode, point `duk` at the least-privilege `fafnir_app` role (mart read-onl
 | `ph SYMBOL` | price history (OHLCV, raw or `--adj`) | ✅ warehouse | ✅ FMP |
 
 `ph` without `--adj` means **raw** — prices as they actually traded, so a split shows
-up as a real jump. Both sources honour that: `db` reads `core.daily_price`, and
+up as a real jump. Both sources honour that: `db` reads `mart.v_daily_price_raw`, and
 `live` reads FMP's `historical-price-eod/non-split-adjusted` (not `.../full`, which
 is already split-adjusted). That is what makes the two sources comparable, and what
 `scripts/reconcile.sh` relies on. With `--adj`, `db` reads

@@ -1,10 +1,17 @@
 """
 Database data source: the fafnir PostgreSQL warehouse.
 
-Reads from the ``mart``/``core`` schemas and returns the same DataFrame contracts
-as the live (FMP) path, so the CLI output and the pure compute modules behave
-identically regardless of source. psycopg is imported lazily so duk remains
+Reads the ``mart`` schema -- and only ``mart`` -- returning the same DataFrame
+contracts as the live (FMP) path, so the CLI output and the pure compute modules
+behave identically regardless of source. psycopg is imported lazily so duk remains
 usable in live mode without it installed.
+
+``mart`` is the whole of it by design: ADR 0008 makes every per-person and per-agent
+role a member of ``fafnir_app``, which holds SELECT on ``mart`` and ``ref`` and
+nothing else. A read added here against ``core`` or ``ops`` will work for whoever
+writes it (loaders run as ``fafnir_ingest``) and fail for every laptop and MCP
+client -- which is exactly how ``ph`` was broken for the ``fafnir_app`` path before
+migration 0020. Add a ``mart`` view instead.
 """
 
 from __future__ import annotations
@@ -51,25 +58,33 @@ def _connect(dsn: str):
     return psycopg.connect(dsn, row_factory=dict_row)
 
 
-# These three queries MUST stay identical to fafnir.db.repository.resolve_security_id
-# (XREF_RESOLVE_SQL / PRIMARY_RESOLVE_SQL / HISTORICAL_XREF_RESOLVE_SQL) so the read
-# path resolves a ticker to the same security_id the loader used. Duplicated (not
-# imported) to keep duk's db datasource free of a hard fafnir/psycopg import at
-# module load.
+# The resolution ladder. Its PREDICATES AND ORDERING must stay identical to
+# fafnir.db.repository.resolve_security_id (XREF_RESOLVE_SQL / PRIMARY_RESOLVE_SQL /
+# HISTORICAL_XREF_RESOLVE_SQL) so the read path resolves a ticker to the same
+# security_id the loader used. Duplicated (not imported) to keep duk's db datasource
+# free of a hard fafnir/psycopg import at module load.
+#
+# The RELATIONS deliberately differ. fafnir runs as fafnir_ingest and reads core;
+# duk reads the `mart` seam, because ADR 0008 makes every per-person and per-agent
+# role a member of fafnir_app, which has no USAGE on core at all. mart.v_symbol_lookup
+# is a passthrough of core.symbol_xref and mart.v_security_profile exposes
+# core.security's primary_symbol/source/delisted_date under the alias `symbol`, so
+# the rows and their order are the same -- asserted by an integration test rather
+# than trusted (test_db_company_summary.py).
 _XREF_RESOLVE_SQL = (
-    "SELECT security_id FROM core.symbol_xref "
+    "SELECT security_id FROM mart.v_symbol_lookup "
     "WHERE symbol = %s AND valid_to IS NULL "
     "ORDER BY is_primary DESC, valid_from DESC LIMIT 1"
 )
 _PRIMARY_RESOLVE_SQL = (
-    "SELECT security_id FROM core.security WHERE primary_symbol = %s "
+    "SELECT security_id FROM mart.v_security_profile WHERE symbol = %s "
     "ORDER BY (source = %s) DESC, (delisted_date IS NULL) DESC, security_id ASC "
     "LIMIT 1"
 )
 # A ticker the security used to trade under, before a rename moved it. Last, so a
 # live owner of a reused ticker and a delisted issuer both win over it.
 _HISTORICAL_XREF_RESOLVE_SQL = (
-    "SELECT security_id FROM core.symbol_xref "
+    "SELECT security_id FROM mart.v_symbol_lookup "
     "WHERE symbol = %s AND valid_to IS NOT NULL "
     "ORDER BY valid_to DESC, valid_from DESC LIMIT 1"
 )
@@ -113,7 +128,9 @@ def price_history(
         sec_id = _resolve_security_id(cur, symbol)
         if sec_id is None:
             return pd.DataFrame()
-        relation = "mart.v_daily_price_adjusted" if adjusted else "core.daily_price"
+        relation = (
+            "mart.v_daily_price_adjusted" if adjusted else "mart.v_daily_price_raw"
+        )
         clauses = ["security_id = %s"]
         params: list[Any] = [sec_id]
         if start is not None:
