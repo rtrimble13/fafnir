@@ -59,6 +59,12 @@ The read seam is `mart` (+ `core` read views). An MCP server should:
 Because adjusted prices are derived in `mart.v_daily_price_adjusted`, MCP clients
 get point-in-time-stable data for free.
 
+Where the server runs, which identity it connects as, and why it exposes no
+free-form SQL tool are settled in
+[ADR 0008](adr/0008-remote-duk-access-and-mcp.md) — which also covers reaching the
+warehouse from a laptop under a person's own credentials, since the MCP server uses
+the same path.
+
 ## Schema change hygiene
 
 - Migrations are code: versioned, reviewed, reversible, one logical change each.
