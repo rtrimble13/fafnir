@@ -153,18 +153,39 @@ are already tested.
 `adjustment_factor_rows`, `latest_factor_effective_date`,
 `cumulative_price_factor_earliest` (how much back-adjustment the oldest bar carries).
 
-**5. `mart.v_security_dq_open`** — the narrow `ops` window:
+**5. `mart.v_security_dq_open`** — the narrow `ops` window. One row per open flag,
+not per group: the aggregation belongs in the caller, because naming the offending
+bar is what makes the section actionable.
 
 ```sql
 CREATE VIEW mart.v_security_dq_open AS
-SELECT security_id, check_name, severity, COUNT(*) AS flags,
-       MIN(detected_at) AS first_detected, MAX(detected_at) AS last_detected
+SELECT dq_flag_id, security_id, check_name, severity, record_key, detected_at
 FROM ops.data_quality_flag
-WHERE resolved_at IS NULL AND security_id IS NOT NULL
-GROUP BY security_id, check_name, severity;
+WHERE resolved_at IS NULL AND security_id IS NOT NULL;
 ```
 
-Counts and dates only, open flags only. `.down.sql` drops all six.
+**Why `record_key` is in and `detail` is out** — the columns differ in kind, and the
+narrowing instinct aims at the wrong one:
+
+- `record_key` holds only `{"trade_date": …}`, `{"symbol", "date"}`, `{"ex_date"}`,
+  `{"last_date"}`, `{"effective_date"}` — dates and tickers, every one derived from
+  data a `mart` reader already reads in full. It costs nothing to expose and it is
+  what turns *"something is wrong in this series"* into *"distrust the 2026-07-14
+  bar"*.
+- `detail` is mostly derived values too (`{"move": 0.62, …}`,
+  `{"prior_close", "dividend"}`) — but `adjustment_failed` writes
+  `{"error": f"{type(exc).__name__}: {exc}"}`, a raw Python exception string that can
+  carry psycopg internals, constraint names and paths. That is the one DQ field not
+  derived from readable market data, and the reason `detail` stays behind
+  `fafnir dq list`.
+
+`resolved_by` and `resolution_note` — the human judgements from migration 0017 — need
+no decision: `ck_dq_flag_resolution_provenance` forces both to `NULL` whenever
+`resolved_at` is, so the open-only filter already guarantees no human-written text
+reaches the seam. That safety rests on the `WHERE`, not on the column list, which is
+worth knowing before anyone relaxes the filter to show resolved flags.
+
+`.down.sql` drops all six.
 
 `ALTER DEFAULT PRIVILEGES … IN SCHEMA mart GRANT SELECT ON TABLES` (migration 0001)
 covers views, so no per-view grant is needed — but the least-privilege test must
@@ -310,10 +331,10 @@ FUNDAMENTALS
   Not loaded — the fundamentals milestone is planned (doc/extending.md).
 
 DATA QUALITY (open flags)
-  CHECK                  SEV    FLAGS  FIRST SEEN  LAST SEEN
-  ---------------------  -----  -----  ----------  ----------
-  gap                    warn       2  2026-07-14  2026-08-02
-  price_scale_collapse   error      1  2026-08-15  2026-08-15
+  CHECK                  SEV    FLAGS  FIRST SEEN  LAST SEEN  KEYS
+  ---------------------  -----  -----  ----------  ---------  ------------------------
+  gap                    warn       2  2026-07-14  2026-08-02  2026-07-14, 2026-08-02
+  price_scale_collapse   error      1  2026-08-15  2026-08-15  2026-08-15
   Detail: fafnir dq list --detail --symbol AAPL
 ```
 

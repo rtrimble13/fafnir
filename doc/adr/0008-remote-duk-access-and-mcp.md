@@ -202,6 +202,7 @@ security get the same series:
 | `screen_securities` | `db.screen` → `mart.security_latest` |
 | `list_sectors` / `list_industries` | `db.list_sectors` / `db.list_industries` |
 | `resolve_symbol` | `db._resolve_security_id` → `mart.v_symbol_lookup` + `mart.security_latest` |
+| `dq_summary` | `mart.v_security_dq_open` — open data-quality flags for a security |
 | `returns`, `indicator` | `duk.return_utils`, `duk.indicators` — pure compute on a prior result |
 
 Design rules that follow from "the role is the boundary":
@@ -217,6 +218,12 @@ Design rules that follow from "the role is the boundary":
   actually happen.
 - Dates in, dates out, ISO; no locale-dependent formatting. `duk`'s CLI formatting
   layer stays in the CLI.
+- **An agent can ask whether the data is trustworthy.** `dq_summary` exists because a
+  model reasoning over a price series should be able to see that the series carries
+  two open `gap` flags, rather than treating every bar as equally sound. It reports
+  open flags only, with `record_key` (dates and tickers) but not `detail` — see the
+  [company-summary plan](../plans/duk-company-summary.md) for why those two columns
+  are treated differently. Triage stays on the host, as `fafnir_ingest`.
 
 ### 4. The seam — `mart` is not yet complete, two views short
 
