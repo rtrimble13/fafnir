@@ -1,0 +1,11 @@
+# flake8 does not read pyproject.toml (no PEP 518 support as of 7.x), so the
+# [tool.flake8] section there was never reaching it and `make lint` ran at the
+# 79-column default against a codebase black formats to 88. That reported ~2500
+# violations on a clean checkout, which is the same as reporting none.
+#
+# Keep this in sync with [tool.flake8] in pyproject.toml, which stays as the
+# documented home of the setting.
+[flake8]
+max-line-length = 100
+extend-ignore = E203, W503
+exclude = .git,__pycache__,build,dist,*.egg-info
