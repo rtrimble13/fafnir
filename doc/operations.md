@@ -318,6 +318,14 @@ get worked. The two take the **same** selection options, so the workflow is to
 narrow with `list` until the page is the problem you mean, then re-run the same
 options under `resolve`.
 
+> Starting from a **symbol** rather than from the queue? `duk -S db ls <TICKER>`
+> shows that security's open flags alongside its price coverage and corporate
+> actions, which is usually enough to tell a real data problem from a real market
+> event. It reads `mart` only, so it works from a laptop; it shows counts and the
+> bars flagged, but not `detail` or resolution notes — for those, and to resolve
+> anything, come back to `fafnir dq list --detail --symbol <TICKER>` on the
+> warehouse host ([ADR 0009](adr/0009-mart-is-the-read-seam.md)).
+
 ```bash
 fafnir dq list                                    # what is open, by check and severity
 fafnir dq list --detail --check gap --limit 20    # the individual gaps

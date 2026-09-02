@@ -16,7 +16,7 @@ migration 0020. Add a ``mart`` view instead.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
@@ -276,3 +276,182 @@ def list_actively_trading(*, dsn: str, limit: Optional[int] = None) -> pd.DataFr
     with _connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(sql)
         return pd.DataFrame(cur.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# Company summary (`duk ls <query>`)
+# ---------------------------------------------------------------------------
+
+# Name search is the LAST rung of the resolution ladder, after the three ticker
+# queries above. A ticker is an exact, unambiguous intent and must never lose to a
+# substring name match -- "CAT" is Caterpillar, not every company with "cat" in its
+# name.
+#
+# Plain ILIKE, no trigram index: core.security is ~21k rows, so this is a sub-10ms
+# sequential scan, and pg_trgm needs a superuser to install -- which the migrator
+# deliberately is not. Revisit if the universe grows an order of magnitude.
+#
+# Ordering: exact match, then prefix match, then alphabetical. `lower(x) = lower(y)`
+# rather than ILIKE for the exact rung, since a name may legitimately contain the
+# LIKE metacharacters % and _.
+_NAME_SEARCH_SQL = """
+    SELECT security_id, symbol, company_name, exchange_code, exchange_name,
+           is_actively_trading, delisted_date
+      FROM mart.v_security_profile
+     WHERE company_name ILIKE %(pattern)s OR lower(company_name) = lower(%(query)s)
+     ORDER BY (lower(company_name) = lower(%(query)s)) DESC,
+              (company_name ILIKE %(prefix)s) DESC,
+              company_name ASC
+     LIMIT %(limit)s
+"""
+
+_PROFILE_BY_ID_SQL = """
+    SELECT * FROM mart.v_security_profile WHERE security_id = %s
+"""
+
+# The ticker a security used to trade under, when THAT is what the user typed.
+# Reported so a summary reached through a rename says so, rather than silently
+# answering about a different-looking company.
+_FORMER_TICKER_SQL = """
+    SELECT symbol, valid_to FROM mart.v_symbol_lookup
+     WHERE security_id = %s AND symbol = %s AND valid_to IS NOT NULL
+     ORDER BY valid_to DESC LIMIT 1
+"""
+
+# Candidates shown when a name matches more than one company. 20 is a screenful;
+# past that the query is too vague to disambiguate by reading anyway.
+NAME_CANDIDATE_LIMIT = 20
+
+# How far back the adjusted series is pulled for the return statistics. Five years
+# covers every trailing window reported (the longest is 1Y, plus headroom for
+# annualised volatility) without dragging 8,000 rows across the wire for a
+# thirty-year name.
+_STATS_LOOKBACK_DAYS = 5 * 366
+
+
+def resolve_company(*, dsn: str, query: str) -> list[dict]:
+    """Resolve a ticker or company name to candidate securities.
+
+    Returns [] for no match, one dict for an unambiguous match, several for an
+    ambiguous name. A ticker hit always returns exactly one candidate -- the
+    ladder is a precedence, not a search.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        sec_id = _resolve_security_id(cur, query.upper())
+        if sec_id is not None:
+            cur.execute(_PROFILE_BY_ID_SQL, (sec_id,))
+            row = cur.fetchone()
+            if row is not None:
+                row = dict(row)
+                cur.execute(_FORMER_TICKER_SQL, (sec_id, query.upper()))
+                former = cur.fetchone()
+                # Only when the *typed* ticker is the retired one. Resolving AAPL
+                # to a security that also once traded as APPL is not a rename hit.
+                row["matched_former_symbol"] = former["symbol"] if former else None
+                row["matched_former_valid_to"] = former["valid_to"] if former else None
+                return [row]
+
+        cur.execute(
+            _NAME_SEARCH_SQL,
+            {
+                "query": query,
+                "pattern": f"%{query}%",
+                "prefix": f"{query}%",
+                "limit": NAME_CANDIDATE_LIMIT,
+            },
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _fundamentals(cur, security_id: int) -> Optional[dict]:
+    """The fundamentals row, when that milestone has landed.
+
+    A capability probe rather than a stub: fundamentals are not in the warehouse
+    yet, and when they arrive as `mart.v_security_fundamentals_latest` this starts
+    reporting them with no duk release. `to_regclass` returns NULL rather than
+    raising for an absent relation, which is what makes the probe cheap.
+    """
+    cur.execute("SELECT to_regclass('mart.v_security_fundamentals_latest') AS rel")
+    row = cur.fetchone()
+    if row is None or row["rel"] is None:
+        return None
+    cur.execute(
+        "SELECT * FROM mart.v_security_fundamentals_latest WHERE security_id = %s",
+        (security_id,),
+    )
+    found = cur.fetchone()
+    return dict(found) if found else None
+
+
+def company_summary(*, dsn: str, security_id: int) -> dict:
+    """Assemble the raw facts behind `duk ls <company>`.
+
+    Returns plain dicts, dates and Decimals -- no formatting and no click. The
+    derived statistics (trailing returns, volatility, drawdown) are computed by
+    :mod:`duk.company_summary` from ``adjusted_prices``, because those formulas
+    already live in ``duk.return_utils`` and are already tested there.
+    """
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(_PROFILE_BY_ID_SQL, (security_id,))
+        profile = cur.fetchone()
+        if profile is None:
+            raise DataSourceError(f"No security with security_id {security_id}")
+
+        cur.execute(
+            "SELECT * FROM mart.v_security_price_coverage WHERE security_id = %s",
+            (security_id,),
+        )
+        coverage = cur.fetchone()
+
+        cur.execute(
+            "SELECT * FROM mart.v_security_action_summary WHERE security_id = %s",
+            (security_id,),
+        )
+        actions = cur.fetchone()
+
+        # Last bar comes from the raw series: `last_close` is what the security
+        # actually traded at, not a back-adjusted figure.
+        cur.execute(
+            "SELECT trade_date, close, volume FROM mart.v_daily_price_raw "
+            "WHERE security_id = %s ORDER BY trade_date DESC LIMIT 1",
+            (security_id,),
+        )
+        last_bar = cur.fetchone()
+
+        cur.execute(
+            "SELECT check_name, severity, record_key, detected_at "
+            "FROM mart.v_security_dq_open WHERE security_id = %s "
+            "ORDER BY check_name, detected_at",
+            (security_id,),
+        )
+        dq_flags = [dict(r) for r in cur.fetchall()]
+
+        fundamentals = _fundamentals(cur, security_id)
+
+    adjusted = pd.DataFrame()
+    if last_bar is not None:
+        start = last_bar["trade_date"] - timedelta(days=_STATS_LOOKBACK_DAYS)
+        adjusted = price_history(
+            dsn=dsn,
+            symbol=profile["symbol"],
+            start_date=start.isoformat(),
+            end_date=last_bar["trade_date"].isoformat(),
+            frequency="day",
+            limit=None,
+            fields=["close"],
+            adjusted=True,
+        )
+
+    return {
+        "profile": dict(profile),
+        "coverage": dict(coverage) if coverage else None,
+        "actions": dict(actions) if actions else None,
+        "last_bar": dict(last_bar) if last_bar else None,
+        "dq_flags": dq_flags,
+        "fundamentals": fundamentals,
+        "adjusted_prices": adjusted,
+    }

@@ -1,7 +1,8 @@
 # Plan: a per-company summary for `duk ls`
 
-- Status: **phase 1 implemented** (migration 0020, `mart` seam, ADR 0009);
-  phases 2-3 (`ls QUERY` itself) not started
+- Status: **implemented** — phases 1-3 complete (`duk ls <ticker|name>` ships).
+  Phase 4 (the fundamentals section) lights up on its own when
+  `mart.v_security_fundamentals_latest` lands; no `duk` change needed.
 - Scope: `duk -S db ls <TICKER>` / `duk -S db ls "<company name>"`
 - Touches: `sql/migrations/0020_*`, `src/duk/datasource/db.py`, `src/duk/cli.py`,
   new `src/duk/company_summary.py`, `doc/duk.md`, `doc/data_dictionary.md`, tests
@@ -148,11 +149,19 @@ are already tested.
 
 **4. `mart.v_security_action_summary`** — per security, from
 `core.corporate_action` + `core.adjustment_factor`: `split_count`,
-`first_split_date`, `last_split_date`, `last_split_ratio`, `dividend_count`,
-`first_dividend_date`, `last_dividend_date`, `last_dividend_amount`,
-`ttm_dividend_amount` (sum over ex-dates in the trailing 365 days),
-`adjustment_factor_rows`, `latest_factor_effective_date`,
-`cumulative_price_factor_earliest` (how much back-adjustment the oldest bar carries).
+`first_split_date`, `last_split_date`, `last_split_numerator`/`_denominator`,
+`dividend_count`, `first_dividend_date`, `last_dividend_date`,
+`last_dividend_amount`, `last_dividend_currency`, `ttm_dividend_amount`,
+`adjustment_factor_rows`, `latest_factor_effective_date`.
+
+`ttm_dividend_amount` sums the 365 days ending at **the security's own latest
+ex-date**, not at `now()`: a view whose output changes with the clock cannot be
+compared between two runs, and a delisted security would report zero rather than
+what it last paid.
+
+An earlier draft also exposed `cumulative_price_factor_earliest`. It is **not** in
+the contract — see [What phase 1 landed](#what-phase-1-landed) for why selecting a
+numeric column of `core.adjustment_factor` here is a trap.
 
 **5. `mart.v_security_dq_open`** — the narrow `ops` window. One row per open flag,
 not per group: the aggregation belongs in the caller, because naming the offending
@@ -323,39 +332,46 @@ records. That divergence is deliberate and must be documented in `doc/duk.md` �
 scripts branch on the command shape, and forcing the profile into a record array
 would flatten away the DQ breakdown.
 
-### Mock (text)
+### Rendered output
+
+Real output, not a mock -- captured from `duk -S db ls AAPL` against a seeded
+warehouse, reading as `fafnir_app`:
 
 ```
-AAPL  Apple Inc.                                          NASDAQ · US · USD
---------------------------------------------------------------------------
-Sector       : Technology                Industry : Consumer Electronics
-Market cap   : 3.42T                     Beta     : 1.24
-Status       : actively trading          IPO      : 1980-12-12
-Identifiers  : CIK 0000320193 · ISIN US0378331005 · CUSIP 037833100
-Profile as of: 2026-08-29  (market cap and beta refresh with the security master)
+AAPL  Apple Inc.                                                            NASDAQ · USD
+----------------------------------------------------------------------------------------
+Sector       : Technology
+Industry     : Consumer Electronics
+Market cap   : 3.42T
+Beta         : 1.24
+Status       : actively trading
+IPO          : 1980-12-12
+Identifiers  : CIK 0000320193 · ISIN US0378331005
+Profile as of: 2026-09-02  (market cap and beta refresh with the security master)
 
 PRICE HISTORY (raw bars; statistics on the adjusted series)
-  Coverage   : 1980-12-12 .. 2026-08-29   11,231 bars over 46 years
-  Last close : 232.14 on 2026-08-29       volume 41,208,300  (60d avg 52.8M)
-  52w range  : 164.08 .. 260.10
-  Returns    : 1M +2.4%   3M +7.1%   6M +11.9%   YTD +14.2%   1Y +18.6%
-  Ann. vol   : 24.3% (1y)                Max drawdown (1y) : -12.8%
-  Gaps       : 3 bars with zero volume
+  Coverage     : 2019-01-02 .. 2026-08-31   1,999 bars over 8 years
+  Last close   : 116.63 on 2026-08-31       volume 41.2M
+  52w range    : 59.37 .. 139.72  (adjusted)
+  Returns      : 1M -10.6%   3M -16.2%   6M +12.9%   YTD +63.8%   1Y +50.3%
+  Ann. vol     : 10.0% (1y)          Max drawdown (1y): -22.1%
+  Gaps         : 1 bar with zero volume
 
 CORPORATE ACTIONS
-  Splits     : 5    last 4-for-1 on 2020-08-31
-  Dividends  : 128  last 0.250000 ex 2026-08-08   TTM 0.990000 (0.43% yield)
-  Adjustment : 133 factor rows, latest ex-boundary 2026-08-08
-               oldest bar carries a cumulative price factor of 0.00089286
+  Splits       : 1    last 4-for-1 on 2020-08-31
+  Dividends    : 4    last 0.250000 ex 2026-08-08   TTM 0.990000 (0.85% yield)
+  Adjustment   : 5 factor rows, latest ex-boundary 2026-08-08
 
 FUNDAMENTALS
   Not loaded — the fundamentals milestone is planned (doc/extending.md).
 
 DATA QUALITY (open flags)
-  CHECK                  SEV    FLAGS  FIRST SEEN  LAST SEEN  KEYS
-  ---------------------  -----  -----  ----------  ---------  ------------------------
-  gap                    warn       2  2026-07-14  2026-08-02  2026-07-14, 2026-08-02
-  price_scale_collapse   error      1  2026-08-15  2026-08-15  2026-08-15
+  CHECK                 SEV    FLAGS  FIRST SEEN  LAST SEEN   KEYS
+  --------------------  -----  -----  ----------  ----------  ----------------------
+  gap                   warn       2  2026-07-14  2026-08-02  2026-07-14, 2026-08-02
+  price_scale_collapse  error      1  2026-08-15  2026-08-15  2026-08-15
+  Note: price_* flags repeat per re-detection by design, so their count is not a count
+        of distinct problems.
   Detail: fafnir dq list --detail --symbol AAPL
 ```
 
@@ -446,9 +462,9 @@ displayed number always matches the statements shown next to it.
 | Phase | Deliverable | Independently mergeable |
 |---|---|---|
 | 1 | ✅ **done** — migration 0020 (six views) + [ADR 0009](../adr/0009-mart-is-the-read-seam.md) + privilege/parity tests; `duk.datasource.db` moved onto `mart` throughout; install §11/§12, `duk.md` and the data dictionary corrected | shipped — it fixes `duk -S db ph` for `fafnir_app` |
-| 2 | `resolve_company` / `company_summary` in `datasource/db.py`; `company_summary.py` assembly + rendering; unit tests | yes — library-only |
-| 3 | `ls QUERY` CLI wiring, output formats, docs, CLI + integration tests | yes — ships the feature |
-| 4 | fundamentals section goes live when `mart.v_security_fundamentals_latest` exists | later milestone, no duk change |
+| 2 | ✅ **done** — `resolve_company` / `company_summary` in `datasource/db.py`; `company_summary.py` assembly + rendering; 33 unit tests | shipped |
+| 3 | ✅ **done** — `ls QUERY` CLI wiring, text/JSON/CSV output, docs, 16 CLI + 10 integration tests | shipped |
+| 4 | fundamentals section goes live when `mart.v_security_fundamentals_latest` exists | later milestone, no duk change — **probe verified against a stub view** |
 
 ## Risks and open questions
 
