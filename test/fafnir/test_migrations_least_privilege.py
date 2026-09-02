@@ -30,6 +30,17 @@ LP_PASSWORD = "lp_test_password"
 LP_DB = "fafnir_lp_test"
 FAFNIR_ROLES = ("fafnir_ingest", "fafnir_read", "fafnir_app")
 
+# A login role that is a MEMBER of fafnir_app, rather than fafnir_app itself.
+#
+# Two reasons. Practically, fafnir_app has no password, and a test DSN pointed at
+# a password-authenticated server (CI's, and any real install) cannot log in as
+# it -- giving the shared role a password to suit a test would be worse. But it is
+# also the more faithful test: ADR 0008 deploys exactly this shape, per person and
+# per agent (`CREATE ROLE rob LOGIN IN ROLE fafnir_app`), so what is asserted here
+# is what a laptop or an MCP server actually connects as.
+APP_MEMBER_ROLE = "fafnir_app_member_test"
+APP_MEMBER_PASSWORD = "app_member_test_password"
+
 
 def _admin() -> Database:
     return Database(TEST_DSN, autocommit=True)
@@ -66,6 +77,22 @@ def least_privilege_dsn():
         for role in FAFNIR_ROLES:
             if not db.fetchval("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
                 db.execute(f"CREATE ROLE {role} LOGIN")
+        # Inherits fafnir_app's grants and nothing else; password so it can log
+        # in over TCP the way CI and every real install authenticate.
+        if not db.fetchval(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (APP_MEMBER_ROLE,)
+        ):
+            db.execute(
+                f"CREATE ROLE {APP_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{APP_MEMBER_PASSWORD}' IN ROLE fafnir_app"
+            )
+        else:
+            db.execute(
+                f"ALTER ROLE {APP_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{APP_MEMBER_PASSWORD}'"
+            )
+            db.execute(f"GRANT fafnir_app TO {APP_MEMBER_ROLE}")
+
         db.execute(f"DROP DATABASE IF EXISTS {LP_DB}")
         if not db.fetchval("SELECT 1 FROM pg_roles WHERE rolname = %s", (LP_ROLE,)):
             db.execute(
@@ -165,21 +192,31 @@ FORBIDDEN_TO_APP = (
 
 
 def _as_app_dsn(dsn: str) -> str:
+    """The LP database, connected to as a member of fafnir_app."""
     parts = conninfo_to_dict(dsn)
-    parts.update(user="fafnir_app")
-    parts.pop("password", None)
+    parts.update(user=APP_MEMBER_ROLE, password=APP_MEMBER_PASSWORD)
     return make_conninfo(**parts)
+
+
+def _migrate_and_open_as_app(dsn: str):
+    """Migrate the LP database, then open it as the fafnir_app member.
+
+    CONNECT is granted explicitly rather than relying on PUBLIC's default: an
+    installation that has revoked it should still be able to run this test, and
+    the grant says out loud what the role needs.
+    """
+    m.migrate(dsn)
+    with Database(dsn, autocommit=True) as owner:
+        owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_app")
+    return Database(_as_app_dsn(dsn), autocommit=True)
 
 
 def test_fafnir_app_can_read_every_relation_duk_uses(least_privilege_dsn):
     """duk connects as a mart-only role (ADR 0008), so every relation it names
-    must be readable as `fafnir_app` -- including the views 0020 added."""
-    m.migrate(least_privilege_dsn)
-    with Database(least_privilege_dsn, autocommit=True) as owner:
-        owner.execute("GRANT CONNECT ON DATABASE %s TO fafnir_app" % LP_DB)
-
+    must be readable by a member of `fafnir_app` -- including the views 0020
+    added."""
     failures = []
-    with Database(_as_app_dsn(least_privilege_dsn), autocommit=True) as app:
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
         for relation in DUK_MART_RELATIONS:
             try:
                 app.fetchval(f"SELECT count(*) FROM {relation}")
@@ -195,12 +232,8 @@ def test_fafnir_app_still_cannot_reach_core_ops_or_landing(least_privilege_dsn):
     table is not. If this test ever fails, the seam has been widened by a stray
     GRANT and mart.v_security_dq_open stopped being a narrowing of the DQ queue.
     """
-    m.migrate(least_privilege_dsn)
-    with Database(least_privilege_dsn, autocommit=True) as owner:
-        owner.execute("GRANT CONNECT ON DATABASE %s TO fafnir_app" % LP_DB)
-
     reachable = []
-    with Database(_as_app_dsn(least_privilege_dsn), autocommit=True) as app:
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
         for relation in FORBIDDEN_TO_APP:
             try:
                 app.fetchval(f"SELECT count(*) FROM {relation}")
