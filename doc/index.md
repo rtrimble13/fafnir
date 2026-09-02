@@ -28,6 +28,9 @@ read through the `duk` CLI.
 ## Growing it
 
 - [Extending](extending.md) — add a source (FRED/BLS/BEA), fundamentals, MCP server
+- Plans (proposed, not yet implemented):
+  - [`duk ls <company>` company summary](plans/duk-company-summary.md) — per-company
+    meta, price/action statistics, fundamentals seam, and open DQ flags
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
@@ -37,6 +40,7 @@ read through the `duk` CLI.
   - [ADR 0006 — A declared universe alongside the screened one (select mutual funds)](adr/0006-curated-fund-universe.md)
   - [ADR 0007 — Corporate actions load incrementally (market-wide calendar sweep)](adr/0007-incremental-corporate-actions.md)
   - [ADR 0008 — Remote `duk` under per-person credentials, and a local stdio MCP server](adr/0008-remote-duk-access-and-mcp.md)
+  - [ADR 0009 — `mart` is the whole read seam, and definer-rights views are how](adr/0009-mart-is-the-read-seam.md)
 
 ## Reference
 

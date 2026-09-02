@@ -12,7 +12,7 @@ import click
 import pandas as pd
 from click.core import ParameterSource
 
-from duk import __version__
+from duk import __version__, company_summary
 from duk.config import get_config
 from duk.datasource import base as ds_base
 from duk.datasource import db as ds_db
@@ -28,7 +28,12 @@ from duk.format_utils import (
     format_price_columns,
     round_price_columns,
 )
-from duk.indicators import calculate_ema, calculate_macd, calculate_rsi, calculate_sma
+from duk.indicators import (
+    calculate_ema,
+    calculate_macd,
+    calculate_rsi,
+    calculate_sma,
+)
 from duk.logging_config import enable_console_logging, setup_logging
 from duk.ls_utils import process_industries, process_sectors
 from duk.return_utils import (
@@ -629,6 +634,7 @@ def yc(
 
 
 @main.command()
+@click.argument("query", required=False)
 @click.option(
     "-v",
     "--verbose",
@@ -740,6 +746,7 @@ def yc(
 @click.pass_context
 def ls(
     ctx,
+    query,
     verbose,
     quiet,
     limit,
@@ -763,9 +770,16 @@ def ls(
     output,
 ):
     """
-    List company and market information.
+    List company and market information, or summarize one company.
 
-    By default, returns actively trading securities with symbol and name.
+    With a QUERY (a ticker or a company name), prints everything the warehouse
+    holds on that one company: meta, price-history and corporate-action
+    statistics, fundamentals when loaded, and any open data-quality flags.
+    Requires --source db, since three of those four describe the warehouse
+    itself.
+
+    Without a QUERY the behaviour is unchanged: returns actively trading
+    securities with symbol and name.
     Use --sectors to list market sectors or --sector="Tech,Healthcare" to screen.
     Use --industries to list industries or --industry="Software,Banking" to screen.
 
@@ -784,6 +798,40 @@ def ls(
     cfg = ctx.obj["config"]
     source = ctx.obj.get("source", "live")
     api_key = cfg.fmp_key
+
+    # ------------------------------------------------------------------
+    # Profile mode: a QUERY names ONE company, and the whole command becomes a
+    # report about it. Handled before anything else and returns, so the list and
+    # screen paths below are untouched by this feature.
+    # ------------------------------------------------------------------
+    if query:
+        _ls_company_summary(
+            ctx,
+            query=query,
+            quiet=quiet,
+            limit=limit,
+            summary=summary,
+            output=output,
+            output_csv=output_csv,
+            output_json=output_json,
+            screening_flags=(
+                sectors_list_flag,
+                industries_list_flag,
+                sectors_filter,
+                industries_filter,
+                market_cap,
+                price,
+                volume,
+                beta,
+                dividend,
+                exchange,
+                country,
+                is_etf,
+                is_fund,
+                is_actively_trading,
+            ),
+        )
+        return
 
     if source == "live" and not api_key:
         logger.error("FMP API key not configured")
@@ -1072,6 +1120,117 @@ def ls(
                 click.echo(df.to_json(orient="records", date_format="iso"))
             else:
                 click.echo(df.to_csv(index=False))
+
+
+def _ls_company_summary(
+    ctx,
+    *,
+    query,
+    quiet,
+    limit,
+    summary,
+    output,
+    output_csv,
+    output_json,
+    screening_flags,
+):
+    """`duk ls <ticker|company name>` -- everything the warehouse holds on one
+    company.
+
+    Split out of `ls` rather than inlined: `ls` is already long, and profile mode
+    shares only the option list with list/screen mode, not the logic.
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    cfg = ctx.obj["config"]
+    source = ctx.obj.get("source", "live")
+
+    if any(screening_flags):
+        click.echo(
+            "Error: a QUERY selects one company; screening flags select many "
+            "-- pick one.",
+            err=True,
+        )
+        sys.exit(1)
+    if summary:
+        # In list mode --summary means "print the row count instead of the rows".
+        # A profile IS the summary, so honouring the flag would mean printing "1".
+        click.echo(
+            "Error: --summary applies to list/screen mode; the company report is "
+            "already a summary.",
+            err=True,
+        )
+        sys.exit(1)
+    if output_csv and output_json:
+        click.echo("Error: Only one of --csv or --json can be specified", err=True)
+        sys.exit(1)
+    if source != "db":
+        # Deliberately not a fallback like `yc`'s: three of the four sections
+        # describe what the WAREHOUSE holds, and the live API cannot answer them.
+        # Silently answering a different question would be worse than an error.
+        click.echo(
+            "Error: 'ls QUERY' reads the warehouse; re-run with -S db.", err=True
+        )
+        sys.exit(1)
+    if limit is not None:
+        logger.debug("--limit is ignored in company-summary mode")
+
+    try:
+        candidates = ds_db.resolve_company(dsn=cfg.dsn, query=query)
+    except Exception as exc:
+        logger.error(f"Company lookup failed: {exc}")
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if not candidates:
+        click.echo(f"No company found matching '{query}'.", err=True)
+        sys.exit(1)
+    if len(candidates) > 1:
+        # A did-you-mean, never a guess: picking the first of several would answer
+        # confidently about the wrong company.
+        click.echo(
+            f"'{query}' matches {len(candidates)} companies. "
+            "Re-run with a ticker, or a more specific name:",
+            err=True,
+        )
+        click.echo(company_summary.render_candidates(candidates), err=True)
+        sys.exit(1)
+
+    matched = candidates[0]
+    try:
+        raw = ds_db.company_summary(dsn=cfg.dsn, security_id=matched["security_id"])
+    except Exception as exc:
+        logger.error(f"Failed to build company summary: {exc}")
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    # The rename note is discovered during resolution, not by the summary query.
+    raw["profile"]["matched_former_symbol"] = matched.get("matched_former_symbol")
+    raw["profile"]["matched_former_valid_to"] = matched.get("matched_former_valid_to")
+
+    report = company_summary.build_summary(raw)
+    logger.info(f"Company summary for {report['meta'].get('symbol')}")
+
+    if output_json:
+        import json
+
+        payload = json.dumps(report, indent=2, default=str)
+    elif output_csv:
+        payload = pd.DataFrame([company_summary.render_flat(report)]).to_csv(
+            index=False
+        )
+    else:
+        payload = company_summary.render_text(report)
+
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(payload if payload.endswith("\n") else payload + "\n")
+        logger.info(f"Data written to {output_path}")
+        if not quiet:
+            click.echo(f"Data written to {output_path}")
+
+    if not quiet:
+        click.echo(payload)
 
 
 @main.command()

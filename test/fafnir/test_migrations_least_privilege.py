@@ -30,6 +30,17 @@ LP_PASSWORD = "lp_test_password"
 LP_DB = "fafnir_lp_test"
 FAFNIR_ROLES = ("fafnir_ingest", "fafnir_read", "fafnir_app")
 
+# A login role that is a MEMBER of fafnir_app, rather than fafnir_app itself.
+#
+# Two reasons. Practically, fafnir_app has no password, and a test DSN pointed at
+# a password-authenticated server (CI's, and any real install) cannot log in as
+# it -- giving the shared role a password to suit a test would be worse. But it is
+# also the more faithful test: ADR 0008 deploys exactly this shape, per person and
+# per agent (`CREATE ROLE rob LOGIN IN ROLE fafnir_app`), so what is asserted here
+# is what a laptop or an MCP server actually connects as.
+APP_MEMBER_ROLE = "fafnir_app_member_test"
+APP_MEMBER_PASSWORD = "app_member_test_password"
+
 
 def _admin() -> Database:
     return Database(TEST_DSN, autocommit=True)
@@ -66,6 +77,22 @@ def least_privilege_dsn():
         for role in FAFNIR_ROLES:
             if not db.fetchval("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
                 db.execute(f"CREATE ROLE {role} LOGIN")
+        # Inherits fafnir_app's grants and nothing else; password so it can log
+        # in over TCP the way CI and every real install authenticate.
+        if not db.fetchval(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (APP_MEMBER_ROLE,)
+        ):
+            db.execute(
+                f"CREATE ROLE {APP_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{APP_MEMBER_PASSWORD}' IN ROLE fafnir_app"
+            )
+        else:
+            db.execute(
+                f"ALTER ROLE {APP_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{APP_MEMBER_PASSWORD}'"
+            )
+            db.execute(f"GRANT fafnir_app TO {APP_MEMBER_ROLE}")
+
         db.execute(f"DROP DATABASE IF EXISTS {LP_DB}")
         if not db.fetchval("SELECT 1 FROM pg_roles WHERE rolname = %s", (LP_ROLE,)):
             db.execute(
@@ -125,3 +152,114 @@ def test_skipped_role_comments_are_reported(least_privilege_dsn, caplog):
     assert any(
         "skipped COMMENT ON ROLE" in record.getMessage() for record in caplog.records
     ), [r.getMessage() for r in caplog.records]
+
+
+# ---------------------------------------------------------------------------
+# The mart read seam (migration 0020, ADR 0008 §4 / ADR 0009)
+#
+# These are the tests the `ph`-as-fafnir_app breakage survived for want of. The
+# grants alone do not tell you whether duk can run: `fafnir_app` held SELECT on
+# core's TABLES via default privileges the whole time and still could not read
+# them, because it has no USAGE on the schema. Only an actual SELECT as that role
+# answers the question, so that is what these do.
+# ---------------------------------------------------------------------------
+
+# Every relation duk's db datasource reads. If duk grows a read, it goes here --
+# that is the point of the list.
+DUK_MART_RELATIONS = (
+    "mart.v_symbol_lookup",
+    "mart.v_daily_price_raw",
+    "mart.v_daily_price_adjusted",
+    "mart.v_security_profile",
+    "mart.v_security_price_coverage",
+    "mart.v_security_action_summary",
+    "mart.v_security_dq_open",
+    "mart.security_latest",
+    "ref.sector",
+    "ref.industry",
+)
+
+# What the seam must NOT reach. core.daily_price is the one that matters most: it
+# is readable through mart.v_daily_price_raw and must not be readable directly, or
+# the view is decoration rather than a boundary.
+FORBIDDEN_TO_APP = (
+    "core.daily_price",
+    "core.symbol_xref",
+    "core.security",
+    "ops.data_quality_flag",
+    "landing.fmp_raw",
+)
+
+
+def _as_app_dsn(dsn: str) -> str:
+    """The LP database, connected to as a member of fafnir_app."""
+    parts = conninfo_to_dict(dsn)
+    parts.update(user=APP_MEMBER_ROLE, password=APP_MEMBER_PASSWORD)
+    return make_conninfo(**parts)
+
+
+def _migrate_and_open_as_app(dsn: str):
+    """Migrate the LP database, then open it as the fafnir_app member.
+
+    CONNECT is granted explicitly rather than relying on PUBLIC's default: an
+    installation that has revoked it should still be able to run this test, and
+    the grant says out loud what the role needs.
+    """
+    m.migrate(dsn)
+    with Database(dsn, autocommit=True) as owner:
+        owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_app")
+    return Database(_as_app_dsn(dsn), autocommit=True)
+
+
+def test_fafnir_app_can_read_every_relation_duk_uses(least_privilege_dsn):
+    """duk connects as a mart-only role (ADR 0008), so every relation it names
+    must be readable by a member of `fafnir_app` -- including the views 0020
+    added."""
+    failures = []
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        for relation in DUK_MART_RELATIONS:
+            try:
+                app.fetchval(f"SELECT count(*) FROM {relation}")
+            except Exception as exc:  # noqa: BLE001 -- the message is the report
+                failures.append(f"{relation}: {type(exc).__name__}: {exc}")
+    assert not failures, "fafnir_app cannot read:\n  " + "\n  ".join(failures)
+
+
+def test_fafnir_app_still_cannot_reach_core_ops_or_landing(least_privilege_dsn):
+    """The other half of the argument for definer-rights views.
+
+    A mart view readable by `fafnir_app` is only a boundary if the underlying
+    table is not. If this test ever fails, the seam has been widened by a stray
+    GRANT and mart.v_security_dq_open stopped being a narrowing of the DQ queue.
+    """
+    reachable = []
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        for relation in FORBIDDEN_TO_APP:
+            try:
+                app.fetchval(f"SELECT count(*) FROM {relation}")
+                reachable.append(relation)
+            except Exception:  # noqa: BLE001 -- denial is the expected outcome
+                pass
+    assert not reachable, f"fafnir_app should not reach: {reachable}"
+
+
+def test_dq_seam_exposes_no_resolution_provenance(least_privilege_dsn):
+    """`mart.v_security_dq_open` must not carry `detail` or the human judgements.
+
+    `detail` is excluded because `adjustment_failed` writes a raw Python exception
+    string into it. `resolved_by`/`resolution_note` are excluded structurally by
+    the open-only filter (0017's CHECK forces them NULL while `resolved_at` is) --
+    this asserts the columns are absent too, so relaxing the WHERE cannot quietly
+    put human-written text on an agent-readable seam.
+    """
+    m.migrate(least_privilege_dsn)
+    with Database(least_privilege_dsn, autocommit=True) as db:
+        columns = {
+            r["column_name"]
+            for r in db.fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'mart' AND table_name = 'v_security_dq_open'"
+            )
+        }
+    assert "record_key" in columns, columns
+    assert not columns & {"detail", "resolved_by", "resolution_note"}, columns
