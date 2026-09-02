@@ -80,7 +80,11 @@ the migrating role, so they run with the owner's privileges — that is what let
 `mart`-only role read an `ops`-derived aggregate without ever being granted `ops`.
 
 > **This is a deliberate crossing of the role boundary** and deserves its own short
-> ADR (0009) alongside the migration. The exposure is narrowed on purpose: the DQ
+> ADR (0009) alongside the migration. The mechanism is verified, not assumed: on the
+> scratch cluster above, `fafnir_app` reads the `mart.v_security_dq_open` definition
+> below and gets its counts back, while `SELECT … FROM ops.data_quality_flag` as the
+> same role still fails with `permission denied for schema ops`. The exposure is
+> narrowed on purpose: the DQ
 > view emits **counts and dates only**, never `detail`/`record_key`, so the read
 > seam cannot be used to walk the queue. Flag detail stays behind
 > `fafnir dq list`, which runs as `fafnir_ingest`.
@@ -154,13 +158,39 @@ prove it rather than trust it.
 
 ### A pre-existing gap this surfaces
 
-`duk -S db ph` reads `core.daily_price` and `core.symbol_xref` directly, so db-mode
-duk needs `fafnir_read` today, not the `fafnir_app` its docs and ADR 0008 name.
-Routing the **new** code path through `mart.v_symbol_lookup` fixes it for `ls`, and
-switching `_resolve_security_id` to the view fixes resolution for `ph` too, at no
-cost. Moving `ph`'s price read itself onto a `mart` view is a separate change and is
-**out of scope here** — but it should be filed, because the role model is currently
-aspirational rather than true.
+`duk -S db ph` cannot run as `fafnir_app` at all. Measured on a scratch cluster with
+all 19 migrations applied and the three roles created as a real install creates them:
+
+| Read, as `fafnir_app` | Result |
+|---|---|
+| `core.symbol_xref` (the first query `_resolve_security_id` runs) | `ERROR: permission denied for schema core` |
+| `core.daily_price` (raw `ph`) | `ERROR: permission denied for schema core` |
+| `mart.v_daily_price_adjusted` (`ph --adj`) | ✅ `100.5000000` |
+| `mart.security_latest` (`ls` screening) | ✅ |
+| `ops.data_quality_flag` | `ERROR: permission denied for schema ops` |
+
+Resolution fails **before** either price relation is reached, so `ph` is broken as
+`fafnir_app` with and without `--adj` — even though the adjusted view itself is
+perfectly readable. It works in practice because nobody runs it as that role: on the
+warehouse host `duk` picks up `FAFNIR_DSN` from `/etc/fafnir/fafnir.env`, which is
+`user=fafnir_ingest` over the socket ([install §4.4](../install_hetzner.md), and §8
+says so outright — *"duk here picks up FAFNIR_DSN from the env file, so it reads as
+fafnir_ingest"*). `fafnir_read` works too. The only `fafnir_app` path is §11's laptop
+tunnel, whose two example commands split: `ls --sector Technology` works (pure
+`mart`), `ph AAPL --adj --close -n 10` cannot. Half of it working is presumably why
+this has gone unnoticed.
+
+The install doc already half-knows: its troubleshooting table carries
+*"`permission denied for schema core` from `duk` → correct by design — use `mart.*`
+views, or connect as `fafnir_read`"*, while §11 and the §12 acceptance checklist both
+still instruct `duk -S db ph SPY --adj -n 5  # reads as fafnir_app`.
+
+Routing the **new** code path through `mart.v_symbol_lookup` fixes resolution for
+`ls`, and switching `_resolve_security_id` to that view fixes it for `ph` too, at no
+cost — which leaves only raw `ph` reading `core` directly. Putting that last read
+behind a `mart` view (and then correcting §11/§12, or the role model, whichever the
+maintainer decides is the intent) is a separate change and is **out of scope here**,
+but it should be filed: right now the documented role model is aspirational, not true.
 
 ## Code changes
 
@@ -310,7 +340,9 @@ displayed number always matches the statements shown next to it.
 - `fafnir_app` can `SELECT` all five new views;
 - `fafnir_app` still **cannot** read `ops.data_quality_flag` directly.
   That pair is the whole argument for the view-owner approach; if it is not tested,
-  it is not true.
+  it is not true. Note this suite skips unless the test DSN's role can create roles
+  and databases — a green run on a restricted DSN proves nothing here, which is how
+  the `ph`-as-`fafnir_app` breakage above survived this long.
 
 **Migration** (`test/fafnir/test_migrations.py` pattern): up/down round trip.
 
