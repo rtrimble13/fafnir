@@ -66,7 +66,7 @@ on purpose — see that module's comment). **Do not add a fourth copy**: extend 
 existing function with an optional `by_name` fallback, and keep the three SQL
 constants as the single statement of the ladder.
 
-## The read seam: four new `mart` views
+## The read seam: six new `mart` views
 
 The summary needs facts from `core` (prices, actions, adjustment factors) and from
 `ops` (the DQ queue). Neither is reachable by the role duk-db is *documented* to
@@ -74,7 +74,7 @@ connect as: migration `0001` grants `fafnir_app` schema `USAGE` on `mart` and `r
 only, and grants **nothing at all on `ops`** to any read role.
 
 So the summary reads `mart`, and one migration adds the views that make that
-possible. Views are unmaterialized (a profile lookup must be current, unlike
+possible — plus the two from ADR 0008 §4 that finish the seam. Views are unmaterialized (a profile lookup must be current, unlike
 `mart.security_latest`, which is a scheduled screening snapshot) and are owned by
 the migrating role, so they run with the owner's privileges — that is what lets a
 `mart`-only role read an `ops`-derived aggregate without ever being granted `ops`.
@@ -107,6 +107,20 @@ WHERE NOT EXISTS (SELECT 1 FROM core.symbol_xref x2
 
 Same rows, same precedence as the current three-query ladder — proved by a test
 (below), not by assertion.
+
+**1b. `mart.v_daily_price_raw`** — the raw counterpart to `v_daily_price_adjusted`,
+so the unadjusted series has a `mart` name too:
+
+```sql
+CREATE VIEW mart.v_daily_price_raw AS
+SELECT security_id, trade_date, open, high, low, close, volume
+FROM core.daily_price;
+```
+
+Unadjusted, as traded (ADR 0001/0004) — the point of the explicit name is that a
+client cannot read unadjusted prices while believing they are adjusted. Not part of
+the company summary itself; it is here because this is the migration that makes
+`mart` complete (see [the gap](#a-pre-existing-gap-this-surfaces) above).
 
 **2. `mart.v_security_profile`** — one row per security: `security_id`, `symbol`,
 `company_name`, `asset_type`, `exchange_code` + `exchange_name`, `sector_name`,
@@ -150,7 +164,7 @@ WHERE resolved_at IS NULL AND security_id IS NOT NULL
 GROUP BY security_id, check_name, severity;
 ```
 
-Counts and dates only, open flags only. `.down.sql` drops all five.
+Counts and dates only, open flags only. `.down.sql` drops all six.
 
 `ALTER DEFAULT PRIVILEGES … IN SCHEMA mart GRANT SELECT ON TABLES` (migration 0001)
 covers views, so no per-view grant is needed — but the least-privilege test must
@@ -185,12 +199,29 @@ The install doc already half-knows: its troubleshooting table carries
 views, or connect as `fafnir_read`"*, while §11 and the §12 acceptance checklist both
 still instruct `duk -S db ph SPY --adj -n 5  # reads as fafnir_app`.
 
-Routing the **new** code path through `mart.v_symbol_lookup` fixes resolution for
-`ls`, and switching `_resolve_security_id` to that view fixes it for `ph` too, at no
-cost — which leaves only raw `ph` reading `core` directly. Putting that last read
-behind a `mart` view (and then correcting §11/§12, or the role model, whichever the
-maintainer decides is the intent) is a separate change and is **out of scope here**,
-but it should be filed: right now the documented role model is aspirational, not true.
+**Decided: close it here.** `mart` becomes the complete read seam for `duk`, and the
+role model becomes true as documented rather than aspirational.
+[ADR 0008 §4](../adr/0008-remote-duk-access-and-mcp.md) records the decision and the
+alternative that was rejected. Two consequences for this plan:
+
+- `mart.v_symbol_lookup` (already listed below) serves `ph` as well as `ls`, and
+  `_resolve_security_id` switches to it.
+- **`mart.v_daily_price_raw` joins this migration** — the raw counterpart to
+  `v_daily_price_adjusted`, so `price_history(adjusted=False)` stops naming `core`.
+  With it, `duk.datasource.db` names no `core` relation at all.
+
+Verified on the scratch cluster: through the view, as `fafnir_app`, on a ten-year
+partitioned table, the plan is byte-identical to the direct read (`Seq Scan on
+daily_price_y2024` — one partition of eleven). Views inline; pruning survives; there
+is no query-cost argument against this.
+
+Two rules that come with it, both belonging in ADR 0009 alongside the `ops` window:
+a `mart` view must never set `security_invoker = true` (definer rights are the whole
+mechanism), and adding a `mart` view grants every `mart` reader whatever it selects
+— so it is a deliberate act, not a convenience.
+
+Correcting install §11/§12, which today instruct `duk -S db ph SPY --adj` as
+`fafnir_app`, is part of phase 1: the commands they name become true.
 
 ## Code changes
 
@@ -335,9 +366,13 @@ displayed number always matches the statements shown next to it.
 - resolution by exact name, by former ticker, and the ambiguous-name path.
 - `mart.v_symbol_lookup` returns the same `security_id` as the existing three-query
   ladder for live, primary, and historical tickers.
+- `mart.v_daily_price_raw` and `core.daily_price` return identical rows for a
+  security across a date range — the `ph` series must not move by a digit when the
+  relation name changes. Worth asserting on the DataFrame, not just the SQL, since
+  that is the contract `scripts/reconcile.sh` depends on.
 
 **Privilege** (extend `test/fafnir/test_migrations_least_privilege.py`):
-- `fafnir_app` can `SELECT` all five new views;
+- `fafnir_app` can `SELECT` all six new views;
 - `fafnir_app` still **cannot** read `ops.data_quality_flag` directly.
   That pair is the whole argument for the view-owner approach; if it is not tested,
   it is not true. Note this suite skips unless the test DSN's role can create roles
@@ -350,19 +385,25 @@ displayed number always matches the statements shown next to it.
 
 - `doc/duk.md` — a `ls QUERY` section: the ladder, the flag rules, the JSON shape
   divergence, worked examples.
-- `doc/data_dictionary.md` — the five new `mart` views under Schema: `mart`,
+- `doc/data_dictionary.md` — the six new `mart` views under Schema: `mart`,
   including the note that `v_security_dq_open` is an owner-privilege window onto
-  `ops`.
+  `ops`, and `v_daily_price_raw` beside the adjusted view it mirrors.
 - `doc/adr/0009-*.md` — the aggregate-`ops`-through-`mart` decision.
 - `doc/operations.md` — `duk -S db ls <TICKER>` as the per-symbol triage entry
   point, next to `fafnir dq list`.
+- `doc/install_hetzner.md` §11/§12 — the `ph`-as-`fafnir_app` examples become true
+  in phase 1; drop the troubleshooting row that documents the failure.
+- `doc/duk.md` — the source table says db-mode raw reads `core.daily_price`; it
+  becomes `mart.v_daily_price_raw`.
+- `doc/architecture.md` — the role table's `fafnir_app` row ("read **mart** (+ ref)
+  only … `duk -S db`") needs no edit; phase 1 is what makes it accurate.
 - `doc/index.md`, `README.md` — link and command-table rows.
 
 ## Phasing
 
 | Phase | Deliverable | Independently mergeable |
 |---|---|---|
-| 1 | migration 0020 + ADR 0009 + migration/privilege tests; `_resolve_security_id` moved onto `mart.v_symbol_lookup` | yes — no user-visible change |
+| 1 | migration 0020 + ADR 0009 + migration/privilege tests; `duk.datasource.db` moved onto `mart` throughout (`_resolve_security_id` → `v_symbol_lookup`, raw `price_history` → `v_daily_price_raw`); install §11/§12 and `duk.md` corrected | yes — and worth shipping on its own: it fixes `duk -S db ph` for `fafnir_app` |
 | 2 | `resolve_company` / `company_summary` in `datasource/db.py`; `company_summary.py` assembly + rendering; unit tests | yes — library-only |
 | 3 | `ls QUERY` CLI wiring, output formats, docs, CLI + integration tests | yes — ships the feature |
 | 4 | fundamentals section goes live when `mart.v_security_fundamentals_latest` exists | later milestone, no duk change |

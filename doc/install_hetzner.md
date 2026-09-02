@@ -1268,6 +1268,16 @@ duk -S db ph AAPL --adj --close -n 10
 duk -S db ls --sector Technology -n 10
 ```
 
+> **Known gap — `ph` does not work as `fafnir_app` yet.** `duk` resolves a ticker
+> against `core.symbol_xref`, and `fafnir_app` has no `USAGE` on `core`, so the `ph`
+> line above fails with `permission denied for schema core` before it reaches a
+> price (with *and* without `--adj`). The `ls` line works — it is pure `mart`. Until
+> this is fixed, use `fafnir_read` for `ph` from a laptop:
+> `user=fafnir_read` + its password. The fix — two `mart` views, after which
+> `fafnir_app` serves every `duk` read and this note goes away — is
+> [ADR 0008 §4](adr/0008-remote-duk-access-and-mcp.md), scheduled in the
+> [company-summary plan](plans/duk-company-summary.md).
+
 Or put it in `~/.dukrc` on the laptop — see [duk.md](duk.md#configuration). Note that
 `duk` takes a **full DSN only** (`FAFNIR_DSN`, or `[database].dsn` in `~/.dukrc`); it
 does not assemble one from the `host`/`port`/`dbname`/`user` parts that `~/.fafnirrc`
@@ -1361,7 +1371,8 @@ ls /etc/logrotate.d/fafnir                           # rotation installed (§10)
 sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh     # every §10 check; exits 0 when clean
 
 # --- From your laptop, with the §11 tunnel up -------------------------------
-duk -S db ph SPY --adj -n 5                          # reads as fafnir_app
+duk -S db ph SPY --adj -n 5                          # see the §11 known gap:
+                                                     # needs fafnir_read for now
 ```
 
 Steady-state operation, reconciliation, and recovery from here on:

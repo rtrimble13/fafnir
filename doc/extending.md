@@ -48,7 +48,8 @@ three-timeline design (ADR 0002) make this additive.
 
 ## Adding the MCP server
 
-The read seam is `mart` (+ `core` read views). An MCP server should:
+The read seam is `mart` — all of it, with no `core` access at all
+([ADR 0008 §4](adr/0008-remote-duk-access-and-mcp.md)). An MCP server should:
 
 - connect as the least-privilege `fafnir_app` role (mart read-only);
 - expose tools mirroring `duk` db-mode reads (price history adjusted/raw, screen,

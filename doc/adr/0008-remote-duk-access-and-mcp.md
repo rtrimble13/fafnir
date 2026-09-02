@@ -2,9 +2,17 @@
 
 - Status: Proposed
 - Date: 2026-09-02
+- Amended: 2026-09-02 — added [§4 The seam](#4-the-seam--mart-is-not-yet-complete-two-views-short).
+  The identity model below makes every per-person and per-agent role a member of
+  `fafnir_app`, and the Consequences already require that `mart` be the whole
+  agent-visible world — but `duk.datasource.db` reads `core` for symbol resolution
+  and raw prices, so as originally written the two most important MCP tools could
+  not run. §4 names the two views that close it. Amended in place rather than
+  superseded because this ADR is still Proposed and nothing has been built on it.
 - Depends on: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md)
 - Related: [install_hetzner.md §11](../install_hetzner.md), [extending.md](../extending.md),
-  [duk.md](../duk.md)
+  [duk.md](../duk.md),
+  [plan: duk company summary](../plans/duk-company-summary.md)
 
 ## Context
 
@@ -190,10 +198,10 @@ security get the same series:
 
 | Tool | Backed by |
 |---|---|
-| `price_history` (raw or adjusted) | `db.price_history` → `core.daily_price` / `mart.v_daily_price_adjusted` |
+| `price_history` (raw or adjusted) | `db.price_history` → `mart.v_daily_price_raw` / `mart.v_daily_price_adjusted` |
 | `screen_securities` | `db.screen` → `mart.security_latest` |
 | `list_sectors` / `list_industries` | `db.list_sectors` / `db.list_industries` |
-| `resolve_symbol` | `db._resolve_security_id` + `mart.security_latest` |
+| `resolve_symbol` | `db._resolve_security_id` → `mart.v_symbol_lookup` + `mart.security_latest` |
 | `returns`, `indicator` | `duk.return_utils`, `duk.indicators` — pure compute on a prior result |
 
 Design rules that follow from "the role is the boundary":
@@ -209,6 +217,74 @@ Design rules that follow from "the role is the boundary":
   actually happen.
 - Dates in, dates out, ISO; no locale-dependent formatting. `duk`'s CLI formatting
   layer stays in the CLI.
+
+### 4. The seam — `mart` is not yet complete, two views short
+
+The Consequences below already require that `mart` be the whole agent-visible world.
+It is not, and the identity model in §2 is what makes that fatal rather than
+academic: `rob` and `rob_mcp` are members of `fafnir_app`, so they inherit `SELECT`
+on `mart` and `ref` and nothing else — while `duk.datasource.db` reads `core` for
+symbol resolution and for raw prices.
+
+Measured on a scratch PG16 cluster with all 19 migrations applied and the three
+roles pre-created the way a real install creates them:
+
+| Read, as `fafnir_app` | Result |
+|---|---|
+| `core.symbol_xref` — the first query `_resolve_security_id` runs | `ERROR: permission denied for schema core` |
+| `core.daily_price` — raw `ph` | `ERROR: permission denied for schema core` |
+| `mart.v_daily_price_adjusted` — `ph --adj` | ✅ |
+| `mart.security_latest` — screening | ✅ |
+
+Resolution fails *before* either price relation is reached, so `price_history` and
+`resolve_symbol` — the two tools the MCP surface exists for — cannot run for any
+member of `fafnir_app`, with or without `--adj`. The adjusted view itself reads
+perfectly, which is what makes this counterintuitive enough to have gone unnoticed:
+install §11's two example commands split, `ls --sector` working and `ph` not.
+
+**Two views close it**, and they are the whole of the change. `duk.datasource.db`
+touches exactly five relations, three of them in `core`:
+
+```sql
+-- Puts the resolver ladder in mart. Same rows, same precedence as the three
+-- queries in duk.datasource.db / fafnir.db.repository.resolve_security_id.
+CREATE VIEW mart.v_symbol_lookup AS ...        -- core.symbol_xref + core.security
+
+-- The raw counterpart to v_daily_price_adjusted. Unadjusted, as traded (ADR 0004).
+CREATE VIEW mart.v_daily_price_raw AS ...      -- core.daily_price
+```
+
+`duk` then names `mart.*` throughout and the role model becomes true as documented.
+Three properties of this, each verified rather than assumed:
+
+- **No query cost.** Through `mart.v_daily_price_raw`, as `fafnir_app`, on a
+  ten-year partitioned table, the plan is byte-identical to the direct read —
+  `Seq Scan on daily_price_y2024`, one partition of eleven. Views inline; partition
+  pruning survives.
+- **Definer rights are the mechanism.** A `mart` view runs with its owner's
+  privileges, which is precisely what lets a `mart`-only role read a `core`-derived
+  relation. `security_invoker = true` must therefore **never** be set on these
+  views — it would silently restore the failure. This makes `mart` a
+  privilege-granting surface: adding a view there grants every `mart` reader
+  whatever it selects, so a new `mart` view is a deliberate act, not a convenience.
+- **Researchers lose nothing.** `fafnir_read` keeps `core`. This changes only which
+  relations *`duk`* names.
+
+The recurring cost, stated honestly: every future `core` table `duk` needs will want
+a `mart` view — fundamentals and economic series each add one. That is a tax, and
+also the point: it forces the read contract to be designed rather than inherited.
+The failure mode is a forgotten view, discovered late by whoever is on the
+least-privilege path — exactly how this one surfaced.
+
+**The alternative that was rejected**: document `fafnir_read` as `duk`'s role and
+demote `fafnir_app` to screening-only. Zero code, and honest about how the system
+runs today — but it makes `core` a de facto public API the moment an agent reads it,
+leaves an agent able to issue an unfiltered `SELECT * FROM core.daily_price` (the
+whole warehouse; `statement_timeout` bounds the damage, not the attempt), removes
+the guarantee that a client cannot read unadjusted prices believing they are
+adjusted, and leaves `fafnir_app` with no user at all. It also does not save the
+edit to this ADR, since the per-person roles would have to inherit `fafnir_read`
+instead. The delta between the two options is two views.
 
 ## Alternatives considered
 
@@ -261,7 +337,9 @@ either way.
 - **`mart` is the whole agent-visible world.** Anything an agent should be able to
   read has to exist in `mart` (or a `mart` view) — which is the existing read seam,
   and keeps `landing` and `core` out of reach by construction. Adjusted prices stay
-  point-in-time stable for free (`mart.v_daily_price_adjusted`).
+  point-in-time stable for free (`mart.v_daily_price_adjusted`). This was **not**
+  true when first written — see §4 — and the two views named there are a
+  prerequisite for anything in this ADR, not a follow-up to it.
 - **Install §11 stays valid** as the shared-role path until this is implemented; it
   should then be rewritten to the per-person model, with the shared `fafnir_app`
   password retired.
@@ -273,9 +351,15 @@ either way.
 
 Roughly in order, each independently useful:
 
+0. **The two views in §4**, and `duk.datasource.db` reading `mart` throughout.
+   Nothing else here works without them, and they are independently useful: they fix
+   `duk -S db ph` for the shared-role path install §11 documents today. Landing them
+   alongside the [company-summary migration](../plans/duk-company-summary.md), which
+   adds `mart` views anyway, costs almost nothing extra.
 1. **Docs first, no code**: rewrite install §11 for the socket forward + per-person
    roles; add an "adding a reader" section to `operations.md`; note the
-   password-free DSN in `duk.md`.
+   password-free DSN in `duk.md`. Correct §11/§12's `ph`-as-`fafnir_app` examples,
+   which step 0 makes true.
 2. `src/fafnir_mcp/` — server, tool definitions, row caps, connection diagnostics;
    `mcp` as an optional dependency group; `fafnir-mcp` console script.
 3. Unit tests for tool argument validation and truncation; an integration test
