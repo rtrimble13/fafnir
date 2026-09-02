@@ -28,6 +28,9 @@ read through the `duk` CLI.
 ## Growing it
 
 - [Extending](extending.md) — add a source (FRED/BLS/BEA), fundamentals, MCP server
+- Plans (proposed, not yet implemented):
+  - [`duk ls <company>` company summary](plans/duk-company-summary.md) — per-company
+    meta, price/action statistics, fundamentals seam, and open DQ flags
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
