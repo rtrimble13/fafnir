@@ -90,12 +90,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return _check(dsn, args.profile)
 
+    # Built BEFORE the privilege check, because the SDK is a hard prerequisite and
+    # server.py imports it lazily -- so this call, not the import above, is what
+    # fails on a host without the mcp extra. Do the check first and such a host
+    # reports a connection warning before the actual cause, sending whoever reads
+    # it to the wrong layer. Building registers tools and opens no connection, so
+    # the reordering costs nothing.
+    from fafnir_mcp.server import build_server
+
+    server = build_server(dsn=dsn, profile=args.profile)
+
     if not _refuse_writable_role(dsn):
         return 1
 
-    from fafnir_mcp.server import build_server
-
-    build_server(dsn=dsn, profile=args.profile).run("stdio")
+    server.run("stdio")
     return 0
 
 
