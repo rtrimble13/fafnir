@@ -31,6 +31,9 @@ read through the `duk` CLI.
 - Plans (proposed, not yet implemented):
   - [`duk ls <company>` company summary](plans/duk-company-summary.md) — per-company
     meta, price/action statistics, fundamentals seam, and open DQ flags
+  - [Database-operations agent](plans/db-operations-agent.md) — an on-host Claude
+    skill plus MCP server for DQ triage, automation assistance and data
+    comprehension; the `fafnir_ops` read tier and the three-tier privilege model
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
