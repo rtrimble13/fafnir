@@ -10,7 +10,7 @@ patterns to add new sources, tables, and consumers.
 | **Initial release** | security master, daily OHLCV, corporate actions, dual-mode duk | ✅ shipped |
 | **Fundamentals** | income/balance/cash-flow statements, key metrics, ratios (bitemporal) | planned |
 | **Economic series** | FRED, BLS, BEA time series; treasury curve for `duk yc` (db) | planned |
-| **MCP server** | agentic read access over `mart` | planned |
+| **MCP server** | agentic read access over `mart`, plus an on-host ops tier | ✅ shipped |
 | **Intraday** | `core.intraday_bar` (TIMESTAMPTZ) | planned |
 
 ## Adding a new data source (FRED / BLS / BEA)
@@ -46,25 +46,43 @@ Point-in-time queries filter `filing_date <= as_of_date`. `period` is pinned to
 FMP's vocabulary (`annual`/`quarter`) at the boundary. The surrogate id and the
 three-timeline design (ADR 0002) make this additive.
 
-## Adding the MCP server
+## The MCP server
 
-The read seam is `mart` — all of it, with no `core` access at all
-([ADR 0008 §4](adr/0008-remote-duk-access-and-mcp.md)). An MCP server should:
+**Shipped** — `src/fafnir_mcp/`, a `fafnir-mcp` console script, and an `mcp`
+optional dependency group. Two profiles, and the difference between them is a
+privilege decision rather than a convenience:
 
-- connect as the least-privilege `fafnir_app` role (mart read-only);
-- expose tools mirroring `duk` db-mode reads (price history adjusted/raw, screen,
-  security lookup) returning the same shapes;
-- reuse `fafnir.db.repository` read functions or the `duk.datasource.db` adapters
-  rather than re-implementing SQL.
+| Profile | Role | Reads | Tools |
+|---|---|---|---|
+| `read` | member of `fafnir_app` | `mart`, `ref` | `resolve_symbol`, `price_history`, `screen_securities`, `list_sectors`/`list_industries`, `security_profile`, `dq_summary` |
+| `ops` | member of `fafnir_ops` (0021) | + `core`, `ops`, `landing`, `meta` | + `dq_queue`, `dq_totals`, `ingestion_runs`, `watermarks`, `landing_payload`, `schema_state`, `sql_read` |
 
-Because adjusted prices are derived in `mart.v_daily_price_adjusted`, MCP clients
-get point-in-time-stable data for free.
+The `read` profile is the surface [ADR 0008 §3](adr/0008-remote-duk-access-and-mcp.md)
+specifies and runs from a laptop through the §11 tunnel unchanged. The `ops`
+profile is for an agent on the warehouse host and is settled in
+[ADR 0010](adr/0010-on-host-operations-agent.md) — including why it may run
+free-form read-only SQL when the `read` profile may not. Deploying either is
+[doc/agent.md](agent.md).
 
-Where the server runs, which identity it connects as, and why it exposes no
-free-form SQL tool are settled in
-[ADR 0008](adr/0008-remote-duk-access-and-mcp.md) — which also covers reaching the
-warehouse from a laptop under a person's own credentials, since the MCP server uses
-the same path.
+Three rules for anyone extending it:
+
+- **Reuse `duk.datasource.db`.** Every read-profile tool is backed by it, so an
+  agent and a person reading the same security get the same rows. A tool with its
+  own SQL for something `duk` already reads is a second read path that will
+  eventually disagree with the first.
+- **The tool layer imports no MCP SDK.** `fafnir_mcp/tools.py` takes plain
+  arguments and returns plain dicts; `server.py` is the only SDK-facing file.
+  That keeps validation, row caps and error wording unit-testable without an SDK
+  installed, and confines a major SDK bump to one module.
+- **Profiles are enforced by registration, not by a check at call time.** An
+  ops-only tool must not exist on the read profile — `test_profiles.py` asserts
+  the registered tool set for exactly this reason, since both profiles are built
+  by the same function and the read profile looks complete either way.
+
+A new tool needs: the implementation in `tools.py`, registration in `server.py`
+under the right profile, its name in `test_profiles.py`'s `READ_TOOLS` or
+`OPS_ONLY_TOOLS`, and — if it reads a new relation — a `mart` view or a
+`fafnir_ops` grant, whichever tier it belongs to.
 
 ## Schema change hygiene
 

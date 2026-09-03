@@ -1,0 +1,26 @@
+{
+  "//": [
+    "MCP server registration for a LAPTOP, reading through the SSH tunnel.",
+    "",
+    "The read profile only: mart + ref, parameterized tools, no free-form SQL.",
+    "That restriction is ADR 0008's and still holds for anything reachable",
+    "remotely -- the ops profile is for an agent on the warehouse host.",
+    "",
+    "Requires the socket forward from install_hetzner.md ~/.ssh/config:",
+    "  ssh -fN fafnir",
+    "and a per-person agent role on the server:",
+    "  CREATE ROLE rob_mcp LOGIN IN ROLE fafnir_app;",
+    "",
+    "Still no password: the forward lands on the remote Unix socket, so peer",
+    "authentication sees the SSH-authenticated user. The SSH key is the only secret."
+  ],
+  "mcpServers": {
+    "fafnir": {
+      "command": "/Users/rob/.venvs/fafnir/bin/fafnir-mcp",
+      "args": ["--profile", "read"],
+      "env": {
+        "FAFNIR_DSN": "host=127.0.0.1 port=15432 dbname=fafnir user=rob_mcp application_name=fafnir-mcp"
+      }
+    }
+  }
+}

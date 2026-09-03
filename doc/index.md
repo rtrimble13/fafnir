@@ -24,6 +24,8 @@ read through the `duk` CLI.
   [working the DQ queue](operations.md#working-the-dq-queue), reconciliation,
   recovery, backups
 - [duk CLI](duk.md) — reading the warehouse (db) vs the API (live)
+- [Operations Agent](agent.md) — running an agent on the host for DQ triage,
+  automation diagnosis and data questions: roles, MCP wiring, audit, revocation
 
 ## Growing it
 
@@ -31,6 +33,11 @@ read through the `duk` CLI.
 - Plans (proposed, not yet implemented):
   - [`duk ls <company>` company summary](plans/duk-company-summary.md) — per-company
     meta, price/action statistics, fundamentals seam, and open DQ flags
+  - [Database-operations agent](plans/db-operations-agent.md) — an on-host Claude
+    skill plus MCP server for DQ triage, automation assistance and data
+    comprehension; the `fafnir_ops` read tier and the three-tier privilege model
+    (**implemented** — see [agent.md](agent.md) and
+    [ADR 0010](adr/0010-on-host-operations-agent.md))
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
@@ -41,6 +48,7 @@ read through the `duk` CLI.
   - [ADR 0007 — Corporate actions load incrementally (market-wide calendar sweep)](adr/0007-incremental-corporate-actions.md)
   - [ADR 0008 — Remote `duk` under per-person credentials, and a local stdio MCP server](adr/0008-remote-duk-access-and-mcp.md)
   - [ADR 0009 — `mart` is the whole read seam, and definer-rights views are how](adr/0009-mart-is-the-read-seam.md)
+  - [ADR 0010 — An on-host operations agent: a fourth read tier, and mutations stay on the CLI](adr/0010-on-host-operations-agent.md)
 
 ## Reference
 
@@ -49,3 +57,5 @@ read through the `duk` CLI.
 - systemd unit templates: [`etc/systemd/`](../etc/systemd/)
 - Migrations: [`sql/migrations/`](../sql/migrations/)
 - Batch scripts: [`scripts/`](../scripts/)
+- Agent configuration templates: [`etc/agent/`](../etc/agent/)
+- Agent skill (DQ playbooks, data semantics): [`.claude/skills/fafnir-dba/`](../.claude/skills/fafnir-dba/)

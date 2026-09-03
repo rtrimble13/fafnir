@@ -38,7 +38,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .[dev]
+        # The mcp extra is included deliberately. The MCP tests guard themselves
+        # with importorskip, so without the SDK they SKIP rather than fail -- and a
+        # test that silently stops running is not a test. They are also the ones
+        # that earn their keep: the profile boundary (sql_read must not exist on the
+        # read profile) and the error surface (our ToolError reaching the caller at
+        # all) are both invisible to every other test in the suite.
+        run: pip install -e .[dev,mcp]
       - name: Unit tests (no database)
         run: pytest test/ -v -m "not integration"
       - name: Integration tests (Postgres)
@@ -49,3 +55,16 @@ jobs:
           fafnir db --help
           duk --help
           duk ph --help
+          fafnir-mcp --help
+      - name: MCP refuses a writable role
+        # The tier boundary ADR 0010 rests on, checked against a real server. The
+        # CI DSN is the owning role, so this MUST fail -- a zero exit here means
+        # fafnir-mcp would happily run as an identity that can change data.
+        run: |
+          if fafnir-mcp --profile ops --check; then
+            echo "FAIL: fafnir-mcp accepted a writable role" >&2
+            exit 1
+          fi
+          echo "OK: refused, as it must"
+        env:
+          FAFNIR_DSN: "host=localhost port=5432 dbname=fafnir user=fafnir password=fafnir"

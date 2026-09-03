@@ -1,0 +1,23 @@
+# /etc/sudoers.d/claude-fafnir   (install with: visudo -f /etc/sudoers.d/claude-fafnir)
+#
+# The whole of tier 3 (ADR 0010). The agent holds no writable database role; every
+# change it makes runs the fafnir CLI as the fafnir OS user, which peer-authenticates
+# as fafnir_ingest.
+#
+# Narrow deliberately:
+#   * one target user (fafnir), not ALL -- so this is not a path to root;
+#   * one absolute binary, the venv's fafnir -- NOT a wildcard, and NOT the venv's
+#     python, which would run anything;
+#   * no arguments constrained here. The argument-level boundary is the Claude Code
+#     permission allowlist (.claude/settings.json), where it belongs: sudoers cannot
+#     express "dry run first" and would fail open on any subcommand not enumerated.
+#
+# NOPASSWD because the agent has no password to type. That is the point of the
+# allowlist prompting on every mutation: a human approves, interactively, per action.
+claude ALL=(fafnir) NOPASSWD: /opt/fafnir/.venv/bin/fafnir
+
+# Deliberately NOT granted, each for a reason:
+#   (postgres)                    -- would make the read tier meaningless
+#   /opt/fafnir/.venv/bin/python  -- arbitrary code as the write identity
+#   /opt/fafnir/scripts/*         -- reset_data.sh lives there
+#   ALL=(ALL)                     -- root
