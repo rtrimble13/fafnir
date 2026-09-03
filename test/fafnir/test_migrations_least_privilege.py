@@ -28,7 +28,11 @@ TEST_DSN = os.environ.get("FAFNIR_TEST_DSN", "")
 LP_ROLE = "fafnir_lp_test_owner"
 LP_PASSWORD = "lp_test_password"
 LP_DB = "fafnir_lp_test"
-FAFNIR_ROLES = ("fafnir_ingest", "fafnir_read", "fafnir_app")
+# 0021 adds fafnir_ops, and like the other three it will not create itself without
+# CREATEROLE -- so the fixture pre-creates it exactly as install_hetzner.md §3.5
+# does. Its NOLOGIN default is overridden here only for the member role below;
+# fafnir_ops itself stays a group that holds grants.
+FAFNIR_ROLES = ("fafnir_ingest", "fafnir_read", "fafnir_app", "fafnir_ops")
 
 # A login role that is a MEMBER of fafnir_app, rather than fafnir_app itself.
 #
@@ -40,6 +44,13 @@ FAFNIR_ROLES = ("fafnir_ingest", "fafnir_read", "fafnir_app")
 # is what a laptop or an MCP server actually connects as.
 APP_MEMBER_ROLE = "fafnir_app_member_test"
 APP_MEMBER_PASSWORD = "app_member_test_password"
+
+# The same shape one tier up: what an on-host operations agent connects as
+# (`CREATE ROLE claude_ops LOGIN IN ROLE fafnir_ops`, ADR 0010). Kept separate from
+# APP_MEMBER_ROLE because the whole point of the tier is that the two see different
+# things, which only two live connections can demonstrate.
+OPS_MEMBER_ROLE = "fafnir_ops_member_test"
+OPS_MEMBER_PASSWORD = "ops_member_test_password"
 
 
 def _admin() -> Database:
@@ -76,7 +87,11 @@ def least_privilege_dsn():
         # without CREATEROLE, exactly as a real install pre-creates them.
         for role in FAFNIR_ROLES:
             if not db.fetchval("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
-                db.execute(f"CREATE ROLE {role} LOGIN")
+                # fafnir_ops is a group that holds grants, never a principal that
+                # connects (ADR 0010) -- per-agent roles are members of it. The
+                # other three keep LOGIN because deployments do connect as them.
+                login = "NOLOGIN" if role == "fafnir_ops" else "LOGIN"
+                db.execute(f"CREATE ROLE {role} {login}")
         # Inherits fafnir_app's grants and nothing else; password so it can log
         # in over TCP the way CI and every real install authenticate.
         if not db.fetchval(
@@ -92,6 +107,19 @@ def least_privilege_dsn():
                 f"'{APP_MEMBER_PASSWORD}'"
             )
             db.execute(f"GRANT fafnir_app TO {APP_MEMBER_ROLE}")
+        if not db.fetchval(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (OPS_MEMBER_ROLE,)
+        ):
+            db.execute(
+                f"CREATE ROLE {OPS_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{OPS_MEMBER_PASSWORD}' IN ROLE fafnir_ops"
+            )
+        else:
+            db.execute(
+                f"ALTER ROLE {OPS_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{OPS_MEMBER_PASSWORD}'"
+            )
+            db.execute(f"GRANT fafnir_ops TO {OPS_MEMBER_ROLE}")
 
         db.execute(f"DROP DATABASE IF EXISTS {LP_DB}")
         if not db.fetchval("SELECT 1 FROM pg_roles WHERE rolname = %s", (LP_ROLE,)):
@@ -263,3 +291,133 @@ def test_dq_seam_exposes_no_resolution_provenance(least_privilege_dsn):
         }
     assert "record_key" in columns, columns
     assert not columns & {"detail", "resolved_by", "resolution_note"}, columns
+
+
+# ---------------------------------------------------------------------------
+# The ops read tier (migration 0021, ADR 0010)
+#
+# Three properties, and the third is the one that decays silently. The tier is
+# only a tier while `fafnir_ops` reads MORE than `fafnir_app` and writes NOTHING,
+# and while adding it has not widened `fafnir_app` as a side effect -- which is
+# precisely what would happen if someone served the agent's need for `detail` by
+# relaxing mart.v_security_dq_open instead of using this role.
+# ---------------------------------------------------------------------------
+
+# The operational record an agent triaging the DQ queue has to be able to read.
+# meta.schema_migration is here because "is this host running the schema the repo
+# expects?" is an operations question with an operations answer.
+OPS_READABLE = (
+    "ops.data_quality_flag",
+    "ops.ingestion_run",
+    "ops.load_watermark",
+    "landing.fmp_raw",
+    "meta.schema_migration",
+    # Everything fafnir_read reaches is included by design: triage starts from a
+    # flag and ends in the bars and actions that explain it.
+    "core.daily_price",
+    "core.security",
+    "core.corporate_action",
+    "core.symbol_change",
+    "mart.v_daily_price_adjusted",
+    "mart.security_latest",
+    "ref.exchange",
+)
+
+# One write of each shape, against a relation the role can definitely SELECT --
+# so a failure here means the privilege is missing, never that the table is.
+OPS_FORBIDDEN_WRITES = (
+    ("INSERT", "INSERT INTO ops.data_quality_flag (check_name) VALUES ('probe')"),
+    ("UPDATE", "UPDATE ops.data_quality_flag SET severity = 'error'"),
+    ("DELETE", "DELETE FROM ops.data_quality_flag"),
+    ("INSERT core", "INSERT INTO core.security (primary_symbol) VALUES ('PROBE')"),
+    ("DELETE core", "DELETE FROM core.daily_price"),
+    ("CREATE ops", "CREATE TABLE ops.privilege_probe (i int)"),
+    ("CREATE core", "CREATE TABLE core.privilege_probe (i int)"),
+    ("CREATE mart", "CREATE TABLE mart.privilege_probe (i int)"),
+)
+
+
+def _as_ops_dsn(dsn: str) -> str:
+    """The LP database, connected to as a member of fafnir_ops."""
+    parts = conninfo_to_dict(dsn)
+    parts.update(user=OPS_MEMBER_ROLE, password=OPS_MEMBER_PASSWORD)
+    return make_conninfo(**parts)
+
+
+def _migrate_and_open_as_ops(dsn: str):
+    m.migrate(dsn)
+    with Database(dsn, autocommit=True) as owner:
+        owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_ops")
+    return Database(_as_ops_dsn(dsn), autocommit=True)
+
+
+def test_fafnir_ops_can_read_the_operational_record(least_privilege_dsn):
+    """The reason the tier exists: ops, landing and meta are readable by it.
+
+    Grants alone would not prove this -- `fafnir_app` held SELECT on core's tables
+    via default privileges for months while being unable to read one of them, for
+    want of USAGE on the schema (ADR 0009). Only a real SELECT as the role answers
+    it, so that is what this does.
+    """
+    failures = []
+    with _migrate_and_open_as_ops(least_privilege_dsn) as ops:
+        for relation in OPS_READABLE:
+            try:
+                ops.fetchval(f"SELECT count(*) FROM {relation}")
+            except Exception as exc:  # noqa: BLE001 -- the message is the report
+                failures.append(f"{relation}: {type(exc).__name__}: {exc}")
+    assert not failures, "fafnir_ops cannot read:\n  " + "\n  ".join(failures)
+
+
+def test_fafnir_ops_cannot_write_anything(least_privilege_dsn):
+    """The tier boundary. A reader that can write is not a read tier.
+
+    This is the assertion that matters most, because the ops role is the one an
+    agent connects as: ADR 0010 puts every mutation on the `fafnir` CLI as
+    `fafnir_ingest` precisely so that the agent's own credential cannot change
+    data even if every tool argument goes wrong at once.
+    """
+    succeeded = []
+    with _migrate_and_open_as_ops(least_privilege_dsn) as ops:
+        for label, statement in OPS_FORBIDDEN_WRITES:
+            try:
+                ops.execute(statement)
+                succeeded.append(label)
+            except Exception:  # noqa: BLE001 -- denial is the expected outcome
+                pass
+    assert not succeeded, f"fafnir_ops should not be able to: {succeeded}"
+
+
+def test_ops_tier_did_not_widen_the_app_tier(least_privilege_dsn):
+    """0021 must open a second door, not widen the first one.
+
+    ADR 0009's rule is that a `mart` view is a grant to every mart reader, so the
+    tempting way to give an agent `ops.data_quality_flag.detail` -- relaxing
+    mart.v_security_dq_open -- would hand it to every laptop and app as well. The
+    two roles are compared directly here so that mistake fails a test rather than
+    passing review.
+    """
+    m.migrate(least_privilege_dsn)
+    with Database(least_privilege_dsn, autocommit=True) as owner:
+        owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_app")
+        owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_ops")
+
+    ops_only = ("ops.data_quality_flag", "landing.fmp_raw")
+
+    reachable_by_app = []
+    with Database(_as_app_dsn(least_privilege_dsn), autocommit=True) as app:
+        for relation in ops_only:
+            try:
+                app.fetchval(f"SELECT count(*) FROM {relation}")
+                reachable_by_app.append(relation)
+            except Exception:  # noqa: BLE001
+                pass
+    assert (
+        not reachable_by_app
+    ), f"0021 widened fafnir_app, which it must not: {reachable_by_app}"
+
+    # And the same relations ARE reachable one tier up -- otherwise this test
+    # would pass just as well if 0021 had never run.
+    with Database(_as_ops_dsn(least_privilege_dsn), autocommit=True) as ops:
+        for relation in ops_only:
+            assert ops.fetchval(f"SELECT count(*) FROM {relation}") is not None

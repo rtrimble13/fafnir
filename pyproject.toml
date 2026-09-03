@@ -42,9 +42,23 @@ dev = [
     "flake8==7.3.0",
 ]
 
+# The MCP server (ADR 0008 §3, ADR 0010). Optional because the warehouse and duk
+# do not need it: the nightly job, the loaders and `duk -S db` all run without an
+# SDK installed, and only a host serving an agent (or a laptop running one) pays
+# for it.
+#
+# Pinned to the 2.x line: FastMCP was renamed to MCPServer in 2.0 and the import
+# path changed with it, so an unpinned range would break `fafnir-mcp` on install
+# rather than at review. fafnir_mcp.server is the only module that imports the
+# SDK -- deliberately, so a future major bump is one file to move.
+mcp = [
+    "mcp>=2.1,<3",
+]
+
 [project.scripts]
 fafnir = "fafnir.cli:main"
 duk = "duk.cli:main"
+fafnir-mcp = "fafnir_mcp.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
