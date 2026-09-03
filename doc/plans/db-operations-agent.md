@@ -1,6 +1,10 @@
 # Plan: a database-operations agent — skill + MCP — on the warehouse host
 
-- Status: **proposed**
+- Status: **implemented** — phases 1-6 complete. The decisions are recorded in
+  [ADR 0010](../adr/0010-on-host-operations-agent.md); deployment is
+  [doc/agent.md](../agent.md). Six findings from building it are noted inline
+  below as **[built]** notes, each where the plan said something the
+  implementation changed.
 - Scope: an agent that triages and resolves the DQ queue, assists with the
   nightly automations, and answers "what is actually in this warehouse?" —
   running as `claude` **on the Hetzner host**, beside the data.
@@ -553,6 +557,27 @@ boundary stated: ops profile, on-host, read-only role, read-only transaction,
 statement allowlist, row cap. If any one of those is dropped, the exception is no
 longer the one that was argued for.
 
+**[built] Six things the implementation changed.** (1) `strip_noise` originally
+stripped comments and quoted text in sequential regex passes; those token classes
+overlap in both directions and cannot be ordered correctly, and
+`SELECT '--'; DROP TABLE core.daily_price` was accepted as one statement — breaking
+the exactly-one-statement constraint above. Replaced with a single-pass scanner.
+(2) `fafnir-mcp` fell back to `~/.fafnirrc` for its DSN, which never returns empty
+and defaults to the *write* role, so a forgotten environment variable would have
+silently connected the agent as `fafnir_ingest`. The DSN is now explicit or
+absent. (3) A startup guard now refuses to run as any role that can write —
+§3's tier argument needs a mechanism, not a convention, since every tool reads and
+so nothing would ever fail. (4) `limit` on `price_history` now anchors to the
+security's own last bar, not to today as `duk` does: the today-anchored window
+returns *nothing* for delisted and stale securities, which are the ones being
+investigated. (5) An unknown ticker raises and explains the resolution ladder
+rather than returning an empty result that reads as "no bars held". (6) The
+permission allowlist ships as `etc/agent/claude-settings.json.example`, **not** as
+the repository's `.claude/settings.json` — that file is inherited by every
+contributor's session, and a developer working on fafnir has every business
+running `psql`. `fafnir_ops` also gained `meta`, so an agent can answer whether
+the host runs the schema the repo expects.
+
 **A found defect, adjacent and small.** `_reject_reason()` in
 `src/fafnir/ingest/daily_price.py:139` returns `"price_out_of_range"`, and the
 caller (`:414`) prefixes it: the flag is written as **`price_price_out_of_range`**
@@ -563,9 +588,11 @@ table and in every `dq list` a person reads. Worth a one-line fix in its own PR;
 renaming a `check_name` that already has rows in the queue is a data change, so it
 needs a decision (rename in place, or accept both spellings) rather than a patch.
 
-**Open: does the agent get its own `fafnir` CLI config?** `~/.fafnirrc` for the
-`claude` user would let read-only CLI commands (`dq list`, `status`) run without
-`sudo` — but they connect as `fafnir_ingest` today, and pointing them at
-`claude_ops` requires the CLI to accept a DSN that cannot write, which nothing tests.
-Simplest resolution: leave read-only CLI reads under `sudo -u fafnir` in phase 5,
-and revisit only if the permission prompts prove noisy in practice.
+**[resolved] Does the agent get its own `fafnir` CLI config?** No `~/.fafnirrc`,
+which would hand it the write role for every CLI read. Read-only `fafnir`
+subcommands run under `sudo -u fafnir` and are on the unattended allowlist, so
+they cost no prompt. The agent's user does get a `~/.dukrc`
+([`etc/agent/dukrc.example`](../../etc/agent/dukrc.example)) naming `claude_app`
+— read-only, peer-authenticated, no secret — so `duk -S db ls <TICKER>` works for
+spot checks and for confirming the MCP tools and the CLI agree about a series.
+Verified end to end on a scratch cluster.

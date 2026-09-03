@@ -1,0 +1,24 @@
+{
+  "//": [
+    "MCP server registration for an operations agent running ON the warehouse",
+    "host. Copy to the agent's working directory as .mcp.json (or merge into",
+    "~/.claude.json), adjusting the venv path if fafnir is not in /opt/fafnir.",
+    "",
+    "Note what is NOT here: no host, no port, no password, no key file. An empty",
+    "host means the local Unix socket, which is what makes peer authentication",
+    "apply -- the OS identity of the process IS the credential (ADR 0008). There",
+    "is no secret in this file, which is why it is safe to commit an example of it.",
+    "",
+    "Verify before wiring it in:  fafnir-mcp --profile ops --check",
+    "See doc/agent.md."
+  ],
+  "mcpServers": {
+    "fafnir": {
+      "command": "/opt/fafnir/.venv/bin/fafnir-mcp",
+      "args": ["--profile", "ops"],
+      "env": {
+        "FAFNIR_DSN": "dbname=fafnir user=claude_ops application_name=fafnir-mcp"
+      }
+    }
+  }
+}

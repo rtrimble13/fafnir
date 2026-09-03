@@ -1259,6 +1259,13 @@ you alerts on them.
 
 ## 11. Reading the warehouse from your laptop
 
+> **Two follow-ups to this section.** The shared-`fafnir_app`-password path below
+> is the simplest thing that works and is what this install produces. Per-person
+> roles with no password at all — the SSH key as the only credential — are
+> [ADR 0008](adr/0008-remote-duk-access-and-mcp.md), and adding a reader under
+> that model is [operations.md](operations.md#adding-a-reader-a-person-or-an-agent).
+> Running an *agent* on this host is [agent.md](agent.md).
+
 Postgres is not exposed (§3.7), so tunnel it over the SSH port you already allow:
 
 ```bash
@@ -1314,6 +1321,7 @@ A `~/.pgpass` line then keeps the password out of your shell history and environ
 | Symptom | Cause | Fix |
 |---|---|---|
 | `db migrate`: *the fafnir roles do not exist and the current user lacks CREATEROLE* | Migration `0001` cannot create the roles it grants to | Run the `CREATE ROLE` statements from §3.5 as a superuser, then re-run `db migrate` |
+| `db migrate`: *role fafnir_ops is missing and the current user lacks CREATEROLE* | Migration `0021` cannot create the ops read tier's role | `sudo -u postgres psql -d fafnir -c 'CREATE ROLE fafnir_ops NOLOGIN;'`, then re-run `db migrate` ([agent.md](agent.md)) |
 | `db migrate`: `permission denied for database fafnir` | The database is owned by `postgres`, not the migrating role | `sudo -u postgres psql -c "ALTER DATABASE fafnir OWNER TO fafnir_ingest;"` (§3.5) |
 | `db seed`: foreign-key error, `Key (exchange_code)=(\x4e4153444151) is not present` | Cluster was created `SQL_ASCII` because the locale was unset (§3.3) | `SHOW server_encoding` — if not `UTF8`, drop and recreate the cluster with `--locale=C.UTF-8 --encoding=UTF8` |
 | `error: externally-managed-environment` from pip | Ubuntu 24.04 system Python is PEP 668 managed | Install into `/opt/fafnir/.venv` (§4.2) |

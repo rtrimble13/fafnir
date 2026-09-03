@@ -9,11 +9,17 @@ SDK is confined here and the surface stays testable without one.
 ops-only tools, ``sql_read`` above all, are not registered under ``--profile read``:
 they do not exist on that surface rather than existing and refusing. ADR 0010 asks
 for exactly that, and it is the difference between a boundary and a reminder.
+
+The one piece of real work here is :func:`_surfaced`, which translates our
+:class:`fafnir_mcp.errors.ToolError` into the SDK's own error type so the message
+actually reaches the caller. See its docstring -- without it, every carefully
+worded diagnostic in this package is replaced by "Error executing tool <name>".
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+from typing import Callable, Optional
 
 from fafnir_mcp import DEFAULT_PROFILE, PROFILES, __version__
 from fafnir_mcp import tools as T
@@ -39,6 +45,40 @@ Nothing here writes. Changes to the warehouse go through the `fafnir` CLI.
 """
 
 
+def _surfaced(fn: Callable) -> Callable:
+    """Re-raise our ToolError as the MCP SDK's, so its message reaches the caller.
+
+    This is not plumbing; it is the difference between the error surface ADR 0008
+    specifies and no error surface at all. The SDK sorts exceptions from a tool
+    body into two classes: its own ``ToolError`` is *"a failure you anticipated"``
+    and the client receives the message, while **anything else** is treated as a
+    crash -- the client gets only ``"Error executing tool <name>"`` and the real
+    text stays in the server's log, where an agent cannot see it.
+
+    ``fafnir_mcp.errors.ToolError`` is deliberately not the SDK's class, because
+    :mod:`fafnir_mcp.tools` imports no SDK (which is what makes the validation and
+    error wording unit-testable without one). So the translation has to happen
+    here, and it has to happen for every tool -- measured, not assumed: before this
+    existed, "no security matches 'NOPE'. The resolver tries the live ticker, then
+    ..." and every refusal from the SQL guard reached the model as five generic
+    words.
+
+    ``functools.wraps`` matters too: ``@server.tool()`` builds the tool's JSON
+    schema by inspecting the signature, and ``inspect.signature`` follows
+    ``__wrapped__``, so the schema is still derived from the real parameters.
+    """
+    from mcp.server.mcpserver.exceptions import ToolError as SdkToolError
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError as exc:
+            raise SdkToolError(str(exc)) from exc
+
+    return wrapper
+
+
 def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
     """Construct an MCP server exposing the tools for ``profile``."""
     if profile not in PROFILES:
@@ -61,6 +101,7 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
 
     # -- read profile: mart + ref, via duk.datasource.db -------------------
     @server.tool()
+    @_surfaced
     def resolve_symbol(symbol: str) -> dict:
         """Resolve a ticker or company name to a security in the warehouse.
 
@@ -71,6 +112,7 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         return T.resolve_symbol(dsn=dsn, symbol=symbol)
 
     @server.tool()
+    @_surfaced
     def price_history(
         symbol: str,
         adjusted: bool = False,
@@ -94,6 +136,7 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         )
 
     @server.tool()
+    @_surfaced
     def screen_securities(
         sector: Optional[list[str]] = None,
         industry: Optional[list[str]] = None,
@@ -125,16 +168,19 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         )
 
     @server.tool()
+    @_surfaced
     def list_sectors() -> dict:
         """Every sector name the warehouse classifies securities into."""
         return T.list_sectors(dsn=dsn)
 
     @server.tool()
+    @_surfaced
     def list_industries() -> dict:
         """Every industry name the warehouse classifies securities into."""
         return T.list_industries(dsn=dsn)
 
     @server.tool()
+    @_surfaced
     def security_profile(symbol: str) -> dict:
         """Everything the warehouse holds on one security, in one call.
 
@@ -145,6 +191,7 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         return T.security_profile(dsn=dsn, symbol=symbol)
 
     @server.tool()
+    @_surfaced
     def dq_summary(symbol: str) -> dict:
         """Open data-quality flags for one security.
 
@@ -163,6 +210,7 @@ def _register_ops_tools(server, dsn: str) -> None:
     """The operational record and free-form reads. Ops profile only (ADR 0010)."""
 
     @server.tool()
+    @_surfaced
     def dq_queue(
         check_name: Optional[str] = None,
         severity: Optional[str] = None,
@@ -188,6 +236,7 @@ def _register_ops_tools(server, dsn: str) -> None:
         )
 
     @server.tool()
+    @_surfaced
     def dq_totals(state: str = "open") -> dict:
         """Flag counts per check and severity -- the shape of the queue.
 
@@ -198,6 +247,7 @@ def _register_ops_tools(server, dsn: str) -> None:
         return T.dq_totals(dsn=dsn, state=state)
 
     @server.tool()
+    @_surfaced
     def ingestion_runs(
         status: Optional[str] = None,
         endpoint: Optional[str] = None,
@@ -214,6 +264,7 @@ def _register_ops_tools(server, dsn: str) -> None:
         )
 
     @server.tool()
+    @_surfaced
     def watermarks(symbol: Optional[str] = None, limit: Optional[int] = None) -> dict:
         """Incremental high-water marks per source/endpoint/security.
 
@@ -224,6 +275,7 @@ def _register_ops_tools(server, dsn: str) -> None:
         return T.watermarks(dsn=dsn, symbol=symbol, limit=limit)
 
     @server.tool()
+    @_surfaced
     def landing_payload(endpoint: str, symbol: Optional[str] = None) -> dict:
         """The most recent RAW vendor payload for an endpoint (and symbol).
 
@@ -234,11 +286,13 @@ def _register_ops_tools(server, dsn: str) -> None:
         return T.landing_payload(dsn=dsn, endpoint=endpoint, symbol=symbol)
 
     @server.tool()
+    @_surfaced
     def schema_state() -> dict:
         """Applied migrations: is this host running the schema the repo expects?"""
         return T.schema_state(dsn=dsn)
 
     @server.tool()
+    @_surfaced
     def sql_read(sql: str, limit: Optional[int] = None) -> dict:
         """Run an arbitrary read-only SELECT against the warehouse.
 

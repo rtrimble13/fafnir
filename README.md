@@ -16,8 +16,9 @@ client.
   are retained (no survivorship bias); every load is idempotent and logged.
 
 > Status: **initial release** — self-maintaining security master (new listings and
-> ticker renames reconciled nightly), daily OHLCV, corporate actions, and the
-> dual-mode `duk` CLI. Fundamentals and economic time series are the next
+> ticker renames reconciled nightly), daily OHLCV, corporate actions, the
+> dual-mode `duk` CLI, and an MCP server for agentic access
+> (`doc/agent.md`). Fundamentals and economic time series are the next
 > milestones (see `doc/extending.md`).
 
 ## Architecture at a glance
@@ -118,7 +119,8 @@ fast-follow lands.
 | [backfill.md](doc/backfill.md) | Initial setup & historical backfill (bandwidth, chunking, resumability) |
 | [operations.md](doc/operations.md) | Daily upkeep runbook, cron, backfill, recovery |
 | [duk.md](doc/duk.md) | CLI usage (live vs db) |
-| [extending.md](doc/extending.md) | Add a source (FRED/BLS/BEA), a table, or the MCP server |
+| [agent.md](doc/agent.md) | Run an operations agent on the host: DQ triage, automations, data questions |
+| [extending.md](doc/extending.md) | Add a source (FRED/BLS/BEA), a table, or an MCP tool |
 | [adr/](doc/adr/) | Architecture decision records |
 
 ## Development

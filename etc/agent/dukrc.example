@@ -1,0 +1,19 @@
+# ~/.dukrc for the agent's OS user (e.g. /home/claude/.dukrc)
+#
+# Read-only, password-free, and NOT a copy of ~/.fafnirrc -- which is the point.
+# The deployment's ~/.fafnirrc names fafnir_ingest, the write role; giving the
+# agent's user a copy of it would hand it the write identity for every CLI read
+# (ADR 0010). This names claude_app instead: mart + ref, SELECT only.
+#
+# No host= -- the empty host is the local Unix socket, so peer authentication maps
+# the claude OS user to this role via pg_ident.conf. No password anywhere.
+#
+# The agent does not NEED this: the MCP server serves every read. It is here so
+# that `duk -S db ls AAPL` works for spot checks and for confirming that the MCP
+# tools and the CLI agree about a series.
+
+[database]
+dsn = "dbname=fafnir user=claude_app application_name=duk-agent"
+
+[general]
+default_source = "db"

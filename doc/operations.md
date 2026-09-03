@@ -311,12 +311,77 @@ Things to watch:
   ORDER BY started_at DESC LIMIT 20;
   ```
 
+## Adding a reader (a person, or an agent)
+
+Per-person and per-agent roles are deployment facts, not schema — migration `0001`
+owns the three functional roles and `0021` the fourth, but who is a *member* of
+them belongs here ([ADR 0008](adr/0008-remote-duk-access-and-mcp.md),
+[ADR 0010](adr/0010-on-host-operations-agent.md)).
+
+Three tiers, and the tier is the whole of the authorization:
+
+| Tier | Group role | Reads | For |
+|---|---|---|---|
+| app | `fafnir_app` | `mart`, `ref` | `duk` from a laptop, apps, an MCP read profile |
+| research | `fafnir_read` | + `core` | notebooks, ad-hoc analysis |
+| ops | `fafnir_ops` | + `ops`, `landing`, `meta` | an operations agent on the host |
+
+Adding a person:
+
+```bash
+sudo adduser --disabled-password --gecos '' rob
+sudo install -d -m 700 -o rob -g rob /home/rob/.ssh
+sudo -u rob tee /home/rob/.ssh/authorized_keys <<'KEY'
+restrict,port-forwarding,command="/usr/sbin/nologin" ssh-ed25519 AAAA... rob@laptop
+KEY
+sudo chmod 600 /home/rob/.ssh/authorized_keys
+```
+
+```sql
+CREATE ROLE rob LOGIN IN ROLE fafnir_app;
+ALTER ROLE rob SET default_transaction_read_only = on;
+ALTER ROLE rob SET statement_timeout = '60s';
+ALTER ROLE rob SET idle_in_transaction_session_timeout = '60s';
+ALTER ROLE rob CONNECTION LIMIT 8;
+```
+
+```
+# /etc/postgresql/16/main/pg_ident.conf
+fafnirmap  rob  rob
+```
+
+No database password is issued at any tier — the SSH key is the credential and
+peer authentication over the socket is the mechanism. Revocation has two
+independent switches, either sufficient: remove the key, or
+`ALTER ROLE rob NOLOGIN` / `REVOKE fafnir_app FROM rob`.
+
+Adding an **agent** is the same shape plus a sudoers rule and an MCP
+registration — the whole procedure, with the audit and revocation queries, is
+[agent.md](agent.md).
+
+> **Upgrading onto migration `0021`.** It creates `fafnir_ops`, which needs
+> `CREATEROLE` the migrator does not have on a least-privilege install, so
+> `fafnir db migrate` fails with an actionable error until the role exists. Same
+> behaviour `0001` has for the other three. One statement, once:
+>
+> ```bash
+> sudo -u postgres psql -d fafnir -c 'CREATE ROLE fafnir_ops NOLOGIN;'
+> sudo -u fafnir fafnir db migrate
+> ```
+
 ## Working the DQ queue
 
 `fafnir dq run` writes flags; `fafnir dq list` and `fafnir dq resolve` are how they
 get worked. The two take the **same** selection options, so the workflow is to
 narrow with `list` until the page is the problem you mean, then re-run the same
 options under `resolve`.
+
+> Running the operations agent ([agent.md](agent.md))? Its playbooks —
+> per-`check_name`, with the diagnosis and the repair for each — are
+> `.claude/skills/fafnir-dba/references/dq-playbooks.md`, and they are worth
+> reading as a runbook whether or not an agent is doing the triage. Its
+> resolutions are attributed `resolved_by = 'claude'`, so
+> `fafnir dq list --state resolved` shows what it decided and why.
 
 > Starting from a **symbol** rather than from the queue? `duk -S db ls <TICKER>`
 > shows that security's open flags alongside its price coverage and corporate

@@ -1,0 +1,60 @@
+{
+  "//": [
+    "Claude Code permissions for an operations agent on the warehouse host.",
+    "",
+    "INSTALL AS the agent's own settings -- ~/.claude/settings.json for the",
+    "claude OS user, or .claude/settings.json inside the agent's working",
+    "directory on the host. Deliberately NOT the repository's",
+    ".claude/settings.json: that file is inherited by every contributor's",
+    "Claude Code session, and a developer working on fafnir has every business",
+    "running psql and pg_dump. A permission boundary drawn for an autonomous",
+    "agent is deployment configuration, not project configuration.",
+    "",
+    "This is tier 3 of ADR 0010's model, at argument granularity -- the part",
+    "sudoers cannot express. sudoers says WHICH binary as WHICH user; this says",
+    "which invocations run unattended and which need a human.",
+    "",
+    "Reads are allowed so that triage is not a permission dialogue. Every",
+    "mutation is ask, because the skill's rules require a dry run to be shown",
+    "first -- so the prompt lands on a decision whose consequences are already",
+    "on screen. See doc/agent.md."
+  ],
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(sudo -u fafnir fafnir status:*)",
+      "Bash(sudo -u fafnir fafnir db status)",
+      "Bash(sudo -u fafnir fafnir dq list:*)",
+      "Bash(sudo -u fafnir fafnir track list:*)",
+      "Bash(duk -S db:*)",
+      "Bash(fafnir-mcp --check:*)",
+      "Bash(scripts/monitor.sh:*)",
+      "Bash(systemctl list-timers:*)",
+      "Bash(systemctl status fafnir-:*)",
+      "Bash(journalctl -u fafnir-:*)",
+      "Bash(df:*)",
+      "Bash(free:*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)"
+    ],
+    "deny": [
+      "Bash(scripts/reset_data.sh:*)",
+      "Bash(sudo -u fafnir fafnir db migrate:*)",
+      "Bash(sudo -u fafnir fafnir db rollback:*)",
+      "Bash(psql:*)",
+      "Bash(pg_dump:*)",
+      "Bash(pg_restore:*)",
+      "Bash(sudo -u postgres:*)",
+      "Bash(systemctl restart:*)",
+      "Bash(systemctl stop:*)",
+      "Bash(systemctl disable:*)",
+      "Read(/etc/fafnir/fafnir.env)",
+      "Read(//home/**/.pgpass)",
+      "Read(//home/**/.fafnirrc)",
+      "Read(//root/**)",
+      "Edit(//opt/fafnir/**)",
+      "Write(//opt/fafnir/**)"
+    ]
+  }
+}

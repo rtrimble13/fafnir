@@ -209,6 +209,12 @@ def price_history(
     if start and end and start > end:
         raise ToolError(f"start_date {start} is after end_date {end}")
 
+    # Every argument is validated before the database is touched. Cheap, but also
+    # the difference between "limit must be at least 1" and a connection error from
+    # a resolve that should never have been attempted -- and an agent reading the
+    # second one will go looking at the warehouse instead of at its own call.
+    requested = clamp_limit(limit, DEFAULT_MAX_ROWS) if limit is not None else None
+
     # Resolve first, so an unknown ticker is an ERROR that explains the ladder
     # rather than an empty result set. duk returns an empty frame for a symbol it
     # cannot resolve -- right for a CLI, where the user can see they typed ABCD and
@@ -221,8 +227,6 @@ def price_history(
     # MOST RECENT n bars. Capping the envelope instead would return the EARLIEST n,
     # which for a price series is not a smaller answer but a different and usually
     # useless one: "the last 10 bars of AAPL" would come back as ten days from 1985.
-    requested = clamp_limit(limit, DEFAULT_MAX_ROWS) if limit is not None else None
-
     # ...and when no end_date is given, the window is anchored to the security's
     # OWN last bar rather than to today. This is a deliberate divergence from
     # `duk -S db ph -n`, which defaults end_date to today because it was designed
