@@ -243,6 +243,20 @@ RSYNC_ARGS=(-a --human-readable --stats -e "${SSH_CMD}")
 # A dump still being written is a .partial (see backup_dump.sh); never ship one.
 RSYNC_ARGS+=(--exclude '*.partial')
 
+# BACKUP_DIR is normally a mount point of its own, and every ext4 filesystem has
+# a root-owned, mode-0700 lost+found at its root. rsync runs as fafnir, cannot
+# opendir it, and reports that as a sending-side I/O error. Two consequences,
+# and the second is the dangerous one:
+#   - the run exits 23 ("partial transfer due to error") and the unit fails,
+#     even though every dump copied fine;
+#   - an I/O error on the sending side makes rsync silently DISABLE --delete
+#     (see rsync(1) under --delete), so the remote quietly stops honouring the
+#     retention window and grows without bound until it hits the Storage Box
+#     quota -- while each night still looks like a transfer that happened.
+# The leading slash anchors this to the transfer root, so it excludes only the
+# filesystem's own lost+found and not some future dump directory named that.
+RSYNC_ARGS+=(--exclude '/lost+found')
+
 echo "==> Copying ${#DUMPS[@]} dump(s) from ${BACKUP_DIR} to ${REMOTE}"
 [[ -n "${SSH_PORT}" ]] && echo "    over ssh port ${SSH_PORT}"
 [[ "${MIRROR}" == "yes" ]] && echo "    mirroring (--delete): the remote matches local retention"
