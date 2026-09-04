@@ -29,8 +29,8 @@ import click
 
 from fafnir import __version__
 from fafnir.config import get_config
-from fafnir.db.connection import Database
-from fafnir.logging_config import setup_logging
+from fafnir.db.connection import Database, DatabaseConnectionError
+from fafnir.logging_config import LogDirectoryError, setup_logging
 
 
 def _parse_date(value: Optional[str]) -> Optional[dt.date]:
@@ -59,7 +59,31 @@ def _split_symbols(value: Optional[str]) -> list[str]:
     return [s.strip().upper() for s in value.split(",") if s.strip()]
 
 
-@click.group()
+class _FafnirGroup(click.Group):
+    """Turns a connection failure into one actionable line, once, for every
+    subcommand.
+
+    Every command in this CLI ends in ``with Database(cfg.dsn)``, so without this
+    a misconfigured host greets the operator with a psycopg traceback through
+    click -- ten frames whose only useful line is libpq's, and whose actual cause
+    is a config value none of the frames mention. Wrapping the group's invoke
+    covers all of them without a try/except in each.
+    """
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except DatabaseConnectionError as exc:
+            # connection.py can only guess the provenance from the environment.
+            # Here the config object is in hand, so the line can name the actual
+            # file -- which matters most under `-c`, where the guess is wrong.
+            cfg = (ctx.obj or {}).get("config")
+            if cfg is not None:
+                exc.source = cfg.dsn_source
+            raise click.ClickException(str(exc)) from exc
+
+
+@click.group(cls=_FafnirGroup)
 @click.version_option(version=__version__, message="%(version)s")
 @click.option(
     "--config",
@@ -73,7 +97,14 @@ def main(ctx, config):
     ctx.ensure_object(dict)
     cfg = get_config(config)
     ctx.obj["config"] = cfg
-    ctx.obj["logger"] = setup_logging(log_level=cfg.log_level, log_dir=cfg.log_dir)
+    # A logging misconfiguration must not reach the user as a traceback through
+    # click and pathlib: this runs before every command, so it is the first thing
+    # a fresh install hits, and the raw PermissionError names a relative path that
+    # appears nowhere the operator has looked.
+    try:
+        ctx.obj["logger"] = setup_logging(log_level=cfg.log_level, log_dir=cfg.log_dir)
+    except LogDirectoryError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

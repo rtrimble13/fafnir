@@ -25,9 +25,12 @@ These are not style guidance. Each one is a way this system gets damaged.
 4. **Never `--force`.** `fafnir security merge-rename --force` overrides guards
    comparing CUSIP/ISIN and overlapping OHLC. If they trip, report the blockers
    and stop.
-5. **Three checks are never yours to close**: `price_scale_collapse`,
-   `corporate_action_drift`, `symbol_change_conflict`. See the playbooks — each
-   is a measurement or needs a different command entirely.
+5. **Five checks are never yours to close**: `price_scale_collapse`,
+   `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`,
+   `price_subresolution_price`. Each is a measurement, an unrepresentable value,
+   or needs a different command entirely — see the playbooks. This list is also
+   `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and `dq_triage` returns
+   `never_auto_resolve` per row; a test asserts the two agree.
 6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` are
    operator commands.** Propose; never run.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
@@ -49,6 +52,7 @@ These are not style guidance. Each one is a way this system gets damaged.
 |---|---|
 | Shape of the queue | `dq_totals` |
 | Individual flags, with `detail` and past resolutions | `dq_queue` |
+| Working the queue in bulk — cohort size, repeat closures | `dq_triage` |
 | Correlate flags across securities/dates | `sql_read` |
 | What the vendor actually sent | `landing_payload` |
 | Which step ran long, what failed, bandwidth | `ingestion_runs` |
@@ -87,11 +91,55 @@ SELECT (record_key->>'trade_date')::date AS d, count(*) AS securities
 A date with a large count is not two hundred problems. It is one, and resolving
 the flags individually is the wrong answer to it.
 
+## The proactive sweep
+
+When asked to sweep, triage, or clear the queue — rather than asked about one
+security — work it in bulk, on your own initiative, under
+`references/sweep-policy.md`. **Read that file before the first batch.**
+
+```
+1. dq_totals                      → the shape. distinct_condition_flags is the
+                                     count of problems; ignore price_* in it.
+2. dq_triage(check_name=…)         → flags WITH cohort_size, prior_resolutions,
+                                     never_auto_resolve, and the security's state
+3. group by (check_name, cause)    → never by "these resolve with the same flag"
+4. per group, apply the tier:
+     Never tier        → report only. Never propose a resolve.
+     Repair-first      → propose the repair; resolve only once it is verifiably gone
+     Judgement         → check the precondition in sweep-policy.md. Not met → leave open.
+5. per qualifying group, in ONE turn:
+     sudo -u fafnir fafnir dq resolve <filter> --by claude --note "<evidence>" --dry-run
+   show the output, then on approval, the same command with --yes
+6. report: closed, repaired, LEFT OPEN AND WHY, and any stop condition hit
+```
+
+Three numbers decide almost every case, and `dq_triage` returns all three:
+
+- **`cohort_size`** — 1 is a market fact; many is one missed load wearing many
+  flags. Resolving the second case is the single worst thing a sweep can do.
+- **`prior_resolutions`** — above 0, this condition was closed before and came
+  back. Read `last_resolution_note` first. At 2 or more, **stop**: it is a defect
+  nobody repaired, and closing it again is the queue churn this whole design is
+  arranged to prevent.
+- **`never_auto_resolve`** — true means report, whatever else you found.
+
+**Caps: 25 flags per batch, 4 batches per sweep.** A queue needing more than that
+is a defect to fix upstream, and grinding it down hides the defect. Stop and say
+so. The full stop-condition list is in `references/sweep-policy.md`; the general
+one is that a dry run whose count surprises you ends the sweep — never run the
+real command to find out what it was matching.
+
+Being proactive is about doing the *investigation* without being asked. It is
+never about lowering the bar for closing something.
+
 ## Reference
 
 - `references/dq-playbooks.md` — every `check_name`: what it means, how to tell a
   defect from a market event, the repair, and when resolving is allowed. **Read
   this before resolving anything.**
+- `references/sweep-policy.md` — the three tiers, the per-check preconditions,
+  batch caps and stop conditions for working the queue in bulk. **Read this
+  before a proactive sweep.**
 - `references/data-semantics.md` — the traps that produce confidently wrong
   answers. Read before answering questions about the data.
 - `references/automations.md` — the nightly job, timers, budgets, backups.

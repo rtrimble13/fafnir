@@ -39,6 +39,7 @@ READ_TOOLS = {
 # The operational record, and free-form reads. These need fafnir_ops (0021).
 OPS_ONLY_TOOLS = {
     "dq_queue",
+    "dq_triage",
     "dq_totals",
     "ingestion_runs",
     "watermarks",

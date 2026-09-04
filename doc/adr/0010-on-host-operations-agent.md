@@ -180,3 +180,69 @@ untested read path gets built by accident.
 - **Per-agent roles stay out of migrations**, exactly as ADR 0008 requires. `0021`
   owns the functional role and the grants; who is a member of it is a deployment
   fact, documented in [doc/agent.md](../agent.md).
+
+---
+
+## Amendment, 2026-09-04: proactive triage sweeps
+
+**The tier model is unchanged.** No new role, no new privilege, no write tool. This
+records a change in how the agent is *asked* to work, and the mitigations that came
+with it.
+
+### What changed
+
+The skill previously described a reactive loop: a person asks about a security or a
+check, the agent investigates that one thing. It now also supports a **sweep** — on
+request, the agent works the whole open queue on its own initiative, groups it by
+condition, and proposes one batched `dq resolve` per group.
+
+Two options were considered and rejected:
+
+- **Unattended resolution for a narrow allowlist.** It would have weakened this
+  ADR's central claim from *every mutation is an interactive approval* to *every
+  judgement call is*, and the boundary between those two is a matter of opinion
+  about which checks are "obvious" — precisely the opinion a confused agent holds
+  most confidently. The prompt stays.
+- **A nightly timer running the sweep unattended.** That is the configuration in
+  which the prompt-injection path this ADR already names (*"vendor text is now an
+  untrusted input path that reaches a decision-maker"*) has no human in the loop at
+  all. Rejected for that reason alone; the residual risk was acceptable only
+  *because* a human sees the dry run.
+
+### Why bulk needed its own rules
+
+Working one flag is a judgement. Working eighty is a judgement that decays: the
+second flag looks like the first, and somewhere around the fortieth *"looks like"*
+has replaced *"was checked"*. The queue churn named under Consequences above is not
+a hypothetical for a sweep — it is its default failure mode.
+
+Three mitigations, all of them reads:
+
+- **`dq_triage`** (ops profile, read-only) returns `cohort_size` — how many
+  securities share a `check_name` on a `record_key` date, aggregated over the
+  **whole** open queue rather than the returned page. A cohort counted after
+  `LIMIT` shrinks with the page size, which would make a missed load look like a
+  market fact at `limit=20`: the exact error the column exists to prevent. One
+  security with a gap is a market fact; two hundred is one missed load, and the
+  sweep must propose a re-ingest rather than two hundred resolutions.
+- **`prior_resolutions`** surfaces a condition that was closed before and came
+  back. At two, the sweep stops. A condition recurring after two closures is a
+  defect nobody repaired, and the third closure is the churn itself.
+- **`NEVER_AUTO_RESOLVE`** is a floor in code, mirroring the skill's standing rule
+  5. It is advisory rather than enforced — the effect runs through the CLI, which
+  is where this ADR deliberately put it — but it appears per row in the tool
+  output, so it is in front of the decision rather than something to have
+  remembered. `test_never_auto_matches_the_skill` parses `SKILL.md` and fails if
+  the two lists diverge, which is the same anti-duplication argument §4 makes
+  against re-implementing the CLI's guards, applied to a policy that genuinely does
+  have to exist twice.
+
+### What this does not change
+
+- Mutations remain CLI-only. `dq_triage` reads; it resolves nothing. Adding a
+  `dq_resolve` MCP tool would still mean two copies of the CLI's guards.
+- The dry-run-then-effect ceremony is unchanged, and now applies per batch rather
+  than per flag.
+- `--by claude` still makes `WHERE resolved_by LIKE 'claude%'` the complete record,
+  and `fafnir dq reopen` still reverses any of it. Batching makes both *more*
+  important: read the notes, and read them by batch.

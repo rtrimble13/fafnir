@@ -237,6 +237,23 @@ def _register_ops_tools(server, dsn: str) -> None:
 
     @server.tool()
     @_surfaced
+    def dq_triage(
+        check_name: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """Open flags plus the corroborating evidence a proactive sweep needs.
+
+        Use this instead of dq_queue when working the queue in bulk. It adds three
+        things per flag: cohort_size (how many securities share this check on this
+        date -- one is a market fact, many is one missed load), prior_resolutions
+        (this condition was closed before and came back, so read the old note), and
+        never_auto_resolve. Reads only; resolving is `fafnir dq resolve`.
+        """
+        return T.dq_triage(dsn=dsn, check_name=check_name, since=since, limit=limit)
+
+    @server.tool()
+    @_surfaced
     def dq_totals(state: str = "open") -> dict:
         """Flag counts per check and severity -- the shape of the queue.
 

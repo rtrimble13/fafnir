@@ -55,7 +55,7 @@ privilege decision rather than a convenience:
 | Profile | Role | Reads | Tools |
 |---|---|---|---|
 | `read` | member of `fafnir_app` | `mart`, `ref` | `resolve_symbol`, `price_history`, `screen_securities`, `list_sectors`/`list_industries`, `security_profile`, `dq_summary` |
-| `ops` | member of `fafnir_ops` (0021) | + `core`, `ops`, `landing`, `meta` | + `dq_queue`, `dq_totals`, `ingestion_runs`, `watermarks`, `landing_payload`, `schema_state`, `sql_read` |
+| `ops` | member of `fafnir_ops` (0021) | + `core`, `ops`, `landing`, `meta` | + `dq_queue`, `dq_triage`, `dq_totals`, `ingestion_runs`, `watermarks`, `landing_payload`, `schema_state`, `sql_read` |
 
 The `read` profile is the surface [ADR 0008 §3](adr/0008-remote-duk-access-and-mcp.md)
 specifies and runs from a laptop through the §11 tunnel unchanged. The `ops`

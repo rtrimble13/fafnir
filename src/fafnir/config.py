@@ -15,6 +15,11 @@ Config sections
     fmp_key, fred_key, bls_key, bea_key
 ``[general]``
     log_level, log_dir, universe, request_rate_per_min, overlap_days
+
+Environment overrides
+---------------------
+``FAFNIR_DSN``, ``FAFNIR_DB_PASSWORD``/``PGPASSWORD``, ``FMP_API_KEY``,
+``FRED_API_KEY``, ``BLS_API_KEY``, ``BEA_API_KEY``, ``FAFNIR_LOG_DIR``.
 """
 
 from __future__ import annotations
@@ -25,6 +30,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_CONFIG_PATH = "~/.fafnirrc"
+
+#: Named once so the connection error surface can describe precedence without
+#: hard-coding the variable it is describing.
+DSN_ENV_VAR = "FAFNIR_DSN"
+PASSWORD_ENV_VARS = ("FAFNIR_DB_PASSWORD", "PGPASSWORD")
 
 
 class FafnirConfig:
@@ -56,7 +66,7 @@ class FafnirConfig:
           3. assembled from ``[database]`` host/port/dbname/user/password,
              with the password overridable by ``FAFNIR_DB_PASSWORD`` / ``PGPASSWORD``.
         """
-        env_dsn = os.environ.get("FAFNIR_DSN", "").strip()
+        env_dsn = os.environ.get(DSN_ENV_VAR, "").strip()
         if env_dsn:
             return env_dsn
 
@@ -77,6 +87,23 @@ class FafnirConfig:
         if password:
             parts.append(f"password={password}")
         return " ".join(parts)
+
+    @property
+    def dsn_source(self) -> str:
+        """Where :attr:`dsn` came from, in words, for diagnostics.
+
+        A connection failure is nearly always a question about *which* of the
+        three sources won, and the answer is invisible in the DSN itself: an
+        assembled `host=localhost` and a `[database].dsn` of `host=localhost`
+        look identical and are fixed in different files.
+        """
+        if os.environ.get(DSN_ENV_VAR, "").strip():
+            return f"the {DSN_ENV_VAR} environment variable"
+        if (self._get("database", "dsn", "") or "").strip():
+            return f"[database].dsn in {self.config_path}"
+        if not Path(self.config_path).exists():
+            return f"built-in defaults ({self.config_path} does not exist)"
+        return f"the [database] section of {self.config_path}"
 
     # -- api keys -----------------------------------------------------------
     @property
@@ -114,6 +141,24 @@ class FafnirConfig:
 
     @property
     def log_dir(self) -> str:
+        """Where the rotating ``fafnir.log`` is written.
+
+        ``FAFNIR_LOG_DIR`` wins over the file, matching how ``FAFNIR_DSN`` and
+        ``FAFNIR_SQL_DIR`` already behave. It exists because the deployment that
+        most needs an absolute path -- the systemd units, which source
+        ``/etc/fafnir/fafnir.env`` -- had no way to set one without editing the
+        service user's ``~/.fafnirrc``.
+
+        The default is **relative**, and deliberately kept that way: a developer
+        running from the checkout gets ``./var/fafnir/log`` and nothing writes
+        outside the tree. On a host that is the wrong answer, which is why
+        install_hetzner.md §4.3 sets an absolute path and
+        :func:`fafnir.logging_config.setup_logging` says so by name when the
+        relative default cannot be created.
+        """
+        env = os.environ.get("FAFNIR_LOG_DIR", "").strip()
+        if env:
+            return env
         return self._get("general", "log_dir", "var/fafnir/log")
 
     @property

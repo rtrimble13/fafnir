@@ -497,6 +497,171 @@ def dq_queue(
     )
 
 
+#: Checks a proactive sweep may never close, whatever the evidence looks like.
+#:
+#: This is a floor, not a judgement. It exists in code because a sweep works a
+#: queue in bulk, and bulk is exactly where "this one looks like the others" stops
+#: being reasoning. Each entry is a playbook line, not a preference:
+#:
+#: * ``price_scale_collapse``     -- the bar STORED, flattened. Resolving deletes
+#:                                   the only record of the lost high/low.
+#: * ``corporate_action_drift``   -- the data is already repaired; the flag is
+#:                                   evidence about the market-wide sweep, and
+#:                                   closing it silently discards that evidence.
+#: * ``symbol_change_conflict``   -- `dq resolve` changes nothing here. The nightly
+#:                                   sweep re-detects it; the terminal state lives
+#:                                   in core.symbol_change via merge-rename or
+#:                                   dismiss-rename.
+#: * ``price_price_out_of_range`` -- a real quote NUMERIC(20,6) cannot hold.
+#: * ``price_subresolution_price``-- below the 5e-7 quantize cliff. Same verdict.
+#:
+#: The first three are the skill's standing rule 5 verbatim; the last two are the
+#: playbooks' "report, do not resolve". ``test_never_auto_matches_the_skill``
+#: parses SKILL.md and asserts the two lists agree, so this cannot drift into
+#: being a second, quieter policy.
+NEVER_AUTO_RESOLVE = frozenset(
+    {
+        "price_scale_collapse",
+        "corporate_action_drift",
+        "symbol_change_conflict",
+        "price_price_out_of_range",
+        "price_subresolution_price",
+    }
+)
+
+
+def dq_triage(
+    *,
+    dsn: str,
+    check_name: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """Open flags with the corroborating evidence a *proactive* sweep needs.
+
+    ``dq_queue`` answers "what is open"; this answers "what else is true about it",
+    which is the difference between triage and guessing when the queue is being
+    worked in bulk rather than one flag at a time.
+
+    Three columns carry that difference, and each one is a playbook step that would
+    otherwise be a hand-written correlation query per check:
+
+    ``cohort_size``
+        How many distinct securities carry this same ``check_name`` on this same
+        ``record_key->>'trade_date'``. This is the single most important number in
+        the whole sweep: **one security with a gap is a market fact; two hundred
+        securities with a gap on the same date is a missed load.** Resolving the
+        second case flag-by-flag is the wrong answer to one problem, and it is the
+        mistake a bulk sweep is most likely to make quickly.
+
+    ``prior_resolutions``
+        How many times this ``(check_name, security_id)`` pair has already been
+        closed. A condition resolved three times and back again is not a market
+        fact being re-observed -- it is a defect nobody has repaired, and closing
+        it a fourth time is the queue churn ADR 0010 names as the likeliest quiet
+        damage. Non-zero here means read ``last_resolution_note`` before deciding.
+
+    ``never_auto_resolve``
+        Whether this check is on :data:`NEVER_AUTO_RESOLVE`. Surfaced per row so it
+        is in front of the decision at the moment it is made, rather than something
+        to have remembered from the skill.
+
+    Plus ``is_actively_trading``/``delisted_date``/``is_fund``, which are what the
+    ``stale`` playbook's three-way split turns on.
+
+    Reads only. Nothing here resolves anything: effects go through
+    ``fafnir dq resolve`` under ``sudo -u fafnir``, where the CLI's guards already
+    live (ADR 0010 §4).
+    """
+    # The CTE already restricts to open flags, so the outer filter starts empty.
+    clauses: list[str] = ["1=1"]
+    params: list[Any] = []
+
+    if check_name:
+        pattern = str(check_name).strip()
+        if pattern.endswith("*"):
+            clauses.append("f.check_name LIKE %s")
+            params.append(pattern[:-1] + "%")
+        else:
+            clauses.append("f.check_name = %s")
+            params.append(pattern)
+    since_date = _parse_date(since, "since")
+    if since_date:
+        clauses.append("f.detected_at >= %s")
+        params.append(since_date)
+
+    cap = clamp_limit(limit, DEFAULT_MAX_ROWS)
+    params.append(cap + 1)
+
+    # cohort is aggregated over the WHOLE open queue, in its own CTE, then joined
+    # back -- not computed as a window over the returned page. A cohort counted
+    # after LIMIT shrinks with the page size, which would make a missed load look
+    # like a market fact at limit=20: the exact error this column exists to prevent.
+    #
+    # It is a separate CTE rather than `count(DISTINCT ...) OVER (...)` because
+    # Postgres does not implement DISTINCT for window functions.
+    sql = (
+        "WITH open_flags AS ("
+        "  SELECT f.dq_flag_id, f.check_name, f.severity, f.security_id,"
+        "         f.record_key, f.detail, f.ingestion_run_id, f.detected_at,"
+        "         (f.record_key->>'trade_date') AS trade_date"
+        "    FROM ops.data_quality_flag f"
+        "   WHERE f.resolved_at IS NULL"
+        "), cohort AS ("
+        "  SELECT check_name, (record_key->>'trade_date') AS trade_date,"
+        "         count(*) AS cohort_flags,"
+        "         count(DISTINCT security_id) AS cohort_size"
+        "    FROM ops.data_quality_flag"
+        "   WHERE resolved_at IS NULL"
+        "   GROUP BY 1, 2"
+        "), prior AS ("
+        "  SELECT check_name, security_id, count(*) AS prior_resolutions,"
+        "         max(resolved_at) AS last_resolved_at,"
+        "         (array_agg(resolution_note ORDER BY resolved_at DESC))[1]"
+        "             AS last_resolution_note,"
+        "         (array_agg(resolved_by ORDER BY resolved_at DESC))[1]"
+        "             AS last_resolved_by"
+        "    FROM ops.data_quality_flag"
+        "   WHERE resolved_at IS NOT NULL"
+        "   GROUP BY check_name, security_id"
+        ") "
+        "SELECT f.dq_flag_id, f.check_name, f.severity, f.security_id,"
+        "       s.primary_symbol AS symbol, f.record_key, f.detail,"
+        "       f.ingestion_run_id, f.detected_at, f.trade_date,"
+        "       c.cohort_size, c.cohort_flags,"
+        "       coalesce(p.prior_resolutions, 0) AS prior_resolutions,"
+        "       p.last_resolved_at, p.last_resolved_by, p.last_resolution_note,"
+        "       s.is_actively_trading, s.delisted_date, s.is_fund,"
+        "       (f.check_name = ANY(%s)) AS never_auto_resolve"
+        "  FROM open_flags f"
+        "  LEFT JOIN core.security s ON s.security_id = f.security_id"
+        # IS NOT DISTINCT FROM, not =: checks whose record_key carries no
+        # trade_date (symbol_change_conflict, adjustment_failed) have a NULL here,
+        # and `NULL = NULL` would drop their cohort row and null the count.
+        "  LEFT JOIN cohort c ON c.check_name = f.check_name"
+        "                    AND c.trade_date IS NOT DISTINCT FROM f.trade_date"
+        "  LEFT JOIN prior p ON p.check_name = f.check_name"
+        "                   AND p.security_id = f.security_id"
+        f" WHERE {' AND '.join(clauses)} "
+        " ORDER BY c.cohort_size DESC NULLS LAST, f.check_name,"
+        "          f.detected_at DESC, f.dq_flag_id DESC LIMIT %s"
+    )
+    rows = _query(dsn, sql, (sorted(NEVER_AUTO_RESOLVE), *params))
+    return envelope(
+        rows,
+        max_rows=cap,
+        never_auto_resolve=sorted(NEVER_AUTO_RESOLVE),
+        note=(
+            "cohort_size is the decisive number: one security is a market fact, "
+            "many securities sharing a date is one missed load and must be "
+            "repaired, not resolved. prior_resolutions > 0 means this condition "
+            "was closed before and came back -- read last_resolution_note before "
+            "closing it again. Nothing here resolves anything; effects go through "
+            "`sudo -u fafnir fafnir dq resolve`."
+        ),
+    )
+
+
 def dq_totals(*, dsn: str, state: str = "open") -> dict:
     """Counts per check and severity -- the shape of the queue before its contents.
 

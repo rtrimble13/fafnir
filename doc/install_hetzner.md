@@ -642,6 +642,36 @@ sudo -u fafnir sed -i \
   /var/lib/fafnir/.fafnirrc
 ```
 
+> ### Check all three edits landed
+> The `sed` above changes three values, and each has its own failure if it is
+> missed. Verify before moving on:
+>
+> ```bash
+> sudo -u fafnir -H grep -E '^(log_dir|calendar_start_year|host)' ~fafnir/.fafnirrc
+> # log_dir = "/var/log/fafnir"
+> # calendar_start_year = 1990
+> # host = "/var/run/postgresql"
+> ```
+>
+> A `host` left at the template's `localhost` is a TCP connection, and TCP means
+> password auth — `fe_sendauth: no password supplied` from every command, even
+> though §3.6 configured peer auth for the socket.
+
+> ### `log_dir` must be absolute
+> The template ships `log_dir = "var/fafnir/log"` — **relative**, which resolves
+> against the working directory. Left alone it means `fafnir status` writes to
+> `./var/fafnir/log` from wherever you happen to stand, and fails outright from a
+> directory the `fafnir` user cannot write:
+>
+> ```
+> PermissionError: [Errno 13] Permission denied: 'var/fafnir/log'
+> ```
+>
+> That path appears nowhere you have configured anything, which is what makes it
+> confusing. The `sed` above fixes it; `FAFNIR_LOG_DIR` in §4.4 fixes it for the
+> units regardless. Newer builds refuse with a message naming the resolved path
+> and the cwd it resolved against, instead of the traceback.
+
 > ### Set `calendar_start_year` **before** you seed
 > It is the earliest year fafnir builds partitions and the trading calendar for, and
 > it defaults to the `--floor-year` of `fafnir db ensure-horizon`. Set it to your
@@ -659,6 +689,10 @@ sudo tee /etc/fafnir/fafnir.env > /dev/null <<'ENV'
 FAFNIR_DSN="host=/var/run/postgresql port=5432 dbname=fafnir user=fafnir_ingest"
 FMP_API_KEY="your_fmp_pro_key"
 FAFNIR_SQL_DIR="/opt/fafnir/sql"
+# The CLI's own rotating fafnir.log. Its config default is RELATIVE
+# ("var/fafnir/log"), so without this it follows the working directory --
+# see the note under 4.3.
+FAFNIR_LOG_DIR="/var/log/fafnir"
 PATH="/opt/fafnir/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Off-server backup destination (§9.2). Optional, but scripts/install_timers.sh
@@ -675,6 +709,9 @@ Why each line matters:
 
 - **`FAFNIR_SQL_DIR`** — the migrator locates `sql/` by walking up from the package or
   the cwd. Setting it explicitly makes `fafnir db migrate` work from any directory.
+- **`FAFNIR_LOG_DIR`** — same idea, for the same reason. It overrides `log_dir` in
+  `~/.fafnirrc`, and the systemd units set it so the CLI's `fafnir.log` lands
+  beside the unit logs instead of following the working directory.
 - **`PATH`** — cron gives you `/usr/bin:/bin` only, so the venv must be prepended or
   `fafnir: command not found` is all you get.
 - **`FAFNIR_BACKUP_REMOTE`** — needs the `:/path` suffix. rsync decides a
@@ -1326,9 +1363,10 @@ A `~/.pgpass` line then keeps the password out of your shell history and environ
 | `db seed`: foreign-key error, `Key (exchange_code)=(\x4e4153444151) is not present` | Cluster was created `SQL_ASCII` because the locale was unset (§3.3) | `SHOW server_encoding` — if not `UTF8`, drop and recreate the cluster with `--locale=C.UTF-8 --encoding=UTF8` |
 | `error: externally-managed-environment` from pip | Ubuntu 24.04 system Python is PEP 668 managed | Install into `/opt/fafnir/.venv` (§4.2) |
 | `fafnir: command not found` in cron/systemd | venv not on `PATH` | Set `PATH=` in `/etc/fafnir/fafnir.env` (§4.4) |
-| `fe_sendauth: no password supplied` | `FAFNIR_DB_PASSWORD` set alongside `FAFNIR_DSN` | Use `PGPASSWORD`, `~/.pgpass`, or peer auth — see the table in §4.4 |
+| `fe_sendauth: no password supplied` | Either `host` is still the template's `localhost` (so it is a TCP connection needing a password), or `FAFNIR_DB_PASSWORD` was set alongside `FAFNIR_DSN` | Set `host = "/var/run/postgresql"` in `~fafnir/.fafnirrc` (§4.3) for peer auth; or use `PGPASSWORD` / `~/.pgpass` — see the table in §4.4. Newer builds name the DSN, its source and the fix instead of raising a traceback |
 | `Peer authentication failed for user "fafnir_ingest"` | The `pg_hba` peer rule landed *below* `local all all peer`, or the ident map name is wrong | §3.6 — reorder so the `fafnir_ingest` rule comes first, then reload |
 | `Could not locate sql/migrations` | Running outside the checkout | Export `FAFNIR_SQL_DIR=/opt/fafnir/sql` |
+| `PermissionError: ... 'var/fafnir/log'` from any `fafnir` command | `log_dir` is the template's **relative** default, so it resolved against the working directory | Set an absolute `log_dir` in `~fafnir/.fafnirrc` (§4.3) or `FAFNIR_LOG_DIR=/var/log/fafnir` in `/etc/fafnir/fafnir.env` (§4.4). Check with `sudo -u fafnir -H grep log_dir ~fafnir/.fafnirrc` |
 | `ingest symbol-changes` fails, or returns zero rows **and** zero bytes | Your FMP plan may not cover `stable/symbol-change`, or the path has changed | Not fatal — the nightly warns and continues, so prices still load. Check the status code with `curl -s -o /dev/null -w '%{http_code}\n' "https://financialmodelingprep.com/stable/symbol-change?apikey=$FMP_API_KEY"` — `402` means the plan does not include it. The path is a single constant (`FMPClient.EP_SYMBOL_CHANGE`) if it needs correcting; until it works, renames are not reconciled and a renamed company will fork into a second `security_id` |
 | Calendar/partitions start at 2015, not your backfill year | `~/.fafnirrc` not found (missing `-H`/`HOME`), or seeded before setting `calendar_start_year` | §5.2; then re-run `fafnir db seed` and `fafnir db ensure-horizon` |
 | `permission denied for schema core` from `duk` | A `duk` older than migration 0020, which still read `core` for symbol resolution and raw prices | Upgrade `duk` and apply `0020` ([ADR 0009](adr/0009-mart-is-the-read-seam.md)); from 0020 on, `fafnir_app` serves every `duk` read |

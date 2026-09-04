@@ -181,6 +181,34 @@ absent, for exactly this reason.
 | **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
+### Proactive sweeps
+
+Asked to *sweep* or *clear* the queue rather than about one security, the agent
+works it in bulk under
+[`references/sweep-policy.md`](../.claude/skills/fafnir-dba/references/sweep-policy.md):
+it investigates and groups on its own initiative, then proposes **one batched
+`dq resolve` per condition**, each preceded by its own `--dry-run` output. The
+approval model is unchanged — every effect is still an interactive prompt, so
+what the sweep removes is the per-flag tedium, not the human.
+
+Three things bound it, and they are worth knowing because they are what you will
+see it refuse on:
+
+- **`cohort_size`** — the `dq_triage` tool counts how many securities share a
+  check on a date across the *whole* open queue. One is a market fact; many is
+  one missed load, and the sweep proposes a re-ingest instead of resolving.
+- **`prior_resolutions`** — a condition closed twice already stops the sweep.
+  That is a defect nobody repaired, and closing it again is the queue churn this
+  design is arranged to prevent.
+- **Caps** — 25 flags per batch, 4 batches per sweep. A queue needing more is a
+  defect to fix upstream, and grinding it down would hide it.
+
+Five checks can never be closed by a sweep at all
+(`price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`,
+`price_price_out_of_range`, `price_subresolution_price`). That list lives in
+`fafnir_mcp.tools.NEVER_AUTO_RESOLVE` as well as the skill, and
+`test_never_auto_matches_the_skill` fails if the two ever disagree.
+
 `psql` is denied deliberately: it is the hole through which the tier model leaks,
 since the `claude` user could open it as any role `pg_ident` permits. SQL goes
 through `sql_read`, which runs in a read-only transaction, refuses anything that

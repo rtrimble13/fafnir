@@ -13,6 +13,11 @@ User=@FAFNIR_USER@
 Group=@FAFNIR_GROUP@
 WorkingDirectory=@FAFNIR_HOME@
 EnvironmentFile=@ENV_FILE@
+# The CLI writes its own rotating fafnir.log via log_dir, whose default is
+# RELATIVE -- so with WorkingDirectory above it would land in
+# @FAFNIR_HOME@/var/fafnir/log, inside the deployed git checkout, where
+# logrotate and monitor.sh never look. Pin it to the unit's own log dir.
+Environment=FAFNIR_LOG_DIR=@LOG_DIR@
 Environment=FAFNIR_BACKUP_DIR=@BACKUP_DIR@
 Environment=FAFNIR_BACKUP_REMOTE=@BACKUP_REMOTE@
 ExecStart=@FAFNIR_HOME@/scripts/backup_offsite.sh
