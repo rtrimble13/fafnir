@@ -5,6 +5,9 @@ The calendar is computed (weekdays minus NYSE holidays with observance rules)
 rather than shipped as a static table so it extends to any year range via config.
 Good Friday is derived from Easter (Anonymous Gregorian algorithm). Juneteenth is
 included from 2022 onward, matching the NYSE schedule.
+
+Recurring holidays are derivable; ad-hoc closures are not, and are listed in
+:data:`AD_HOC_CLOSURES`. Both are excluded from the generated calendar.
 """
 
 from __future__ import annotations
@@ -80,13 +83,42 @@ def us_market_holidays(year: int) -> set[dt.date]:
     return holidays
 
 
+# Days the US market did not open that no annual rule predicts: state funerals, a
+# hurricane, the September 11 attacks. `us_market_holidays` derives the recurring
+# calendar and by construction cannot know about any of these, so they are listed.
+#
+# Left out, every security in the universe carries a `gap` flag for every one of
+# these dates, because check_gaps asks the calendar what a session was. On this
+# warehouse that was 69,229 flags across 16,569 securities -- 10% of the whole DQ
+# queue -- describing eleven days on which nothing was wrong.
+#
+# Bounded by the range this project generates (calendar_start_year is 1990 here).
+# Earlier closures are real -- the July 1977 New York blackout, Hurricane Gloria in
+# September 1985 -- but fall outside it. Add them if that floor ever moves back.
+AD_HOC_CLOSURES: frozenset[dt.date] = frozenset(
+    {
+        dt.date(1994, 4, 27),  # Richard Nixon, national day of mourning
+        dt.date(2001, 9, 11),  # September 11 attacks. Shut through the 14th;
+        dt.date(2001, 9, 12),  # trading resumed Monday the 17th, the longest
+        dt.date(2001, 9, 13),  # closure since 1933.
+        dt.date(2001, 9, 14),
+        dt.date(2004, 6, 11),  # Ronald Reagan, national day of mourning
+        dt.date(2007, 1, 2),  # Gerald Ford, national day of mourning
+        dt.date(2012, 10, 29),  # Hurricane Sandy: two consecutive sessions, the
+        dt.date(2012, 10, 30),  # first weather closure of that length since 1888
+        dt.date(2018, 12, 5),  # George H. W. Bush, national day of mourning
+        dt.date(2025, 1, 9),  # Jimmy Carter, national day of mourning
+    }
+)
+
+
 def trading_days(start_year: int, end_year: int) -> Iterable[dt.date]:
     for year in range(start_year, end_year + 1):
         holidays = us_market_holidays(year)
         d = dt.date(year, 1, 1)
         end = dt.date(year, 12, 31)
         while d <= end:
-            if d.weekday() < 5 and d not in holidays:
+            if d.weekday() < 5 and d not in holidays and d not in AD_HOC_CLOSURES:
                 yield d
             d += dt.timedelta(days=1)
 
