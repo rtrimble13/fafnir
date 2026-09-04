@@ -514,6 +514,60 @@ def test_an_equity_one_day_behind_is_still_stale(db):
     assert checks.check_freshness(db) == 1
 
 
+def test_a_bar_on_a_closed_day_does_not_make_the_universe_stale(db):
+    """The market's latest date must be a session, not merely the newest bar.
+
+    Money-market funds strike a NAV seven days a week, so `core.daily_price` holds
+    Saturday and Sunday bars for a couple of dozen of them. An unrestricted
+    max(trade_date) takes one of those as "the market", and then every security
+    whose last bar is Friday's -- which is all of them -- is a session behind and
+    the entire universe is flagged stale in a single run. That is not a stale
+    universe, it is a bad reference point, and it buries the few hundred genuinely
+    late securities the check exists to surface.
+    """
+    from fafnir.dq import checks
+
+    yesterday, today = _trading_days(db, 2, through=dt.date(2024, 12, 31))
+    closed_day = today + dt.timedelta(days=1)
+    assert not db.fetchval(
+        "SELECT count(*) FROM ref.trading_calendar "
+        "WHERE exchange_code = 'NASDAQ' AND is_open AND trade_date = %s",
+        (closed_day,),
+    ), "the day after the last session must be closed for this test to mean anything"
+
+    # A money-market fund: asset_type 'equity' in the master, as the real ones are,
+    # so the NAV_LAGGING_ASSET_TYPES allowance is not what is under test here.
+    money_fund = repo.upsert_security(
+        db, primary_symbol="AEAXX", company_name="Money Market", asset_type="equity"
+    )
+    equity = repo.upsert_security(
+        db, primary_symbol="AAA", company_name="Test", asset_type="equity"
+    )
+    db.commit()
+    _price_on(db, money_fund, today, close=1)
+    _price_on(db, money_fund, closed_day, close=1)  # NAV struck on a closed day
+    _price_on(db, equity, today)
+
+    # The equity is current: its last bar is the last *session*.
+    assert checks.check_freshness(db) == 0
+
+    # And a security that really is a session behind is still caught, so the
+    # narrower reference point has not blunted the check.
+    _price_on(db, equity, yesterday)
+    db.execute(
+        "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
+        (equity, today),
+    )
+    db.commit()
+    assert checks.check_freshness(db) == 1
+    assert (
+        db.fetchval(
+            "SELECT security_id FROM ops.data_quality_flag WHERE check_name = 'stale'"
+        )
+        == equity
+    )
+
+
 # ---------------------------------------------------------------------------
 # Interaction with the rename-merge path (0018)
 # ---------------------------------------------------------------------------

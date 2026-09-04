@@ -165,6 +165,12 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     is flagged once; one that takes a bar and then falls behind again is a new
     occurrence and is flagged again.
 
+    "The market's latest date" is the newest date carrying a bar *that is an open
+    session on the calendar*. Some securities -- money-market funds especially --
+    publish a price on days the market is shut, and one such bar is enough to move
+    an unrestricted max(trade_date) onto a weekend and make every other security
+    in the universe look a session behind.
+
     Securities priced at a NAV struck after the equity close get
     :data:`NAV_LAG_TRADING_DAYS` of slack, measured in trading days off the
     calendar rather than calendar days -- a Monday-morning run must not treat the
@@ -173,7 +179,16 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     row = db.fetchone(
         """
         WITH market_latest AS (
-            SELECT max(trade_date) AS d FROM core.daily_price
+            -- Restricted to open sessions on the venue calendar. A money-market
+            -- fund strikes a NAV seven days a week, so an unrestricted
+            -- max(trade_date) lands on a Saturday whenever one of them is loaded
+            -- -- and then every security whose last bar is Friday's is "behind
+            -- the market" and the whole universe is flagged stale at once.
+            SELECT max(p.trade_date) AS d
+              FROM core.daily_price p
+              JOIN ref.trading_calendar c
+                ON c.trade_date = p.trade_date
+               AND c.exchange_code = %s AND c.is_open
         ),
         allowance AS (
             -- The oldest last_date a NAV-priced security may carry and still be
@@ -225,7 +240,12 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
         SELECT (SELECT count(*) FROM detected) AS detected,
                (SELECT count(*) FROM written)  AS flagged
         """,
-        (exchange_code, NAV_LAG_TRADING_DAYS + 1, list(NAV_LAGGING_ASSET_TYPES)),
+        (
+            exchange_code,
+            exchange_code,
+            NAV_LAG_TRADING_DAYS + 1,
+            list(NAV_LAGGING_ASSET_TYPES),
+        ),
     )
     logger.info(
         "freshness check: %d stale securities, %d newly flagged",
