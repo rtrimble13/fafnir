@@ -128,7 +128,7 @@ def upsert_security(
             -- must not blank the one already stored. Without this the nightly
             -- `ingest securities` -- which upserts the whole active universe and
             -- passed neither field -- erased sector and industry for every
-            -- security it touched, every night. It emptied 75% of the master in
+            -- security it touched, every night. It emptied 75%% of the master in
             -- eight days, and read as "sector never populates" rather than as an
             -- overwrite, because the surviving rows were exactly the delisted ones
             -- the nightly load no longer touches.

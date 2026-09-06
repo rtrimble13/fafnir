@@ -786,9 +786,12 @@ class _VenueFMP:
     bytes_downloaded = 0
     request_count = 0
 
-    def __init__(self, venue, symbol="ABC"):
+    def __init__(self, venue, symbol="ABC", name="Acme Corp"):
         self.venue = venue
         self.symbol = symbol
+        # The company name is what `is_retired_listing` arbitrates on, so a test
+        # about a ticker's NEXT owner has to hand the second load a different one.
+        self.name = name
 
     def company_screener(self, *, exchange=None, **_kw):
         if exchange != self.venue:
@@ -797,7 +800,7 @@ class _VenueFMP:
             {
                 "symbol": self.symbol,
                 "exchangeShortName": self.venue,
-                "name": "Acme Corp",
+                "name": self.name,
                 "isEtf": False,
             }
         ]
@@ -856,14 +859,19 @@ def test_the_duk_read_path_still_reaches_a_transferred_security(db):
 
 def test_ticker_reuse_after_a_delisting_still_mints_a_new_security(db):
     """The venue drop must not weaken 0009: the key is still scoped to LISTED rows,
-    so a dead issuer's ticker cannot be overwritten by its next owner."""
+    so a dead issuer's ticker cannot be overwritten by its next owner.
+
+    The newcomer carries a different company name because that is what makes it a
+    newcomer: an entry repeating the retired name is the vendor lagging a
+    delisting, and `is_retired_listing` declines it rather than minting a second
+    row. Reuse and echo are told apart by the name, not by the venue."""
     repo.ensure_exchange(db, "NYSE", "NYSE", "US")
     security_master.load_securities(db, _VenueFMP("NYSE"))
     dead = repo.resolve_security_id(db, "ABC")
     _give_history(db, dead)
     repo.mark_delisted(db, security_id=dead, delisted_date=dt.date(2024, 6, 10))
 
-    security_master.load_securities(db, _VenueFMP("NASDAQ"))
+    security_master.load_securities(db, _VenueFMP("NASDAQ", name="Beta Industries"))
 
     newcomer = repo.resolve_security_id(db, "ABC")
     assert newcomer != dead
