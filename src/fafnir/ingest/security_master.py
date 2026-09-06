@@ -522,10 +522,15 @@ def load_securities(
             ),
         )
         if skipped_retired:
+            one = len(skipped_retired) == 1
             logger.info(
-                "%d vendor entr%s skipped as already-retired listings: %s%s",
-                len(skipped_retired),
-                "y was" if len(skipped_retired) == 1 else "ies were",
+                "%s skipped as %s: %s%s",
+                (
+                    "1 vendor entry was"
+                    if one
+                    else f"{len(skipped_retired)} vendor entries were"
+                ),
+                "an already-retired listing" if one else "already-retired listings",
                 ", ".join(skipped_retired[:20]),
                 "..." if len(skipped_retired) > 20 else "",
             )
