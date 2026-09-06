@@ -4,9 +4,15 @@ Security-master loader.
 Builds ``core.security`` + ``core.symbol_xref`` from FMP. The default
 ``us-equity-etf`` universe comes from ``company-screener``, the only bulk endpoint
 carrying the exchange; ``stock-list`` / ``etf-list`` back the unfiltered universes.
-The screener also supplies market cap and beta, so screening data costs nothing
-beyond the universe load (0010). :func:`enrich_profiles` is optional and adds only
-the long-form description and the identifiers, at one request per symbol.
+The screener also supplies market cap, beta and the sector/industry
+classification, so all of it costs nothing beyond the universe load (0010).
+:func:`enrich_profiles` is optional and adds the long-form description and the
+identifiers, at one request per symbol.
+
+The vendor keeps listing names for months after they stop trading, and the upsert
+cannot see a delisted row (its arbiter is the partial index over
+``delisted_date IS NULL``). :func:`is_retired_listing` is what stops those entries
+being minted as new securities night after night.
 
 Delisted/inactive securities are never deleted; a reconciliation step
 (``fafnir ingest delisted``) flips ``is_actively_trading``/``delisted_date``.
@@ -173,16 +179,71 @@ def check_company_name_drift(
     return True
 
 
+def is_retired_listing(
+    incoming_name: Optional[str], retired: list[dict]
+) -> Optional[dict]:
+    """The delisted row this vendor entry is a stale echo of, or None.
+
+    FMP keeps serving a name on the screener for months after it stops trading,
+    and :func:`repo.upsert_security` cannot see that it is already held: its
+    conflict arbiter is the partial index over ``delisted_date IS NULL``. So every
+    such entry looks like a new listing and mints a second security_id -- which the
+    delisting sweep stamps the same night, so the next run mints another. The row
+    that carries the price history keeps its bars but loses the ticker, because
+    each mint closes the previous period in ``core.symbol_xref``; the empty shell
+    is what `duk ls` and `resolve_symbol` then find.
+
+    The tell is the company name, compared on
+    :func:`_normalize_company_name`'s normal form -- which absorbs exactly the
+    corporate-form churn that is not a change of company ("Ares Acquisition Corp"
+    and "Ares Acquisition Corporation" are both ``ares acquisition``).
+
+    Equality, deliberately, and NOT :func:`company_name_similarity`. That helper
+    answers a different question, and answers it correctly for its own caller: for
+    drift detection, one name containing the other is the same company growing a
+    suffix ("Meta Platforms" -> "Meta Platforms, Inc."). Here containment is the
+    trap. SPAC families reuse their own tickers -- "Ares Acquisition Corporation"
+    retired in 2023 and "Ares Acquisition Corp. III Class A" listed on the same
+    ticker later -- and the first normalizes to a prefix of the second. That helper
+    short-circuits on containment and returns None, its "no opinion" answer, which
+    check_company_name_drift reads as the same company; the raw ratio underneath is
+    0.842, so a threshold would not have saved it either. Treating that as an echo
+    would silently refuse to mint a
+    company that really did list, which costs it every bar it will ever have. A
+    duplicate row is the cheaper error and the new ``security_duplicate_identity``
+    check catches it; a missing company is silent forever. Measured against this
+    warehouse the strict rule loses nothing: of 4,321 forked tickers, 4,315 carry
+    a byte-identical company name on every row.
+    """
+    if not incoming_name:
+        return None
+    incoming = _normalize_company_name(incoming_name)
+    if not incoming:
+        return None
+    for row in retired:
+        stored = row.get("company_name")
+        if stored and _normalize_company_name(stored) == incoming:
+            return row
+    return None
+
+
 class SecurityLoadResult(NamedTuple):
     """Outcome of a security-master load.
 
     ``new_symbols`` is what makes the nightly run legible: the difference between
     "refreshed 21,412 securities" and "refreshed 21,412 securities, 3 of them new
     tonight" is the difference between a load you can ignore and one you can audit.
+
+    ``skipped_retired`` is the same argument for the entries this load declined:
+    names the vendor still lists that this warehouse has already retired. A steady
+    handful is normal -- the vendor lags a delisting by weeks. A number that climbs
+    every night means the delisting sweep and the screener disagree about the
+    universe, which is worth seeing rather than inferring from a row count.
     """
 
     total: int
     new_symbols: list[str]
+    skipped_retired: list[str]
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:
@@ -347,12 +408,45 @@ def load_securities(
         # upsert below inserts or updates. The venue is not part of it (0012), so a
         # company changing exchange is a refresh, not an arrival.
         listed = repo.listed_securities(db)
+        # The other half of the identity question. `listed` answers "is this a
+        # refresh?"; only this answers "is this arrival real?" -- see
+        # :func:`is_retired_listing` for why the upsert cannot answer it itself.
+        retired = repo.delisted_securities(db)
         new_symbols: list[str] = []
+        skipped_retired: list[str] = []
+        # Memoised for the run. get_or_create_* is two round-trips (an
+        # ON CONFLICT DO NOTHING insert, then a select), and the screener carries
+        # a classification on every one of ~21k entries drawn from a taxonomy of
+        # roughly a dozen sectors and a few hundred industries. Uncached that is
+        # ~85,000 queries a night to learn the same handful of ids.
+        sector_ids: dict[Optional[str], Optional[int]] = {}
+        industry_ids: dict[Optional[str], Optional[int]] = {}
+
+        def sector_id(name: Optional[str]) -> Optional[int]:
+            if name not in sector_ids:
+                sector_ids[name] = repo.get_or_create_sector(db, name)
+            return sector_ids[name]
+
+        def industry_id(name: Optional[str]) -> Optional[int]:
+            if name not in industry_ids:
+                industry_ids[name] = repo.get_or_create_industry(db, name)
+            return industry_ids[name]
 
         count = 0
         for entry, asset_type, is_etf in entries:
             symbol = (entry.get("symbol") or "").strip()
             if not symbol:
+                continue
+            company_name = entry.get("name") or entry.get("companyName")
+            previous = listed.get(symbol)
+            # Before anything is written or flagged: a name this warehouse has
+            # already retired, still being served by the vendor, is not a listing.
+            # Inserting it mints a duplicate identity that captures the ticker's
+            # xref period and hides the row holding the price history.
+            if previous is None and is_retired_listing(
+                company_name, retired.get(symbol, [])
+            ):
+                skipped_retired.append(symbol)
                 continue
             # The us-equity-etf filter lives in _us_entries now -- it needs the
             # screener's fields, which the bulk lists do not carry.
@@ -362,8 +456,6 @@ def load_securities(
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
-            company_name = entry.get("name") or entry.get("companyName")
-            previous = listed.get(symbol)
             if previous is None:
                 new_symbols.append(symbol)
             else:
@@ -384,6 +476,13 @@ def load_securities(
                 company_name=company_name,
                 asset_type=asset_type,
                 exchange_code=exchange,
+                # The screener carries `sector` and `industry` alongside the
+                # market cap and beta, so the whole classification comes from the
+                # universe load at no extra request. This is the only nightly
+                # writer of these two: `enrich_profiles` costs one request per
+                # symbol and is not in the nightly job.
+                sector_id=sector_id(entry.get("sector")),
+                industry_id=industry_id(entry.get("industry")),
                 country=entry.get("country"),
                 is_actively_trading=bool(entry.get("isActivelyTrading", True)),
                 is_etf=is_etf,
@@ -422,6 +521,14 @@ def load_securities(
                 else ""
             ),
         )
+        if skipped_retired:
+            logger.info(
+                "%d vendor entr%s skipped as already-retired listings: %s%s",
+                len(skipped_retired),
+                "y was" if len(skipped_retired) == 1 else "ies were",
+                ", ".join(skipped_retired[:20]),
+                "..." if len(skipped_retired) > 20 else "",
+            )
         if len(new_symbols) >= LARGE_NEW_LISTING_BATCH:
             logger.warning(
                 "%d securities are new to the master this run. None has a price "
@@ -431,16 +538,28 @@ def load_securities(
                 "with --limit, consider `scripts/initial_backfill.sh` instead.",
                 len(new_symbols),
             )
-        return SecurityLoadResult(count, new_symbols)
+        return SecurityLoadResult(count, new_symbols, skipped_retired)
 
 
 def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:
     """Fetch per-symbol profiles for the long-form description.
 
     Optional since 0010: market cap and beta now come from the screener in
-    :func:`load_securities`, so the only thing this adds is `description`
-    (plus CIK/ISIN/CUSIP and the IPO date). One request per symbol -- over an
-    hour across a 21k universe -- so weigh it against what you actually read.
+    :func:`load_securities`, and so does the sector/industry classification. What
+    this adds over the universe load is `description`, CIK/ISIN/CUSIP and the IPO
+    date. One request per symbol -- over an hour across a 21k universe -- so weigh
+    it against what you actually read.
+
+    An earlier revision of this docstring listed only `description` and the
+    identifiers, omitting sector and industry at a time when :func:`load_securities`
+    did not carry them either. Reading it as the whole truth is what justified
+    dropping `--enrich` from ``scripts/initial_backfill.sh`` on 2026-08-27, which
+    left the warehouse with no writer of the classification at all. Keep this list
+    honest: it is load-bearing.
+
+    Note this walks whatever symbols the caller passes. Pass only LISTED ones --
+    `upsert_security` arbitrates on the partial index over `delisted_date IS NULL`,
+    so a delisted symbol here inserts a second security_id instead of updating.
     """
     symbols = list(symbols)
     with RunLog(

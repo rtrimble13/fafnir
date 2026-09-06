@@ -123,8 +123,19 @@ def upsert_security(
             -- a transfer onto the existing security.
             exchange_code       = COALESCE(EXCLUDED.exchange_code,
                                            core.security.exchange_code),
-            sector_id           = EXCLUDED.sector_id,
-            industry_id         = EXCLUDED.industry_id,
+            -- COALESCE for the same reason as the venue above, and it is the
+            -- same class of bug: a caller that does not carry a classification
+            -- must not blank the one already stored. Without this the nightly
+            -- `ingest securities` -- which upserts the whole active universe and
+            -- passed neither field -- erased sector and industry for every
+            -- security it touched, every night. It emptied 75% of the master in
+            -- eight days, and read as "sector never populates" rather than as an
+            -- overwrite, because the surviving rows were exactly the delisted ones
+            -- the nightly load no longer touches.
+            sector_id           = COALESCE(EXCLUDED.sector_id,
+                                           core.security.sector_id),
+            industry_id         = COALESCE(EXCLUDED.industry_id,
+                                           core.security.industry_id),
             currency            = EXCLUDED.currency,
             country             = EXCLUDED.country,
             is_actively_trading = EXCLUDED.is_actively_trading,
@@ -1159,6 +1170,39 @@ def listed_securities(db: Database, source: str = "fmp") -> dict[str, dict]:
             (source,),
         )
     }
+
+
+def delisted_securities(db: Database, source: str = "fmp") -> dict[str, list[dict]]:
+    """Every delisted security, grouped by the ticker it retired under.
+
+    The mirror of :func:`listed_securities`, and needed for the same reason from
+    the other side. The upsert arbitrates on the *partial* unique index over
+    ``delisted_date IS NULL`` (0009), so a delisted row is invisible to it: a
+    vendor list that still carries a retired name looks exactly like a brand-new
+    listing, and inserting it mints a second security_id for a company already
+    held. Only the caller can tell those two cases apart, and only if it can see
+    what was retired -- which is what this returns.
+
+    A list per symbol, not one row: a ticker can be retired more than once, and the
+    caller weighs the incoming name against every retirement it has.
+    """
+    out: dict[str, list[dict]] = {}
+    for row in db.fetchall(
+        """
+        SELECT security_id, primary_symbol, company_name, delisted_date
+          FROM core.security
+         WHERE delisted_date IS NOT NULL AND source = %s
+        """,
+        (source,),
+    ):
+        out.setdefault(row["primary_symbol"], []).append(
+            {
+                "security_id": row["security_id"],
+                "company_name": row["company_name"],
+                "delisted_date": row["delisted_date"],
+            }
+        )
+    return out
 
 
 def security_asset_type(db: Database, security_id: int) -> Optional[str]:

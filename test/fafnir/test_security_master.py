@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from fafnir.ingest.security_master import (
@@ -13,6 +15,7 @@ from fafnir.ingest.security_master import (
     _normalize_company_name,
     _us_entries,
     company_name_similarity,
+    is_retired_listing,
 )
 
 
@@ -177,3 +180,71 @@ def test_noise_stripping_keeps_the_identifying_words():
     # "co" as a standalone token is boilerplate; inside a word it is not.
     assert _normalize_company_name("The Coca-Cola Company") == "coca cola"
     assert _normalize_company_name("Ford Motor Co.") == "ford motor"
+
+
+# ---------------------------------------------------------------------------
+# Retired listings: the vendor keeps serving names the warehouse has retired
+# ---------------------------------------------------------------------------
+
+
+def _retired(name: str, security_id: int = 1) -> dict:
+    return {
+        "company_name": name,
+        "security_id": security_id,
+        "delisted_date": date(2026, 8, 20),
+    }
+
+
+def test_retired_listing_matches_the_same_company():
+    # The production failure: FMP kept listing AACB for weeks after 2026-08-20,
+    # and every nightly run minted another security_id for it. Eight rows by
+    # 2026-09-05, seven of them with no bars.
+    name = "Artius II Acquisition Inc. Class A Ordinary Shares"
+    assert is_retired_listing(name, [_retired(name)]) is not None
+
+
+def test_retired_listing_matches_across_a_restyling():
+    # Same company, different vendor spelling between revisions. The whole point
+    # of comparing _normalize_company_name forms rather than the raw strings --
+    # note this is equality on the normal form, NOT company_name_similarity, whose
+    # containment rule would swallow the genuine reuse in the next test.
+    assert (
+        is_retired_listing(
+            "Ares Acquisition Corp",
+            [_retired("Ares Acquisition Corporation")],
+        )
+        is not None
+    )
+
+
+def test_retired_listing_does_not_match_a_genuine_ticker_reuse():
+    # AAC in production: "Ares Acquisition Corporation" retired 2023-11-06, and a
+    # different issuer took the ticker. That MUST still mint a new security_id --
+    # it is a different company, and 0009 exists to give it its own identity.
+    assert (
+        is_retired_listing(
+            "Ares Acquisition Corp. III Class A",
+            [_retired("Ares Acquisition Corporation")],
+        )
+        is None
+    )
+
+
+def test_retired_listing_ignores_unrelated_retirements_on_other_tickers():
+    assert (
+        is_retired_listing("Apple Inc.", [_retired("Duke Energy Corporation")]) is None
+    )
+
+
+def test_retired_listing_is_conservative_without_names():
+    # No name on either side is no evidence. Insert rather than drop: a dropped
+    # listing costs a company its bars, a spurious one costs a duplicate row.
+    assert is_retired_listing(None, [_retired("Apple Inc.")]) is None
+    assert is_retired_listing("Apple Inc.", [_retired(None)]) is None
+    assert is_retired_listing("Apple Inc.", []) is None
+
+
+def test_retired_listing_checks_every_retirement_for_the_ticker():
+    # A ticker can be retired more than once; the match may be any of them.
+    retired = [_retired("Some Dead SPAC", 1), _retired("Apple Inc.", 2)]
+    assert is_retired_listing("Apple Inc.", retired)["security_id"] == 2

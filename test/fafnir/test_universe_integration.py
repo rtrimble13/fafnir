@@ -997,3 +997,136 @@ def test_a_rename_does_not_trip_the_drift_check(db):
 
     assert repo.resolve_security_id(db, "META") == sid
     assert _drift_flags(db) == []
+
+
+# ---------------------------------------------------------------------------
+# Identity is not forked by a vendor that keeps listing retired names
+# ---------------------------------------------------------------------------
+
+
+def _load_rows(db, rows):
+    return security_master.load_securities(db, _ScreenerFMP(rows))
+
+
+def _row(symbol, name, **extra):
+    row = {
+        "symbol": symbol,
+        "exchangeShortName": "NASDAQ",
+        "name": name,
+        "isEtf": False,
+    }
+    row.update(extra)
+    return row
+
+
+def test_delisted_name_still_on_the_screener_does_not_mint_a_second_row(db):
+    """The production failure: 4,321 tickers forked, 13,665 rows with no bars.
+
+    FMP served AACB for weeks after it delisted on 2026-08-20. Each nightly run
+    minted another security_id (the upsert's arbiter cannot see a delisted row),
+    the delisting sweep stamped the new one, and the next run minted another.
+    """
+    name = "Artius II Acquisition Inc. Class A Ordinary Shares"
+    first = _load_rows(db, [_row("AACB", name)])
+    sid = repo.resolve_security_id(db, "AACB")
+    assert first.new_symbols == ["AACB"]
+
+    repo.mark_delisted(db, security_id=sid, delisted_date=dt.date(2026, 8, 20))
+
+    # The vendor has not caught up: the same row comes back the next night.
+    second = _load_rows(db, [_row("AACB", name)])
+    assert second.new_symbols == []
+    assert second.skipped_retired == ["AACB"]
+    assert (
+        db.fetchval("SELECT count(*) FROM core.security WHERE primary_symbol = 'AACB'")
+        == 1
+    )
+    # And the ticker still reaches the security that holds the history.
+    assert repo.resolve_security_id(db, "AACB") == sid
+
+
+def test_a_genuinely_reused_ticker_still_mints_a_new_security(db):
+    """The other half: a different issuer taking a dead ticker must get its own id.
+
+    AAC in production -- "Ares Acquisition Corporation" retired 2023-11-06, and
+    "Ares Acquisition Corp. III Class A" listed on the ticker afterwards. Refusing
+    to mint here would cost the new company every bar it will ever have.
+    """
+    _load_rows(db, [_row("AAC", "Ares Acquisition Corporation")])
+    old_sid = repo.resolve_security_id(db, "AAC")
+    repo.mark_delisted(db, security_id=old_sid, delisted_date=dt.date(2023, 11, 6))
+
+    result = _load_rows(db, [_row("AAC", "Ares Acquisition Corp. III Class A")])
+
+    assert result.new_symbols == ["AAC"]
+    assert result.skipped_retired == []
+    new_sid = repo.resolve_security_id(db, "AAC")
+    assert new_sid is not None and new_sid != old_sid
+
+
+# ---------------------------------------------------------------------------
+# Sector and industry: populated by the universe load, never erased by it
+# ---------------------------------------------------------------------------
+
+
+def test_universe_load_stores_the_screener_classification(db):
+    _load_rows(
+        db,
+        [
+            _row(
+                "AAPL",
+                "Apple Inc.",
+                sector="Technology",
+                industry="Consumer Electronics",
+            )
+        ],
+    )
+    row = db.fetchone("""
+        SELECT sec.sector_name, ind.industry_name
+          FROM core.security s
+          LEFT JOIN ref.sector sec ON sec.sector_id = s.sector_id
+          LEFT JOIN ref.industry ind ON ind.industry_id = s.industry_id
+         WHERE s.primary_symbol = 'AAPL'
+        """)
+    assert (row["sector_name"], row["industry_name"]) == (
+        "Technology",
+        "Consumer Electronics",
+    )
+
+
+def test_a_load_without_a_classification_does_not_erase_the_stored_one(db):
+    """The regression that emptied 75% of the master in eight days.
+
+    `sector_id = EXCLUDED.sector_id` with no COALESCE meant every caller that did
+    not carry the field wrote NULL over it -- and the nightly universe load was
+    exactly such a caller.
+    """
+    _load_rows(
+        db,
+        [
+            _row(
+                "DUK",
+                "Duke Energy Corporation",
+                sector="Utilities",
+                industry="Regulated Electric",
+            )
+        ],
+    )
+    sid = repo.resolve_security_id(db, "DUK")
+    before = db.fetchone(
+        "SELECT sector_id, industry_id FROM core.security WHERE security_id = %s",
+        (sid,),
+    )
+    assert before["sector_id"] is not None
+
+    # A bulk-list universe carries no sector/industry at all.
+    _load_rows(db, [_row("DUK", "Duke Energy Corporation")])
+
+    after = db.fetchone(
+        "SELECT sector_id, industry_id FROM core.security WHERE security_id = %s",
+        (sid,),
+    )
+    assert (after["sector_id"], after["industry_id"]) == (
+        before["sector_id"],
+        before["industry_id"],
+    )

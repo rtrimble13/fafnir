@@ -273,7 +273,12 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
             syms = [
                 r["primary_symbol"]
                 for r in database.fetchall(
-                    "SELECT primary_symbol FROM core.security ORDER BY security_id"
+                    # Listed rows only. upsert_security arbitrates on the partial
+                    # index over `delisted_date IS NULL`, so enriching a delisted
+                    # ticker cannot update it -- it inserts a SECOND security_id
+                    # for a company already held, with none of its price history.
+                    "SELECT primary_symbol FROM core.security"
+                    " WHERE delisted_date IS NULL ORDER BY security_id"
                     + (f" LIMIT {int(limit)}" if limit else "")
                 )
             ]
