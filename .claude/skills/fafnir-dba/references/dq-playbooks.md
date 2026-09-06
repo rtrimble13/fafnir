@@ -270,6 +270,75 @@ assumption is wrong for this universe, and the second issuer has been silently
 
 ---
 
+## `security_duplicate_identity` — one ticker, two or more security rows
+
+**Never resolve with `fafnir dq resolve`.** The flag is a measurement of the
+master's shape: while the extra rows exist the next `dq run` re-detects it, and
+closing it only hides a forked company.
+
+A ticker names one issuer at a time. Two rows under one symbol means the identity
+has forked: the bars sit on one `security_id` and the ticker resolves to another,
+because every mint closes the previous period in `core.symbol_xref` and the newest
+open period wins. Nothing downstream complains — `duk ls` asks for one security and
+gets one. It is simply the wrong one, with no history.
+
+`detail` carries `row_count`, `rows_without_bars` and `distinct_company_names`.
+Those three separate the two causes:
+
+- **`distinct_company_names = 1`, most rows without bars → re-minting.** The vendor
+  is still listing a name the warehouse retired, and each load minted another row.
+  This is a repair, not a judgement. Confirm with:
+
+```sql
+SELECT security_id, primary_symbol, company_name, delisted_date, first_seen_at,
+       (SELECT count(*) FROM core.daily_price p WHERE p.security_id = s.security_id)
+         AS bars
+  FROM core.security s
+ WHERE primary_symbol = '<SYM>' ORDER BY security_id;
+```
+
+  Keep the row with bars, delete the shells, re-point the xref period. The
+  loader-side cause is fixed by `is_retired_listing` in
+  `fafnir/ingest/security_master.py`; a warehouse still accumulating these is
+  running code that predates it.
+
+- **Names differ → genuine ticker reuse.** A new issuer took a dead ticker, and
+  two rows is *correct* (0009). Nothing to repair. Say so and leave it open, or
+  escalate to have the check taught about this pair — do not close it as though
+  the data were wrong.
+
+**Escalate** either way. The repair deletes rows from `core.security`, which no
+`fafnir` subcommand does today.
+
+---
+
+## `security_missing_classification` — a listed security with no sector/industry
+
+Informational, and repair-first. `sector` and `industry` ride in on the company
+screener with every universe load, so a listed security without them means either
+the vendor omitted the fields for that symbol or the write path dropped them.
+
+**The count is the diagnostic.** One security is a vendor omission. The whole
+active universe at once is a single write-path regression wearing thousands of
+flags — in 2026-08 an `upsert_security` that assigned `sector_id` from `EXCLUDED`
+without `COALESCE` blanked 26,393 rows over eight days, and every night reported
+success. Resolving those individually would have been the worst possible response.
+
+```sql
+SELECT count(*) FILTER (WHERE sector_id IS NULL) AS unclassified,
+       count(*) AS listed
+  FROM core.security WHERE is_actively_trading AND delisted_date IS NULL;
+```
+
+**Repair** by running `fafnir ingest securities` on a build that carries the
+screener classification through `upsert_security`, then `fafnir db refresh-marts`
+so `mart.security_latest` — and therefore `screen_securities` — agrees.
+
+**Resolve when** the universe load has run since and the security is still
+unclassified: that is the vendor's gap, not the warehouse's. Say which in the note.
+
+---
+
 ## `symbol_change_conflict` — two live claims on one ticker
 
 **Never resolve with `fafnir dq resolve`.** The nightly sweep re-detects the

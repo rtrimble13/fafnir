@@ -526,6 +526,7 @@ NEVER_AUTO_RESOLVE = frozenset(
         "symbol_change_conflict",
         "price_price_out_of_range",
         "price_subresolution_price",
+        "security_duplicate_identity",
     }
 )
 

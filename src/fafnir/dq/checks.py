@@ -6,6 +6,8 @@ corrupting research data.
   * gaps      -- trading-calendar days with no price row (per active security)
   * outliers  -- implausible close-to-close moves not explained by a split
   * freshness -- securities whose latest price lags the market's latest date
+  * identity  -- one ticker carrying more than one security row
+  * profile   -- actively-traded securities with no sector/industry
 
 These are deliberately set-based SQL so they scale across the universe.
 
@@ -255,6 +257,137 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     return int(row["flagged"])
 
 
+def check_duplicate_identity(db: Database) -> int:
+    """Flag tickers carried by more than one row in ``core.security``.
+
+    A ticker names one issuer at a time, so two rows under one symbol means the
+    company's identity has forked: its bars sit on one security_id while the ticker
+    resolves to another. The read path cannot detect this -- it asks for one
+    security and gets one -- so nothing downstream ever complains, which is how
+    4,321 forked tickers accumulated over three weeks without a single failed run.
+
+    Keyed on the symbol rather than on a security_id, and flagged against the row
+    holding the *oldest* identity, so re-forking the same ticker tomorrow does not
+    open a second flag for the same condition. `detail` carries the competing ids
+    and how many of them have no bars, which is what says whether this is a repair
+    (shells to delete) or a genuine reuse to leave alone.
+
+    Repair, then resolve: deleting the shells and re-pointing ``core.symbol_xref``
+    is what closes this, not the resolve.
+
+    Shaped to match ``var/fafnir-fixes-2026-09-06/survey-duplicate-securities.sql``,
+    which measured this against production: a correlated EXISTS per security row
+    against ``core.daily_price`` (partitioned on trade_date, ~150M rows, so a probe
+    by security_id alone cannot prune and hits every partition) exceeded the read
+    role's statement_timeout. One pass building the distinct set, joined, is the
+    form that finishes -- and the forked groups are resolved first so the bar
+    lookup covers ~18k rows rather than the whole master.
+    """
+    row = db.fetchone("""
+        WITH groups AS (
+            SELECT primary_symbol
+              FROM core.security
+             GROUP BY primary_symbol
+            HAVING count(*) > 1
+        ),
+        withbars AS (
+            SELECT DISTINCT security_id FROM core.daily_price
+        ),
+        forked AS (
+            SELECT s.primary_symbol,
+                   min(s.security_id) AS anchor_id,
+                   count(*)           AS row_count,
+                   count(*) FILTER (WHERE b.security_id IS NULL)
+                       AS rows_without_bars,
+                   count(DISTINCT s.company_name) AS distinct_names
+              FROM core.security s
+              JOIN groups g USING (primary_symbol)
+              LEFT JOIN withbars b ON b.security_id = s.security_id
+             GROUP BY s.primary_symbol
+        ),
+        written AS (
+            INSERT INTO ops.data_quality_flag
+                (security_id, table_name, record_key, check_name, severity,
+                 detail, detected_at)
+            SELECT f.anchor_id, 'core.security',
+                   jsonb_build_object('symbol', f.primary_symbol),
+                   'security_duplicate_identity', 'warn',
+                   jsonb_build_object(
+                       'row_count', f.row_count,
+                       'rows_without_bars', f.rows_without_bars,
+                       'distinct_company_names', f.distinct_names
+                   ),
+                   now()
+            FROM forked f
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag d
+                WHERE d.check_name = 'security_duplicate_identity'
+                  AND d.record_key = jsonb_build_object('symbol', f.primary_symbol)
+                  AND d.resolved_at IS NULL
+            )
+            RETURNING 1
+        )
+        SELECT (SELECT count(*) FROM forked)  AS detected,
+               (SELECT count(*) FROM written) AS flagged
+        """)
+    logger.info(
+        "identity check: %d forked tickers, %d newly flagged",
+        row["detected"],
+        row["flagged"],
+    )
+    return int(row["flagged"])
+
+
+def check_missing_classification(db: Database) -> int:
+    """Flag actively-traded securities with no sector or industry.
+
+    Cheap, and it is the check whose absence let an eight-day outage read as a
+    feature request. The classification is a screener field on every universe
+    load, so a listed security without one means either the vendor omitted it or
+    something in the write path dropped it -- and the second case is silent in
+    every other signal the warehouse produces.
+
+    Actively-traded only. Delisted rows legitimately predate the classification
+    and cannot be refreshed: the universe load no longer sees them, and enriching
+    them through `upsert_security` would insert rather than update.
+    """
+    row = db.fetchone("""
+        WITH detected AS (
+            SELECT security_id, primary_symbol
+              FROM core.security
+             WHERE is_actively_trading
+               AND delisted_date IS NULL
+               AND (sector_id IS NULL OR industry_id IS NULL)
+        ),
+        written AS (
+            INSERT INTO ops.data_quality_flag
+                (security_id, table_name, record_key, check_name, severity,
+                 detail, detected_at)
+            SELECT d.security_id, 'core.security',
+                   jsonb_build_object('symbol', d.primary_symbol),
+                   'security_missing_classification', 'info',
+                   '{}'::jsonb,
+                   now()
+            FROM detected d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'security_missing_classification'
+                  AND f.security_id = d.security_id
+                  AND f.resolved_at IS NULL
+            )
+            RETURNING 1
+        )
+        SELECT (SELECT count(*) FROM detected) AS detected,
+               (SELECT count(*) FROM written)  AS flagged
+        """)
+    logger.info(
+        "classification check: %d unclassified securities, %d newly flagged",
+        row["detected"],
+        row["flagged"],
+    )
+    return int(row["flagged"])
+
+
 def run_all(
     db: Database,
     exchange_code: str = "NASDAQ",
@@ -271,4 +404,6 @@ def run_all(
         "gaps": check_gaps(db, exchange_code),
         "outliers": check_outliers(db, outlier_threshold),
         "stale": check_freshness(db, exchange_code),
+        "duplicate_identity": check_duplicate_identity(db),
+        "missing_classification": check_missing_classification(db),
     }

@@ -18,8 +18,8 @@ preconditions.
 
 | Tier | Checks | What a sweep may do |
 |---|---|---|
-| **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
-| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic) | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
+| **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price`, `security_duplicate_identity` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
+| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
 | **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `tracked_symbol_unknown_to_source` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
 
 The **Never** tier is also `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and
@@ -76,6 +76,13 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 ### `security_company_name_drift`
 - The price history continues sensibly across the change, and the note names
   which it was: a rebrand, or a vendor abbreviation.
+
+### `security_missing_classification`
+- The universe load has run **since** the fix that carries the screener's
+  `sector`/`industry` through `upsert_security`, and the security still has no
+  classification. Then it is a vendor omission, not a warehouse defect.
+- If the whole active universe is flagged at once, that is not thousands of
+  problems: it is one write-path regression. Report it and resolve nothing.
 
 ### `tracked_symbol_unknown_to_source`
 - The fund closed, and `track rm <SYM> --closed <date>` has been run.

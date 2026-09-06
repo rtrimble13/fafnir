@@ -33,7 +33,9 @@ def _backticked_checks(text: str) -> set[str]:
     return {
         m
         for m in re.findall(r"`([a-z][a-z0-9_]+)`", text)
-        if m.startswith(("price_", "corporate_", "symbol_", "adjustment_", "dividend_"))
+        if m.startswith(
+            ("price_", "corporate_", "symbol_", "adjustment_", "dividend_", "security_")
+        )
         or m in {"gap", "outlier", "stale"}
     }
 

@@ -236,9 +236,26 @@ def test_dq_run_twice_over_unchanged_data_leaves_the_open_count_unchanged(db):
 
     # The first pass finds the problems; the second finds the same ones and writes
     # nothing, because they are all still sitting in the queue.
-    assert first == {"gaps": 2, "outliers": 1, "stale": 1}
-    assert second == {"gaps": 0, "outliers": 0, "stale": 0}
-    assert _open_flags(db) == after_first == 4
+    #
+    # Both fixture securities are unclassified -- `_mk_security` upserts without a
+    # sector, as the nightly load did before the screener carried one -- so
+    # `missing_classification` finds two. That is the check working, and it obeys
+    # the same once-per-condition rule as the rest.
+    assert first == {
+        "gaps": 2,
+        "outliers": 1,
+        "stale": 1,
+        "duplicate_identity": 0,
+        "missing_classification": 2,
+    }
+    assert second == {
+        "gaps": 0,
+        "outliers": 0,
+        "stale": 0,
+        "duplicate_identity": 0,
+        "missing_classification": 0,
+    }
+    assert _open_flags(db) == after_first == 6
 
 
 def test_dq_run_still_records_a_problem_that_is_new(db):
@@ -319,3 +336,72 @@ def test_adjust_flags_a_new_ex_date_it_has_not_seen(db):
     adjustments.adjust_all(db)
 
     assert _open_flags(db, "dividend_exceeds_price") == 2
+
+
+# ---------------------------------------------------------------------------
+# The two checks that would have made the 2026-08 regressions visible
+# ---------------------------------------------------------------------------
+
+
+def test_missing_classification_is_flagged_once_and_clears_on_repair(db):
+    sid = _mk_security(db, "DUK", name="Duke Energy Corporation")
+
+    assert checks.check_missing_classification(db) == 1
+    # Standing condition, one row -- however many nights it goes unrepaired.
+    assert checks.check_missing_classification(db) == 0
+    assert _open_flags(db, "security_missing_classification") == 1
+
+    # The repair is the universe load storing what the screener sent.
+    repo.upsert_security(
+        db,
+        primary_symbol="DUK",
+        company_name="Duke Energy Corporation",
+        asset_type="equity",
+        exchange_code="NASDAQ",
+        sector_id=repo.get_or_create_sector(db, "Utilities"),
+        industry_id=repo.get_or_create_industry(db, "Regulated Electric"),
+    )
+    assert (
+        db.fetchval(
+            "SELECT sector_id FROM core.security WHERE security_id = %s", (sid,)
+        )
+        is not None
+    )
+    assert checks.check_missing_classification(db) == 0
+
+
+def test_missing_classification_ignores_delisted_securities(db):
+    sid = _mk_security(db, "GONE")
+    repo.mark_delisted(db, security_id=sid, delisted_date=dt.date(2024, 6, 3))
+
+    # A delisted row legitimately predates the classification and cannot be
+    # refreshed: the universe load no longer sees it.
+    assert checks.check_missing_classification(db) == 0
+
+
+def test_duplicate_identity_flags_a_forked_ticker_once(db):
+    live = _mk_security(db, "AACB", name="Artius II Acquisition Inc.")
+    _bars(db, live, {dt.date(2024, 6, 3): 10})
+    repo.mark_delisted(db, security_id=live, delisted_date=dt.date(2024, 6, 4))
+    # The shell a pre-fix loader minted: same ticker, same name, no bars.
+    shell = _mk_security(db, "AACB", name="Artius II Acquisition Inc.")
+    assert shell != live
+
+    assert checks.check_duplicate_identity(db) == 1
+    # Keyed on the symbol and anchored to the oldest row, so a later run over the
+    # same fork is the same condition and writes nothing.
+    assert checks.check_duplicate_identity(db) == 0
+    assert _open_flags(db, "security_duplicate_identity") == 1
+
+    detail = db.fetchone("""
+        SELECT detail FROM ops.data_quality_flag
+         WHERE check_name = 'security_duplicate_identity' AND resolved_at IS NULL
+        """)["detail"]
+    assert detail["distinct_company_names"] == 1
+    assert detail["rows_without_bars"] == detail["row_count"] - 1
+
+
+def test_duplicate_identity_is_silent_on_a_clean_master(db):
+    _mk_security(db, "AAA")
+    _mk_security(db, "BBB")
+    assert checks.check_duplicate_identity(db) == 0
