@@ -755,14 +755,26 @@ def render_flat(summary: dict) -> dict:
     return flat
 
 
+def _listing_status(candidate: dict) -> str:
+    """Listing status as active/delisted, or "-" when the source did not say.
+
+    The live identifier search returns no listing flag, and rendering its silence
+    as "delisted" would be the table asserting something no source claimed.
+    """
+    trading = candidate.get("is_actively_trading")
+    if trading is None:
+        return MISSING
+    return "active" if trading else "delisted"
+
+
 def render_candidates(candidates: Sequence[dict]) -> str:
-    """The did-you-mean table shown when a name matches several companies."""
+    """The did-you-mean table shown when a query matches several companies."""
     rows = [
         [
             c.get("symbol") or MISSING,
             c.get("company_name") or MISSING,
             c.get("exchange_code") or MISSING,
-            "active" if c.get("is_actively_trading") else "delisted",
+            _listing_status(c),
         ]
         for c in candidates
     ]

@@ -32,7 +32,7 @@ on enrichment.
 | `industry_id` | INT → ref.industry | Set during profile enrichment. |
 | `currency` | TEXT | Default `USD`. |
 | `country` | TEXT | |
-| `cik` / `isin` / `cusip` | TEXT | External identifiers (nullable). |
+| `cik` / `isin` / `cusip` | TEXT | External identifiers (nullable). Populated from the vendor profile, so a security never profiled carries none. A lookup key for `duk ph cik:51143` / `duk ls cusip:459200101`, matched on a normalised form (zero-padding, case and grouping ignored) and indexed as such by migration 0023. Not unique: one CIK covers every share class of an issuer. |
 | `is_actively_trading` | BOOLEAN | False for delisted/inactive. |
 | `is_etf` / `is_fund` | BOOLEAN | |
 | `ipo_date` | DATE | |
@@ -248,7 +248,9 @@ reads `mart.v_security_profile`, which is why resolution reads two views.
 `security_latest`.
 
 Adds over `security_latest`: `exchange_name`, `cik`/`isin`/`cusip`, `ipo_date`,
-`delisted_date`, `source`, `first_seen_at`, `updated_at`, `description`. As with
+`delisted_date`, `source`, `first_seen_at`, `updated_at`, `description`. It is also
+the relation `duk` resolves `cik:`/`isin:`/`cusip:` arguments against, which is why
+the identifier columns belong on this view and not only on `core.security`. As with
 `security_latest`, `market_cap_usd` and `beta` are a company-screener snapshot
 refreshed with the security master — **not** history; do not use them in a backtest.
 

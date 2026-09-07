@@ -7,6 +7,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from duk import identifiers as ids
 from duk.datasource import db as ds_db
 from duk.datasource.base import DataSourceError, resolve_source, shape_price_dataframe
 
@@ -181,3 +182,85 @@ def test_price_history_limit_counts_trading_bars(monkeypatch):
     # The fetched window spans more calendar days than the bar count.
     window_start, window_end = cur.calls[-1][1][1], cur.calls[-1][1][2]
     assert (window_end - window_start).days > 5
+
+
+# ---------------------------------------------------------------------------
+# Identifier resolution: which statements run, in which order
+# ---------------------------------------------------------------------------
+
+
+class FakeCursor:
+    """Records the SQL it is handed and replays queued result sets.
+
+    The ladder's VALUE is which query runs when -- a CUSIP falling through to the
+    ISIN column is a second round trip, not a wider WHERE clause -- so what a test
+    needs to see is the sequence of statements, which a fake cursor shows and a
+    real database does not.
+    """
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return self.results.pop(0) if self.results else []
+
+
+IBM_ROW = {"security_id": 7, "symbol": "IBM", "company_name": "IBM"}
+
+
+def test_cik_resolves_in_one_query():
+    cur = FakeCursor([[IBM_ROW]])
+    found = ds_db._resolve_by_identifier(cur, ids.parse("cik:51143"))
+    assert found == [IBM_ROW]
+    assert len(cur.executed) == 1
+    assert cur.executed[0][1] == ("51143",)
+
+
+def test_a_cik_may_match_several_and_all_of_them_are_returned():
+    # One issuer, two share classes. Narrowing to one here would move the guess
+    # from the caller (which asks) into the datasource (which cannot).
+    rows = [dict(IBM_ROW, symbol="GOOG"), dict(IBM_ROW, symbol="GOOGL")]
+    cur = FakeCursor([rows])
+    assert ds_db._resolve_by_identifier(cur, ids.parse("cik:1652044")) == rows
+
+
+def test_cusip_falls_through_to_the_isin_column_only_when_it_must():
+    direct = FakeCursor([[IBM_ROW]])
+    ds_db._resolve_by_identifier(direct, ids.parse("cusip:459200101"))
+    assert len(direct.executed) == 1
+
+    # Nothing in `cusip`, so the CUSIP embedded in a US/CA ISIN is tried next.
+    fallback = FakeCursor([[], [IBM_ROW]])
+    found = ds_db._resolve_by_identifier(fallback, ids.parse("cusip:459200101"))
+    assert found == [IBM_ROW]
+    assert len(fallback.executed) == 2
+    assert fallback.executed[1][1] == (9, "459200101")
+
+
+def test_an_eight_character_cusip_matches_on_the_stored_prefix():
+    cur = FakeCursor([[IBM_ROW]])
+    ds_db._resolve_by_identifier(cur, ids.parse("cusip:45920010"))
+    assert "left(upper(btrim(cusip)), 8)" in cur.executed[0][0]
+    assert cur.executed[0][1] == ("45920010",)
+
+
+def test_isin_falls_through_to_the_cusip_column():
+    cur = FakeCursor([[], [IBM_ROW]])
+    found = ds_db._resolve_by_identifier(cur, ids.parse("isin:US4592001014"))
+    assert found == [IBM_ROW]
+    assert cur.executed[1][1] == ("459200101",)
+
+
+def test_a_non_north_american_isin_has_no_cusip_to_fall_back_to():
+    cur = FakeCursor([[]])
+    assert ds_db._resolve_by_identifier(cur, ids.parse("isin:DE0005190003")) == []
+    assert len(cur.executed) == 1
+
+
+def test_price_history_needs_a_symbol_or_an_id():
+    with pytest.raises(DataSourceError):
+        ds_db.price_history(dsn="x", start_date=None, end_date=None)

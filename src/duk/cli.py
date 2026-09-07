@@ -12,7 +12,7 @@ import click
 import pandas as pd
 from click.core import ParameterSource
 
-from duk import __version__, company_summary
+from duk import __version__, company_summary, identifiers
 from duk.config import get_config
 from duk.datasource import base as ds_base
 from duk.datasource import db as ds_db
@@ -73,6 +73,64 @@ def apply_precision_to_dataframe(df, precision, exclude_columns=None):
     # Apply rounding
     df[numeric_columns] = df[numeric_columns].round(precision)
     return df
+
+
+def parse_security_argument(argument):
+    """Parse a SYMBOL argument that may be ``cik:``/``isin:``/``cusip:`` prefixed.
+
+    Exits 1 on a malformed identifier rather than letting it reach a data source:
+    ``cik:51413`` transposed is not a lookup that should come back "no data found",
+    which is what sending it on as a ticker would produce.
+    """
+    try:
+        return identifiers.parse(argument)
+    except identifiers.IdentifierError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+def resolve_security_identifier(ctx, identifier):
+    """Turn an identifier into the ``(symbol, security_id)`` of one security.
+
+    ``security_id`` is None in live mode, which has no security master; the ticker
+    the vendor returned is the whole of what live resolution yields.
+
+    Never picks among several. A CIK is an issuer and an issuer can list more than
+    one class, so "the first one" would silently answer about GOOG when the caller
+    meant GOOGL -- the same reason a name matching several companies prints a
+    did-you-mean and stops.
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    cfg = ctx.obj["config"]
+    source = ctx.obj.get("source", "live")
+
+    try:
+        if source == "db":
+            candidates = ds_db.resolve_identifier(dsn=cfg.dsn, identifier=identifier)
+        else:
+            candidates = ds_live.resolve_identifier(
+                api_key=cfg.fmp_key, identifier=identifier
+            )
+    except Exception as exc:
+        logger.error(f"Identifier lookup failed: {exc}")
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if not candidates:
+        click.echo(f"No security found for {identifier.describe()}.", err=True)
+        sys.exit(1)
+    if len(candidates) > 1:
+        click.echo(
+            f"{identifier.describe()} matches {len(candidates)} securities. "
+            "Re-run with one of these tickers:",
+            err=True,
+        )
+        click.echo(company_summary.render_candidates(candidates), err=True)
+        sys.exit(1)
+
+    matched = candidates[0]
+    logger.info(f"Resolved {identifier.describe()} to {matched['symbol']}")
+    return matched["symbol"], matched.get("security_id")
 
 
 @click.group()
@@ -214,7 +272,9 @@ def ph(
     """
     Request price history for a symbol.
 
-    SYMBOL: The ticker symbol (e.g., AAPL, MSFT). Case insensitive.
+    SYMBOL: The ticker symbol (e.g., AAPL, MSFT). Case insensitive. A security may
+    also be named by identifier -- cik:51143, isin:US4592001014, cusip:459200101 --
+    which is resolved to its ticker before anything else happens.
     """
     # Get logger from context
     logger = ctx.obj.get("logger", logging.getLogger("duk"))
@@ -223,10 +283,10 @@ def ph(
     if verbose:
         enable_console_logging(logger)
 
-    # Make symbol uppercase for consistency
-    symbol = symbol.upper()
-
-    logger.info(f"Requesting price history for {symbol}")
+    # Ticker, or an identifier standing in for one. Parsed before anything else so
+    # a malformed identifier is a parse error, not an empty price series.
+    identifier = parse_security_argument(symbol)
+    symbol = identifier.value
 
     # Resolve data source and credentials
     cfg = ctx.obj["config"]
@@ -241,6 +301,17 @@ def ph(
             err=True,
         )
         sys.exit(1)
+
+    # An identifier is resolved to ONE security up front, so everything downstream
+    # -- the query, the log line, the -o filename -- works on a ticker exactly as it
+    # always has. In db mode the resolved security_id is carried through too: a
+    # security found by CIK must not be re-found by its primary_symbol, which a
+    # reused ticker can resolve to somebody else.
+    security_id = None
+    if not identifier.is_ticker:
+        symbol, security_id = resolve_security_identifier(ctx, identifier)
+
+    logger.info(f"Requesting price history for {symbol}")
 
     # Determine output format
     if output_csv and output_json:
@@ -282,6 +353,7 @@ def ph(
             df = ds_db.price_history(
                 dsn=cfg.dsn,
                 symbol=symbol,
+                security_id=security_id,
                 start_date=start_date,
                 end_date=end_date,
                 frequency=frequency,
@@ -772,11 +844,11 @@ def ls(
     """
     List company and market information, or summarize one company.
 
-    With a QUERY (a ticker or a company name), prints everything the warehouse
-    holds on that one company: meta, price-history and corporate-action
-    statistics, fundamentals when loaded, and any open data-quality flags.
-    Requires --source db, since three of those four describe the warehouse
-    itself.
+    With a QUERY (a ticker, an identifier such as cik:51143 / isin:US4592001014 /
+    cusip:459200101, or a company name), prints everything the warehouse holds on
+    that one company: meta, price-history and corporate-action statistics,
+    fundamentals when loaded, and any open data-quality flags. Requires --source
+    db, since three of those four describe the warehouse itself.
 
     Without a QUERY the behaviour is unchanged: returns actively trading
     securities with symbol and name.
@@ -1174,6 +1246,12 @@ def _ls_company_summary(
     if limit is not None:
         logger.debug("--limit is ignored in company-summary mode")
 
+    # Validated here rather than inside the datasource so a typo'd identifier is a
+    # parse error naming the scheme, not a lookup that reports the security missing.
+    # The parsed form also decides how a miss and an ambiguity are worded: "a more
+    # specific name" is useless advice to someone who typed a CIK.
+    identifier = parse_security_argument(query)
+
     try:
         candidates = ds_db.resolve_company(dsn=cfg.dsn, query=query)
     except Exception as exc:
@@ -1182,16 +1260,27 @@ def _ls_company_summary(
         sys.exit(1)
 
     if not candidates:
-        click.echo(f"No company found matching '{query}'.", err=True)
+        if identifier.is_ticker:
+            click.echo(f"No company found matching '{query}'.", err=True)
+        else:
+            click.echo(f"No security found for {identifier.describe()}.", err=True)
         sys.exit(1)
     if len(candidates) > 1:
         # A did-you-mean, never a guess: picking the first of several would answer
-        # confidently about the wrong company.
-        click.echo(
-            f"'{query}' matches {len(candidates)} companies. "
-            "Re-run with a ticker, or a more specific name:",
-            err=True,
-        )
+        # confidently about the wrong company -- and for a CIK, which identifies an
+        # ISSUER rather than an issue, several is the ordinary case, not a typo.
+        if identifier.is_ticker:
+            click.echo(
+                f"'{query}' matches {len(candidates)} companies. "
+                "Re-run with a ticker, or a more specific name:",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"{identifier.describe()} matches {len(candidates)} securities. "
+                "Re-run with one of these tickers:",
+                err=True,
+            )
         click.echo(company_summary.render_candidates(candidates), err=True)
         sys.exit(1)
 

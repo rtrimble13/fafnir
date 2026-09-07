@@ -103,11 +103,13 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
     @server.tool()
     @_surfaced
     def resolve_symbol(symbol: str) -> dict:
-        """Resolve a ticker or company name to a security in the warehouse.
+        """Resolve a ticker, an identifier or a company name to a security.
 
         Tries the live ticker, then the primary symbol, then a ticker the security
         used to trade under before a rename -- so a former ticker resolves, and
-        says that it did.
+        says that it did. A security may also be named by identifier instead of
+        ticker: cik:51143, isin:US4592001014, cusip:459200101. Every tool below
+        that takes a `symbol` accepts those too.
         """
         return T.resolve_symbol(dsn=dsn, symbol=symbol)
 

@@ -1195,3 +1195,87 @@ def get_yield_curve(
     # Multiple dates - return as-is with date index
     logger.info(f"Returning {len(df)} yield curve records")
     return df
+
+
+# ---------------------------------------------------------------------------
+# Identifier search (`cik:` / `isin:` / `cusip:`)
+# ---------------------------------------------------------------------------
+
+# FMP's stable identifier searches, one per scheme. The warehouse resolves these
+# against its own security master; live mode has no master, so it asks the vendor
+# and then reads prices for the ticker that comes back.
+#
+# NOTE ON ENDPOINTS: these mirror the note at the top of fafnir.sources.fmp -- the
+# stable paths are the documented ones, but a plan that does not carry them will
+# fail here rather than silently. That failure is loud and specific (an FMPAPIError
+# naming the endpoint), which is the point: the alternative was sending "CIK:51143"
+# to the price endpoint as if it were a ticker.
+_IDENTIFIER_SEARCH = {
+    "cik": ("search-cik", "cik"),
+    "isin": ("search-isin", "isin"),
+    "cusip": ("search-cusip", "cusip"),
+}
+
+
+def identifier_search_api(
+    scheme: str, value: str, api_key: str
+) -> List[Dict[str, Any]]:
+    """
+    Look a security up by CIK, ISIN or CUSIP.
+
+    Args:
+        scheme: One of "cik", "isin", "cusip"
+        value: The identifier value, already normalised by duk.identifiers
+        api_key: FMP API key for authentication
+
+    Returns:
+        List of dictionaries, each carrying at least ``symbol`` and ``companyName``.
+        Empty when the identifier matches nothing.
+
+    Raises:
+        FMPAPIError: If the API request fails or returns an error
+        ValueError: If required parameters are invalid
+
+    Example:
+        >>> identifier_search_api("cik", "51143", "your_api_key")
+    """
+    if scheme not in _IDENTIFIER_SEARCH:
+        raise ValueError(f"Unknown identifier scheme '{scheme}'")
+    if not value:
+        raise ValueError("Identifier value cannot be empty")
+    if not api_key:
+        raise ValueError("API key cannot be empty")
+
+    path, param = _IDENTIFIER_SEARCH[scheme]
+    endpoint = f"https://financialmodelingprep.com/stable/{path}"
+    params: Dict[str, Any] = {param: value, "apikey": api_key}
+
+    logger.debug(f"Searching FMP for {scheme}={value}")
+
+    try:
+        response = requests.get(endpoint, params=params, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        detail = redact_secrets(str(e))
+        logger.error(f"Failed to search {scheme} {value}: {detail}")
+        raise FMPAPIError(f"Failed to search {scheme} {value}: {detail}") from None
+
+    try:
+        data = response.json()
+    except ValueError as e:
+        logger.error(f"Failed to parse JSON response: {e}")
+        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
+
+    if isinstance(data, dict) and "Error Message" in data:
+        error_msg = data["Error Message"]
+        logger.error(f"FMP API error: {error_msg}")
+        raise FMPAPIError(f"FMP API error: {error_msg}")
+
+    if isinstance(data, list):
+        logger.info(f"Retrieved {len(data)} match(es) for {scheme} {value}")
+        return data
+    if isinstance(data, dict):
+        # A single-object payload, which some FMP searches return for an exact key.
+        return [data]
+    logger.warning(f"Unexpected response format for {scheme} search")
+    return []

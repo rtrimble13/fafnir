@@ -108,6 +108,68 @@ precision, `--json` stays numeric, and `-o` files are written unrounded unless y
 pass `-p` explicitly -- they feed the `ti`/`rc` compute path, where quantizing a
 sub-dollar series would introduce real error.
 
+## Naming a security by identifier
+
+Anywhere `duk` takes a ticker, it also takes a **CIK, ISIN or CUSIP**, written
+`scheme:value`:
+
+```bash
+duk -S db ph  cik:51143            # IBM, by SEC filer number
+duk -S db ph  isin:US4592001014 --adj
+duk -S db ls  cusip:459200101      # the full company summary
+duk -S db ls  cik:0000051143       # zero-padding is optional
+```
+
+| Scheme | Value | Notes |
+|---|---|---|
+| `cik:` | digits | leading zeros optional — `51143` and `0000051143` are the same filer |
+| `isin:` | 12 characters | case and grouping are ignored: `isin:"us4592 0010 14"` works |
+| `cusip:` | 8 or 9 characters | the check digit may be dropped |
+| `ticker:` / `symbol:` | a ticker | an escape hatch, for when the argument must not be read as anything else |
+
+**The prefix is required.** An identifier is not guessable from its shape — `51143`
+is a plausible CIK and a plausible nothing — so a bare argument still means exactly
+what it always did: a ticker, or for `ls` a company name. An *unrecognised* prefix
+is not an error either, so `ls "Baker: A History"` is still a name search.
+
+A malformed value is refused rather than passed on (`'cik:five' is not a CIK:
+expected digits, e.g. cik:51143`). A transposed identifier that came back "no data
+found" would read as *the warehouse does not hold this security*, which is a
+different and much more alarming claim.
+
+### One identifier, several securities
+
+A CIK identifies an **issuer**, and an issuer can have more than one listed class.
+When an identifier matches several securities, `duk` prints them and exits 1 — it
+never picks:
+
+```
+$ duk -S db ph cik:1652044
+CIK 1652044 matches 2 securities. Re-run with one of these tickers:
+SYMBOL  NAME          EXCHANGE  STATUS
+------  ------------  --------  ------
+GOOG    Alphabet Inc  NYSE      active
+GOOGL   Alphabet Inc  NYSE      active
+```
+
+### How resolution works, per source
+
+In **db mode** the warehouse's own `cik`/`isin`/`cusip` columns are matched, on
+normalised forms of both the typed and the stored value (migration 0023 indexes
+exactly those expressions). CUSIP and ISIN also cross-check each other: a North
+American ISIN is literally `country || CUSIP || check digit`, so `cusip:459200101`
+still finds a security whose `cusip` the vendor left null but whose `isin` it
+filled in, and vice versa. The resolved `security_id` — not the ticker it maps to —
+is what the price query then uses, so a **reused ticker** cannot redirect the
+answer to its current owner.
+
+In **live mode** there is no security master, so the identifier is handed to FMP's
+own `search-cik` / `search-isin` / `search-cusip` and the ticker that comes back is
+used from there. `ls QUERY` is db-only in either case.
+
+Identifiers work on the MCP surface too: every tool taking a `symbol` accepts
+`cik:`/`isin:`/`cusip:` (see [agent.md](agent.md)).
+
 ## `ls QUERY` — one company, everything held
 
 `ls` with a positional argument switches from listing many securities to
@@ -153,6 +215,10 @@ its name. The ladder is: live ticker → primary symbol → a ticker the company
 traded under before a rename (reported as *"Matched a former ticker: …"*) → company
 name, exact match first, then `ILIKE`.
 
+A `cik:`/`isin:`/`cusip:` argument short-circuits that ladder entirely — the user
+named a key, so no rung below can improve on the answer, and falling through would
+end in a name search for the literal string `"cik:51143"`.
+
 A name matching several companies prints a did-you-mean table and exits 1. It never
 picks the first — answering confidently about the wrong company is the one failure
 that cannot be spotted from the output.
@@ -165,6 +231,8 @@ that cannot be spotted from the output.
 | `QUERY` + `--summary` | error, exit 1 — `--summary` means "row count" in list mode; the profile *is* the summary |
 | no match | `No company found matching 'X'.` on stderr, exit 1 |
 | several name matches | candidate table on stderr, exit 1 |
+| malformed identifier | error naming the scheme, exit 1 |
+| identifier matching several securities | candidate table on stderr, exit 1 |
 | `-S live` | error, exit 1 — three of the four sections describe the warehouse, so falling back would answer a different question |
 | `-n/--limit` | ignored |
 
