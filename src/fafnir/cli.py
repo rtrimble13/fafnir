@@ -1395,7 +1395,7 @@ def _dq_filter(
     checks=(),
     severities=(),
     symbol=None,
-    security_id=None,
+    security_ids=(),
     since=None,
     until=None,
     trade_dates=(),
@@ -1416,17 +1416,18 @@ def _dq_filter(
             raise click.ClickException(
                 f"Unknown symbol {symbol.upper()}: not in the security master."
             )
-        if security_id is not None and security_id != resolved:
+        if security_ids and set(security_ids) != {resolved}:
             raise click.ClickException(
-                f"--symbol {symbol.upper()} is security_id {resolved}, "
-                f"which contradicts --security-id {security_id}."
+                f"--symbol {symbol.upper()} is security_id {resolved}, which "
+                "contradicts --security-id "
+                f"{', '.join(str(i) for i in security_ids)}."
             )
-        security_id = resolved
+        security_ids = (resolved,)
     return repo.DqFilter(
         state=state,
         checks=tuple(checks),
         severities=tuple(severities),
-        security_id=security_id,
+        security_ids=tuple(security_ids),
         since=since.date() if since else None,
         until=until.date() if until else None,
         trade_dates=tuple(d.date() for d in trade_dates),
@@ -1458,8 +1459,17 @@ def _dq_filter_options(func):
                 help="Severity, repeatable.",
             ),
             click.option("--symbol", help="Limit to one security, by ticker."),
+            # Repeatable so a cohort can be worked in one command. The sparse
+            # -coverage cleanup is 642 securities; without this it is 642
+            # invocations, and a loop that long is one typo away from resolving
+            # the wrong thing without anyone reading the dry run.
             click.option(
-                "--security-id", type=int, help="Limit to one security, by id."
+                "--security-id",
+                "security_ids",
+                multiple=True,
+                type=int,
+                metavar="ID",
+                help="Limit to these securities, by id. Repeatable.",
             ),
             # click.DateTime rather than the module's _parse_date: a bad date is a
             # usage error and should read as one ("invalid value for '--since'"),
@@ -1537,7 +1547,7 @@ def dq_list(
     checks,
     severities,
     symbol,
-    security_id,
+    security_ids,
     since,
     until,
     trade_dates,
@@ -1568,7 +1578,7 @@ def dq_list(
             checks=checks,
             severities=severities,
             symbol=symbol,
-            security_id=security_id,
+            security_ids=security_ids,
             since=since,
             until=until,
             trade_dates=trade_dates,
@@ -1733,7 +1743,7 @@ def dq_resolve(
     checks,
     severities,
     symbol,
-    security_id,
+    security_ids,
     since,
     until,
     trade_dates,
@@ -1760,13 +1770,7 @@ def dq_resolve(
     from fafnir.db import repository as repo
 
     narrowed = bool(
-        checks
-        or severities
-        or symbol
-        or since
-        or until
-        or trade_dates
-        or security_id is not None
+        checks or severities or symbol or since or until or trade_dates or security_ids
     )
     if flag_ids and narrowed:
         raise click.ClickException(
@@ -1791,7 +1795,7 @@ def dq_resolve(
             checks=checks,
             severities=severities,
             symbol=symbol,
-            security_id=security_id,
+            security_ids=security_ids,
             since=since,
             until=until,
             trade_dates=trade_dates,

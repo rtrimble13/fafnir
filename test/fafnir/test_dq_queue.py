@@ -167,7 +167,7 @@ def test_a_check_glob_matches_the_family_and_nothing_else(queue):
 
 def test_the_detail_view_carries_the_ticker_and_the_keys(queue):
     rows = repo.list_dq_flags(
-        queue.db, repo.DqFilter(checks=("outlier",), security_id=queue.aapl)
+        queue.db, repo.DqFilter(checks=("outlier",), security_ids=(queue.aapl,))
     )
 
     assert len(rows) == 1
@@ -245,7 +245,7 @@ def test_paging_bounds_are_rejected_before_they_reach_postgres(queue):
 
 def test_resolve_closes_exactly_what_the_same_filter_lists(queue):
     """The workflow is "narrow with list, re-run as resolve"; the two must agree."""
-    filt = repo.DqFilter(checks=("gap",), security_id=queue.aapl)
+    filt = repo.DqFilter(checks=("gap",), security_ids=(queue.aapl,))
     listed = {r["dq_flag_id"] for r in repo.list_dq_flags(queue.db, filt, limit=1000)}
 
     closed = set(repo.resolve_dq_flags(queue.db, filt, note="backfilled"))
@@ -506,3 +506,74 @@ def test_resolve_trade_date_dry_run_changes_nothing(queue):
     assert result.exit_code == 0, _text(result)
     assert "Dry run" in _text(result)
     assert _open_ids(queue.db, checks=("gap",)) == before
+
+
+# ---------------------------------------------------------------------------
+# --security-id: a cohort in one command
+# ---------------------------------------------------------------------------
+
+
+def test_security_id_is_repeatable_and_unions(queue):
+    just_aapl = _open_ids(queue.db, security_ids=(queue.aapl,))
+    just_msft = _open_ids(queue.db, security_ids=(queue.msft,))
+    both = _open_ids(queue.db, security_ids=(queue.aapl, queue.msft))
+    assert just_aapl and just_msft
+    assert just_aapl.isdisjoint(just_msft)
+    assert both == just_aapl | just_msft
+
+
+def test_security_ids_counts_as_narrowing(queue):
+    assert repo.DqFilter(security_ids=(queue.aapl,)).is_narrowed
+    assert not repo.DqFilter().is_narrowed
+
+
+def test_resolve_closes_a_cohort_in_one_command(queue):
+    """The case this exists for: one dry run an operator can actually read."""
+    before = _open_ids(queue.db, checks=("gap",))
+    result = _run(
+        queue.db,
+        [
+            "resolve",
+            "--check",
+            "gap",
+            "--security-id",
+            str(queue.aapl),
+            "--security-id",
+            str(queue.msft),
+            "--by",
+            "tester",
+            "--note",
+            "cohort closed under one reviewed dry run",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, _text(result)
+    assert _open_ids(queue.db, checks=("gap",)) == set()
+    assert len(before) == 3
+
+
+def test_symbol_still_refuses_to_contradict_security_id(queue):
+    """The guard that stops a mistyped ticker widening a resolve must survive.
+
+    A list makes the contradiction easier to write, not less dangerous.
+    """
+    result = _run(
+        queue.db,
+        [
+            "list",
+            "--symbol",
+            "AAPL",
+            "--security-id",
+            str(queue.msft),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "contradicts" in _text(result)
+
+
+def test_symbol_agreeing_with_security_id_is_accepted(queue):
+    result = _run(
+        queue.db,
+        ["list", "--symbol", "AAPL", "--security-id", str(queue.aapl)],
+    )
+    assert result.exit_code == 0, _text(result)
