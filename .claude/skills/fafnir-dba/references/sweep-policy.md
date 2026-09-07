@@ -22,6 +22,10 @@ preconditions.
 | **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
 | **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `tracked_symbol_unknown_to_source` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
 
+`sparse_coverage` is not yet placed in a tier. Until it is, treat it as **report
+only**: nothing about it has been repaired, so closing one frees its slot and the
+next `fafnir dq run` writes it again. See its playbook entry for why.
+
 The **Never** tier is also `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and
 `dq_triage` returns `never_auto_resolve` per row so it is in front of you at the
 moment you decide. `test_never_auto_matches_the_skill` asserts the two lists
@@ -36,6 +40,9 @@ you cannot establish one from the warehouse, it does not qualify — say so and
 leave it open. "I could not check" is not "it is fine".
 
 ### `gap`
+- The security is on the per-session path at all. Securities under 80% session
+  density carry `sparse_coverage` instead and emit no `gap` flags; a `gap` flag
+  therefore already means the check judged this security dense enough to check.
 - `cohort_size == 1` for that `(check_name, trade_date)`. **This is the whole
   test.** A cohort above 1 is one missed load wearing many flags; propose
   `ingest prices --symbols <SYM> --from <d> --to <d>` for the window and resolve

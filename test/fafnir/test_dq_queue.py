@@ -406,7 +406,7 @@ def test_reopen_reports_the_condition_that_is_already_back(queue):
 def test_one_conflict_does_not_block_the_other_ids(queue):
     """Each id gets its own savepoint, so a bad one costs only itself."""
     outlier = sorted(_open_ids(queue.db, checks=("outlier",)))
-    gaps = sorted(_open_ids(queue.db, checks=("gap",), security_id=queue.aapl))
+    gaps = sorted(_open_ids(queue.db, checks=("gap",), security_ids=(queue.aapl,)))
     repo.resolve_dq_flags(
         queue.db, repo.DqFilter(flag_ids=outlier + gaps), note="triage"
     )
