@@ -23,6 +23,13 @@ resolving anything of that kind.
 Written by `fafnir dq run`. A trading day in `ref.trading_calendar` for which the
 security has no row in `core.daily_price`.
 
+Only for securities that trade densely enough for a missing day to mean something.
+A security holding a bar for less than `GAP_MIN_SESSION_DENSITY` (0.80) of the
+sessions in its own window gets one `sparse_coverage` flag instead — see below —
+and no per-session `gap` flags at all. Windows shorter than
+`GAP_MIN_SESSIONS_FOR_DENSITY` (60 sessions) are always treated as dense, so a
+newly-listed symbol is still checked per session.
+
 **Diagnose.** Count securities per gap date first (the query in SKILL.md). Then:
 
 ```sql
@@ -45,6 +52,40 @@ then re-check. Resolving two hundred gap flags individually is the wrong answer 
 one missed night.
 
 ---
+
+## `sparse_coverage` — the security does not trade every session
+
+Written by `fafnir dq run` (the gap check), severity `info`. One flag per security,
+not per session: `record_key` is empty on purpose, so the condition dedupes for the
+life of the security while the numbers move underneath it. They live in `detail`:
+`bars`, `sessions`, `density`, `from`, `to`, `exchange`.
+
+**What it means.** The security holds bars for under 80% of the sessions in its own
+window. For a name whose median daily volume is single digits, an absent bar is a
+fact about liquidity, not about the load — the vendor has no bar to return. This
+flag exists so that fact is stated once rather than 3,000 times, and so the
+securities whose missing days *do* look like real holes stay visible.
+
+**Diagnose.** Read `detail` first; it is the whole picture. Then confirm the
+absence is the vendor's, not ours:
+
+```sql
+-- Do the bars we do hold look like a thin name, or like a truncated load?
+SELECT count(*) AS bars, count(*) FILTER (WHERE volume = 0) AS zero_volume,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY volume) AS median_volume
+  FROM core.daily_price WHERE security_id = <id>;
+```
+
+A re-ingest of one thin window settles it: `ingest prices --symbols <SYM> --from
+<d> --to <d>` returning ~0 `rows_inserted` means the bars are not there to fetch.
+
+**Do not** resolve it as "backfilled" and do not bulk re-ingest the cohort on the
+strength of the flag alone. Nothing has been repaired: the condition is still true
+the next night, and closing it only frees the slot for `dq run` to rewrite.
+
+**Escalate when** the density is high (near the 0.80 line) on a liquid name — that
+is not thinness, and the per-session check was silenced for it. Read the two
+constants in `src/fafnir/dq/checks.py` before arguing with the classification.
 
 ## `outlier` — a close-to-close move of 50% or more
 

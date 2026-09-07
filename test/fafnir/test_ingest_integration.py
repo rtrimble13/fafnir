@@ -215,6 +215,130 @@ def test_gap_check_flags_missing_day(db):
     assert "2023-06-02" in flagged_dates
 
 
+# ---------------------------------------------------------------------------
+# Session density: a missing day only means something for a security that trades
+# ---------------------------------------------------------------------------
+
+
+def _sessions(db, start, count):
+    """The first ``count`` open NASDAQ sessions on or after ``start``."""
+    rows = db.fetchall(
+        """
+        SELECT trade_date FROM ref.trading_calendar
+         WHERE exchange_code = 'NASDAQ' AND is_open AND trade_date >= %s
+         ORDER BY trade_date LIMIT %s
+        """,
+        (start, count),
+    )
+    return [r["trade_date"] for r in rows]
+
+
+def _flat_bar(sid, day):
+    return {
+        "security_id": sid,
+        "trade_date": day,
+        "open": 10,
+        "high": 10,
+        "low": 10,
+        "close": 10,
+        "volume": 1,
+    }
+
+
+def _flags(db, sid, check_name):
+    return db.fetchall(
+        """
+        SELECT record_key, detail FROM ops.data_quality_flag
+         WHERE check_name = %s AND security_id = %s AND resolved_at IS NULL
+        """,
+        (check_name, sid),
+    )
+
+
+def test_sparse_security_gets_one_flag_not_one_per_session(db):
+    """A security holding a third of its sessions is thin, not broken.
+
+    This is the case that produced 599,808 gap rows: securities whose absent days
+    are a fact about liquidity, flagged once per session as though each were a
+    failed load.
+    """
+    sid = _mk_security(db, "SPRS")
+    days = _sessions(db, dt.date(2023, 1, 3), 200)
+    kept = days[::3]  # ~33% density over a 199-session window
+    repo.upsert_daily_prices(db, [_flat_bar(sid, d) for d in kept])
+
+    checks.check_gaps(db, exchange_code="NASDAQ")
+
+    assert _flags(db, sid, "gap") == []
+    sparse = _flags(db, sid, "sparse_coverage")
+    assert len(sparse) == 1
+    assert sparse[0]["detail"]["density"] < 0.8
+    assert sparse[0]["detail"]["bars"] == len(kept)
+
+
+def test_dense_security_still_flags_every_missing_session(db):
+    """The check must not go quiet on the securities it is actually for."""
+    sid = _mk_security(db, "DNSE")
+    days = _sessions(db, dt.date(2023, 1, 3), 200)
+    missing = {days[50], days[120]}  # 99% density
+    repo.upsert_daily_prices(db, [_flat_bar(sid, d) for d in days if d not in missing])
+
+    checks.check_gaps(db, exchange_code="NASDAQ")
+
+    flagged = {f["record_key"]["trade_date"] for f in _flags(db, sid, "gap")}
+    assert flagged == {d.isoformat() for d in missing}
+    assert _flags(db, sid, "sparse_coverage") == []
+
+
+def test_short_window_is_never_called_sparse(db):
+    """Density over a handful of sessions is noise, so the check declines to use it.
+
+    Ten sessions at 30% density is one security that listed last week, not a
+    security that does not trade -- and calling it sparse would silence the gap
+    check for every newly-added symbol.
+    """
+    sid = _mk_security(db, "SHRT")
+    days = _sessions(db, dt.date(2023, 1, 3), 10)
+    repo.upsert_daily_prices(
+        db, [_flat_bar(sid, d) for d in (days[0], days[4], days[9])]
+    )
+
+    checks.check_gaps(db, exchange_code="NASDAQ")
+
+    assert _flags(db, sid, "sparse_coverage") == []
+    assert len(_flags(db, sid, "gap")) == 7
+
+
+def test_sparse_coverage_is_flagged_once_across_runs(db):
+    """The record_key is empty on purpose: the window moves, the condition does not.
+
+    Keying it on the price window would defeat add_dq_flag_once and add a row per
+    sparse security per night -- the unbounded growth the once-per-occurrence rule
+    exists to prevent.
+    """
+    sid = _mk_security(db, "ONCE")
+    days = _sessions(db, dt.date(2023, 1, 3), 200)
+    repo.upsert_daily_prices(db, [_flat_bar(sid, d) for d in days[::3]])
+
+    checks.check_gaps(db, exchange_code="NASDAQ")
+    checks.check_gaps(db, exchange_code="NASDAQ")
+
+    assert len(_flags(db, sid, "sparse_coverage")) == 1
+
+
+def test_density_threshold_is_a_parameter(db):
+    """Same security, different line: 70% is sparse at 0.80 and dense at 0.50."""
+    sid = _mk_security(db, "PARM")
+    days = _sessions(db, dt.date(2023, 1, 3), 200)
+    kept = [d for i, d in enumerate(days) if i % 10 < 7]  # 70% density
+
+    repo.upsert_daily_prices(db, [_flat_bar(sid, d) for d in kept])
+
+    checks.check_gaps(db, exchange_code="NASDAQ", min_density=0.5)
+    assert _flags(db, sid, "sparse_coverage") == []
+    assert _flags(db, sid, "gap") != []
+
+
 def test_outlier_check_flags_unexplained_jump(db):
     sid = _mk_security(db, "EEE")
     rows = _prices(

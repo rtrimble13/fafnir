@@ -1395,9 +1395,10 @@ def _dq_filter(
     checks=(),
     severities=(),
     symbol=None,
-    security_id=None,
+    security_ids=(),
     since=None,
     until=None,
+    trade_dates=(),
     flag_ids=(),
 ):
     """Turn the shared CLI options into one repository filter.
@@ -1415,19 +1416,21 @@ def _dq_filter(
             raise click.ClickException(
                 f"Unknown symbol {symbol.upper()}: not in the security master."
             )
-        if security_id is not None and security_id != resolved:
+        if security_ids and set(security_ids) != {resolved}:
             raise click.ClickException(
-                f"--symbol {symbol.upper()} is security_id {resolved}, "
-                f"which contradicts --security-id {security_id}."
+                f"--symbol {symbol.upper()} is security_id {resolved}, which "
+                "contradicts --security-id "
+                f"{', '.join(str(i) for i in security_ids)}."
             )
-        security_id = resolved
+        security_ids = (resolved,)
     return repo.DqFilter(
         state=state,
         checks=tuple(checks),
         severities=tuple(severities),
-        security_id=security_id,
+        security_ids=tuple(security_ids),
         since=since.date() if since else None,
         until=until.date() if until else None,
+        trade_dates=tuple(d.date() for d in trade_dates),
         flag_ids=tuple(flag_ids),
     )
 
@@ -1456,8 +1459,17 @@ def _dq_filter_options(func):
                 help="Severity, repeatable.",
             ),
             click.option("--symbol", help="Limit to one security, by ticker."),
+            # Repeatable so a cohort can be worked in one command. The sparse
+            # -coverage cleanup is 642 securities; without this it is 642
+            # invocations, and a loop that long is one typo away from resolving
+            # the wrong thing without anyone reading the dry run.
             click.option(
-                "--security-id", type=int, help="Limit to one security, by id."
+                "--security-id",
+                "security_ids",
+                multiple=True,
+                type=int,
+                metavar="ID",
+                help="Limit to these securities, by id. Repeatable.",
             ),
             # click.DateTime rather than the module's _parse_date: a bad date is a
             # usage error and should read as one ("invalid value for '--since'"),
@@ -1473,6 +1485,20 @@ def _dq_filter_options(func):
                 type=click.DateTime(formats=["%Y-%m-%d"]),
                 metavar="YYYY-MM-DD",
                 help="Detected on or before (inclusive).",
+            ),
+            # --since/--until are about when the check ran; this is about the
+            # session the flag describes. Keeping them separate is the point:
+            # "the gaps on 2001-09-11" and "the flags written last Tuesday" are
+            # different sets, and a bulk resolve needs to say the first one.
+            click.option(
+                "--trade-date",
+                "trade_dates",
+                multiple=True,
+                type=click.DateTime(formats=["%Y-%m-%d"]),
+                metavar="YYYY-MM-DD",
+                help="Session the flag is about (record_key.trade_date), "
+                "repeatable. Only matches checks keyed on a session (gap, "
+                "outlier).",
             ),
         ]
     ):
@@ -1521,9 +1547,10 @@ def dq_list(
     checks,
     severities,
     symbol,
-    security_id,
+    security_ids,
     since,
     until,
+    trade_dates,
     state,
     limit,
     offset,
@@ -1537,6 +1564,7 @@ def dq_list(
       fafnir dq list --detail --check gap --limit 20  # the gaps themselves
       fafnir dq list -d --symbol AAPL --state all     # one security's history
       fafnir dq list --check 'price_*' --since 2024-08-01
+      fafnir dq list -d --check gap --trade-date 2001-09-11   # one session's gaps
 
     The same selection options work on `fafnir dq resolve`, so a filter narrowed
     here can be handed straight to it.
@@ -1550,9 +1578,10 @@ def dq_list(
             checks=checks,
             severities=severities,
             symbol=symbol,
-            security_id=security_id,
+            security_ids=security_ids,
             since=since,
             until=until,
+            trade_dates=trade_dates,
         )
         totals = repo.dq_flag_totals(database, filt)
         if detail:
@@ -1714,9 +1743,10 @@ def dq_resolve(
     checks,
     severities,
     symbol,
-    security_id,
+    security_ids,
     since,
     until,
+    trade_dates,
     note,
     resolved_by,
     dry_run,
@@ -1728,6 +1758,7 @@ def dq_resolve(
       fafnir dq resolve 12841 12842 --note "exchange holiday, no bar expected"
       fafnir dq resolve --check gap --symbol AAPL --note "backfilled" --yes
       fafnir dq resolve --check outlier --since 2024-08-01 --dry-run
+      fafnir dq resolve --check gap --trade-date 2012-10-29 -m "Sandy" --dry-run
 
     Takes explicit ids, or the same selection options as `fafnir dq list` -- run it
     as a list first and you can see exactly what will close. One or the other, not
@@ -1739,7 +1770,7 @@ def dq_resolve(
     from fafnir.db import repository as repo
 
     narrowed = bool(
-        checks or severities or symbol or since or until or security_id is not None
+        checks or severities or symbol or since or until or trade_dates or security_ids
     )
     if flag_ids and narrowed:
         raise click.ClickException(
@@ -1750,7 +1781,8 @@ def dq_resolve(
     if not flag_ids and not narrowed:
         raise click.ClickException(
             "Nothing selected. Pass flag ids, or narrow with --check / --symbol / "
-            "--severity / --since / --until. Refusing to close the whole queue."
+            "--severity / --since / --until / --trade-date. Refusing to close the "
+            "whole queue."
         )
 
     if resolved_by is None:
@@ -1763,9 +1795,10 @@ def dq_resolve(
             checks=checks,
             severities=severities,
             symbol=symbol,
-            security_id=security_id,
+            security_ids=security_ids,
             since=since,
             until=until,
+            trade_dates=trade_dates,
             flag_ids=flag_ids,
         )
         totals = repo.dq_flag_totals(database, filt)

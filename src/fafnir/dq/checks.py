@@ -3,7 +3,9 @@ Scheduled data-quality checks. Each check writes to ``ops.data_quality_flag``
 rather than failing the load, so anomalies surface for review instead of silently
 corrupting research data.
 
-  * gaps      -- trading-calendar days with no price row (per active security)
+  * gaps      -- trading-calendar days with no price row (per active security),
+                for securities that trade densely enough for a missing day to mean
+                something; the rest get one `sparse_coverage` flag instead
   * outliers  -- implausible close-to-close moves not explained by a split
   * freshness -- securities whose latest price lags the market's latest date
   * identity  -- one ticker carrying more than one security row
@@ -31,6 +33,36 @@ logger = get_logger("dq")
 
 DEFAULT_OUTLIER_THRESHOLD = 0.5  # 50% close-to-close move flags for review
 
+# The share of its own calendar sessions a security must actually have a bar for
+# before a missing session is evidence of anything.
+#
+# `gap` asks the exchange calendar what a session was and flags every one without a
+# bar. That is the right question for a security that trades daily and the wrong one
+# for a security that does not: MAIR's median daily volume is one share, ACOM holds
+# bars for 26% of its sessions since 1998, and for names like these an absent bar is
+# a fact about liquidity, not about the load. Flagging per session turned ~2,900 such
+# securities into 599,808 rows and buried the ~29 that look genuinely broken.
+#
+# Below this density the security gets ONE `sparse_coverage` flag carrying the
+# numbers, and no per-session gap flags. Above it, nothing changes. 0.80 is chosen
+# to sit clear of both populations rather than between them: of the 200 securities
+# with the most gap flags, 171 fall below it and 29 above, and the ones above are
+# the ones whose missing days look like real holes. It is deliberately not a tuning
+# knob for queue size -- moving it down hides broken securities, and moving it up
+# starts flagging thin ones per session again.
+GAP_MIN_SESSION_DENSITY = 0.80
+
+# Sessions a security's window must span before its density means anything.
+#
+# Density over a handful of sessions is noise: a security with two bars and one
+# missing day scores 0.67 and would be called sparse on the strength of a single
+# absence. Below this many sessions the security is treated as dense and flagged
+# per session as before -- the check declines to guess rather than guessing wrong.
+# On this warehouse the guard costs almost nothing: of the 642 securities under the
+# density threshold, 42 span fewer than 60 sessions and they hold 584 gap flags
+# between them.
+GAP_MIN_SESSIONS_FOR_DENSITY = 60
+
 # Asset types whose price is published after the equity close, and how many trading
 # days behind the market they are allowed to sit before that counts as stale.
 #
@@ -47,30 +79,62 @@ NAV_LAG_TRADING_DAYS = 1
 
 
 def check_gaps(
-    db: Database, exchange_code: str = "NASDAQ", limit_securities: int = 0
+    db: Database,
+    exchange_code: str = "NASDAQ",
+    limit_securities: int = 0,
+    min_density: float = GAP_MIN_SESSION_DENSITY,
+    min_sessions: int = GAP_MIN_SESSIONS_FOR_DENSITY,
 ) -> int:
     """Flag trading days (per the calendar) missing from core.daily_price.
 
     Only checks securities that have at least one price row, between their own
-    min and max loaded date. Returns the number of new flags written -- a gap
-    already open in the queue is not flagged again.
+    min and max loaded date, and only those holding a bar for at least
+    ``min_density`` of the sessions in that window -- see
+    :data:`GAP_MIN_SESSION_DENSITY`. A security below that line gets a single
+    ``sparse_coverage`` flag instead of one flag per session it did not trade.
+    A window shorter than ``min_sessions`` is too short for density to mean
+    anything, so those securities stay on the per-session path.
+
+    Returns the number of new flags written, of both kinds -- a condition already
+    open in the queue is not flagged again.
     """
     limit_clause = f"LIMIT {int(limit_securities)}" if limit_securities else ""
     row = db.fetchone(
         f"""
         WITH bounds AS (
-            SELECT security_id, min(trade_date) AS dmin, max(trade_date) AS dmax
+            SELECT security_id, min(trade_date) AS dmin, max(trade_date) AS dmax,
+                   count(*) AS bars
             FROM core.daily_price GROUP BY security_id {limit_clause}
         ),
-        detected AS (
-            SELECT b.security_id,
-                   jsonb_build_object('trade_date', c.trade_date::text) AS record_key
+        coverage AS (
+            SELECT b.security_id, b.dmin, b.dmax, b.bars,
+                   count(c.trade_date) AS sessions
             FROM bounds b
             JOIN ref.trading_calendar c
               ON c.exchange_code = %s AND c.is_open
              AND c.trade_date BETWEEN b.dmin AND b.dmax
+            GROUP BY 1, 2, 3, 4
+        ),
+        classified AS (
+            SELECT *, bars::numeric / nullif(sessions, 0) AS density FROM coverage
+        ),
+        dense AS (
+            SELECT * FROM classified
+             WHERE sessions < %s OR density >= %s
+        ),
+        sparse AS (
+            SELECT * FROM classified
+             WHERE sessions >= %s AND density < %s
+        ),
+        detected AS (
+            SELECT d.security_id,
+                   jsonb_build_object('trade_date', c.trade_date::text) AS record_key
+            FROM dense d
+            JOIN ref.trading_calendar c
+              ON c.exchange_code = %s AND c.is_open
+             AND c.trade_date BETWEEN d.dmin AND d.dmax
             LEFT JOIN core.daily_price p
-              ON p.security_id = b.security_id AND p.trade_date = c.trade_date
+              ON p.security_id = d.security_id AND p.trade_date = c.trade_date
             WHERE p.security_id IS NULL
         ),
         written AS (
@@ -88,16 +152,61 @@ def check_gaps(
                   AND f.resolved_at IS NULL
             )
             RETURNING 1
+        ),
+        -- One row per security, keyed on an empty record_key so the condition
+        -- dedupes for the life of the security. The window moves every night as
+        -- new bars land; keying on it would defeat add_dq_flag_once and grow the
+        -- queue by one row per sparse security per night, which is the failure
+        -- NAV_LAG_TRADING_DAYS exists to prevent elsewhere. The moving numbers
+        -- live in `detail`, which does not participate in the dedupe.
+        written_sparse AS (
+            INSERT INTO ops.data_quality_flag
+                (security_id, table_name, record_key, check_name, severity,
+                 detail, detected_at)
+            SELECT s.security_id, 'core.daily_price', '{{}}'::jsonb,
+                   'sparse_coverage', 'info',
+                   jsonb_build_object('bars', s.bars,
+                                      'sessions', s.sessions,
+                                      'density', round(s.density, 4)::float8,
+                                      'from', s.dmin::text,
+                                      'to', s.dmax::text,
+                                      'exchange', %s::text),
+                   now()
+            FROM sparse s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'sparse_coverage'
+                  AND f.security_id = s.security_id
+                  AND f.resolved_at IS NULL
+            )
+            RETURNING 1
         )
-        SELECT (SELECT count(*) FROM detected) AS detected,
-               (SELECT count(*) FROM written)  AS flagged
+        SELECT (SELECT count(*) FROM detected)       AS detected,
+               (SELECT count(*) FROM written)        AS flagged,
+               (SELECT count(*) FROM sparse)         AS sparse_securities,
+               (SELECT count(*) FROM written_sparse) AS sparse_flagged
         """,
-        (exchange_code, exchange_code),
+        (
+            exchange_code,
+            min_sessions,
+            min_density,
+            min_sessions,
+            min_density,
+            exchange_code,
+            exchange_code,
+            exchange_code,
+        ),
     )
     logger.info(
-        "gap check: %d missing days, %d newly flagged", row["detected"], row["flagged"]
+        "gap check: %d missing days, %d newly flagged; "
+        "%d securities below %.0f%% session density, %d newly flagged sparse",
+        row["detected"],
+        row["flagged"],
+        row["sparse_securities"],
+        min_density * 100,
+        row["sparse_flagged"],
     )
-    return int(row["flagged"])
+    return int(row["flagged"]) + int(row["sparse_flagged"])
 
 
 def check_outliers(db: Database, threshold: float = DEFAULT_OUTLIER_THRESHOLD) -> int:

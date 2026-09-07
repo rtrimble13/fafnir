@@ -2029,14 +2029,22 @@ class DqFilter(NamedTuple):
     ``state`` is about resolution: ``open`` (the default -- the queue), ``resolved``
     (the triage record) or ``all``. ``checks`` entries are exact names or a `*` glob
     (`price_*`). ``until`` is inclusive of the whole day.
+
+    ``security_ids`` is a set: empty means every security, and the CLI's `--symbol`
+    resolves into a one-element form of it. ``since``/``until`` filter on
+    ``detected_at`` -- when the check ran. ``trade_dates``
+    filters on the session the flag is *about* (``record_key->>'trade_date'``), which
+    is a different question and the one triage usually asks: "the gaps on these eleven
+    days", not "the flags written on the night we happened to notice them".
     """
 
     state: str = "open"
     checks: Sequence[str] = ()
     severities: Sequence[str] = ()
-    security_id: Optional[int] = None
+    security_ids: Sequence[int] = ()
     since: Optional[date] = None
     until: Optional[date] = None
+    trade_dates: Sequence[date] = ()
     flag_ids: Sequence[int] = ()
 
     @property
@@ -2052,9 +2060,10 @@ class DqFilter(NamedTuple):
             self.checks
             or self.severities
             or self.flag_ids
-            or self.security_id is not None
+            or self.security_ids
             or self.since is not None
             or self.until is not None
+            or self.trade_dates
         )
 
 
@@ -2099,9 +2108,9 @@ def _dq_where(filt: DqFilter, alias: str = "") -> tuple[str, list[Any]]:
     if filt.severities:
         clauses.append(f"{q}severity = ANY(%s)")
         params.append(list(filt.severities))
-    if filt.security_id is not None:
-        clauses.append(f"{q}security_id = %s")
-        params.append(filt.security_id)
+    if filt.security_ids:
+        clauses.append(f"{q}security_id = ANY(%s)")
+        params.append(list(filt.security_ids))
     if filt.since is not None:
         clauses.append(f"{q}detected_at >= %s")
         params.append(filt.since)
@@ -2111,6 +2120,14 @@ def _dq_where(filt: DqFilter, alias: str = "") -> tuple[str, list[Any]]:
         # date widens to midnight.
         clauses.append(f"{q}detected_at < (%s::date + 1)")
         params.append(filt.until)
+    if filt.trade_dates:
+        # The session the flag describes, not the night the check ran. Only the
+        # checks keyed on a session carry this key (gap, outlier); a flag whose
+        # record_key has no `trade_date` yields NULL and simply does not match,
+        # which is the wanted behaviour -- `--trade-date` is a narrowing option
+        # and must never widen a selection to a differently-keyed check.
+        clauses.append(f"{q}record_key->>'trade_date' = ANY(%s)")
+        params.append([d.isoformat() for d in filt.trade_dates])
     if filt.flag_ids:
         clauses.append(f"{q}dq_flag_id = ANY(%s)")
         params.append(list(filt.flag_ids))
