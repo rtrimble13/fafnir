@@ -80,6 +80,7 @@ fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
 
 # 7. Read with duk (db mode)
 duk ph AAPL --adj -S db
+duk ph cik:51143 -S db                    # or name a security by CIK/ISIN/CUSIP
 duk ls --sector Technology -S db
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
 ```
@@ -107,6 +108,20 @@ global `--source/-S`:
 Return and indicator commands (`rc`, `ti`) operate on input files and are
 source-agnostic. `yc` (yield curve) is live-only until the economic-series
 fast-follow lands.
+
+Anywhere `duk` takes a ticker it also takes a **CIK, ISIN or CUSIP**, prefixed so
+the intent is explicit:
+
+```bash
+duk -S db ph cik:51143             # IBM's prices, by SEC filer number
+duk -S db ls cusip:459200101       # IBM's company summary
+duk -S db ph isin:US4592001014 --adj
+```
+
+Leading zeros, case and grouping are ignored; a bare argument still means a ticker
+(or, for `ls`, a company name). When an identifier matches several securities --
+one CIK covers every share class of an issuer -- `duk` lists them and exits rather
+than guessing. See **[doc/duk.md](doc/duk.md)**.
 
 ## Documentation
 

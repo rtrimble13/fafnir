@@ -93,14 +93,42 @@ def _require_symbol(symbol: str) -> str:
 
 
 def _resolve_or_raise(dsn: str, symbol: str) -> int:
-    """Resolve a ticker to a security_id through duk's ladder, or say so plainly."""
+    """The security_id for a ticker or identifier. See :func:`_resolve_named`."""
+    return _resolve_named(dsn, symbol)[1]
+
+
+def _resolve_named(dsn: str, symbol: str) -> tuple[str, int]:
+    """Resolve a ticker or identifier to ``(ticker, security_id)``, or say why not.
+
+    ``cik:``/``isin:``/``cusip:`` is accepted here for the same reason ``duk`` takes
+    it: an agent reading a filing or a holdings file has the identifier and not the
+    ticker. It is also the only way this stays consistent -- ``resolve_symbol`` goes
+    through ``duk.datasource.db.resolve_company``, which understands the prefixes,
+    so a surface that took ``cik:51143`` for one tool and not the next would be an
+    accident rather than a decision.
+    """
+    from duk import identifiers
     from duk.datasource.db import _connect as _duk_connect
-    from duk.datasource.db import _resolve_security_id
+    from duk.datasource.db import _resolve_by_identifier, _resolve_security_id
 
     symbol = _require_symbol(symbol)
     try:
+        identifier = identifiers.parse(symbol)
+    except identifiers.IdentifierError as exc:
+        raise ToolError(str(exc)) from None
+
+    resolved = identifier.value
+    try:
         with _duk_connect(dsn) as conn, conn.cursor() as cur:
-            sec_id = _resolve_security_id(cur, symbol)
+            if identifier.is_ticker:
+                sec_id = _resolve_security_id(cur, identifier.value)
+            else:
+                match = _one_candidate(
+                    identifier, _resolve_by_identifier(cur, identifier)
+                )
+                resolved, sec_id = str(match["symbol"]), int(match["security_id"])
+    except (ToolError, KeyboardInterrupt):
+        raise
     except Exception as exc:  # noqa: BLE001
         raise connection_error(exc, dsn) from None
     if sec_id is None:
@@ -110,7 +138,29 @@ def _resolve_or_raise(dsn: str, symbol: str) -> int:
             f"under -- so this symbol is in none of them. Check the spelling, or "
             f"use screen_securities to find it by name."
         )
-    return sec_id
+    return resolved, sec_id
+
+
+def _one_candidate(identifier, candidates: list[dict]) -> dict:
+    """The single security an identifier names, or an error naming the choice.
+
+    Never the first of several. A CIK identifies an ISSUER, so two share classes
+    under one CIK is the ordinary case; picking one would answer about GOOG when
+    the caller meant GOOGL, and an agent has no way to notice.
+    """
+    if not candidates:
+        raise ToolError(
+            f"no security carries {identifier.describe()}. The warehouse loads "
+            f"CIK/ISIN/CUSIP from the vendor profile, so a security it has never "
+            f"profiled carries none of them -- try the ticker."
+        )
+    if len(candidates) > 1:
+        tickers = ", ".join(str(c.get("symbol")) for c in candidates)
+        raise ToolError(
+            f"{identifier.describe()} matches {len(candidates)} securities "
+            f"({tickers}). Call again with one of those tickers."
+        )
+    return candidates[0]
 
 
 def _last_trade_date(dsn: str, security_id: int) -> Optional[dt.date]:
@@ -220,8 +270,10 @@ def price_history(
     # cannot resolve -- right for a CLI, where the user can see they typed ABCD and
     # there is no ABCD, and wrong here: "rows: []" reads as "the warehouse holds no
     # bars for this security", which is a different and much more alarming claim.
-    # The resolved id is reused below rather than resolved twice.
-    sec_id = _resolve_or_raise(dsn, symbol)
+    # The resolved id is reused below rather than resolved twice -- and handed to
+    # duk instead of the argument, so an identifier does not get re-resolved as if
+    # it were a ticker, and a reused ticker cannot land on its current owner.
+    symbol, sec_id = _resolve_named(dsn, symbol)
 
     # `limit` is handed to duk rather than applied to the result, so it means the
     # MOST RECENT n bars. Capping the envelope instead would return the EARLIEST n,
@@ -257,6 +309,7 @@ def price_history(
         df = _duk_price_history(
             dsn=dsn,
             symbol=symbol,
+            security_id=sec_id,
             start_date=start.isoformat() if start else None,
             end_date=end.isoformat() if end else None,
             frequency="day",

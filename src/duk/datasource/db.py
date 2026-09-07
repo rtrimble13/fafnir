@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from duk import identifiers
 from duk.datasource.base import DataSourceError, shape_price_dataframe
 from duk.date_utils import get_api_date_range
 
@@ -104,19 +105,124 @@ def _resolve_security_id(cur, symbol: str, source: str = "fmp") -> Optional[int]
     return int(row["security_id"]) if row else None
 
 
+# ---------------------------------------------------------------------------
+# Identifier resolution (`cik:` / `isin:` / `cusip:`)
+# ---------------------------------------------------------------------------
+
+# Deliberately NOT a rung of the ticker ladder above. That ladder is a precedence
+# duplicated from fafnir.db.repository.resolve_security_id and asserted to match it
+# (test_mart_read_seam.py); an identifier reaches a security by a different key and
+# with a different failure mode (a CIK is an ISSUER, so it can legitimately match
+# several securities), so it resolves separately and returns candidates rather than
+# one id.
+#
+# All three predicates compare NORMALISED forms on both sides, because the vendor's
+# spelling and the user's differ in ways that carry no information: the SEC writes
+# CIK 0000051143 and people type 51143, and an ISIN or CUSIP is pasted in whatever
+# case and grouping it was copied from. duk.identifiers normalises the typed value;
+# these expressions normalise the stored one. Migration 0023 indexes exactly these
+# expressions, so they must not drift from it.
+_IDENT_COLUMNS = (
+    "security_id, symbol, company_name, exchange_code, exchange_name, "
+    "is_actively_trading, delisted_date"
+)
+# Candidate order, when there is more than one: listed before delisted, then by
+# ticker. It orders the did-you-mean table; it never picks a winner.
+_IDENT_ORDER = (
+    " ORDER BY (delisted_date IS NULL) DESC, is_actively_trading DESC, symbol ASC"
+)
+
+_CIK_RESOLVE_SQL = (
+    f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile "
+    "WHERE ltrim(btrim(cik), '0') = %s" + _IDENT_ORDER
+)
+_ISIN_RESOLVE_SQL = (
+    f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile "
+    "WHERE upper(btrim(isin)) = %s" + _IDENT_ORDER
+)
+_CUSIP_RESOLVE_SQL = (
+    f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile "
+    "WHERE upper(btrim(cusip)) = %s" + _IDENT_ORDER
+)
+# An 8-character CUSIP is the same issue without its check digit; match on the
+# stored value's first eight.
+_CUSIP8_RESOLVE_SQL = (
+    f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile "
+    "WHERE left(upper(btrim(cusip)), 8) = %s" + _IDENT_ORDER
+)
+# Second rung for both CUSIP and ISIN: a North American ISIN is literally
+# `country || CUSIP || check digit`, so each identifier still finds the security
+# when the vendor filled in only the other column. Not a guess -- the two encode
+# the same issue -- and only reached when the direct match found nothing.
+_CUSIP_VIA_ISIN_SQL = (
+    f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile "
+    "WHERE left(upper(btrim(isin)), 2) IN ('US', 'CA') "
+    "AND substring(upper(btrim(isin)) from 3 for %s) = %s" + _IDENT_ORDER
+)
+
+
+def _rows(cur, sql: str, params: tuple) -> list[dict]:
+    cur.execute(sql, params)
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _resolve_by_identifier(cur, ident: identifiers.Identifier) -> list[dict]:
+    """Candidate securities carrying an identifier. Empty, one, or several.
+
+    Several is a real answer, not a failure of the query: one CIK is one SEC filer,
+    and a filer can have several listed classes (GOOG and GOOGL share one). The
+    caller shows a did-you-mean rather than picking, for the same reason the name
+    search does -- answering confidently about the wrong share class is the failure
+    that cannot be spotted from the output.
+    """
+    if ident.scheme == identifiers.CIK:
+        return _rows(cur, _CIK_RESOLVE_SQL, (ident.value,))
+    if ident.scheme == identifiers.ISIN:
+        found = _rows(cur, _ISIN_RESOLVE_SQL, (ident.value,))
+        if found:
+            return found
+        cusip = identifiers.cusip_from_isin(ident.value)
+        return _rows(cur, _CUSIP_RESOLVE_SQL, (cusip,)) if cusip else []
+    if ident.scheme == identifiers.CUSIP:
+        sql = _CUSIP_RESOLVE_SQL if len(ident.value) == 9 else _CUSIP8_RESOLVE_SQL
+        found = _rows(cur, sql, (ident.value,))
+        if found:
+            return found
+        return _rows(cur, _CUSIP_VIA_ISIN_SQL, (len(ident.value), ident.value))
+    raise DataSourceError(  # pragma: no cover -- tickers never reach here
+        f"{ident.label} is not resolvable as an identifier"
+    )
+
+
+def resolve_identifier(*, dsn: str, identifier: identifiers.Identifier) -> list[dict]:
+    """`_resolve_by_identifier` with its own connection, for callers outside a cursor."""
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        return _resolve_by_identifier(cur, identifier)
+
+
 def price_history(
     *,
     dsn: str,
-    symbol: str,
+    symbol: Optional[str] = None,
     start_date: Optional[str],
     end_date: Optional[str],
     frequency: str = "day",
     limit: Optional[int] = None,
     fields: Optional[list[str]] = None,
     adjusted: bool = False,
+    security_id: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Return a date-indexed OHLCV DataFrame from fafnir, shaped like the live path."""
-    symbol = symbol.upper()
+    """Return a date-indexed OHLCV DataFrame from fafnir, shaped like the live path.
+
+    Give ``symbol`` to resolve a ticker through the ladder, or ``security_id`` when
+    the caller already holds the identity -- which is not merely a saved query. A
+    caller that resolved by CIK/ISIN/CUSIP, or that is reporting on a security it
+    already has in hand, must not round-trip through ``primary_symbol``: a reused
+    ticker resolves to whoever owns it NOW, so the round trip can hand back a
+    different security's prices under the right-looking name.
+    """
+    if security_id is None and not symbol:
+        raise DataSourceError("price_history needs either a symbol or a security_id")
     start, end = get_api_date_range(
         _parse_date(start_date, "start date"),
         _parse_date(end_date, "end date"),
@@ -125,7 +231,9 @@ def price_history(
     )
 
     with _connect(dsn) as conn, conn.cursor() as cur:
-        sec_id = _resolve_security_id(cur, symbol)
+        sec_id = security_id
+        if sec_id is None:
+            sec_id = _resolve_security_id(cur, symbol.upper())
         if sec_id is None:
             return pd.DataFrame()
         relation = (
@@ -330,30 +438,47 @@ _STATS_LOOKBACK_DAYS = 5 * 366
 
 
 def resolve_company(*, dsn: str, query: str) -> list[dict]:
-    """Resolve a ticker or company name to candidate securities.
+    """Resolve a ticker, an identifier or a company name to candidate securities.
 
     Returns [] for no match, one dict for an unambiguous match, several for an
-    ambiguous name. A ticker hit always returns exactly one candidate -- the
-    ladder is a precedence, not a search.
+    ambiguous name or an identifier shared by more than one security. A ticker hit
+    always returns exactly one candidate -- the ladder is a precedence, not a
+    search.
+
+    ``cik:``/``isin:``/``cusip:`` short-circuits the ladder entirely: the user named
+    a key, so neither the ticker rungs nor the name search below can improve on the
+    answer, and running them would let ``cik:51143`` fall through to a name search
+    for the string "cik:51143".
+
+    Raises :class:`duk.identifiers.IdentifierError` for a malformed identifier.
     """
     query = (query or "").strip()
     if not query:
         return []
+    ident = identifiers.parse(query)
 
     with _connect(dsn) as conn, conn.cursor() as cur:
-        sec_id = _resolve_security_id(cur, query.upper())
+        if not ident.is_ticker:
+            return _resolve_by_identifier(cur, ident)
+
+        sec_id = _resolve_security_id(cur, ident.value)
         if sec_id is not None:
             cur.execute(_PROFILE_BY_ID_SQL, (sec_id,))
             row = cur.fetchone()
             if row is not None:
                 row = dict(row)
-                cur.execute(_FORMER_TICKER_SQL, (sec_id, query.upper()))
+                cur.execute(_FORMER_TICKER_SQL, (sec_id, ident.value))
                 former = cur.fetchone()
                 # Only when the *typed* ticker is the retired one. Resolving AAPL
                 # to a security that also once traded as APPL is not a rename hit.
                 row["matched_former_symbol"] = former["symbol"] if former else None
                 row["matched_former_valid_to"] = former["valid_to"] if former else None
                 return [row]
+
+        if ident.explicit:
+            # `ticker:`/`symbol:` is an assertion about what the argument IS. A name
+            # search on it would answer a question the user explicitly did not ask.
+            return []
 
         cur.execute(
             _NAME_SEARCH_SQL,
@@ -437,7 +562,7 @@ def company_summary(*, dsn: str, security_id: int) -> dict:
         start = last_bar["trade_date"] - timedelta(days=_STATS_LOOKBACK_DAYS)
         adjusted = price_history(
             dsn=dsn,
-            symbol=profile["symbol"],
+            security_id=security_id,
             start_date=start.isoformat(),
             end_date=last_bar["trade_date"].isoformat(),
             frequency="day",

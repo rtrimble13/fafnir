@@ -350,3 +350,71 @@ def test_security_profile_omits_the_price_series(db):
     assert profile["profile"]["symbol"] == SYMBOL
     assert "adjusted_prices" not in profile
     assert profile["coverage"]["bar_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Identifier arguments (`cik:` / `isin:` / `cusip:`)
+# ---------------------------------------------------------------------------
+
+
+def _identified(db, symbol, name, **identifiers):
+    repo.ensure_exchange(db, "NASDAQ", "Nasdaq", "US")
+    sid = repo.upsert_security(
+        db,
+        primary_symbol=symbol,
+        company_name=name,
+        asset_type="equity",
+        exchange_code="NASDAQ",
+        **identifiers,
+    )
+    repo.upsert_symbol_xref(db, security_id=sid, symbol=symbol)
+    return sid
+
+
+def test_every_symbol_argument_accepts_an_identifier(db):
+    """The consistency that motivated extending the resolver at all.
+
+    `resolve_symbol` goes through duk's resolve_company and understood the
+    prefixes the moment duk did; `price_history` and `security_profile` go through
+    the ticker ladder and did not. A surface that takes cik:51143 for one tool and
+    rejects it for the next is an accident, so this asserts all three agree.
+    """
+    _seed(db)
+    db.execute(
+        "UPDATE core.security SET cik = '0000051143', isin = 'US4592001014', "
+        "cusip = '459200101' WHERE primary_symbol = %s",
+        (SYMBOL,),
+    )
+
+    for argument in ("cik:51143", "isin:US4592001014", "cusip:459200101"):
+        assert T.resolve_symbol(dsn=DSN, symbol=argument)["rows"][0]["symbol"] == SYMBOL
+        assert T.security_profile(dsn=DSN, symbol=argument)["profile"]["symbol"] == (
+            SYMBOL
+        )
+        by_identifier = T.price_history(dsn=DSN, symbol=argument)["rows"]
+        assert by_identifier == T.price_history(dsn=DSN, symbol=SYMBOL)["rows"]
+
+
+def test_an_identifier_matching_two_securities_names_the_choice(db):
+    # An agent cannot notice a silently picked share class, so the error has to
+    # hand it the tickers rather than an answer.
+    _identified(db, "GOOG", "Alphabet Inc", cik="1652044")
+    _identified(db, "GOOGL", "Alphabet Inc", cik="0001652044")
+    with pytest.raises(ToolError) as exc:
+        T.price_history(dsn=DSN, symbol="cik:1652044")
+    message = str(exc.value)
+    assert "matches 2 securities" in message
+    assert "GOOG" in message and "GOOGL" in message
+
+
+def test_a_malformed_identifier_says_so_instead_of_reporting_it_missing(db):
+    with pytest.raises(ToolError) as exc:
+        T.security_profile(dsn=DSN, symbol="cusip:12345")
+    assert "is not a CUSIP" in str(exc.value)
+
+
+def test_an_unmatched_identifier_points_back_at_the_ticker(db):
+    _seed(db)
+    with pytest.raises(ToolError) as exc:
+        T.price_history(dsn=DSN, symbol="cik:99999999")
+    assert "no security carries CIK 99999999" in str(exc.value)
