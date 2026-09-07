@@ -421,3 +421,88 @@ def test_one_conflict_does_not_block_the_other_ids(queue):
 
     assert conflicted == outlier
     assert sorted(reopened) == gaps
+
+
+# ---------------------------------------------------------------------------
+# --trade-date: the session the flag is about, not the night it was written
+# ---------------------------------------------------------------------------
+
+
+def test_trade_date_selects_by_session_not_detection(queue):
+    """`--trade-date` reads record_key, which is what triage actually means.
+
+    The eleven ad-hoc market closures (migration 0022) were flagged as gaps on one
+    night, so `--since`/`--until` cannot separate them from the genuine coverage
+    holes detected by the same run. Only the session distinguishes them.
+    """
+    selected = _open_ids(queue.db, checks=("gap",), trade_dates=(dt.date(2024, 1, 10),))
+    everything = _open_ids(queue.db, checks=("gap",))
+    assert len(selected) == 1
+    assert selected < everything
+
+
+def test_trade_date_is_repeatable_and_unions(queue):
+    both = _open_ids(
+        queue.db,
+        checks=("gap",),
+        trade_dates=(dt.date(2024, 1, 10), dt.date(2024, 1, 11)),
+    )
+    assert len(both) == 2
+
+
+def test_trade_date_never_widens_to_other_checks(queue):
+    """A flag whose record_key has no `trade_date` must not match.
+
+    `--trade-date` is a narrowing option. `adjustment_failed` carries no session
+    key, so it yields NULL and drops out -- if it matched, a resolve narrowed by
+    session would close flags of a check the operator never named.
+    """
+    ids = _open_ids(queue.db, trade_dates=(dt.date(2024, 5, 2),))
+    outliers = _open_ids(queue.db, checks=("outlier",))
+    assert ids == outliers
+
+
+def test_trade_date_counts_as_narrowing(queue):
+    """Otherwise `resolve --trade-date` is refused as an unfiltered resolve."""
+    assert repo.DqFilter(trade_dates=(dt.date(2024, 1, 10),)).is_narrowed
+
+
+def test_list_and_resolve_agree_on_trade_date(queue):
+    """The workflow is "narrow with list, re-run as resolve" -- so they must match."""
+    listed = _run(
+        queue.db,
+        ["list", "-d", "--check", "gap", "--trade-date", "2024-01-10", "--limit", "50"],
+    )
+    assert listed.exit_code == 0
+
+    before = _open_ids(queue.db, checks=("gap",))
+    result = _run(
+        queue.db,
+        [
+            "resolve",
+            "--check",
+            "gap",
+            "--trade-date",
+            "2024-01-10",
+            "--by",
+            "tester",
+            "--note",
+            "US market closed that session; no bar was ever expected",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, _text(result)
+    after = _open_ids(queue.db, checks=("gap",))
+    assert len(before - after) == 1
+    assert len(after) == len(before) - 1
+
+
+def test_resolve_trade_date_dry_run_changes_nothing(queue):
+    before = _open_ids(queue.db, checks=("gap",))
+    result = _run(
+        queue.db,
+        ["resolve", "--check", "gap", "--trade-date", "2024-01-10", "--dry-run"],
+    )
+    assert result.exit_code == 0, _text(result)
+    assert "Dry run" in _text(result)
+    assert _open_ids(queue.db, checks=("gap",)) == before
