@@ -2043,6 +2043,100 @@ def _warn_unclosed(database, flag_ids, *, closed: set) -> None:
             )
 
 
+@dq.command("recheck")
+@click.option(
+    "--check",
+    "checks",
+    multiple=True,
+    metavar="NAME",
+    help="Only this check, repeatable. Default: every re-evaluable check.",
+)
+@click.option("--note", "-m", help="Prepended to the per-check reason on each row.")
+@click.option(
+    "--by",
+    "resolved_by",
+    help="Who is closing them  [default: the OS user running the command]",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Show what no longer holds and change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
+    """Close the flags whose condition is no longer true.
+
+    \b
+      fafnir dq recheck --dry-run
+      fafnir dq recheck --check stale --dry-run
+      fafnir dq recheck --check gap --check outlier --by claude --yes
+
+    The checks only ever add: `add_dq_flag_once` skips a condition already open and
+    never retracts one, so a flag outlives the defect it describes and a repair
+    leaves the queue asserting things that are not so. Until now the only way to
+    correct that was to rebuild the repaired set by hand as a `dq resolve` filter --
+    written in a different language from the check, against a different reading of
+    the same rule, and wrong in the direction that closes live problems.
+
+    This re-runs each check's OWN predicate against the flags it wrote and closes
+    only the ones it would no longer write. That is not a judgement that the data is
+    acceptable; it is the observation that the recorded condition is absent now.
+
+    `price_*` and the NEVER_AUTO_RESOLVE checks are excluded and cannot be named:
+    a quarantine describes a bar that was never stored, so there is nothing to
+    re-evaluate, and a measurement's value is the record itself.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.dq import recheck as rc
+
+    if resolved_by is None:
+        resolved_by = _os_user()
+    try:
+        results = None
+        with Database(ctx.obj["config"].dsn) as database:
+            results = rc.recheck(database, checks=list(checks) or None)
+
+            total = sum(r.stale for r in results)
+            width = max(len(r.check_name) for r in results)
+            for r in results:
+                click.echo(
+                    f"  {r.check_name:<{width}}  {r.stale:>7} of {r.open_flags:>7} "
+                    "no longer hold"
+                )
+            if not total:
+                click.echo("Nothing to close: every open flag's condition still holds.")
+                return
+            if dry_run:
+                click.echo(
+                    f"Dry run: {_plural(total, 'flag')} would be closed. "
+                    "Nothing changed."
+                )
+                return
+            if not yes:
+                click.confirm(f"Close {_plural(total, 'flag')}?", abort=True)
+
+            closed = 0
+            for r in results:
+                if not r.stale:
+                    continue
+                # One resolve per check, so the note carries that check's own
+                # predicate. A single note across all of them would say nothing
+                # true about any particular row.
+                reason = f"Re-checked: {r.reason}."
+                closed += len(
+                    repo.resolve_dq_flags(
+                        database,
+                        repo.DqFilter(state="open", flag_ids=tuple(r.stale_flag_ids)),
+                        note=f"{note} {reason}" if note else reason,
+                        resolved_by=resolved_by,
+                    )
+                )
+            database.commit()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Resolved {_plural(closed, 'DQ flag')} as {resolved_by}.")
+
+
 @dq.command("reopen")
 @click.argument("flag_ids", nargs=-1, type=int, required=True, metavar="ID...")
 @click.pass_context
