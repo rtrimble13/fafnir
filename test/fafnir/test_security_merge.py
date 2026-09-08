@@ -501,3 +501,295 @@ def test_re_dismissing_is_a_no_op_that_says_so(db, bogus_rename):
     again = _run(db, cli.security_dismiss_rename, args)
     assert again.exit_code == 0, _text(again)
     assert "already terminal" in _text(again)
+
+
+# ---------------------------------------------------------------------------
+# `security dedupe` -- folding re-minted rows back onto the history
+# ---------------------------------------------------------------------------
+
+
+def _mint_duplicate(db, symbol, *, delisted=None, name=None):
+    """A second core.security row for a ticker, the way the master used to mint it.
+
+    Direct INSERT on purpose: `upsert_security` is the code path that stopped doing
+    this, so it cannot be used to reproduce what it used to produce.
+
+    The caller must leave at most one row of the pair listed: 0012's
+    ux_security_active_source_symbol is UNIQUE (source, primary_symbol) WHERE
+    delisted_date IS NULL, so two *active* rows for one ticker is a state the
+    schema has refused since before this bug existed. The re-mint chain is
+    therefore delisted-with-the-bars first, then the fresh active shell -- which is
+    why `_retire` runs on the keeper in every test below.
+    """
+    repo.ensure_exchange(db, "NASDAQ", "Nasdaq", "US")
+    sid = db.fetchval(
+        """
+        INSERT INTO core.security
+            (primary_symbol, company_name, asset_type, exchange_code, delisted_date)
+        VALUES (%s, %s, 'equity', 'NASDAQ', %s)
+        RETURNING security_id
+        """,
+        (symbol, name or f"{symbol} Inc", delisted),
+    )
+    repo.upsert_symbol_xref(db, security_id=sid, symbol=symbol)
+    return int(sid)
+
+
+def _retire(db, sid, when=dt.date(2023, 5, 1)):
+    """Delist a row and close its open ticker period, the way `mark_delisted` does.
+
+    This is the step that makes room for the re-mint: while the row is listed the
+    unique index refuses a second one.
+    """
+    repo.mark_delisted(db, security_id=sid, delisted_date=when)
+
+
+def _periods(db, sid, symbol):
+    """Every xref period this security holds for the ticker, oldest first."""
+    return [
+        r["valid_to"]
+        for r in db.fetchall(
+            """
+            SELECT valid_to FROM core.symbol_xref
+             WHERE security_id = %s AND symbol = %s
+             ORDER BY valid_from
+            """,
+            (sid, symbol),
+        )
+    ]
+
+
+def _security_ids(db, symbol):
+    return {
+        int(r["security_id"])
+        for r in db.fetchall(
+            "SELECT security_id FROM core.security WHERE primary_symbol = %s",
+            (symbol,),
+        )
+    }
+
+
+def test_survivor_is_the_row_holding_the_bars(db):
+    keeper = _mk_security(db, "DDUP")
+    _bars(db, keeper, 5)
+    _retire(db, keeper)
+    shell = _mint_duplicate(db, "DDUP")
+
+    groups = repo.duplicate_symbol_groups(db, symbol="DDUP")
+
+    assert len(groups) == 1
+    assert groups[0].survivor_id == keeper
+    assert [v.security_id for v in groups[0].victims] == [shell]
+    assert groups[0].blocker is None
+
+
+def test_a_group_with_two_history_holders_is_refused(db):
+    """Ticker reuse (0009) says two rows is correct -- never fold that silently."""
+    a = _mk_security(db, "DREU")
+    _bars(db, a, 5)
+    _retire(db, a)
+    b = _mint_duplicate(db, "DREU")
+    _bars(db, b, 5, close=7.0)
+
+    group = repo.duplicate_symbol_groups(db, symbol="DREU")[0]
+
+    assert group.survivor_id is None
+    assert "hold bars" in group.blocker
+    assert group.victims == []
+
+
+def test_a_group_with_no_history_holder_is_refused(db):
+    a = _mk_security(db, "DNOH")
+    _retire(db, a)
+    _mint_duplicate(db, "DNOH")
+
+    group = repo.duplicate_symbol_groups(db, symbol="DNOH")[0]
+
+    assert group.survivor_id is None
+    assert "no row holds bars" in group.blocker
+    assert a in _security_ids(db, "DNOH")
+
+
+def test_dedupe_deletes_the_shell_and_keeps_the_history(db):
+    keeper = _mk_security(db, "DFOLD")
+    _bars(db, keeper, 5)
+    _retire(db, keeper)
+    _mint_duplicate(db, "DFOLD")
+
+    result = _run(db, cli.security_dedupe, ["--symbol", "DFOLD", "--by", "t", "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert _security_ids(db, "DFOLD") == {keeper}
+    assert len(_bar_dates(db, keeper)) == 5
+
+
+def test_dedupe_dry_run_changes_nothing(db):
+    keeper = _mk_security(db, "DDRY")
+    _bars(db, keeper, 5)
+    _retire(db, keeper)
+    shell = _mint_duplicate(db, "DDRY")
+
+    result = _run(db, cli.security_dedupe, ["--symbol", "DDRY", "--dry-run"])
+
+    assert result.exit_code == 0, _text(result)
+    assert "Dry run" in _text(result)
+    assert _security_ids(db, "DDRY") == {keeper, shell}
+
+
+def test_dedupe_takes_the_merge_path_for_a_shell_carrying_actions(db):
+    """A shell that accumulated duplicate actions is not `fold`-able.
+
+    `security_has_history` counts corporate actions, so `fold_empty_security`
+    refuses it; the guarded merge is what moves it. Without that branch the
+    commonest shell on this warehouse -- 2,289 of them -- would be skipped.
+    """
+    keeper = _mk_security(db, "DACT")
+    _bars(db, keeper, 5)
+    _retire(db, keeper)
+    shell = _mint_duplicate(db, "DACT")
+    repo.upsert_corporate_action(
+        db,
+        security_id=shell,
+        action_type="dividend",
+        ex_date=dt.date(2024, 6, 4),
+        dividend_amount=0.25,
+    )
+    assert repo.security_has_history(db, shell)
+
+    result = _run(db, cli.security_dedupe, ["--symbol", "DACT", "--by", "t", "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert _security_ids(db, "DACT") == {keeper}
+    moved = db.fetchval(
+        "SELECT count(*) FROM core.corporate_action WHERE security_id = %s", (keeper,)
+    )
+    assert int(moved) == 1
+
+
+def test_dedupe_reopens_the_survivors_xref_period(db):
+    """Each mint closed the previous period; deleting the shells must not leave the
+    ticker resolving only as a former symbol.
+
+    Asserted on the xref row rather than through `active_security_for_symbol`,
+    which falls back to `core.security.primary_symbol` when no period is open and
+    so answers `keeper` either way -- it cannot see whether the period re-opened.
+    """
+    keeper = _mk_security(db, "DXRF")
+    _bars(db, keeper, 5)
+    # Close the keeper's period first: while it is open, `upsert_symbol_xref`
+    # re-points that same row at the new security rather than opening a second
+    # one, and the mint would leave the keeper holding no period at all.
+    db.execute(
+        "UPDATE core.symbol_xref SET valid_to = %s WHERE security_id = %s",
+        (dt.date(2024, 1, 1), keeper),
+    )
+    shell = _mint_duplicate(db, "DXRF", delisted=dt.date(2024, 1, 2))
+    assert _periods(db, keeper, "DXRF") == [dt.date(2024, 1, 1)]
+
+    result = _run(db, cli.security_dedupe, ["--symbol", "DXRF", "--by", "t", "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert _security_ids(db, "DXRF") == {keeper}
+    assert shell not in _security_ids(db, "DXRF")
+    assert _periods(db, keeper, "DXRF") == [None]
+    assert repo.active_security_for_symbol(db, "DXRF") == keeper
+
+
+def test_dedupe_leaves_a_delisted_survivors_period_closed(db):
+    """A closed period on a delisted row is what it means -- do not re-open it."""
+    keeper = _mk_security(db, "DDEL")
+    _bars(db, keeper, 5)
+    _retire(db, keeper, dt.date(2024, 6, 10))
+    _mint_duplicate(db, "DDEL")
+
+    _run(db, cli.security_dedupe, ["--symbol", "DDEL", "--by", "t", "--yes"])
+
+    assert _security_ids(db, "DDEL") == {keeper}
+    assert _periods(db, keeper, "DDEL") == [dt.date(2024, 6, 10)]
+    assert repo.active_security_for_symbol(db, "DDEL") is None
+
+
+def _open_identity_flags(db):
+    """The tickers carrying an open `security_duplicate_identity` flag."""
+    return {r["record_key"]["symbol"] for r in db.fetchall("""
+            SELECT record_key FROM ops.data_quality_flag
+             WHERE check_name = 'security_duplicate_identity'
+               AND resolved_at IS NULL
+            """)}
+
+
+def _identity_flag(db, security_id, symbol):
+    db.execute(
+        """
+        INSERT INTO ops.data_quality_flag
+            (security_id, table_name, record_key, check_name, severity, detail,
+             detected_at)
+        VALUES (%s, 'core.security', jsonb_build_object('symbol', %s::text),
+                'security_duplicate_identity', 'warn', '{}'::jsonb, now())
+        """,
+        (security_id, symbol),
+    )
+
+
+def _remint(db, symbol, *, name=None):
+    """The shape this command exists for: the bar-holder delisted, a fresh shell."""
+    keeper = _mk_security(db, symbol, name=name)
+    _bars(db, keeper, 5)
+    _retire(db, keeper)
+    _mint_duplicate(db, symbol, name=name)
+    return keeper
+
+
+def test_dedupe_closes_only_the_flags_for_tickers_it_actually_repaired(db):
+    """A bare `--check` filter would close the whole queue.
+
+    `resolve_dq_flags` refuses a filter that narrows nothing, but a check name
+    narrows it enough to pass that guard while still selecting every duplicated
+    ticker in the warehouse -- including the ones `--symbol` never looked at and
+    the ones reported as needing review. Their duplicates are still there.
+    """
+    repaired = _remint(db, "DSCPA")
+    _identity_flag(db, repaired, "DSCPA")
+
+    untouched = _remint(db, "DSCPB")
+    _identity_flag(db, untouched, "DSCPB")
+
+    reviewed = _mk_security(db, "DSCPC")
+    _bars(db, reviewed, 5)
+    _retire(db, reviewed)
+    _bars(db, _mint_duplicate(db, "DSCPC"), 5, close=7.0)  # two bar-holders: skipped
+    _identity_flag(db, reviewed, "DSCPC")
+
+    assert _open_identity_flags(db) == {"DSCPA", "DSCPB", "DSCPC"}
+
+    result = _run(db, cli.security_dedupe, ["--symbol", "DSCPA", "--by", "t", "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert _security_ids(db, "DSCPA") == {repaired}
+    assert _open_identity_flags(db) == {"DSCPB", "DSCPC"}
+
+
+def test_a_group_whose_rows_name_different_companies_is_refused(db):
+    """Ticker reuse: a new issuer on a dead ticker, before its first bars land.
+
+    Structurally identical to a re-mint -- one delisted row with the history, one
+    empty listed row -- so the bars rule alone would fold a legitimately new
+    security into a dead company's identity, which is the fork 0009 mints a
+    separate security_id to avoid. The name is the only thing that separates them,
+    which is why `security_duplicate_identity` reports distinct_company_names.
+    """
+    dead = _mk_security(db, "DNAME", name="Old Issuer Inc")
+    _bars(db, dead, 5)
+    _retire(db, dead)
+    newcomer = _mint_duplicate(db, "DNAME", name="Wholly Different Corp")
+
+    group = repo.duplicate_symbol_groups(db, symbol="DNAME")[0]
+
+    assert group.survivor_id is None
+    assert "distinct company names" in group.blocker
+    assert group.victims == []
+
+    result = _run(db, cli.security_dedupe, ["--symbol", "DNAME", "--by", "t", "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert _security_ids(db, "DNAME") == {dead, newcomer}

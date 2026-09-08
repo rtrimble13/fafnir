@@ -505,6 +505,202 @@ def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bo
     return True
 
 
+class DuplicateRow(NamedTuple):
+    """One ``core.security`` row competing for a ticker, and what hangs off it."""
+
+    security_id: int
+    first_seen_at: Optional[date]
+    delisted_date: Optional[date]
+    has_bars: bool
+    has_actions: bool
+    has_factors: bool
+    company_name: Optional[str] = None
+
+    @property
+    def has_history(self) -> bool:
+        """Mirrors :func:`security_has_history` -- what a delete would destroy."""
+        return self.has_bars or self.has_actions or self.has_factors
+
+
+class DuplicateGroup(NamedTuple):
+    """Every ``core.security`` row holding one ticker.
+
+    ``survivor_id`` is the row that owns the price history, and is None when the
+    group cannot be resolved automatically -- see ``blocker``.
+    """
+
+    symbol: str
+    rows: Sequence[DuplicateRow]
+    survivor_id: Optional[int]
+    blocker: Optional[str]
+
+    @property
+    def victims(self) -> list[DuplicateRow]:
+        if self.survivor_id is None:
+            return []
+        return [r for r in self.rows if r.security_id != self.survivor_id]
+
+
+def duplicate_symbol_groups(
+    db: Database, *, symbol: Optional[str] = None, limit: int = 0
+) -> list[DuplicateGroup]:
+    """Tickers held by more than one ``core.security`` row, with a survivor chosen.
+
+    The survivor is the row that holds the bars, and that is the whole rule. It is
+    deliberately not "the oldest" or "the one with a CUSIP": bars are the thing a
+    delete would destroy and attributes are rewritten by the next master load, so
+    the row with history is the only defensible one to keep.
+
+    A group is refused -- ``survivor_id`` None, ``blocker`` set -- when the rows
+    name more than one company, or when that rule does not pick exactly one row:
+
+    * the rows carry different company names. Same name and most rows empty is the
+      re-mint this repairs; differing names is genuine ticker reuse, where two rows
+      is *correct* (0009), or a rebrand. The bars rule cannot tell those apart --
+      both look like one delisted row with the history and a newer empty one -- so
+      the name is checked first and disagreement is always a refusal;
+    * no row has bars, so there is no history to preserve and nothing to prefer;
+    * more than one row has bars, which is either genuine ticker reuse (0009 says
+      two rows is *correct* there) or a rename the sweep missed. Both need
+      `security merge-rename` and a human reading the OHLC comparison.
+
+    Set-based on purpose: the per-row ``EXISTS`` form of this question times out
+    over 18,000 rows.
+    """
+    params: list[Any] = []
+    symbol_clause = ""
+    if symbol:
+        symbol_clause = "WHERE s.primary_symbol = %s"
+        params.append(symbol.upper())
+    limit_clause = f"LIMIT {int(limit)}" if limit else ""
+
+    rows = db.fetchall(
+        f"""
+        WITH dup AS (
+            SELECT primary_symbol
+              FROM core.security s
+              {symbol_clause}
+             GROUP BY primary_symbol
+            HAVING count(*) > 1
+             ORDER BY primary_symbol
+             {limit_clause}
+        ),
+        r AS (
+            SELECT s.security_id, s.primary_symbol, s.first_seen_at::date AS seen,
+                   s.delisted_date, s.company_name
+              FROM core.security s JOIN dup USING (primary_symbol)
+        )
+        SELECT r.security_id, r.primary_symbol, r.seen, r.delisted_date,
+               r.company_name,
+               (p.security_id IS NOT NULL) AS has_bars,
+               (a.security_id IS NOT NULL) AS has_actions,
+               (f.security_id IS NOT NULL) AS has_factors
+          FROM r
+          LEFT JOIN (SELECT DISTINCT security_id FROM core.daily_price
+                      WHERE security_id IN (SELECT security_id FROM r)) p
+                 ON p.security_id = r.security_id
+          LEFT JOIN (SELECT DISTINCT security_id FROM core.corporate_action
+                      WHERE security_id IN (SELECT security_id FROM r)) a
+                 ON a.security_id = r.security_id
+          LEFT JOIN (SELECT DISTINCT security_id FROM core.adjustment_factor
+                      WHERE security_id IN (SELECT security_id FROM r)) f
+                 ON f.security_id = r.security_id
+         ORDER BY r.primary_symbol, r.security_id
+        """,
+        params,
+    )
+
+    grouped: dict[str, list[DuplicateRow]] = {}
+    for row in rows:
+        grouped.setdefault(row["primary_symbol"], []).append(
+            DuplicateRow(
+                security_id=int(row["security_id"]),
+                first_seen_at=row["seen"],
+                delisted_date=row["delisted_date"],
+                has_bars=bool(row["has_bars"]),
+                has_actions=bool(row["has_actions"]),
+                has_factors=bool(row["has_factors"]),
+                company_name=row["company_name"],
+            )
+        )
+
+    out: list[DuplicateGroup] = []
+    for sym, members in grouped.items():
+        holders = [r for r in members if r.has_bars]
+        # Names first, because a name disagreement outranks the bars rule. The bars
+        # rule cannot tell a re-mint from genuine ticker reuse: both look like one
+        # delisted row holding the history and a newer row holding none, and folding
+        # the second case would delete a legitimately new issuer into a dead
+        # company's identity -- exactly what 0009 mints a separate row to prevent.
+        # `security_duplicate_identity` already reports distinct_company_names for
+        # this reason, and the playbook reads it the same way: same name is a
+        # repair, differing names are two companies and are nobody's to fold.
+        names = {r.company_name.strip().casefold() for r in members if r.company_name}
+        if len(names) > 1:
+            out.append(
+                DuplicateGroup(
+                    sym,
+                    members,
+                    None,
+                    f"{len(names)} distinct company names -- ticker reuse (two rows "
+                    "is correct) or a rebrand; neither is this command's to fold",
+                )
+            )
+        elif len(holders) == 1:
+            out.append(DuplicateGroup(sym, members, holders[0].security_id, None))
+        elif not holders:
+            out.append(
+                DuplicateGroup(
+                    sym,
+                    members,
+                    None,
+                    f"no row holds bars ({len(members)} rows) -- nothing to keep",
+                )
+            )
+        else:
+            out.append(
+                DuplicateGroup(
+                    sym,
+                    members,
+                    None,
+                    f"{len(holders)} rows hold bars -- ticker reuse or a missed "
+                    "rename; use `security merge-rename` after reading the OHLC "
+                    "comparison",
+                )
+            )
+    return out
+
+
+def reopen_symbol_period(db: Database, *, security_id: int, symbol: str) -> bool:
+    """Re-open the survivor's xref period after its usurpers are gone.
+
+    Each mint closed the previous period (0012), so once the shells are deleted the
+    survivor is left holding a *closed* period and the ticker resolves only as a
+    former symbol -- `resolve_symbol` looks for `valid_to IS NULL` first. For a
+    security that never stopped trading that is still the wrong answer, just a
+    quieter one than before.
+
+    Only re-opens when nothing else holds the ticker open and the security is not
+    delisted; a delisted row keeps its closed period, which is what it means.
+    """
+    return bool(
+        db.execute(
+            """
+            UPDATE core.symbol_xref x
+               SET valid_to = NULL
+             WHERE x.security_id = %s AND x.symbol = %s
+               AND x.valid_to = (SELECT max(valid_to) FROM core.symbol_xref
+                                  WHERE symbol = %s AND security_id = %s)
+               AND NOT EXISTS (SELECT 1 FROM core.symbol_xref o
+                                WHERE o.symbol = %s AND o.valid_to IS NULL)
+               AND EXISTS (SELECT 1 FROM core.security s
+                            WHERE s.security_id = %s AND s.delisted_date IS NULL)
+            """,
+            (security_id, symbol, symbol, security_id, symbol, security_id),
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Merging two securities that are one company
 # ---------------------------------------------------------------------------
