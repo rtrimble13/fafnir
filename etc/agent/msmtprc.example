@@ -1,0 +1,31 @@
+# ~/.msmtprc for the AGENT user -- see doc/nightly_report.md.
+#
+#   cp etc/agent/msmtprc.example ~/.msmtprc && chmod 600 ~/.msmtprc
+#
+# chmod 600 is not advice: msmtp refuses to run on a config that carries a
+# password and is readable by anyone else.
+#
+# Port 587 + STARTTLS, deliberately. Hetzner blocks outbound SMTP on new cloud
+# accounts (install_hetzner.md §10); where it is unblocked, 587 is the port that
+# comes back. Confirm before assuming, because a blocked port hangs rather than
+# refusing, which reads as a broken script:
+#     timeout 8 bash -c 'exec 3<>/dev/tcp/smtp.example.com/587' && echo open
+
+defaults
+auth           on
+tls            on
+tls_starttls   on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        ~/fafnir-report/msmtp.log
+
+account        fafnir
+host           smtp.example.com          # smtp.gmail.com, smtp.fastmail.com, ...
+port           587
+from           REPLACE_ME@example.com
+user           REPLACE_ME@example.com
+# An APP PASSWORD, not the account password. If the provider offers neither app
+# passwords nor a send-only credential, prefer a transactional-email API over
+# putting a real account password on the warehouse host.
+password       REPLACE_ME
+
+account default : fafnir

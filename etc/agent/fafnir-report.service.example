@@ -1,0 +1,39 @@
+# fafnir-report.service -- the nightly summary email. See doc/nightly_report.md.
+#
+# NOT in etc/systemd/ with the pipeline units, and not a @PLACEHOLDER@ template:
+# install_timers.sh installs units that run as the fafnir user, and this one runs
+# as the AGENT (doc/agent.md). Its user, its home and its Claude credentials are
+# agent deployment facts, so it lives here and is installed by hand.
+#
+#   sudo install -m 644 etc/agent/fafnir-report.service.example \
+#        /etc/systemd/system/fafnir-report.service
+# Edit User=/Group=/paths below if the agent account is not `claude`.
+
+[Unit]
+Description=Email a Claude-written summary of the fafnir nightly automations
+Documentation=file:///opt/fafnir/doc/nightly_report.md
+# Ordering only -- these are long finished by the time this fires. It matters on
+# a boot where systemd catches up several Persistent=true timers at once and this
+# would otherwise report on a sweep still in flight.
+After=fafnir-daily.service fafnir-dq.service
+
+[Service]
+Type=oneshot
+User=claude
+Group=claude
+WorkingDirectory=/opt/fafnir
+# claude(1) resolves its OAuth credentials and config out of $HOME; systemd does
+# not set it for a oneshot unit, and without it the summariser exits unauthorised.
+Environment=HOME=/home/claude
+EnvironmentFile=/etc/fafnir/report.env
+ExecStart=/opt/fafnir/scripts/nightly_report.sh
+# systemd opens these before ExecStart, and creates the file but NOT its parent
+# directory -- so ~/fafnir-report must already exist or the unit fails before the
+# script runs its own mkdir. Step 1 of the runbook creates it.
+StandardOutput=append:/home/claude/fafnir-report/report.log
+StandardError=append:/home/claude/fafnir-report/report.log
+# The evidence sweep plus a cold model call; the 90s default is not enough.
+TimeoutStartSec=20m
+# No ProtectHome= here: unlike the pipeline units, this one must read its own
+# home for the Claude credentials and ~/.msmtprc.
+PrivateTmp=true
