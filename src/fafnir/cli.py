@@ -1023,6 +1023,181 @@ def security_merge_rename(
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
+@security.command("dedupe")
+@click.option("--symbol", help="One ticker only, instead of the whole master.")
+@click.option(
+    "--limit", type=int, default=0, help="Stop after this many tickers (0 = all)."
+)
+@click.option("--note", "-m", help="Why, kept on the DQ flags this closes.")
+@click.option(
+    "--by",
+    "resolved_by",
+    help="Who is closing them  [default: the OS user running the command]",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be folded and change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
+    """Fold re-minted duplicate rows into the security that holds the history.
+
+    \b
+      fafnir security dedupe --dry-run
+      fafnir security dedupe --symbol AAIC --dry-run
+      fafnir security dedupe --limit 50 -m "re-mint cleanup" --yes
+
+    FMP keeps serving a delisted name on the screener, and before
+    `is_retired_listing` the master minted a fresh security_id for it every night.
+    The row with the bars keeps them but loses the ticker -- each mint closes the
+    previous xref period and the newest open period wins -- so `resolve_symbol`
+    returns an empty shell with no CUSIP, no history and no delisting.
+
+    The survivor is the row holding the bars, and among rows naming one company
+    that is the only rule. A ticker is reported and skipped when its rows name
+    different companies -- ticker reuse, where two rows is correct, or a rebrand --
+    and when no row has bars or more than one does, which is reuse or a missed
+    rename. All of those need `security merge-rename` and a human.
+
+    Shells with nothing on them are folded; shells that accumulated duplicate
+    corporate actions go through the same guarded merge `merge-rename` uses, which
+    refuses on a populated identity mismatch or disagreeing OHLC.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    if resolved_by is None:
+        resolved_by = _os_user()
+
+    folded = merged = skipped = 0
+    rows_deleted = 0
+    # Survivors whose group came out clean. Only these get their flag closed: the
+    # condition the flag describes is "this ticker has more than one row", and that
+    # is only untrue for a ticker every duplicate of which actually went away.
+    cleaned_ids: list[int] = []
+
+    with Database(ctx.obj["config"].dsn) as database:
+        groups = repo.duplicate_symbol_groups(database, symbol=symbol, limit=limit)
+        if not groups:
+            click.echo("No ticker is held by more than one security. Nothing to do.")
+            return
+
+        actionable = [g for g in groups if g.survivor_id is not None]
+        blocked = [g for g in groups if g.survivor_id is None]
+        victims = sum(len(g.victims) for g in actionable)
+
+        click.echo(
+            f"{_plural(len(groups), 'duplicated ticker')}: "
+            f"{len(actionable)} with one history-holder ({victims} rows to fold), "
+            f"{len(blocked)} needing review."
+        )
+        for g in blocked[:20]:
+            click.echo(f"  SKIP {g.symbol}: {g.blocker}")
+        if len(blocked) > 20:
+            click.echo(f"  ... and {len(blocked) - 20} more skipped.")
+
+        if dry_run:
+            for g in actionable[:20]:
+                keep = g.survivor_id
+                detail = ", ".join(
+                    f"{r.security_id}"
+                    + ("+actions" if r.has_actions or r.has_factors else "")
+                    for r in g.victims
+                )
+                click.echo(f"  {g.symbol}: keep {keep}, fold {detail}")
+            if len(actionable) > 20:
+                click.echo(f"  ... and {len(actionable) - 20} more tickers.")
+            click.echo(
+                f"Dry run: {_plural(victims, 'security row')} would be deleted "
+                f"across {_plural(len(actionable), 'ticker')}. Nothing changed."
+            )
+            return
+
+        if not actionable:
+            click.echo("Nothing to fold.")
+            return
+        if not yes:
+            click.confirm(
+                f"Delete {_plural(victims, 'security row')} across "
+                f"{_plural(len(actionable), 'ticker')}?",
+                abort=True,
+            )
+
+        for g in actionable:
+            survivor = g.survivor_id
+            actions_moved = False
+            left_behind = 0
+            for victim in g.victims:
+                if not victim.has_history:
+                    if repo.fold_empty_security(
+                        database, victim_id=victim.security_id, survivor_id=survivor
+                    ):
+                        folded += 1
+                        rows_deleted += 1
+                    else:
+                        # The guard disagreed with what duplicate_symbol_groups
+                        # read. Something wrote to the row between the two, so
+                        # leave it and say so rather than reaching for the merge.
+                        skipped += 1
+                        left_behind += 1
+                        click.echo(
+                            f"  SKIP {g.symbol} {victim.security_id}: gained "
+                            "history since it was listed"
+                        )
+                    continue
+                try:
+                    report = repo.merge_security(
+                        database, victim_id=victim.security_id, survivor_id=survivor
+                    )
+                except repo.MergeRefused as exc:
+                    skipped += 1
+                    left_behind += 1
+                    click.echo(f"  SKIP {g.symbol} {victim.security_id}: {exc}")
+                    continue
+                merged += 1
+                rows_deleted += 1
+                actions_moved = actions_moved or bool(report.actions_moved)
+
+            repo.reopen_symbol_period(database, security_id=survivor, symbol=g.symbol)
+            # Only when actions actually moved: recomputing for every survivor
+            # would walk the whole master for no change.
+            if actions_moved:
+                adjustments.compute_for_security(database, survivor)
+            if not left_behind:
+                cleaned_ids.append(survivor)
+
+        # Scoped to the survivors, never the bare check name: a bare filter closes
+        # the flag for every duplicated ticker in the warehouse, including the ones
+        # `--symbol`/`--limit` never looked at and the ones reported above as
+        # needing review. Their duplicates are still there, and the operator would
+        # have no list of what to reopen.
+        closed: list[int] = []
+        if cleaned_ids:
+            closed = repo.resolve_dq_flags(
+                database,
+                repo.DqFilter(
+                    state="open",
+                    checks=("security_duplicate_identity",),
+                    security_ids=tuple(cleaned_ids),
+                ),
+                note=note
+                or (
+                    f"Re-mint cleanup: folded {rows_deleted} duplicate security "
+                    "rows into the row holding the bars."
+                ),
+                resolved_by=resolved_by,
+            )
+        database.commit()
+
+    click.echo(
+        f"Folded {folded} empty rows, merged {merged} rows carrying actions, "
+        f"skipped {skipped}."
+    )
+    click.echo(f"Deleted {_plural(rows_deleted, 'security row')}.")
+    click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
 @security.command("dismiss-rename")
 @click.argument("old_symbol")
 @click.argument("new_symbol")
