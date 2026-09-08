@@ -1,0 +1,22 @@
+# fafnir-report.timer -- see doc/nightly_report.md.
+#
+#   sudo install -m 644 etc/agent/fafnir-report.timer.example \
+#        /etc/systemd/system/fafnir-report.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fafnir-report.timer
+
+[Unit]
+Description=Morning fafnir nightly-automation summary email
+
+[Timer]
+Unit=fafnir-report.service
+# Market time, not host time -- same convention as etc/systemd/*.timer.in.
+# Tue..Sat because the jobs it reports on run Mon..Fri *night*: Friday night's
+# run is Saturday's email, and Monday morning has nothing new to say.
+# 06:15 ET clears fafnir-dq's 2h TimeoutStartSec with room to spare.
+OnCalendar=Tue..Sat 06:15 America/New_York
+# If the host was down at 06:15, still send once it is back.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

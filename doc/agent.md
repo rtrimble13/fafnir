@@ -181,6 +181,13 @@ absent, for exactly this reason.
 | **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
+### The nightly report
+
+The agent can also run unattended on a timer, emailing a summary of the night's
+automations and the DQ queue each morning — collection is deterministic shell,
+and only the summary is the model. It reads strictly within the boundary above
+and changes nothing. See [nightly_report.md](nightly_report.md).
+
 ### Proactive sweeps
 
 Asked to *sweep* or *clear* the queue rather than about one security, the agent

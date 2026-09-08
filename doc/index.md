@@ -26,6 +26,8 @@ read through the `duk` CLI.
 - [duk CLI](duk.md) — reading the warehouse (db) vs the API (live)
 - [Operations Agent](agent.md) — running an agent on the host for DQ triage,
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation
+- [Nightly Report Email](nightly_report.md) — the agent's morning summary of the
+  automations and the DQ queue: schedule, mail transport, what it can and cannot see
 
 ## Growing it
 
