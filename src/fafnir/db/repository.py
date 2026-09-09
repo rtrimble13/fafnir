@@ -2126,15 +2126,24 @@ def add_dq_flag_once(
     # ix_dq_flag_open_condition (migration 0014), which this predicate matches.
     clauses = ["check_name = %s", "resolved_at IS NULL"]
     probe: list[Any] = [check_name]
+    # The acceptance probe is the same lookup with the other predicate, so it is
+    # built alongside and served by ix_dq_flag_accepted_condition (0024). Two
+    # index-backed probes, rather than one `resolved_at IS NULL OR accepted_at IS
+    # NOT NULL` that no partial index can serve -- see the note above.
+    accepted_clauses = ["check_name = %s", "accepted_at IS NOT NULL"]
     if security_id is None:
         clauses.append("security_id IS NULL")
+        accepted_clauses.append("security_id IS NULL")
     else:
         clauses.append("security_id = %s")
+        accepted_clauses.append("security_id = %s")
         probe.append(security_id)
     if key_json is None:
         clauses.append("record_key IS NULL")
+        accepted_clauses.append("record_key IS NULL")
     else:
         clauses.append("record_key = %s::jsonb")
+        accepted_clauses.append("record_key = %s::jsonb")
         probe.append(key_json)
 
     return (
@@ -2149,6 +2158,10 @@ def add_dq_flag_once(
                 SELECT 1 FROM ops.data_quality_flag
                 WHERE {" AND ".join(clauses)}
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag
+                WHERE {" AND ".join(accepted_clauses)}
+            )
             """,
             (
                 ingestion_run_id,
@@ -2158,6 +2171,9 @@ def add_dq_flag_once(
                 check_name,
                 severity,
                 json.dumps(detail) if detail else None,
+                # Once per NOT EXISTS: the two probes take the same values in the
+                # same order, differing only in the predicate they are matched on.
+                *probe,
                 *probe,
             ),
         )
@@ -2209,7 +2225,7 @@ def count_price_quarantines(db: Database, security_id: int, date_iso: str) -> in
 # --symbol AAPL` shows. A filter that meant one thing when listing and another when
 # resolving is how a triage session closes flags nobody ever looked at.
 
-DQ_STATES = ("open", "resolved", "all")
+DQ_STATES = ("open", "resolved", "accepted", "all")
 
 # Order severity by how much it wants attention. Alphabetically 'error' < 'info' <
 # 'warn', which puts the worst first only by accident and 'info' above 'warn'.
@@ -2293,7 +2309,12 @@ def _dq_where(filt: DqFilter, alias: str = "") -> tuple[str, list[Any]]:
     if filt.state == "open":
         clauses.append(f"{q}resolved_at IS NULL")
     elif filt.state == "resolved":
+        # Accepted rows are resolved too (0024's CHECK constraint), but they are a
+        # different decision and asking for one should not return the other.
         clauses.append(f"{q}resolved_at IS NOT NULL")
+        clauses.append(f"{q}accepted_at IS NULL")
+    elif filt.state == "accepted":
+        clauses.append(f"{q}accepted_at IS NOT NULL")
     if filt.checks:
         ors: list[str] = []
         for value in filt.checks:
@@ -2402,6 +2423,10 @@ def list_dq_flags(
         SELECT f.dq_flag_id, f.check_name, f.severity, f.security_id,
                s.primary_symbol, f.table_name, f.record_key, f.detail,
                f.detected_at, f.resolved_at, f.resolved_by, f.resolution_note,
+               -- Acceptance travels with the row: 0024's down migration tells the
+               -- operator to keep `dq list --state accepted --detail --json` before
+               -- dropping these columns, and that is the only copy there will be.
+               f.accepted_at, f.accepted_by, f.accepted_note,
                f.ingestion_run_id
           FROM ops.data_quality_flag f
           LEFT JOIN core.security s ON s.security_id = f.security_id
@@ -2482,6 +2507,50 @@ def resolve_dq_flags(
     return [int(r["dq_flag_id"]) for r in rows]
 
 
+def accept_dq_flags(
+    db: Database,
+    filt: DqFilter,
+    *,
+    note: str,
+    accepted_by: str,
+) -> list[int]:
+    """Accept conditions as real, permanent and unfixable. Returns the ids closed.
+
+    The difference from :func:`resolve_dq_flags` is what happens next. A resolution
+    is judged against the data, so it frees the condition's slot and the next
+    `fafnir dq run` writes the flag again if the problem is still there -- which is
+    the point, and why resolving a vendor's missing decade achieves nothing. An
+    acceptance says the problem IS still there and always will be, so the checks
+    skip it (see the guards in :mod:`fafnir.dq.checks` and the second probe in
+    :func:`add_dq_flag_once`).
+
+    ``note`` is required and has no default. Everything else about a flag can be
+    re-derived from the data; the reason someone decided to stop asking cannot.
+    """
+    if not filt.is_narrowed:
+        raise ValueError(
+            "accept_dq_flags needs flag ids or at least one filter; refusing to "
+            "accept the whole queue"
+        )
+    if not (note and note.strip()):
+        raise ValueError(
+            "accept_dq_flags needs a note: an accepted flag is a standing decision "
+            "to stop looking, and the note is the whole record of why"
+        )
+    where, params = _dq_where(filt._replace(state="open"))
+    rows = db.fetchall(
+        f"""
+        UPDATE ops.data_quality_flag
+           SET resolved_at = now(), resolved_by = %s, resolution_note = %s,
+               accepted_at = now(), accepted_by = %s, accepted_note = %s
+         {where}
+        RETURNING dq_flag_id
+        """,
+        [accepted_by, note, accepted_by, note, *params],
+    )
+    return [int(r["dq_flag_id"]) for r in rows]
+
+
 def reopen_dq_flags(
     db: Database, flag_ids: Sequence[int]
 ) -> tuple[list[int], list[int]]:
@@ -2511,7 +2580,13 @@ def reopen_dq_flags(
                     """
                     UPDATE ops.data_quality_flag
                        SET resolved_at = NULL, resolved_by = NULL,
-                           resolution_note = NULL
+                           resolution_note = NULL,
+                           -- Acceptance goes with it. A row that is open again is
+                           -- one nobody has decided about, and leaving accepted_at
+                           -- set would keep the checks skipping the condition while
+                           -- the queue showed it as unjudged.
+                           accepted_at = NULL, accepted_by = NULL,
+                           accepted_note = NULL
                      WHERE dq_flag_id = %s AND resolved_at IS NOT NULL
                     RETURNING dq_flag_id
                     """,

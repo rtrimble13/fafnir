@@ -1691,7 +1691,7 @@ def _dq_filter_options(func):
 @_dq_filter_options
 @click.option(
     "--state",
-    type=click.Choice(["open", "resolved", "all"]),
+    type=click.Choice(["open", "resolved", "accepted", "all"]),
     default="open",
     show_default=True,
     help="Open queue, the resolved record, or both.",
@@ -1782,7 +1782,15 @@ def _echo_dq_empty(filt) -> None:
 
 
 def _dq_label(filt) -> str:
-    return {"open": "Open", "resolved": "Resolved", "all": "All"}[filt.state]
+    # Keyed off DQ_STATES rather than a literal dict: `--state` takes its choices
+    # from there, so a state added to one and not the other turns every listing of
+    # it into a KeyError -- which is what shipping `accepted` without this line did.
+    return {
+        "open": "Open",
+        "resolved": "Resolved",
+        "accepted": "Accepted",
+        "all": "All",
+    }[filt.state]
 
 
 def _echo_dq_summary(rows, totals, filt) -> None:
@@ -1889,6 +1897,135 @@ def _echo_dq_detail(rows, totals, filt, *, limit, offset, hints=True) -> None:
             + " ".join(str(r["dq_flag_id"]) for r in rows[:3])
             + ' --note "..."'
         )
+
+
+@dq.command("accept")
+@click.argument("flag_ids", nargs=-1, type=int, metavar="[ID]...")
+@_dq_filter_options
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why there is nothing to do. Required -- this is the whole record.",
+)
+@click.option(
+    "--by",
+    "accepted_by",
+    help="Who is accepting them  [default: the OS user running the command]",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be accepted and change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def dq_accept(
+    ctx,
+    flag_ids,
+    checks,
+    severities,
+    symbol,
+    security_ids,
+    since,
+    until,
+    trade_dates,
+    note,
+    accepted_by,
+    dry_run,
+    yes,
+):
+    """Accept conditions that are real, permanent and have no repair.
+
+    \b
+      fafnir dq accept --check gap --symbol CBFV --dry-run
+      fafnir dq accept --check gap --security-id 4212 -m "vendor has no 1990s bars"
+
+    `dq resolve` says the condition went away. It is judged against the data, so it
+    frees the condition's slot and the next `fafnir dq run` writes the flag again if
+    the problem is still there -- which is why resolving a vendor's missing decade
+    achieves nothing but churn.
+
+    This says the opposite: the problem IS still there, it always will be, and there
+    is nothing to do about it. The checks then skip the condition instead of asking
+    again every night. A vendor that has no bars for a security's first decade will
+    not produce them tomorrow.
+
+    \b
+    What acceptance does NOT suppress: the `price_<reason>` quarantine flags the
+    loader writes on a rejected bar. Those go through `add_dq_flag`, which has no
+    dedupe probe by design -- `count_price_quarantines` counts their repeats to
+    decide when a persistently-bad bar has held the watermark long enough, and a
+    probe there would freeze that counter behind the bar forever. Accepting them
+    clears the backlog, but re-reading the same bar writes a new flag. Every
+    condition written through `add_dq_flag_once` or one of the checks in
+    `fafnir.dq.checks` is suppressed properly.
+
+    Accepting is never automatic and no sweep may do it. `--note` is required, and
+    `dq reopen` takes it back. Accepted flags stay visible under
+    `dq list --state accepted`.
+    """
+    from fafnir.db import repository as repo
+
+    narrowed = bool(
+        checks or severities or symbol or since or until or trade_dates or security_ids
+    )
+    if flag_ids and narrowed:
+        raise click.ClickException(
+            "Give ids or filters, not both: the ids say exactly which rows, and a "
+            "filter alongside them can only narrow that into something you did not "
+            "list."
+        )
+    if not flag_ids and not narrowed:
+        raise click.ClickException(
+            "Nothing selected. Pass flag ids, or narrow with --check / --symbol / "
+            "--severity / --since / --until / --trade-date / --security-id. "
+            "Refusing to accept the whole queue."
+        )
+
+    if accepted_by is None:
+        accepted_by = _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        filt = _dq_filter(
+            database,
+            state="open",
+            checks=checks,
+            severities=severities,
+            symbol=symbol,
+            security_ids=security_ids,
+            since=since,
+            until=until,
+            trade_dates=trade_dates,
+            flag_ids=flag_ids,
+        )
+        totals = repo.dq_flag_totals(database, filt)
+        matched = int(totals.get("flags") or 0)
+
+        if dry_run:
+            preview = repo.list_dq_flags(database, filt, limit=20)
+            _echo_dq_detail(preview, totals, filt, limit=20, offset=0, hints=False)
+            click.echo(
+                f"Dry run: {_plural(matched, 'flag')} would be accepted. "
+                "Nothing changed."
+            )
+            return
+        if not matched:
+            click.echo("Nothing to accept: no open flags match.")
+            return
+        if not yes:
+            click.confirm(
+                f"Accept {_plural(matched, 'flag')}? The checks will stop "
+                "reporting these conditions.",
+                abort=True,
+            )
+
+        accepted = repo.accept_dq_flags(
+            database, filt, note=note, accepted_by=accepted_by
+        )
+        database.commit()
+
+    click.echo(f"Accepted {_plural(len(accepted), 'DQ flag')} as {accepted_by}.")
+    click.echo(f'Note: "{note}"')
+    click.echo("`fafnir dq list --state accepted` lists them; `dq reopen` undoes it.")
 
 
 @dq.command("resolve")

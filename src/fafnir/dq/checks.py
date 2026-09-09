@@ -22,6 +22,15 @@ number of real problems stayed flat. A condition with a different record_key -- 
 new gap date, a later stale date -- is a different occurrence and is still
 recorded. See ``repository.add_dq_flag_once``, which is the same rule for the
 row-at-a-time callers.
+
+A condition that has been ACCEPTED (0024) is skipped as well, and that is a
+different statement from a resolution. Resolving is judged against the data, so it
+frees the slot and a condition still present is written again on the next pass --
+which is what makes the queue trustworthy. Acceptance says the condition is real,
+permanent and has no repair: a vendor that has no bars for a security's first
+decade will not produce them tomorrow. Each guard below therefore carries two
+NOT EXISTS probes rather than one widened predicate, so both stay matched to a
+partial index (ix_dq_flag_open_condition, ix_dq_flag_accepted_condition).
 """
 
 from __future__ import annotations
@@ -151,6 +160,13 @@ def check_gaps(
                   AND f.record_key = d.record_key
                   AND f.resolved_at IS NULL
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'gap'
+                  AND f.security_id = d.security_id
+                  AND f.record_key = d.record_key
+                  AND f.accepted_at IS NOT NULL
+            )
             RETURNING 1
         ),
         -- One row per security, keyed on an empty record_key so the condition
@@ -178,6 +194,12 @@ def check_gaps(
                 WHERE f.check_name = 'sparse_coverage'
                   AND f.security_id = s.security_id
                   AND f.resolved_at IS NULL
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'sparse_coverage'
+                  AND f.security_id = s.security_id
+                  AND f.accepted_at IS NOT NULL
             )
             RETURNING 1
         )
@@ -252,6 +274,13 @@ def check_outliers(db: Database, threshold: float = DEFAULT_OUTLIER_THRESHOLD) -
                   AND f.security_id = d.security_id
                   AND f.record_key = jsonb_build_object('trade_date', d.trade_date::text)
                   AND f.resolved_at IS NULL
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'outlier'
+                  AND f.security_id = d.security_id
+                  AND f.record_key = jsonb_build_object('trade_date', d.trade_date::text)
+                  AND f.accepted_at IS NOT NULL
             )
             RETURNING 1
         )
@@ -346,6 +375,13 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
                   AND f.record_key = jsonb_build_object('last_date', d.last_date::text)
                   AND f.resolved_at IS NULL
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'stale'
+                  AND f.security_id = d.security_id
+                  AND f.record_key = jsonb_build_object('last_date', d.last_date::text)
+                  AND f.accepted_at IS NOT NULL
+            )
             RETURNING 1
         )
         SELECT (SELECT count(*) FROM detected) AS detected,
@@ -434,6 +470,12 @@ def check_duplicate_identity(db: Database) -> int:
                   AND d.record_key = jsonb_build_object('symbol', f.primary_symbol)
                   AND d.resolved_at IS NULL
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag d
+                WHERE d.check_name = 'security_duplicate_identity'
+                  AND d.record_key = jsonb_build_object('symbol', f.primary_symbol)
+                  AND d.accepted_at IS NOT NULL
+            )
             RETURNING 1
         )
         SELECT (SELECT count(*) FROM forked)  AS detected,
@@ -483,6 +525,12 @@ def check_missing_classification(db: Database) -> int:
                 WHERE f.check_name = 'security_missing_classification'
                   AND f.security_id = d.security_id
                   AND f.resolved_at IS NULL
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM ops.data_quality_flag f
+                WHERE f.check_name = 'security_missing_classification'
+                  AND f.security_id = d.security_id
+                  AND f.accepted_at IS NOT NULL
             )
             RETURNING 1
         )
