@@ -11,9 +11,17 @@
 --
 --   * A vendor that has no bars for a security's first decade. FMP will not
 --     produce them tomorrow. `gap` is right that the sessions are missing.
---   * A security quoted below the quantize cliff (price_subresolution_price) or
---     above NUMERIC(20,6) (price_price_out_of_range). The value is
---     unrepresentable; the flag is a measurement, not a defect to fix.
+--   * A security whose stored bar is a measurement rather than a defect --
+--     price_scale_collapse, say: real, permanent, and nothing to repair.
+--
+-- Note what acceptance does NOT reach: the price_<reason> quarantine flags the
+-- loader writes on a REJECTED bar (price_subresolution_price,
+-- price_price_out_of_range). Those go through add_dq_flag, which has no dedupe
+-- probe by design -- count_price_quarantines counts their repeats to decide when a
+-- persistently-bad bar has held the watermark long enough, so a probe there would
+-- freeze that counter behind the bar forever. Accepting them clears the backlog,
+-- but a re-read of the same bar writes a new row. Suppression covers what goes
+-- through add_dq_flag_once and the checks in fafnir.dq.checks.
 --
 -- Resolving one of these is not terminal, because resolution is judged against
 -- the data: closing the flag frees its slot in ux_dq_flag_open_condition (0016)

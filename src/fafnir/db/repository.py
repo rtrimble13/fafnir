@@ -2423,6 +2423,10 @@ def list_dq_flags(
         SELECT f.dq_flag_id, f.check_name, f.severity, f.security_id,
                s.primary_symbol, f.table_name, f.record_key, f.detail,
                f.detected_at, f.resolved_at, f.resolved_by, f.resolution_note,
+               -- Acceptance travels with the row: 0024's down migration tells the
+               -- operator to keep `dq list --state accepted --detail --json` before
+               -- dropping these columns, and that is the only copy there will be.
+               f.accepted_at, f.accepted_by, f.accepted_note,
                f.ingestion_run_id
           FROM ops.data_quality_flag f
           LEFT JOIN core.security s ON s.security_id = f.security_id

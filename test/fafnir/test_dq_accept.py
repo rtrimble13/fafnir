@@ -226,6 +226,80 @@ def _ids(db, **kwargs):
     }
 
 
+def test_the_listing_carries_the_acceptance_provenance(db):
+    """0024's down migration tells the operator to keep
+    `dq list --state accepted --detail --json` before dropping the columns, because
+    that is the only copy the decisions will have. That is only true if the listing
+    actually carries them."""
+    sid = _mk(db, "ACPROV")
+    _bars_with_a_hole(db, sid)
+    checks.check_gaps(db, exchange_code="NASDAQ")
+    (flag,) = _open_gap_ids(db, sid)
+    repo.accept_dq_flags(
+        db,
+        repo.DqFilter(state="open", flag_ids=(flag,)),
+        note="vendor has no bar for this session",
+        accepted_by="tester",
+    )
+
+    (row,) = repo.list_dq_flags(db, repo.DqFilter(state="accepted"), limit=10)
+    assert row["accepted_at"] is not None
+    assert row["accepted_by"] == "tester"
+    assert row["accepted_note"] == "vendor has no bar for this session"
+
+
+def test_accepting_a_quarantine_flag_does_not_suppress_it(db):
+    """The one family acceptance cannot suppress, pinned so the claim stays honest.
+
+    The loader writes `price_<reason>` on a REJECTED bar through `add_dq_flag`,
+    which has no dedupe probe by design: `count_price_quarantines` counts the
+    repeats to decide when a persistently-bad bar has held the watermark long
+    enough, so a probe there would freeze that counter behind the bar forever.
+    Accepting clears the backlog; it does not stop the next read re-flagging it.
+    """
+    sid = _mk(db, "ACQTN")
+    key = {"symbol": "ACQTN", "date": "2024-06-05"}
+    repo.add_dq_flag(
+        db,
+        check_name="price_subresolution_price",
+        severity="warn",
+        security_id=sid,
+        record_key=key,
+    )
+    open_ids = [
+        int(r["dq_flag_id"])
+        for r in db.fetchall(
+            "SELECT dq_flag_id FROM ops.data_quality_flag WHERE security_id = %s "
+            "AND check_name = 'price_subresolution_price' AND resolved_at IS NULL",
+            (sid,),
+        )
+    ]
+    repo.accept_dq_flags(
+        db,
+        repo.DqFilter(state="open", flag_ids=tuple(open_ids)),
+        note="below the quantize cliff",
+        accepted_by="tester",
+    )
+
+    # The next run re-reads the same bar and re-validates it.
+    repo.add_dq_flag(
+        db,
+        check_name="price_subresolution_price",
+        severity="warn",
+        security_id=sid,
+        record_key=key,
+    )
+    still_open = db.fetchval(
+        "SELECT count(*) FROM ops.data_quality_flag WHERE security_id = %s "
+        "AND check_name = 'price_subresolution_price' AND resolved_at IS NULL",
+        (sid,),
+    )
+    assert still_open == 1, "the quarantine flag is expected back: see the docstring"
+    # And the budget still sees every attempt, accepted or not -- which is the
+    # reason the probe is not there.
+    assert repo.count_price_quarantines(db, sid, "2024-06-05") == 2
+
+
 def test_accepted_flags_are_listed_as_accepted_not_as_resolved(db):
     """Suppressed is not the same as invisible: an operator must be able to ask
     what has been agreed away, without it hiding among ordinary resolutions."""
@@ -302,6 +376,42 @@ class _Cfg:
 
 def _run(db, args):
     return CliRunner().invoke(cli.dq_accept, args, obj={"config": _Cfg(db.dsn)})
+
+
+def test_every_dq_state_has_a_label():
+    """`--state` takes its choices from DQ_STATES, and every listing renders
+    `_dq_label`. A state in one and not the other is a KeyError on the command the
+    feature tells operators to use -- no database needed to catch it."""
+    for state in repo.DQ_STATES:
+        assert cli._dq_label(repo.DqFilter(state=state))
+
+
+def test_dq_list_renders_the_accepted_state(db):
+    """`dq list --state accepted` is named in the command's own output, in its
+    help, and in 0024's down migration as the way to keep the decisions. It has to
+    render in text mode, not just under --json, which takes a different path."""
+    sid = _mk(db, "ACRENDER")
+    _bars_with_a_hole(db, sid)
+    checks.check_gaps(db, exchange_code="NASDAQ")
+    (flag,) = _open_gap_ids(db, sid)
+
+    empty = CliRunner().invoke(
+        cli.dq_list, ["--state", "accepted"], obj={"config": _Cfg(db.dsn)}
+    )
+    assert empty.exit_code == 0, empty.output
+
+    repo.accept_dq_flags(
+        db,
+        repo.DqFilter(state="open", flag_ids=(flag,)),
+        note="vendor has no bar for this session",
+        accepted_by="tester",
+    )
+    for args in (["--state", "accepted"], ["--state", "accepted", "--detail"]):
+        result = CliRunner().invoke(cli.dq_list, args, obj={"config": _Cfg(db.dsn)})
+        assert result.exit_code == 0, result.output
+        # The summary heads with "Accepted DQ flags"; the detail page closes with
+        # "... (accepted)". Either way the state has to reach the output.
+        assert "accepted" in result.output.lower()
 
 
 def test_accept_dry_run_changes_nothing(db):

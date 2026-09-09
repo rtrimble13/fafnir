@@ -1782,7 +1782,15 @@ def _echo_dq_empty(filt) -> None:
 
 
 def _dq_label(filt) -> str:
-    return {"open": "Open", "resolved": "Resolved", "all": "All"}[filt.state]
+    # Keyed off DQ_STATES rather than a literal dict: `--state` takes its choices
+    # from there, so a state added to one and not the other turns every listing of
+    # it into a KeyError -- which is what shipping `accepted` without this line did.
+    return {
+        "open": "Open",
+        "resolved": "Resolved",
+        "accepted": "Accepted",
+        "all": "All",
+    }[filt.state]
 
 
 def _echo_dq_summary(rows, totals, filt) -> None:
@@ -1929,7 +1937,7 @@ def dq_accept(
 
     \b
       fafnir dq accept --check gap --symbol CBFV --dry-run
-      fafnir dq accept --check price_subresolution_price -m "unrepresentable" --yes
+      fafnir dq accept --check gap --security-id 4212 -m "vendor has no 1990s bars"
 
     `dq resolve` says the condition went away. It is judged against the data, so it
     frees the condition's slot and the next `fafnir dq run` writes the flag again if
@@ -1939,8 +1947,17 @@ def dq_accept(
     This says the opposite: the problem IS still there, it always will be, and there
     is nothing to do about it. The checks then skip the condition instead of asking
     again every night. A vendor that has no bars for a security's first decade will
-    not produce them tomorrow; a price below the quantize cliff is unrepresentable,
-    not broken.
+    not produce them tomorrow.
+
+    \b
+    What acceptance does NOT suppress: the `price_<reason>` quarantine flags the
+    loader writes on a rejected bar. Those go through `add_dq_flag`, which has no
+    dedupe probe by design -- `count_price_quarantines` counts their repeats to
+    decide when a persistently-bad bar has held the watermark long enough, and a
+    probe there would freeze that counter behind the bar forever. Accepting them
+    clears the backlog, but re-reading the same bar writes a new flag. Every
+    condition written through `add_dq_flag_once` or one of the checks in
+    `fafnir.dq.checks` is suppressed properly.
 
     Accepting is never automatic and no sweep may do it. `--note` is required, and
     `dq reopen` takes it back. Accepted flags stay visible under
