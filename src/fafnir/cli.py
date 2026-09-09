@@ -1198,6 +1198,170 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
+@security.command("merge")
+@click.argument("victim_id", type=int)
+@click.argument("survivor_id", type=int)
+@click.option(
+    "--note", "-m", help="Why these are one instrument. Kept on the flags it closes."
+)
+@click.option(
+    "--by",
+    "resolved_by",
+    help="Who is merging them  [default: the OS user running the command]",
+)
+@click.option("--dry-run", is_flag=True, help="Show the comparison and change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Merge despite blockers. Read them first; they mean the rows disagree "
+    "about what they describe.",
+)
+@click.pass_context
+def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes, force):
+    """Fold one security row into another, by id, when both are one instrument.
+
+    \b
+      fafnir security merge 264310 18821 --dry-run
+      fafnir security merge 264310 18821 -m "MAPP re-minted after the MATR rename" --yes
+
+    VICTIM_ID is absorbed and deleted; SURVIVOR_ID keeps its id and gains anything
+    the victim held that it did not. On the overlap the survivor wins.
+
+    The two commands either side of this one each assume something about the pair.
+    `security dedupe` groups by ticker, so it cannot see a duplicate that spans two
+    of them -- a rename re-minted on the OLD ticker looks like an unrelated
+    security. `security merge-rename` needs the old ticker to be live, because it
+    is for a rename the sweep has not applied yet. Neither fits a duplicate that is
+    simply a duplicate, which is what a re-mint leaves behind once the rename is
+    already terminal.
+
+    Naming both ids is the whole interface: this command will not guess which row
+    is the keeper, because the guess it would make -- most bars -- is wrong exactly
+    when it matters, on the pair where the newer row has been fed by the daily load
+    and the older one holds the history.
+
+    Refuses on a populated identity mismatch (CUSIP/ISIN/CIK) or disagreeing OHLC.
+    Run --dry-run first: the preview is the same comparison the guard reads.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    if victim_id == survivor_id:
+        raise click.ClickException("VICTIM_ID and SURVIVOR_ID are the same security.")
+    if resolved_by is None:
+        resolved_by = _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = {
+            int(r["security_id"]): r
+            for r in database.fetchall(
+                """
+                SELECT security_id, primary_symbol, company_name, cusip, isin, cik,
+                       is_actively_trading, delisted_date
+                  FROM core.security WHERE security_id = ANY(%s)
+                """,
+                ([victim_id, survivor_id],),
+            )
+        }
+        for sid in (victim_id, survivor_id):
+            if sid not in rows:
+                raise click.ClickException(f"No such security: {sid}")
+        victim, survivor = rows[victim_id], rows[survivor_id]
+
+        plan = repo.compare_securities(
+            database, survivor_id=survivor_id, victim_id=victim_id
+        )
+        click.echo(
+            f"{victim['primary_symbol']} ({victim['company_name']}) "
+            f"-> {survivor['primary_symbol']} ({survivor['company_name']})"
+        )
+        _echo_merge_plan(plan)
+
+        # compare_securities only reports a mismatch where BOTH sides carry the
+        # field, which is right for deciding whether these are one instrument and
+        # silent about the thing a merge destroys: an identifier only the victim
+        # has goes with its row. The next security-master load rewrites the
+        # survivor's attributes, but it will not rewrite them for a delisted
+        # security the vendor has stopped serving.
+        losing = [
+            f
+            for f in ("cusip", "isin", "cik")
+            if victim[f] is not None and survivor[f] is None
+        ]
+        if losing:
+            click.echo(
+                "WARNING: the victim carries "
+                + ", ".join(f"{f}={victim[f]!r}" for f in losing)
+                + " and the survivor has none. Deleting the victim discards it.",
+                err=True,
+            )
+
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if plan.blockers and not force:
+            raise click.ClickException(
+                "Refusing to merge -- see the blockers above. If you have read them "
+                "and this is still one instrument, re-run with --force."
+            )
+        if not yes:
+            click.confirm(
+                f"Merge security {victim_id} into {survivor_id} and delete "
+                f"{victim_id}?",
+                abort=True,
+            )
+
+        report = repo.merge_security(
+            database, victim_id=victim_id, survivor_id=survivor_id, force=force
+        )
+        # The survivor's corporate actions may have changed, which makes its factors
+        # stale by construction. merge-rename recomputes for the same reason.
+        adjustments.compute_for_security(database, survivor_id)
+
+        # Close `security_duplicate_identity` only for a ticker that is now actually
+        # single. The flag's condition is "this ticker has more than one row"; a
+        # merge that leaves a third row behind has not made that untrue, and closing
+        # it would free the slot for the next `dq run` to write it straight back.
+        closed: list[int] = []
+        for symbol in {victim["primary_symbol"], survivor["primary_symbol"]}:
+            remaining = int(
+                database.fetchval(
+                    "SELECT count(*) FROM core.security WHERE primary_symbol = %s",
+                    (symbol,),
+                )
+            )
+            if remaining > 1:
+                click.echo(
+                    f"{symbol} still has {remaining} rows; leaving its "
+                    "security_duplicate_identity flag open."
+                )
+                continue
+            flag_ids = repo.open_dq_flag_ids_for_record(
+                database,
+                check_name="security_duplicate_identity",
+                record_key={"symbol": symbol},
+            )
+            if flag_ids:
+                closed += repo.resolve_dq_flags(
+                    database,
+                    repo.DqFilter(state="open", flag_ids=tuple(flag_ids)),
+                    note=note or f"merged duplicate {victim_id} into {survivor_id}",
+                    resolved_by=resolved_by,
+                )
+        database.commit()
+
+    click.echo(
+        f"Moved {report.bars_moved} bars ({report.bars_dropped} duplicated), "
+        f"{report.actions_moved} actions ({report.actions_dropped} duplicated), "
+        f"{report.flags_moved} flags ({report.flags_dropped} duplicated)."
+    )
+    click.echo(f"Security {victim_id} is gone. Adjustment factors recomputed.")
+    if closed:
+        click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
 @security.command("dismiss-rename")
 @click.argument("old_symbol")
 @click.argument("new_symbol")

@@ -793,3 +793,146 @@ def test_a_group_whose_rows_name_different_companies_is_refused(db):
 
     assert result.exit_code == 0, _text(result)
     assert _security_ids(db, "DNAME") == {dead, newcomer}
+
+
+# ---------------------------------------------------------------------------
+# `security merge` -- the pair neither sibling command can reach
+# ---------------------------------------------------------------------------
+
+
+def _sec_ids(db, *symbols):
+    return {
+        int(r["security_id"])
+        for r in db.fetchall(
+            "SELECT security_id FROM core.security WHERE primary_symbol = ANY(%s)",
+            (list(symbols),),
+        )
+    }
+
+
+def test_merge_folds_a_duplicate_that_spans_two_tickers(db):
+    """The MAPP/MATR shape: a rename re-minted on the OLD ticker after it applied.
+
+    `dedupe` groups by primary_symbol so it never pairs these, and `merge-rename`
+    needs the old ticker live. This is the case that had no command.
+    """
+    survivor = _mk_security(db, "NEWT", cusip="41151J836")
+    _bars(db, survivor, 6)
+    victim = _mint_duplicate(db, "OLDT", delisted=dt.date(2024, 6, 30))
+    _bars(db, victim, 4)
+
+    result = _run(db, cli.security_merge, [str(victim), str(survivor), "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert _sec_ids(db, "OLDT") == set()
+    assert _sec_ids(db, "NEWT") == {survivor}
+    assert len(_bar_dates(db, survivor)) == 6
+
+
+def test_merge_refuses_a_row_against_itself(db):
+    sid = _mk_security(db, "SELF")
+    result = _run(db, cli.security_merge, [str(sid), str(sid), "--yes"])
+    assert result.exit_code != 0
+    assert "same security" in _text(result)
+
+
+def test_merge_refuses_an_unknown_id(db):
+    sid = _mk_security(db, "KNOWN")
+    result = _run(db, cli.security_merge, ["999999999", str(sid), "--yes"])
+    assert result.exit_code != 0
+    assert "No such security" in _text(result)
+
+
+def test_merge_dry_run_changes_nothing(db):
+    survivor = _mk_security(db, "DRYA")
+    _bars(db, survivor, 5)
+    victim = _mint_duplicate(db, "DRYB")
+    _bars(db, victim, 5)
+
+    result = _run(db, cli.security_merge, [str(victim), str(survivor), "--dry-run"])
+
+    assert result.exit_code == 0, _text(result)
+    assert "Dry run" in _text(result)
+    assert _sec_ids(db, "DRYA", "DRYB") == {survivor, victim}
+
+
+def test_merge_refuses_disagreeing_ohlc_without_force(db):
+    survivor = _mk_security(db, "DISA")
+    _bars(db, survivor, 5, close=100.0)
+    victim = _mint_duplicate(db, "DISB")
+    _bars(db, victim, 5, close=7.0)
+
+    result = _run(db, cli.security_merge, [str(victim), str(survivor), "--yes"])
+
+    assert result.exit_code != 0
+    assert "BLOCKER" in _text(result)
+    assert victim in _sec_ids(db, "DISB")
+
+
+def test_merge_force_overrides_the_guard(db):
+    survivor = _mk_security(db, "FRCA")
+    _bars(db, survivor, 5, close=100.0)
+    victim = _mint_duplicate(db, "FRCB")
+    _bars(db, victim, 5, close=7.0)
+
+    result = _run(
+        db, cli.security_merge, [str(victim), str(survivor), "--yes", "--force"]
+    )
+
+    assert result.exit_code == 0, _text(result)
+    assert _sec_ids(db, "FRCB") == set()
+
+
+def test_merge_warns_when_an_identifier_only_the_victim_has_will_be_lost(db):
+    """compare_securities is silent here: it only reports a mismatch where BOTH
+    sides carry the field, so a victim-only CUSIP is invisible to the guard and
+    goes with the deleted row."""
+    survivor = _mk_security(db, "LOSA")
+    _bars(db, survivor, 5)
+    victim = _mint_duplicate(db, "LOSB")
+    _bars(db, victim, 5)
+    db.execute(
+        "UPDATE core.security SET cusip = %s WHERE security_id = %s",
+        ("999999999", victim),
+    )
+
+    result = _run(db, cli.security_merge, [str(victim), str(survivor), "--dry-run"])
+
+    assert result.exit_code == 0, _text(result)
+    assert "WARNING" in _text(result)
+    assert "999999999" in _text(result)
+
+
+def test_merge_closes_the_identity_flag_only_when_the_ticker_is_single(db):
+    keeper = _mk_security(db, "TRIO")
+    _bars(db, keeper, 5)
+    second = _mint_duplicate(db, "TRIO")
+    _bars(db, second, 5)
+    third = _mint_duplicate(db, "TRIO")
+    repo.add_dq_flag_once(
+        db,
+        check_name="security_duplicate_identity",
+        security_id=keeper,
+        record_key={"symbol": "TRIO"},
+    )
+
+    def _flag_open():
+        return bool(
+            repo.open_dq_flag_ids_for_record(
+                db,
+                check_name="security_duplicate_identity",
+                record_key={"symbol": "TRIO"},
+            )
+        )
+
+    # Two of three folded: the ticker still has more than one row, so the
+    # condition the flag describes is still true and it must stay open.
+    result = _run(db, cli.security_merge, [str(second), str(keeper), "--yes"])
+    assert result.exit_code == 0, _text(result)
+    assert _flag_open()
+    assert "still has 2 rows" in _text(result)
+
+    # The last duplicate goes: now it is single, and the flag may close.
+    result = _run(db, cli.security_merge, [str(third), str(keeper), "--yes"])
+    assert result.exit_code == 0, _text(result)
+    assert not _flag_open()
