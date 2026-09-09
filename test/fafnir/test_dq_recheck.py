@@ -16,6 +16,7 @@ from click.testing import CliRunner
 
 from fafnir import cli
 from fafnir.db import repository as repo
+from fafnir.dq import checks
 from fafnir.dq import recheck as rc
 
 # ---------------------------------------------------------------------------
@@ -148,11 +149,24 @@ def test_gap_flag_clears_when_the_calendar_closes_the_session(db):
 
     assert flag not in _stale_ids(db, "gap")
 
+    # ref.trading_calendar is seeded reference data and survives the per-test
+    # truncation, so this edit has to be put back or it leaks into every test that
+    # runs after it and into every later run against the same database. Scoped to
+    # the one exchange for the same reason: unqualified, it shuts that session on
+    # all six.
     db.execute(
-        "UPDATE ref.trading_calendar SET is_open = FALSE WHERE trade_date = %s",
-        (dt.date(2024, 6, 5),),
+        "UPDATE ref.trading_calendar SET is_open = FALSE "
+        " WHERE exchange_code = %s AND trade_date = %s",
+        ("NASDAQ", dt.date(2024, 6, 5)),
     )
-    assert flag in _stale_ids(db, "gap")
+    try:
+        assert flag in _stale_ids(db, "gap")
+    finally:
+        db.execute(
+            "UPDATE ref.trading_calendar SET is_open = TRUE "
+            " WHERE exchange_code = %s AND trade_date = %s",
+            ("NASDAQ", dt.date(2024, 6, 5)),
+        )
 
 
 @pytest.mark.integration
@@ -206,7 +220,18 @@ def test_sparse_coverage_clears_when_the_security_becomes_dense(db):
     ]
     for d in days[::3]:  # ~33% density
         _bar(db, sid, d)
-    flag = _flag(db, check="sparse_coverage", sid=sid, record_key={}, severity="info")
+    # Written by check_gaps itself rather than by hand. Its sparse flag carries an
+    # empty record_key as `'{}'::jsonb`, and `add_dq_flag_once` cannot produce that
+    # row -- it maps a falsy record_key to NULL -- so a hand-built flag here would
+    # be a shape the warehouse never holds.
+    checks.check_gaps(db)
+    flag = int(
+        db.fetchval(
+            "SELECT dq_flag_id FROM ops.data_quality_flag "
+            "WHERE check_name = 'sparse_coverage' AND security_id = %s",
+            (sid,),
+        )
+    )
     assert flag not in _stale_ids(db, "sparse_coverage")
 
     for d in days:  # fill it in: now 100%
