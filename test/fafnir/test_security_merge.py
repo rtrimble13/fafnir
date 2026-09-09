@@ -903,11 +903,37 @@ def test_merge_warns_when_an_identifier_only_the_victim_has_will_be_lost(db):
     assert "999999999" in _text(result)
 
 
+def test_merge_reports_a_late_blocker_instead_of_a_traceback(db, monkeypatch):
+    """The comparison and the merge each run their own guard, with the confirmation
+    between them. If the rows change in that window the second guard fires on a
+    merge the first one cleared, and that must read like the refusal it is."""
+    survivor = _mk_security(db, "LATEA")
+    _bars(db, survivor, 5)
+    victim = _mint_duplicate(db, "LATEB")
+    _bars(db, victim, 5)
+
+    def _refuse(*args, **kwargs):
+        raise repo.MergeRefused("refusing to merge: 3 overlapping days disagree", None)
+
+    monkeypatch.setattr(repo, "merge_security", _refuse)
+    result = _run(db, cli.security_merge, [str(victim), str(survivor), "--yes"])
+
+    assert result.exit_code != 0
+    assert "disagree" in _text(result)
+    assert "changed since the comparison" in _text(result)
+    assert victim in _sec_ids(db, "LATEB")
+
+
 def test_merge_closes_the_identity_flag_only_when_the_ticker_is_single(db):
+    # The re-mint chain, per _mint_duplicate: each mint follows a retirement,
+    # because 0012's ux_security_active_source_symbol allows one LISTED row per
+    # ticker. Three rows minted active is a state the schema has always refused.
     keeper = _mk_security(db, "TRIO")
     _bars(db, keeper, 5)
+    _retire(db, keeper)
     second = _mint_duplicate(db, "TRIO")
     _bars(db, second, 5)
+    _retire(db, second, dt.date(2023, 5, 2))
     third = _mint_duplicate(db, "TRIO")
     repo.add_dq_flag_once(
         db,

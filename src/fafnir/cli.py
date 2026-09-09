@@ -960,9 +960,20 @@ def security_merge_rename(
                 abort=True,
             )
 
-        report = repo.merge_security(
-            database, victim_id=victim_id, survivor_id=survivor_id, force=force
-        )
+        # merge_security re-runs compare_securities and raises on blockers. The plan
+        # above already cleared them, so reaching this means the rows changed while
+        # the confirmation sat open -- a nightly ingest landing a bar the survivor
+        # holds differently is enough. Report it the way the guard would rather than
+        # unwinding as a traceback; `security dedupe` catches the same exception.
+        try:
+            report = repo.merge_security(
+                database, victim_id=victim_id, survivor_id=survivor_id, force=force
+            )
+        except repo.MergeRefused as exc:
+            raise click.ClickException(
+                f"{exc} -- the rows changed since the comparison above. Re-run to "
+                "see the current one."
+            ) from exc
         # Only now does the ticker move: the merge is about identity, the retarget
         # is about the rename, and they carry different dates.
         repo.retarget_symbol(
@@ -1312,9 +1323,20 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
                 abort=True,
             )
 
-        report = repo.merge_security(
-            database, victim_id=victim_id, survivor_id=survivor_id, force=force
-        )
+        # merge_security re-runs compare_securities and raises on blockers. The plan
+        # above already cleared them, so reaching this means the rows changed while
+        # the confirmation sat open -- a nightly ingest landing a bar the survivor
+        # holds differently is enough. Report it the way the guard would rather than
+        # unwinding as a traceback; `security dedupe` catches the same exception.
+        try:
+            report = repo.merge_security(
+                database, victim_id=victim_id, survivor_id=survivor_id, force=force
+            )
+        except repo.MergeRefused as exc:
+            raise click.ClickException(
+                f"{exc} -- the rows changed since the comparison above. Re-run to "
+                "see the current one."
+            ) from exc
         # The survivor's corporate actions may have changed, which makes its factors
         # stale by construction. merge-rename recomputes for the same reason.
         adjustments.compute_for_security(database, survivor_id)
