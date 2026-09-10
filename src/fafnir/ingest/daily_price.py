@@ -442,6 +442,29 @@ def _drop_non_session(
     return kept, dropped
 
 
+def _window_start(
+    start_date: Optional[date],
+    watermark: Optional[date],
+    overlap_days: int,
+    backfill_start: Optional[date],
+) -> Optional[date]:
+    """The first date to ask the vendor for.
+
+    An explicit window wins; a symbol with a watermark resumes from it, less the
+    overlap that catches late corrections; a symbol with neither is being loaded for
+    the first time and starts at ``backfill_start``. Asking with no start at all is
+    not "everything": FMP applies its own default window of about five years, which
+    is how GBF, DDI and MRT -- loaded after the initial backfill, without ``--from``
+    -- came to hold histories starting 2021-08-30..09-02 while their dividends went
+    back decades. None only when the caller gave no ``backfill_start`` either.
+    """
+    if start_date is not None:
+        return start_date
+    if watermark is not None:
+        return watermark - timedelta(days=overlap_days)
+    return backfill_start
+
+
 def load_symbol_prices(
     db: Database,
     fmp: FMPClient,
@@ -452,12 +475,14 @@ def load_symbol_prices(
     end_date: Optional[date] = None,
     overlap_days: int = 5,
     stats: Optional[dict] = None,
+    backfill_start: Optional[date] = None,
 ) -> int:
     """Load one symbol's prices within the (incremental) window.
 
     Returns rows upserted. ``stats``, when given, accumulates outcomes that only mean
     something in aggregate -- see :func:`load_prices`, which uses them to tell a
-    genuinely empty load apart from a successful one.
+    genuinely empty load apart from a successful one. ``backfill_start`` is where a
+    symbol with no watermark starts (see :func:`_window_start`).
     """
 
     def _tally(key: str) -> None:
@@ -478,8 +503,7 @@ def load_symbol_prices(
 
     if start_date is None:
         wm = repo.get_watermark(db, "fmp", ENDPOINT, sec_id)
-        if wm is not None:
-            start_date = wm - timedelta(days=overlap_days)
+        start_date = _window_start(None, wm, overlap_days, backfill_start)
 
     bars = fmp.eod_raw(
         symbol,
@@ -668,8 +692,12 @@ def load_prices(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     overlap_days: int = 5,
+    backfill_start: Optional[date] = None,
 ) -> int:
     """Load prices for many symbols.
+
+    ``backfill_start`` is where a symbol loaded for the first time (no watermark, no
+    explicit window) starts; the CLI passes the configured calendar_start_year.
 
     Raises rather than returning a quiet zero when the load cannot have worked.
     A run that reports success having written nothing is the most expensive kind
@@ -704,6 +732,7 @@ def load_prices(
                 end_date=end_date,
                 overlap_days=overlap_days,
                 stats=stats,
+                backfill_start=backfill_start,
             )
             # One symbol -- its landing payload, bars, DQ flags and watermark --
             # is the unit of work. Committing here is what makes the backfill

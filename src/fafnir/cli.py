@@ -373,6 +373,9 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
             start_date=_parse_date(from_date),
             end_date=_parse_date(to_date),
             overlap_days=cfg.overlap_days,
+            # A symbol with no watermark is new to the warehouse and gets its whole
+            # history, not FMP's default ~5-year window.
+            backfill_start=dt.date(cfg.calendar_start_year, 1, 1),
         )
     click.echo(
         f"Loaded {n} price rows for {len(syms)} symbols. "
