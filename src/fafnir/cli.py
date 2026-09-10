@@ -1137,6 +1137,10 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
                 abort=True,
             )
 
+        # Collected and printed after the commit: an echo from inside this loop is
+        # a stdout write mid-transaction, and a closed pipe there rolls back every
+        # fold already made (see dq_resolve).
+        skip_lines: list[str] = []
         for g in actionable:
             survivor = g.survivor_id
             actions_moved = False
@@ -1154,7 +1158,7 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
                         # leave it and say so rather than reaching for the merge.
                         skipped += 1
                         left_behind += 1
-                        click.echo(
+                        skip_lines.append(
                             f"  SKIP {g.symbol} {victim.security_id}: gained "
                             "history since it was listed"
                         )
@@ -1166,7 +1170,7 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
                 except repo.MergeRefused as exc:
                     skipped += 1
                     left_behind += 1
-                    click.echo(f"  SKIP {g.symbol} {victim.security_id}: {exc}")
+                    skip_lines.append(f"  SKIP {g.symbol} {victim.security_id}: {exc}")
                     continue
                 merged += 1
                 rows_deleted += 1
@@ -1203,6 +1207,8 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
             )
         database.commit()
 
+    for line in skip_lines:
+        click.echo(line)
     click.echo(
         f"Folded {folded} empty rows, merged {merged} rows carrying actions, "
         f"skipped {skipped}."
@@ -1349,6 +1355,10 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         # merge that leaves a third row behind has not made that untrue, and closing
         # it would free the slot for the next `dq run` to write it straight back.
         closed: list[int] = []
+        # Reported after the commit, not from inside the merge: a line printed
+        # here is a write to stdout between the delete and the commit, and a
+        # closed pipe at that moment rolls the whole merge back (see dq_resolve).
+        still_forked: list[str] = []
         for symbol in {victim["primary_symbol"], survivor["primary_symbol"]}:
             remaining = int(
                 database.fetchval(
@@ -1357,7 +1367,7 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
                 )
             )
             if remaining > 1:
-                click.echo(
+                still_forked.append(
                     f"{symbol} still has {remaining} rows; leaving its "
                     "security_duplicate_identity flag open."
                 )
@@ -1376,6 +1386,8 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
                 )
         database.commit()
 
+    for line in still_forked:
+        click.echo(line)
     click.echo(
         f"Moved {report.bars_moved} bars ({report.bars_dropped} duplicated), "
         f"{report.actions_moved} actions ({report.actions_dropped} duplicated), "
@@ -2333,6 +2345,12 @@ def dq_resolve(
         closed = repo.resolve_dq_flags(
             database, filt, note=note, resolved_by=resolved_by
         )
+        # Durable before a word of it is printed. The connection otherwise commits
+        # only when this block exits cleanly, after the summary below -- so a
+        # reader that stops early (`| head -2`) broke the pipe on the third line
+        # and rolled back a resolve that had already printed its success. That
+        # happened to 81 flags on 2026-09-10.
+        database.commit()
         click.echo(f"Resolved {_plural(len(closed), 'flag')} as {resolved_by}.")
         if note:
             click.echo(f'Note: "{note}"')
@@ -2479,6 +2497,8 @@ def dq_reopen(ctx, flag_ids):
 
     with Database(ctx.obj["config"].dsn) as database:
         reopened, conflicted = repo.reopen_dq_flags(database, flag_ids)
+        # Durable before it is reported -- see dq_resolve.
+        database.commit()
         missing = [
             i for i in flag_ids if i not in set(reopened) and i not in set(conflicted)
         ]
