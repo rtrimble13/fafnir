@@ -53,3 +53,19 @@ def test_a_fund_is_nav_priced_whatever_its_asset_type():
     assert checks.NAV_PRICED_PREDICATE in db.sql
     # Grouped on, or the HAVING that reads it would not compile.
     assert "s.is_fund" in db.sql.split("GROUP BY", 1)[1].split("HAVING", 1)[0]
+
+
+def test_the_nav_rule_matches_the_loaders():
+    """An ETF the master also marks is_fund trades in sessions: no NAV slack.
+
+    The loader answers the same question in daily_price._is_nav_priced. Two
+    definitions of "fund" in one warehouse would let a security be a NAV strike to
+    the loader and a session close to the freshness check.
+    """
+    from fafnir.ingest import daily_price
+
+    assert set(checks.SESSION_TRADED_ASSET_TYPES) == set(
+        daily_price.SESSION_TRADED_ASSET_TYPES
+    )
+    for asset_type in checks.SESSION_TRADED_ASSET_TYPES:
+        assert f"'{asset_type}'" in checks.NAV_PRICED_PREDICATE

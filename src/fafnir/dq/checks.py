@@ -85,8 +85,9 @@ GAP_MIN_SESSIONS_FOR_DENSITY = 60
 # a handful of symbols would be the more expensive fix.
 #
 # The allowance is also granted to any security whose master row carries is_fund,
-# whatever its asset_type. The screener stores funds as 'equity' -- all 5,097 on this
-# warehouse -- so an allowance keyed on asset_type alone never fired for any of them.
+# unless its asset_type trades in sessions (SESSION_TRADED_ASSET_TYPES, below). The
+# screener stores funds as 'equity' -- all 5,097 on this warehouse -- so an allowance
+# keyed on asset_type alone never fired for any of them.
 NAV_LAGGING_ASSET_TYPES = ("fund",)
 NAV_LAG_TRADING_DAYS = 1
 
@@ -160,8 +161,20 @@ cutoff AS (
 )
 """
 
-# Whether the security aliased ``s`` is priced at a NAV. Binds the asset types.
-NAV_PRICED_PREDICATE = "(s.is_fund OR s.asset_type = ANY(%s::text[]))"
+# Asset types that trade in exchange sessions even when the master also marks the
+# row is_fund: an ETF prints a session close, not a NAV struck after it. Kept equal
+# to fafnir.ingest.daily_price.SESSION_TRADED_ASSET_TYPES -- a test pins the two --
+# so the loader and this check agree on which securities are NAV-priced.
+SESSION_TRADED_ASSET_TYPES = ("etf",)
+
+# Whether the security aliased ``s`` is priced at a NAV: a NAV asset type, or is_fund
+# on anything that does not trade in sessions -- the loader's _is_nav_priced rule.
+# COALESCE keeps a fund with no asset_type NAV-priced here as it is there. Binds the
+# NAV asset types; the session-traded types are literals from the constant above.
+NAV_PRICED_PREDICATE = (
+    "(s.asset_type = ANY(%s::text[]) OR (s.is_fund AND COALESCE(s.asset_type, '') "
+    "NOT IN (" + ", ".join(f"'{t}'" for t in SESSION_TRADED_ASSET_TYPES) + ")))"
+)
 
 
 def freshness_cutoff_params(exchange_code: str) -> tuple:
