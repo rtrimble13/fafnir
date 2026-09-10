@@ -617,12 +617,18 @@ sudo -u fafnir -H python3 -m venv /opt/fafnir/.venv
 sudo -u fafnir -H /opt/fafnir/.venv/bin/pip install --upgrade pip
 sudo -u fafnir -H /opt/fafnir/.venv/bin/pip install -e /opt/fafnir
 
-sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir --version    # 0.1.0
-sudo -u fafnir -H /opt/fafnir/.venv/bin/duk --version       # 1.1.0
+sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir --version    # e.g. 0.1.0
+sudo -u fafnir -H /opt/fafnir/.venv/bin/duk --version       # the same number
+sudo -u fafnir -H git -C /opt/fafnir describe --tags        # e.g. v0.1.0
 ```
 
 (`-H` gives pip a writable cache under `/var/lib/fafnir` instead of the calling user's
 home.)
+
+All three CLIs report the same number: one repository, one version (ADR 0011). The
+`git describe` line is the cross-check — it names the tag the checkout is on, and the
+`v` prefix belongs to the tag alone. Upgrading later is a `git pull`; see
+[Releasing and upgrading](releasing.md).
 
 Add `dev` extras (`pip install -e '/opt/fafnir[dev]'`) only if you intend to run the
 test suite on the server.

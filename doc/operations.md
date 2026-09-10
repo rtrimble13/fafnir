@@ -463,6 +463,20 @@ the compared window is not by itself a reason for the two to disagree.
 - **Re-run adjustments** — `fafnir adjust` (whole universe) or `fafnir adjust --symbol AAPL`.
   Run it after any price reload as well as after an actions load: dividend factors
   are valued against the prior raw close, so new prices can change them.
+- **Upgrade the deployed code** — `git -C /opt/fafnir pull`, then reinstall only if
+  dependencies changed and `fafnir db migrate` only if `sql/migrations/` gained a
+  file. Full procedure, including which of `fafnir --version`, `git describe` and
+  `pip show` to trust: [releasing.md](releasing.md). To ask what is deployed right
+  now:
+
+  ```bash
+  sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir --version   # the code on disk
+  sudo -u fafnir -H git -C /opt/fafnir describe --tags       # the commit, e.g. v0.2.0
+  ```
+
+  A `v0.2.0-3-gabc1234` from `describe` means three commits past the tag — the host
+  is on something between releases, which is worth knowing before you conclude a
+  defect is unfixed.
 
 ## Recovery
 

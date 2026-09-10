@@ -25,7 +25,7 @@ testable without the SDK installed, and confines an SDK version bump to one file
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+from fafnir import __version__  # one repository, one version -- see ADR 0011
 
 #: The profiles a server can be started with. Order is meaningful: each is a
 #: superset of the one before it.

@@ -1,0 +1,66 @@
+name: version
+
+# A tag is a promise that a particular commit is a particular version. Nothing
+# enforces that by itself: `git tag v9.9.9` on any commit succeeds, and the mistake
+# is invisible until someone deploys and `fafnir --version` disagrees with the tag
+# they thought they shipped.
+#
+# This job is the enforcement. It runs on every version tag, installs the tagged
+# commit the way the host does, and refuses the tag if the code does not say what
+# the tag says. scripts/release.sh keeps the two in step on the way out; this is
+# what catches a tag pushed by hand.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  tag-matches-the-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installed, not just imported: this is also what proves the pyproject
+      # `dynamic = ["version"]` wiring reads the source constant, which is the one
+      # link the source-only tests cannot check.
+      - name: Install package
+        run: pip install -e .[dev]
+
+      - name: The tag, the source and the distribution metadata must agree
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          SOURCE="$(python -c 'import fafnir; print(fafnir.__version__)')"
+          DIST="$(python -c 'import importlib.metadata as m; print(m.version("fafnir"))')"
+
+          echo "tag      : ${TAG}"
+          echo "source   : ${SOURCE}"
+          echo "metadata : ${DIST}"
+
+          if [ "${TAG}" != "v${SOURCE}" ]; then
+            echo "::error::Tag ${TAG} does not match fafnir.__version__ (${SOURCE})." \
+                 "Delete the tag, run scripts/release.sh, and push what it makes." >&2
+            exit 1
+          fi
+          if [ "${DIST}" != "${SOURCE}" ]; then
+            echo "::error::Distribution metadata (${DIST}) does not match the source" \
+                 "constant (${SOURCE}). The pyproject dynamic-version wiring is broken." >&2
+            exit 1
+          fi
+          echo "OK: ${TAG} names code that says ${SOURCE}."
+
+      # The same assertions a developer sees locally, including the ones the release
+      # script has to defer -- here the install is fresh, so nothing is deselected.
+      - name: Version consistency tests
+        run: pytest test/fafnir/test_version.py -v
+
+      - name: Every CLI reports the tagged version
+        run: |
+          set -euo pipefail
+          for cli in fafnir duk fafnir-mcp; do
+            printf '%-12s %s\n' "${cli}" "$("${cli}" --version)"
+            test "$("${cli}" --version)" = "${GITHUB_REF_NAME#v}"
+          done
+          echo "OK: all three CLIs agree with the tag."
