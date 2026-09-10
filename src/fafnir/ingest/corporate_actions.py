@@ -570,11 +570,19 @@ def _redated_dividends(withdrawn: dict, feed: dict) -> dict:
 
     ``withdrawn`` is ``{ex_date: amount}`` for settled stored dividends the per-symbol
     feed no longer carries; ``feed`` is ``{ex_date: amount}`` for every dividend it
-    does. A withdrawn dividend is a re-dated copy when the feed carries one within
-    :data:`REDATE_WINDOW_DAYS` whose amount agrees within
+    does. A withdrawn dividend is a re-dated copy when the feed carries **exactly
+    one** dividend within :data:`REDATE_WINDOW_DAYS` whose amount agrees within
     :data:`REDATE_AMOUNT_TOLERANCE`: the two feeds dated one distribution
-    differently, and the upsert kept both. The nearest such date wins, so a dividend
-    moved by two days is not paired with a neighbour five days off.
+    differently, and the upsert kept both.
+
+    Exactly one, not the nearest of several. This is the only inference in the
+    reconciliation that *deletes*, so it may only run where the pairing is
+    unambiguous. A security whose distributions fall closer together than the window
+    -- a money-market fund accruing daily -- has a matching neighbour on either side
+    of any dividend the feed happens to drop, and "the nearest one" would pick one of
+    them and delete a real distribution. Two candidates mean the shape does not tell
+    a re-dating from a dropped row, so nothing is deleted and the dividend stays
+    withdrawn: reported, and still there for an operator to judge.
 
     Everything else stays withdrawn -- reported, never deleted. The feed drops real
     dividends too: TLT's July distribution vanished from its per-symbol payload in
@@ -584,15 +592,15 @@ def _redated_dividends(withdrawn: dict, feed: dict) -> dict:
     """
     moved: dict = {}
     for old, amount in withdrawn.items():
-        best = None
-        for new, fed in feed.items():
-            gap = abs((new - old).days)
-            if new == old or gap > REDATE_WINDOW_DAYS or not _same_amount(amount, fed):
-                continue
-            if best is None or gap < abs((best - old).days):
-                best = new
-        if best is not None:
-            moved[old] = best
+        candidates = [
+            new
+            for new, fed in feed.items()
+            if new != old
+            and abs((new - old).days) <= REDATE_WINDOW_DAYS
+            and _same_amount(amount, fed)
+        ]
+        if len(candidates) == 1:
+            moved[old] = candidates[0]
     return moved
 
 

@@ -755,11 +755,27 @@ def test_redated_dividends_pairs_only_close_dates_with_matching_amounts():
     }
 
 
-def test_redated_dividends_prefers_the_nearest_feed_date():
+def test_redated_dividends_declines_an_ambiguous_pairing():
+    """Two candidates in the window are not evidence of a re-dating.
+
+    A fund accruing daily has a matching neighbour on either side of any dividend
+    the feed drops, so picking the nearest would delete a real distribution. This is
+    the only inference in the reconciliation that deletes; it only runs on a pair.
+    """
+    assert (
+        ca._redated_dividends(
+            {date(2026, 9, 7): 0.95334},
+            {date(2026, 9, 3): 0.95, date(2026, 9, 8): 0.95},
+        )
+        == {}
+    )
+
+
+def test_redated_dividends_still_pairs_a_lone_match_at_the_same_distance():
+    """The guard is about ambiguity, not distance: one candidate still pairs."""
     assert ca._redated_dividends(
-        {date(2026, 9, 7): 0.95334},
-        {date(2026, 9, 3): 0.95, date(2026, 9, 8): 0.95},
-    ) == {date(2026, 9, 7): date(2026, 9, 8)}
+        {date(2026, 9, 7): 0.95334}, {date(2026, 9, 3): 0.95}
+    ) == {date(2026, 9, 7): date(2026, 9, 3)}
 
 
 def test_redated_dividends_respects_the_window_and_tolerance_edges():
