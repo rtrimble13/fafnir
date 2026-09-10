@@ -275,6 +275,30 @@ def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> boo
     return True
 
 
+def security_bar_span(
+    db: Database, security_id: int
+) -> tuple[Optional[date], Optional[date]]:
+    """The security's first and last stored bar dates, or (None, None) with no bars.
+
+    Two ORDER BY ... LIMIT 1 probes rather than min()/max(): each is an index scan
+    per partition that stops at its first row, which is what keeps this cheap enough
+    to ask once per delisting the nightly sweep considers.
+    """
+    row = db.fetchone(
+        """
+        SELECT
+            (SELECT trade_date FROM core.daily_price
+              WHERE security_id = %s ORDER BY trade_date ASC LIMIT 1)  AS first_bar,
+            (SELECT trade_date FROM core.daily_price
+              WHERE security_id = %s ORDER BY trade_date DESC LIMIT 1) AS last_bar
+        """,
+        (security_id, security_id),
+    )
+    if row is None:
+        return None, None
+    return row["first_bar"], row["last_bar"]
+
+
 def upsert_company_profile(
     db: Database,
     *,

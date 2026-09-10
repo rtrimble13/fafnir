@@ -35,6 +35,13 @@ logger = get_logger("ingest.delisted")
 
 ENDPOINT = "delisted-companies"
 
+# How long a security may go on printing bars after the delisting date the feed
+# reports and still be the security that delisted. The nightly sweep reads the tail
+# of the feed, which lags a delisting by days to weeks, and the price step keeps
+# loading the name until it is marked -- so a genuine delisting can arrive with a
+# few weeks of bars after it. Years of them cannot.
+TRADED_AFTER_GRACE_DAYS = 30
+
 
 def _parse_date(value) -> Optional[date]:
     if not value:
@@ -46,6 +53,41 @@ def _parse_date(value) -> Optional[date]:
         return None
 
 
+def delisting_contradicted(
+    delisted: date, first_bar: Optional[date], last_bar: Optional[date]
+) -> Optional[str]:
+    """Why a delisting cannot describe the security now holding the ticker, or None.
+
+    The feed reports delistings by ticker, and a ticker outlives its issuer: FMP's
+    list still carries the 2018 delisting of an earlier CMDT, and applied by ticker
+    it lands on whoever trades as CMDT today. Production, 2026-09: PIMCO's CMDT fund
+    (bars 2023-05-11 onwards) stamped delisted 2018-10-10; WBIF delisted 2019-10-25
+    with bars to 2026-08; RDFI delisted 2024-02-29 with bars to 2026-08; PHOS
+    delisted 2026-03-18 with its first bar on 2026-07-20. Each live fund left the
+    active universe, the next security-master load minted it a second row, and the
+    ticker forked -- five open ``security_duplicate_identity`` flags that no command
+    could fold.
+
+    Two contradictions, both read off the security's own bars:
+
+    * ``precedes_first_bar`` -- the delisting happened before this security ever
+      traded. It is some earlier holder's.
+    * ``traded_after`` -- the security kept printing bars for more than
+      :data:`TRADED_AFTER_GRACE_DAYS` after it. A security that delisted has no
+      such history. The one legitimate way to get it is a name that left the
+      exchange and kept trading under the same ticker elsewhere; declining to mark
+      that keeps a trading security loading, which is the cheaper error, and the
+      warning names it for a human.
+
+    A security with no bars contradicts nothing and is marked as before.
+    """
+    if first_bar is not None and delisted < first_bar:
+        return "precedes_first_bar"
+    if last_bar is not None and (last_bar - delisted).days > TRADED_AFTER_GRACE_DAYS:
+        return "traded_after"
+    return None
+
+
 def load_delisted(
     db: Database,
     fmp: FMPClient,
@@ -53,7 +95,11 @@ def load_delisted(
     max_pages: int = 5,
     exchanges: Iterable[str] = SCREENER_EXCHANGES,
 ) -> tuple[int, int]:
-    """Mark newly delisted securities. Returns (marked, seen_for_our_venues)."""
+    """Mark newly delisted securities. Returns (marked, seen_for_our_venues).
+
+    A delisting the security's own bars contradict is declined, counted as the
+    run's ``rows_quarantined`` and logged -- see :func:`delisting_contradicted`.
+    """
     wanted = {_norm_exchange({"exchangeShortName": code}) for code in exchanges} - {
         None
     }
@@ -68,6 +114,7 @@ def load_delisted(
         marked = 0
         seen = 0
         undated = 0
+        declined = 0
         for row in rows:
             symbol = (row.get("symbol") or "").strip()
             exchange = _norm_exchange(row)
@@ -96,6 +143,24 @@ def load_delisted(
                 # count it, because a large number here means the security master
                 # is running behind the delisted feed.
                 continue
+            # "Currently trading under that ticker" is necessary, not sufficient: the
+            # security holding the ticker today may not be the one that delisted.
+            # mark_delisted is one-way, so this is the last point it can be caught.
+            first_bar, last_bar = repo.security_bar_span(db, sec_id)
+            reason = delisting_contradicted(when, first_bar, last_bar)
+            if reason is not None:
+                declined += 1
+                logger.warning(
+                    "%s (%s): not applying delisting dated %s -- %s (bars %s..%s); "
+                    "the feed's record describes an earlier holder of the ticker",
+                    symbol,
+                    exchange,
+                    when,
+                    reason,
+                    first_bar,
+                    last_bar,
+                )
+                continue
             if repo.mark_delisted(db, security_id=sec_id, delisted_date=when):
                 marked += 1
                 db.commit()
@@ -103,13 +168,16 @@ def load_delisted(
 
         run.symbols_requested = seen
         run.rows_inserted = marked
+        run.rows_quarantined = declined
         run.bytes_downloaded = fmp.bytes_downloaded
         if undated:
             logger.warning("%d delisted rows had no usable delistedDate", undated)
         logger.info(
-            "Delisting sweep: %d rows, %d on our venues, %d newly marked",
+            "Delisting sweep: %d rows, %d on our venues, %d newly marked, "
+            "%d declined as contradicted by the security's own bars",
             len(rows),
             seen,
             marked,
+            declined,
         )
         return marked, seen
