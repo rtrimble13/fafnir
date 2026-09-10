@@ -1415,6 +1415,50 @@ def security_asset_type(db: Database, security_id: int) -> Optional[str]:
     return str(val) if val is not None else None
 
 
+def security_price_profile(db: Database, security_id: int) -> Optional[dict]:
+    """What the price loader needs to know about a security before reading its bars.
+
+    ``asset_type`` and ``is_fund`` decide whether a bar is judged as an exchange
+    session or a NAV strike; ``exchange_code`` picks the calendar that says which
+    dates were sessions at all. One read per symbol, not per bar. None if the
+    security does not exist.
+    """
+    row = db.fetchone(
+        "SELECT asset_type, is_fund, exchange_code FROM core.security "
+        "WHERE security_id = %s",
+        (security_id,),
+    )
+    return dict(row) if row else None
+
+
+def open_sessions(
+    db: Database, exchange_code: str, start: date, end: date
+) -> Optional[tuple[frozenset, date, date]]:
+    """The open sessions of one venue's calendar between two dates, with its span.
+
+    Returns ``(open_dates, first, last)`` where ``first``/``last`` bound everything
+    ref.trading_calendar holds for the venue -- not just the requested window --
+    because the seed writes open days only: a weekend has no row at all, so "no row"
+    means *closed* inside the calendar's span and *unknown* outside it, and only the
+    span can tell those apart. None when the venue has no calendar rows at all.
+    """
+    bounds = db.fetchone(
+        "SELECT min(trade_date) AS first, max(trade_date) AS last "
+        "FROM ref.trading_calendar WHERE exchange_code = %s",
+        (exchange_code,),
+    )
+    if not bounds or bounds["first"] is None:
+        return None
+    rows = db.fetchall(
+        """
+        SELECT trade_date FROM ref.trading_calendar
+         WHERE exchange_code = %s AND is_open AND trade_date BETWEEN %s AND %s
+        """,
+        (exchange_code, start, end),
+    )
+    return frozenset(r["trade_date"] for r in rows), bounds["first"], bounds["last"]
+
+
 # ---------------------------------------------------------------------------
 # Declared universe (ref.tracked_symbol, migration 0019 / ADR 0006)
 # ---------------------------------------------------------------------------

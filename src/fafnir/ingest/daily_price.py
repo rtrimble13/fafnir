@@ -3,8 +3,17 @@ Daily OHLCV loader.
 
 For each symbol: resolve security_id, compute the incremental window from the
 watermark (minus an overlap to catch late corrections), fetch raw bars, land the
-raw payload, validate each bar at the boundary, quarantine bad bars (never drop),
-upsert good bars idempotently, and advance the watermark.
+raw payload, set aside bars dated on days the venue did not trade, validate each
+remaining bar at the boundary, quarantine bad bars (never drop), upsert good bars
+idempotently, and advance the watermark.
+
+NON-SESSION DATES. FMP returns bars for weekends and holidays for some symbols:
+money-market funds strike a NAV seven days a week, and a ticker shared with another
+instrument can carry that instrument's weekend prints (PI's ~$0.09 Saturday bars
+between $150 closes). None of them is a session of the venue the security is
+listed on, so they are not bars of *this* security and are not stored -- and they
+are not quarantined either, because a quarantine is a claim that a real session's
+bar was bad. The raw payload still lands in full. See :func:`_drop_non_session`.
 
 NAV-PRICED SECURITIES. An open-end mutual fund has one price a day and no volume:
 FMP returns a bar carrying a close and no open/high/low. That shape is a correct
@@ -40,6 +49,11 @@ LEGACY_SPLIT_ADJUSTED_ENDPOINT = "historical-price-eod/full"
 # A bar quarantined this many times stops holding the watermark (it stays flagged
 # for review, but ingestion is allowed to advance past it).
 MAX_QUARANTINE_HOLDS = 5
+
+# The calendar used when a security's own venue has none. Funds carry pseudo-venues
+# that ref.trading_calendar does not seed; the US equity sessions are the right
+# answer for every venue this project loads.
+CALENDAR_FALLBACK_EXCHANGE = "NASDAQ"
 
 # Asset types priced at a single daily NAV rather than traded through a session.
 # For these, a bar with a close and no open/high/low is the whole truth about the
@@ -330,6 +344,53 @@ def _validate_bar(
     }, None
 
 
+def _session_calendar(
+    db: Database, exchange_code: Optional[str], bars: list[dict]
+) -> Optional[tuple[frozenset, date, date]]:
+    """The venue calendar covering these bars, or None when there is none to judge by.
+
+    Read once per symbol, bounded by the bars' own dates, so a nightly run reads a
+    handful of rows and a backfill one span. Falls back to
+    :data:`CALENDAR_FALLBACK_EXCHANGE` when the security's venue has no calendar.
+    """
+    dates = [d for d in (_parse_date(b.get("date")) for b in bars) if d is not None]
+    if not dates:
+        return None
+    start, end = min(dates), max(dates)
+    for code in dict.fromkeys(
+        c for c in (exchange_code, CALENDAR_FALLBACK_EXCHANGE) if c
+    ):
+        calendar = repo.open_sessions(db, code, start, end)
+        if calendar is not None:
+            return calendar
+    return None
+
+
+def _drop_non_session(
+    bars: list[dict], calendar: Optional[tuple[frozenset, date, date]]
+) -> tuple[list[dict], int]:
+    """Split off bars dated on days the venue was closed. Returns (kept, dropped).
+
+    A date counts as closed only when the calendar covers it and has no open session
+    for it: the seed writes open days only, so inside the calendar's span a missing
+    row is a weekend, a holiday or a closure, while outside it (past the
+    ensure-horizon range) nothing is known and the bar is kept. An unparseable date
+    is kept too -- :func:`_validate_bar` quarantines it with the precise reason.
+    """
+    if calendar is None:
+        return list(bars), 0
+    open_dates, first, last = calendar
+    kept: list[dict] = []
+    dropped = 0
+    for bar in bars:
+        d = _parse_date(bar.get("date"))
+        if d is not None and first <= d <= last and d not in open_dates:
+            dropped += 1
+            continue
+        kept.append(bar)
+    return kept, dropped
+
+
 def load_symbol_prices(
     db: Database,
     fmp: FMPClient,
@@ -358,10 +419,11 @@ def load_symbol_prices(
         _tally("unknown")
         return 0
 
-    # Read the asset type once per symbol, not once per bar: what shape of payload
-    # counts as a valid bar is a property of the security, and a fund's whole
-    # history goes through this loop.
-    nav_only = repo.security_asset_type(db, sec_id) in NAV_ASSET_TYPES
+    # Read the security once per symbol, not once per bar: what shape of payload
+    # counts as a valid bar, and which calendar says a date was a session, are
+    # properties of the security, and a fund's whole history goes through this loop.
+    profile = repo.security_price_profile(db, sec_id) or {}
+    nav_only = profile.get("asset_type") in NAV_ASSET_TYPES
 
     if start_date is None:
         wm = repo.get_watermark(db, "fmp", ENDPOINT, sec_id)
@@ -397,6 +459,16 @@ def load_symbol_prices(
         # backfill. Only the caller can tell which, so record and move on.
         _tally("empty")
         logger.debug("No bars returned for %s (from=%s)", symbol, start_date)
+
+    bars, off_session = _drop_non_session(
+        bars, _session_calendar(db, profile.get("exchange_code"), bars)
+    )
+    if off_session:
+        if stats is not None:
+            stats["non_session"] = stats.get("non_session", 0) + off_session
+        logger.debug(
+            "%s: set aside %d bar(s) dated on non-session days", symbol, off_session
+        )
 
     clean: list[dict] = []
     quarantined_dates: list[date] = []
@@ -613,6 +685,12 @@ def load_prices(
                 "%d of %d symbols returned no bars in the requested window",
                 empty,
                 len(symbols),
+            )
+        non_session = stats.get("non_session", 0)
+        if non_session:
+            logger.info(
+                "Set aside %d bars dated on non-session days (weekends, holidays)",
+                non_session,
             )
         logger.info("Loaded %d price rows across %d symbols", total, len(symbols))
         return total
