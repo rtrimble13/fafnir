@@ -48,6 +48,7 @@ from typing import Iterable, NamedTuple, Optional
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
+from fafnir.ingest import adjustments
 from fafnir.ingest.daily_price import NAV_ASSET_TYPES
 from fafnir.ingest.runlog import RunLog
 from fafnir.logging_config import get_logger
@@ -68,12 +69,25 @@ WHOLE_ENDPOINT = 0
 
 MODES = ("symbol", "calendar", "auto")
 
+# How close, in calendar days and in amount, a dividend the per-symbol feed carries
+# must be to a stored one it no longer carries for the stored one to count as the
+# same distribution on a different date. Production, 2026-09: the calendar sweep
+# stored PRGMX's August distribution on 08-31 (0.023823) and the per-symbol feed
+# reports it on 08-28 (0.0238); RPSIX the same pair. Both were kept, so both funds
+# carry August's dividend twice in every adjusted price before it. Five days spans a
+# weekend plus a holiday; distinct distributions of even a weekly payer are seven
+# apart. One percent absorbs the rounding the two feeds disagree by.
+REDATE_WINDOW_DAYS = 5
+REDATE_AMOUNT_TOLERANCE = 0.01
+
 
 class Applied(NamedTuple):
-    """One stored action: its natural key, and whether this write changed anything."""
+    """One stored action: its natural key, whether this write changed anything, and
+    for a dividend its cash amount (None for a split)."""
 
     key: tuple[str, date]
     changed: bool
+    amount: Optional[float] = None
 
 
 @dataclass
@@ -243,7 +257,7 @@ def _apply_dividend(
     if changed:
         result.changed += 1
         result.changed_security_ids.add(security_id)
-    return Applied(("dividend", ex_date), changed)
+    return Applied(("dividend", ex_date), changed, amount)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +293,7 @@ def load_symbol_actions(
     as_of: date,
     result: ActionsResult,
     seen: Optional[dict] = None,
+    amounts: Optional[dict] = None,
 ) -> None:
     """One security's complete split and dividend history. Two requests.
 
@@ -287,6 +302,10 @@ def load_symbol_actions(
     asks for it, because it is the only caller that needs to know what the feed
     *omitted* -- an upsert-only loader cannot otherwise tell a withdrawn action from
     one it simply never saw.
+
+    ``amounts``, when given, maps the ex-date of every dividend the feed carried to
+    its cash amount. :func:`reconcile` needs it to tell a dividend the feed has
+    merely moved to another date from one it has dropped (:func:`_redated_dividends`).
     """
     splits = fmp.splits(symbol)
     repo.land_payload(
@@ -337,6 +356,8 @@ def load_symbol_actions(
         )
         if seen is not None and applied is not None:
             seen[applied.key] = applied.changed
+        if amounts is not None and applied is not None:
+            amounts[applied.key[1]] = applied.amount
     result.symbols_pulled += 1
 
 
@@ -536,6 +557,45 @@ def sweep_calendar(
 # ---------------------------------------------------------------------------
 
 
+def _same_amount(a, b) -> bool:
+    """Whether two dividend amounts are one distribution, within the feeds' rounding."""
+    if a is None or b is None:
+        return False
+    a, b = float(a), float(b)
+    return abs(a - b) <= REDATE_AMOUNT_TOLERANCE * max(abs(a), abs(b))
+
+
+def _redated_dividends(withdrawn: dict, feed: dict) -> dict:
+    """Map each withdrawn dividend's ex-date to the feed ex-date it was moved to.
+
+    ``withdrawn`` is ``{ex_date: amount}`` for settled stored dividends the per-symbol
+    feed no longer carries; ``feed`` is ``{ex_date: amount}`` for every dividend it
+    does. A withdrawn dividend is a re-dated copy when the feed carries one within
+    :data:`REDATE_WINDOW_DAYS` whose amount agrees within
+    :data:`REDATE_AMOUNT_TOLERANCE`: the two feeds dated one distribution
+    differently, and the upsert kept both. The nearest such date wins, so a dividend
+    moved by two days is not paired with a neighbour five days off.
+
+    Everything else stays withdrawn -- reported, never deleted. The feed drops real
+    dividends too: TLT's July distribution vanished from its per-symbol payload in
+    2026-09 while the warehouse held it correctly, and the nearest feed dividend was
+    a month away with a different amount. Only the pair is evidence of a duplicate;
+    an absence on its own is not evidence of anything.
+    """
+    moved: dict = {}
+    for old, amount in withdrawn.items():
+        best = None
+        for new, fed in feed.items():
+            gap = abs((new - old).days)
+            if new == old or gap > REDATE_WINDOW_DAYS or not _same_amount(amount, fed):
+                continue
+            if best is None or gap < abs((best - old).days):
+                best = new
+        if best is not None:
+            moved[old] = best
+    return moved
+
+
 def reconcile(
     db: Database,
     fmp: FMPClient,
@@ -573,11 +633,15 @@ def reconcile(
     cutoff = as_of - timedelta(days=settle_days)
     for sec in securities:
         symbol, sec_id = sec["symbol"], sec["security_id"]
-        stored_before = {
-            (r["action_type"], r["ex_date"])
-            for r in repo.corporate_actions_for(db, sec_id)
+        before = repo.corporate_actions_for(db, sec_id)
+        stored_before = {(r["action_type"], r["ex_date"]) for r in before}
+        stored_amounts = {
+            r["ex_date"]: r["dividend_amount"]
+            for r in before
+            if r["action_type"] == "dividend"
         }
         on_feed: dict = {}
+        feed_amounts: dict = {}
         marker = ActionsResult()
         load_symbol_actions(
             db,
@@ -588,6 +652,7 @@ def reconcile(
             as_of=as_of,
             result=marker,
             seen=on_feed,
+            amounts=feed_amounts,
         )
         result.absorb(marker)
         result.reconciled += 1
@@ -597,11 +662,32 @@ def reconcile(
         # On the feed and not in the warehouse: an event the sweep missed. This is the
         # coverage gap the rotation exists to find.
         missing = sorted(f"{t} {d}" for t, d in settled_feed - settled_stored)
+        gone = settled_stored - settled_feed
+        # Of the settled rows the feed no longer carries, the dividends it has only
+        # moved to another date. The upsert stored the feed's date and kept the old
+        # one, so the distribution sits in the factor chain twice -- the one kind of
+        # withdrawal this acts on. _redated_dividends says why the rest are not.
+        redated = _redated_dividends(
+            {d: stored_amounts.get(d) for t, d in gone if t == "dividend"},
+            feed_amounts,
+        )
+        for old, new in sorted(redated.items()):
+            repo.delete_corporate_action(
+                db, security_id=sec_id, action_type="dividend", ex_date=old
+            )
+            logger.info(
+                "%s: removed dividend %s, which the feed now reports on %s",
+                symbol,
+                old,
+                new,
+            )
         # In the warehouse and no longer on the feed: a withdrawn or corrected-away
         # action. The loader upserts and never deletes, so this is reported rather
         # than acted on -- but comparing against the feed, rather than the warehouse
         # before against the warehouse after, is the only way to see one at all.
-        withdrawn = sorted(f"{t} {d}" for t, d in settled_stored - settled_feed)
+        withdrawn = sorted(
+            f"{t} {d}" for t, d in gone if not (t == "dividend" and d in redated)
+        )
         # On both sides, but the values moved: an amendment the sweep's overlap
         # window should have caught and did not.
         amended = sorted(
@@ -609,8 +695,14 @@ def reconcile(
             for (t, d), changed in on_feed.items()
             if changed and (t, d) in settled_stored
         )
+        if redated:
+            # A delete leaves no row stamped with this run, so
+            # securities_changed_by_run -- and with it `adjust --changed` -- cannot
+            # see it, and the factor still carrying the deleted dividend would stand.
+            # Recompute here, as the merge commands do after they move actions.
+            adjustments.compute_for_security(db, sec_id)
 
-        if missing or withdrawn or amended:
+        if missing or withdrawn or amended or redated:
             result.drift += 1
             result.changed_security_ids.add(sec_id)
             repo.add_dq_flag_once(
@@ -624,6 +716,10 @@ def reconcile(
                     "missing_from_calendar": missing[:20],
                     "withdrawn_by_source": withdrawn[:20],
                     "amended": amended[:20],
+                    "redated": [
+                        f"dividend {old} -> {new}"
+                        for old, new in sorted(redated.items())
+                    ][:20],
                     "settled_through": cutoff.isoformat(),
                 },
                 ingestion_run_id=run.run_id,

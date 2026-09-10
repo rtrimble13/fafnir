@@ -1796,6 +1796,30 @@ def corporate_actions_for(db: Database, security_id: int) -> list[dict]:
     )
 
 
+def delete_corporate_action(
+    db: Database, *, security_id: int, action_type: str, ex_date: date
+) -> bool:
+    """Delete one corporate action. Returns True when a row was removed.
+
+    The one caller is the reconciliation, and only for a dividend the per-symbol feed
+    has *re-dated* (see ``fafnir.ingest.corporate_actions._redated_dividends``). Any
+    other action the feed stops carrying is reported and kept: the feed can drop a
+    real dividend, and a loader that deleted on every disagreement would be trusting
+    the vendor on its worst day. Adjustment factors are derived from these rows and
+    no row is left stamped with the run, so the caller recomputes them itself.
+    """
+    return (
+        db.execute(
+            """
+        DELETE FROM core.corporate_action
+        WHERE security_id = %s AND action_type = %s AND ex_date = %s
+        """,
+            (security_id, action_type, ex_date),
+        )
+        > 0
+    )
+
+
 def close_before(db: Database, security_id: int, d: date) -> Optional[Decimal]:
     """Raw close on the latest trade_date STRICTLY BEFORE ``d``.
 
