@@ -15,6 +15,7 @@ from fafnir.ingest.security_master import (
     _normalize_company_name,
     _us_entries,
     company_name_similarity,
+    is_exchange_test_issue,
     is_retired_listing,
 )
 
@@ -248,3 +249,34 @@ def test_retired_listing_checks_every_retirement_for_the_ticker():
     # A ticker can be retired more than once; the match may be any of them.
     retired = [_retired("Some Dead SPAC", 1), _retired("Apple Inc.", 2)]
     assert is_retired_listing("Apple Inc.", retired)["security_id"] == 2
+
+
+@pytest.mark.parametrize(
+    "symbol", ["ZXZZT", "ZVZZT", "ZWZZT", "ZBZZT", "ZJZZT", "zxzzt"]
+)
+def test_nasdaq_test_symbols_are_test_issues(symbol):
+    # ZXZZT in production: an active security with 4,400 synthetic bars since 2003
+    # and 2,286 outlier flags, served by the screener like any listing.
+    assert is_exchange_test_issue(symbol, None)
+
+
+@pytest.mark.parametrize(
+    "name", ["SuperMontage TEST", "NASDAQ TEST STOCK", "NYSE Arca Test Security"]
+)
+def test_exchange_test_names_are_test_issues(name):
+    assert is_exchange_test_issue("QQQT", name)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "name"),
+    [
+        ("TST", "Test Systems Inc."),  # TEST-ish, but no venue: a company
+        ("NDAQ", "Nasdaq, Inc."),  # a venue, but no TEST: a company
+        ("ZZZ", "Some Real Corp"),
+        ("ZXZZ", None),  # close to the pattern, not on it
+        ("AZXZZT", None),
+        (None, None),
+    ],
+)
+def test_real_listings_are_not_test_issues(symbol, name):
+    assert not is_exchange_test_issue(symbol, name)

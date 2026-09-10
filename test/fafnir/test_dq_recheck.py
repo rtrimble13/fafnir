@@ -44,12 +44,32 @@ def test_every_rule_binds_the_settings_its_sql_asks_for():
     """A rule whose params do not match its placeholders binds the wrong value."""
     for name, rule in rc.RECHECKABLE.items():
         assert rule.sql.count("%s") == len(rule.params), name
-        assert set(rule.params) <= {"exch", "threshold", "min_density", "min_sessions"}
+        assert set(rule.params) <= {
+            "exch",
+            "threshold",
+            "min_density",
+            "min_sessions",
+            "stale_listed",
+            "stale_nav",
+            "nav_types",
+        }
 
 
 def test_an_unknown_check_is_refused_by_name():
     with pytest.raises(ValueError, match="not re-evaluable"):
         rc.recheck(None, checks=["security_duplicate_identity"])
+
+
+def test_the_stale_negation_judges_against_the_checks_own_reference_dates():
+    """The threshold lives in one place.
+
+    A recheck carrying its own copy of the reference dates would go on closing --
+    or keeping -- flags by a rule the check no longer applies, from the day someone
+    moves STALE_MIN_SESSIONS_BEHIND.
+    """
+    rule = rc.RECHECKABLE["stale"]
+    assert checks.FRESHNESS_CUTOFF_CTES in rule.sql
+    assert checks.NAV_PRICED_PREDICATE in rule.sql
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +199,39 @@ def test_stale_flag_clears_once_a_later_bar_lands(db):
     key = {"last_date": "2024-06-03"}
     unchanged = _flag(db, check="stale", sid=behind, record_key=key)
     moved_on = _flag(db, check="stale", sid=current, record_key=key)
+    # Two sessions on, so `behind` is still past check_freshness's threshold.
     _bar(db, current, dt.date(2024, 6, 4))
+    _bar(db, current, dt.date(2024, 6, 5))
 
     stale = _stale_ids(db, "stale")
     assert moved_on in stale
     assert unchanged not in stale
+
+
+@pytest.mark.integration
+def test_stale_flag_clears_when_it_is_no_longer_far_enough_behind(db):
+    """A flag written under the old one-session threshold is not the check's today.
+
+    Nothing about the security changed -- it is still one session behind -- but
+    check_freshness would no longer write it, so it is not what the queue asserts.
+    """
+    one_behind = _mk(db, "RSTLC")
+    two_behind = _mk(db, "RSTLD")
+    leader = _mk(db, "RSTLE")
+    _bar(db, two_behind, dt.date(2024, 6, 3))
+    _bar(db, one_behind, dt.date(2024, 6, 4))
+    _bar(db, leader, dt.date(2024, 6, 5))
+
+    lagging = _flag(
+        db, check="stale", sid=one_behind, record_key={"last_date": "2024-06-04"}
+    )
+    lost = _flag(
+        db, check="stale", sid=two_behind, record_key={"last_date": "2024-06-03"}
+    )
+
+    stale = _stale_ids(db, "stale")
+    assert lagging in stale
+    assert lost not in stale
 
 
 @pytest.mark.integration

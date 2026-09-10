@@ -45,8 +45,12 @@ from typing import NamedTuple, Optional, Sequence
 from fafnir.db.connection import Database
 from fafnir.dq.checks import (
     DEFAULT_OUTLIER_THRESHOLD,
+    FRESHNESS_CUTOFF_CTES,
     GAP_MIN_SESSION_DENSITY,
     GAP_MIN_SESSIONS_FOR_DENSITY,
+    NAV_LAGGING_ASSET_TYPES,
+    NAV_PRICED_PREDICATE,
+    stale_sessions_required,
 )
 from fafnir.logging_config import get_logger
 
@@ -151,22 +155,39 @@ SELECT m.dq_flag_id
                   AND ca.action_type = 'split' AND ca.ex_date = m.d)
 """
 
-_STALE_SQL = """
+# The reference dates are check_freshness's own CTEs, verbatim, so the negation
+# cannot drift from the check when the threshold moves.
+_STALE_SQL = (
+    "WITH "
+    + FRESHNESS_CUTOFF_CTES
+    + """
 SELECT f.dq_flag_id
   FROM ops.data_quality_flag f
+  LEFT JOIN core.security s ON s.security_id = f.security_id
+ CROSS JOIN cutoff co
+ CROSS JOIN LATERAL (
+     SELECT max(p.trade_date) AS d FROM core.daily_price p
+      WHERE p.security_id = f.security_id) lb
  WHERE f.check_name = 'stale' AND f.resolved_at IS NULL
    AND (
         -- the security stopped trading, so check_freshness no longer considers it
-        NOT EXISTS (SELECT 1 FROM core.security s
-                     WHERE s.security_id = f.security_id AND s.is_actively_trading)
+        NOT COALESCE(s.is_actively_trading, FALSE)
         -- or it has taken a bar since. The flag is keyed on the last_date it had
         -- when written, so a later bar ends THAT occurrence: a security that falls
         -- behind again is a new record_key and a new flag.
-     OR COALESCE((SELECT max(p.trade_date) FROM core.daily_price p
-                   WHERE p.security_id = f.security_id), DATE '1900-01-01')
-        > (f.record_key->>'last_date')::date
+     OR COALESCE(lb.d, DATE '1900-01-01') > (f.record_key->>'last_date')::date
+        -- or it is no longer far enough behind the market to be called stale: the
+        -- flag was written under an earlier, one-session threshold, or it is a fund
+        -- that has only now been recognised as NAV-priced
+     OR COALESCE(lb.d, DATE '1900-01-01') >= CASE
+            WHEN """
+    + NAV_PRICED_PREDICATE
+    + """ THEN co.nav_d
+            ELSE co.listed_d
+        END
    )
 """
+)
 
 _SPARSE_SQL = """
 WITH f AS (
@@ -235,9 +256,10 @@ RECHECKABLE: dict[str, _Rule] = {
     ),
     "stale": _Rule(
         _STALE_SQL,
-        (),
+        ("exch", "exch", "stale_listed", "exch", "stale_nav", "nav_types"),
         "the security has taken a bar later than the last_date this flag records, "
-        "or it is no longer actively trading",
+        "or is no longer far enough behind the market to be stale, or is no longer "
+        "actively trading",
     ),
     "sparse_coverage": _Rule(
         _SPARSE_SQL,
@@ -306,6 +328,12 @@ def recheck(
         "threshold": outlier_threshold,
         "min_density": min_density,
         "min_sessions": min_sessions,
+        # Not caller settings: check_freshness takes none, so its negation must
+        # not either, or a recheck could judge against a threshold the check never
+        # used.
+        "stale_listed": stale_sessions_required(False),
+        "stale_nav": stale_sessions_required(True),
+        "nav_types": list(NAV_LAGGING_ASSET_TYPES),
     }
     out: list[RecheckResult] = []
     for name in wanted:

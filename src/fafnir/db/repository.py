@@ -275,6 +275,30 @@ def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> boo
     return True
 
 
+def security_bar_span(
+    db: Database, security_id: int
+) -> tuple[Optional[date], Optional[date]]:
+    """The security's first and last stored bar dates, or (None, None) with no bars.
+
+    Two ORDER BY ... LIMIT 1 probes rather than min()/max(): each is an index scan
+    per partition that stops at its first row, which is what keeps this cheap enough
+    to ask once per delisting the nightly sweep considers.
+    """
+    row = db.fetchone(
+        """
+        SELECT
+            (SELECT trade_date FROM core.daily_price
+              WHERE security_id = %s ORDER BY trade_date ASC LIMIT 1)  AS first_bar,
+            (SELECT trade_date FROM core.daily_price
+              WHERE security_id = %s ORDER BY trade_date DESC LIMIT 1) AS last_bar
+        """,
+        (security_id, security_id),
+    )
+    if row is None:
+        return None, None
+    return row["first_bar"], row["last_bar"]
+
+
 def upsert_company_profile(
     db: Database,
     *,
@@ -1415,6 +1439,50 @@ def security_asset_type(db: Database, security_id: int) -> Optional[str]:
     return str(val) if val is not None else None
 
 
+def security_price_profile(db: Database, security_id: int) -> Optional[dict]:
+    """What the price loader needs to know about a security before reading its bars.
+
+    ``asset_type`` and ``is_fund`` decide whether a bar is judged as an exchange
+    session or a NAV strike; ``exchange_code`` picks the calendar that says which
+    dates were sessions at all. One read per symbol, not per bar. None if the
+    security does not exist.
+    """
+    row = db.fetchone(
+        "SELECT asset_type, is_fund, exchange_code FROM core.security "
+        "WHERE security_id = %s",
+        (security_id,),
+    )
+    return dict(row) if row else None
+
+
+def open_sessions(
+    db: Database, exchange_code: str, start: date, end: date
+) -> Optional[tuple[frozenset, date, date]]:
+    """The open sessions of one venue's calendar between two dates, with its span.
+
+    Returns ``(open_dates, first, last)`` where ``first``/``last`` bound everything
+    ref.trading_calendar holds for the venue -- not just the requested window --
+    because the seed writes open days only: a weekend has no row at all, so "no row"
+    means *closed* inside the calendar's span and *unknown* outside it, and only the
+    span can tell those apart. None when the venue has no calendar rows at all.
+    """
+    bounds = db.fetchone(
+        "SELECT min(trade_date) AS first, max(trade_date) AS last "
+        "FROM ref.trading_calendar WHERE exchange_code = %s",
+        (exchange_code,),
+    )
+    if not bounds or bounds["first"] is None:
+        return None
+    rows = db.fetchall(
+        """
+        SELECT trade_date FROM ref.trading_calendar
+         WHERE exchange_code = %s AND is_open AND trade_date BETWEEN %s AND %s
+        """,
+        (exchange_code, start, end),
+    )
+    return frozenset(r["trade_date"] for r in rows), bounds["first"], bounds["last"]
+
+
 # ---------------------------------------------------------------------------
 # Declared universe (ref.tracked_symbol, migration 0019 / ADR 0006)
 # ---------------------------------------------------------------------------
@@ -1749,6 +1817,30 @@ def corporate_actions_for(db: Database, security_id: int) -> list[dict]:
         ORDER BY ex_date ASC
         """,
         (security_id,),
+    )
+
+
+def delete_corporate_action(
+    db: Database, *, security_id: int, action_type: str, ex_date: date
+) -> bool:
+    """Delete one corporate action. Returns True when a row was removed.
+
+    The one caller is the reconciliation, and only for a dividend the per-symbol feed
+    has *re-dated* (see ``fafnir.ingest.corporate_actions._redated_dividends``). Any
+    other action the feed stops carrying is reported and kept: the feed can drop a
+    real dividend, and a loader that deleted on every disagreement would be trusting
+    the vendor on its worst day. Adjustment factors are derived from these rows and
+    no row is left stamped with the run, so the caller recomputes them itself.
+    """
+    return (
+        db.execute(
+            """
+        DELETE FROM core.corporate_action
+        WHERE security_id = %s AND action_type = %s AND ex_date = %s
+        """,
+            (security_id, action_type, ex_date),
+        )
+        > 0
     )
 
 

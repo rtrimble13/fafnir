@@ -82,6 +82,60 @@ def _ordered_changes(rows: list[dict]) -> list[tuple[date, str, str, Optional[st
     return out
 
 
+def _close_applied_conflict(
+    db: Database,
+    *,
+    old: str,
+    new: str,
+    change_date: date,
+    security_id: Optional[int],
+) -> int:
+    """Close the conflict flag a rename left open, once the rename has applied.
+
+    A conflict is retried on every sweep because it can clear itself -- the
+    duplicate that blocked it is merged away, or the old ticker's holder is marked
+    delisted -- and once a retry succeeds the flag describing the conflict is no
+    longer true. Nothing closed it: the applied branch only logged, the sweep then
+    skips the terminal row for good, `merge-rename` refuses a retired old ticker,
+    `dismiss-rename` would record something false (the rename is real) and `dq
+    recheck` never touches this check. MAPP->MATR (flag 876928) sat open for nine
+    days after the 2026-09-02 retry applied it.
+
+    Matched on the (old, new) record_key the flag was written with, so only this
+    rename's flag closes. Returns how many were closed.
+    """
+    flag_ids = repo.open_dq_flag_ids_for_record(
+        db,
+        check_name="symbol_change_conflict",
+        record_key={"old_symbol": old, "new_symbol": new},
+    )
+    if not flag_ids:
+        return 0
+    # The straggler sweep only knows the row is terminal, not which security it
+    # landed on; the flag row itself already carries that security_id.
+    target = (
+        f"security {security_id}"
+        if security_id is not None
+        else "the security recorded in core.symbol_change"
+    )
+    closed = repo.resolve_dq_flags(
+        db,
+        repo.DqFilter(state="open", flag_ids=tuple(flag_ids)),
+        note=(
+            f"{old} -> {new} (effective {change_date}) was applied to {target} on "
+            "a later sweep retry; the conflict this flag reported no longer stands."
+        ),
+        resolved_by="fafnir",
+    )
+    logger.info(
+        "closed %d conflict flag(s) for %s -> %s: applied on retry",
+        len(closed),
+        old,
+        new,
+    )
+    return len(closed)
+
+
 def load_symbol_changes(
     db: Database, fmp: FMPClient, *, max_pages: int = 5
 ) -> dict[str, int]:
@@ -91,7 +145,8 @@ def load_symbol_changes(
     screener had already minted was absorbed), ``conflict``, ``ignored``,
     ``unknown`` (a rename for a ticker fafnir does not track -- the feed is
     global, so this is the common case) and ``skipped`` (already applied by an
-    earlier sweep).
+    earlier sweep), plus ``conflicts_closed``: conflict flags closed because the
+    rename they described has since applied.
     """
     counts = {
         "rows": 0,
@@ -101,6 +156,7 @@ def load_symbol_changes(
         "ignored": 0,
         "unknown": 0,
         "skipped": 0,
+        "conflicts_closed": 0,
     }
 
     with RunLog(
@@ -133,6 +189,18 @@ def load_symbol_changes(
             )
             if recorded in repo.TERMINAL_CHANGE_STATUSES:
                 counts["skipped"] += 1
+                # A rename that conflicted on one sweep and applied on a later one,
+                # before the applied branch below learned to close its flag, still
+                # has that flag open -- and this skip is the only place the sweep
+                # will ever see the row again. Dismissed and ignored rows are left
+                # exactly as they are.
+                if recorded == repo.CHANGE_APPLIED:
+                    closed = _close_applied_conflict(
+                        db, old=old, new=new, change_date=when, security_id=None
+                    )
+                    if closed:
+                        counts["conflicts_closed"] += closed
+                        db.commit()
                 continue
 
             outcome = repo.apply_symbol_change(
@@ -214,6 +282,15 @@ def load_symbol_changes(
                     outcome.security_id,
                     when,
                 )
+                # Part of the same unit of work as the rename, so the flag closes
+                # in the commit that makes it untrue.
+                counts["conflicts_closed"] += _close_applied_conflict(
+                    db,
+                    old=old,
+                    new=new,
+                    change_date=when,
+                    security_id=outcome.security_id,
+                )
 
             # One rename -- its xref periods, primary_symbol, audit row and any
             # fold -- is the unit of work, committed here so an interruption
@@ -225,7 +302,8 @@ def load_symbol_changes(
         run.bytes_downloaded = fmp.bytes_downloaded
         logger.info(
             "Symbol-change sweep: %d dated rows, %d applied (%d folded), "
-            "%d conflicts, %d ignored, %d untracked, %d already applied",
+            "%d conflicts, %d ignored, %d untracked, %d already applied, "
+            "%d conflict flags closed",
             counts["rows"],
             counts["applied"],
             counts["folded"],
@@ -233,5 +311,6 @@ def load_symbol_changes(
             counts["ignored"],
             counts["unknown"],
             counts["skipped"],
+            counts["conflicts_closed"],
         )
         return counts

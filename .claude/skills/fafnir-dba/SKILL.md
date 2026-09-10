@@ -15,7 +15,11 @@ These are not style guidance. Each one is a way this system gets damaged.
 1. **Resolving is a judgement, not a repair.** Closing a flag frees its slot in
    `ux_dq_flag_open_condition`; if the defect is still in the data, the next
    `fafnir dq run` flags it again. Never close a flag to make a count go down.
-   **Repair first, then resolve.**
+   **Repair first, then resolve.** And `resolve` is only one of four dispositions
+   — `dq recheck`, `dq accept`, `security merge` and `dq resolve` close a flag in
+   ways that are not interchangeable. **Read the durability matrix at the top of
+   `references/dq-playbooks.md` before choosing one.** Resolving a condition its
+   writer will re-detect is the most common way this queue churns.
 2. **Never resolve by filter without showing its own dry run first.** Run the
    identical command with `--dry-run`, show the output, and only then run it for
    real. Never put `--dry-run` and `--yes` in the same turn.
@@ -25,13 +29,20 @@ These are not style guidance. Each one is a way this system gets damaged.
 4. **Never `--force`.** `fafnir security merge-rename --force` overrides guards
    comparing CUSIP/ISIN and overlapping OHLC. If they trip, report the blockers
    and stop.
-5. **Six checks are never yours to close**: `price_scale_collapse`,
+5. **Six checks are never yours to auto-resolve**: `price_scale_collapse`,
    `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`,
    `price_subresolution_price`, `security_duplicate_identity`. Each is a
    measurement, an unrepresentable value, or needs a different command
    entirely — see the playbooks. This list is also
    `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and `dq_triage` returns
    `never_auto_resolve` per row; a test asserts the two agree.
+
+   This bars the *bulk resolve*, not every disposition. `security merge` is the
+   right answer to `security_duplicate_identity`, `ingest symbol-changes` closes an
+   applied `symbol_change_conflict` itself, and `dq accept` records a condition
+   that is real and permanent while **keeping** the record — which a resolve does
+   not. Under an operator's explicit direction to clear a check, accept is the
+   disposition to reach for; see `references/sweep-policy.md`.
 6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` are
    operator commands.** Propose; never run.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
@@ -46,6 +57,47 @@ These are not style guidance. Each one is a way this system gets damaged.
 9. **Facts come from SQL, effects from the CLI.** Read with `sql_read` and the
    ops tools. Never parse CLI output to reason over — `fafnir dq list --json`
    exists, but `dq_queue` is better. The CLI is for *changing* things.
+10. **Verify every effect in SQL before reporting it.** A `Resolved N` /
+    `Accepted N` line is what the command *attempted*, not evidence of what is
+    committed. Re-query the state, the counts and the note text. On 2026-09-10 a
+    resolve printed "Resolved 81 flags" and rolled all 81 back; only the SQL check
+    afterwards caught it.
+11. **Never pipe a mutating command through anything that can close early.**
+    `| head`, `| grep -q`, `| less` — a broken pipe raises inside the command's
+    transaction block and rolls back work it has already announced. Redirect to a
+    file and `tail` it. (`dq resolve` now commits before it prints; the rule stands
+    anyway, because it is about the shape of the pipeline, not that one bug.)
+
+## Check the environment before planning anything
+
+Run these before the first triage plan of a session. Each one has cost a session
+time by being assumed rather than checked.
+
+```bash
+# What the claude user may actually run. Expect exactly one absolute binary.
+sudo -n -l
+
+# Read-only; confirms the DB config resolves.
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir dq list | head -3
+
+# 3 requests; fails fast if the FMP key is absent.
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
+    --symbol AAPL --date 1990-01-02
+```
+
+- **Always the absolute path.** Sudoers grants one absolute binary and matches the
+  command as written, so `sudo -u fafnir fafnir …` — the bare name — is *refused*
+  (`etc/agent/sudoers.example`). That refusal reads like a policy block and is not
+  one: never report a task as blocked on it. Every example in these files uses the
+  full path for the same reason.
+- **If the FMP key is absent, every repair needing a fresh vendor fetch is
+  blocked** — re-ingests, backfills, re-fetching a bad bar. The probe costs 3
+  requests and fails fast. Say so in the *first* report, not when a repair fails
+  halfway through a plan.
+- **Read the actions mode from the data**, not from `automations.md`: `params.mode`
+  on the latest `corporate-actions` `ops.ingestion_run`.
+- **`journalctl` needs the `adm` or `systemd-journal` group**, which `claude` is
+  not in. Use `ops.ingestion_run` for what ran and how it ended.
 
 ## Which tool for what
 
@@ -72,11 +124,16 @@ These are not style guidance. Each one is a way this system gets damaged.
                                              same ingestion_run? many securities?
 4. landing_payload                        → what the vendor sent, if it's in doubt
 5. decide, per condition:
-     data defect  → repair (ingest / adjust / refresh-marts), THEN resolve
-     market fact  → resolve, with the evidence in --note
+     data defect  → repair (ingest / adjust / refresh-marts), THEN dq recheck
+     market fact  → dq accept, with the evidence in --note (a resolve returns)
+     wrong shape  → the command that fixes it (security merge, track rm --closed)
      neither      → escalate; leave it open
-6. sudo -u fafnir fafnir dq resolve <ids> --by claude --note "<evidence>"
+6. sudo -u fafnir $F <disposition> <ids> --by claude --note "<evidence>"
+7. verify in SQL that it committed (rule 10)
 ```
+
+Step 5 picks the *disposition*, and the durability matrix decides it. `dq resolve`
+is right only where the writer will not re-detect the condition.
 
 Step 3 is the step that distinguishes triage from guessing. **One security with a
 gap is a market fact; two hundred securities with a gap on the same date is a
@@ -109,7 +166,7 @@ security — work it in bulk, on your own initiative, under
      Repair-first      → propose the repair; resolve only once it is verifiably gone
      Judgement         → check the precondition in sweep-policy.md. Not met → leave open.
 5. per qualifying group, in ONE turn:
-     sudo -u fafnir fafnir dq resolve <filter> --by claude --note "<evidence>" --dry-run
+     sudo -u fafnir /opt/fafnir/.venv/bin/fafnir dq resolve <filter> --by claude --note "<evidence>" --dry-run
    show the output, then on approval, the same command with --yes
 6. report: closed, repaired, LEFT OPEN AND WHY, and any stop condition hit
 ```
@@ -133,6 +190,43 @@ real command to find out what it was matching.
 Being proactive is about doing the *investigation* without being asked. It is
 never about lowering the bar for closing something.
 
+## Classifying a systemic check
+
+Over 1% of the universe on one check means systemic — that is the stop rule, and
+it says when to stop, not what to do next. This is what to do next:
+
+```
+1. Classify with aggregate SQL, from the flag table alone where you can
+2. Partition the flags into batches by cause, returning ids
+3. Dry-run each batch
+4. ONE approval for the whole plan
+5. Run the batches
+6. Check every effect in SQL (rule 10)
+```
+
+One cause per batch, one note per batch. The classification is the work; the
+closing is bookkeeping. Queries that carried this on real systemic checks:
+
+- **Spike-and-revert pairs, from the flag table only.** Pair each outlier with the
+  next one on the same security (`lead(close)`, `lead(prev_close)`); it is a spike
+  when the next flag's `prev_close` equals this `close` and the price returns
+  within 25%. Finds vendor histories mixing two instruments under one ticker.
+- **Split-like jumps.** The close-to-prev ratio is within 3% of ×k or ÷k, k ≥ 3.
+- **Where a gap sits, and the price across it.** One pass with `lead(trade_date)`
+  and `lead(close)` over `WHERE security_id IN (…)`. Separates thin trading from a
+  history block, and a recent block with a price-level jump across it from the
+  rest — that last one is two issuers on one row.
+- **Non-session dates.** `NOT EXISTS (SELECT 1 FROM ref.trading_calendar … is_open)`.
+- **Median volume with a date bound** (`trade_date >= …`). `core.daily_price` is
+  partitioned: without the bound the query walks every partition and times out.
+  For coverage spans use `mart.v_security_price_coverage`, never a per-security
+  probe of `core.daily_price`.
+
+**Check a surprising result against the rows before stating it.** A 100% hit rate,
+or a "duplicate" found by pattern, gets a spot check first. Two duplication
+hypotheses and one "173/173 off-screener" finding were retracted on 2026-09-10,
+each of which a single spot check would have caught before it was said out loud.
+
 ## Reference
 
 - `references/dq-playbooks.md` — every `check_name`: what it means, how to tell a
@@ -152,3 +246,8 @@ Say which series you read (raw or adjusted) and, when it matters, that
 `security_latest` is refresh-lagged. When you resolve flags, list the ids and the
 notes. When you repair, say what you ran. When you escalate, say what you ruled
 out — the value is in the eliminations, not the conclusion.
+
+**Say what will come back.** A batch report that does not name the flags the next
+nightly will re-write leaves the operator to discover it as a surprise. The usual
+ones: `price_*` re-reads, money-market weekend zeros on a warehouse predating the
+non-session fix, and new `stale` flags for anything the vendor publishes late.

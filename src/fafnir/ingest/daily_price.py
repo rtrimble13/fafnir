@@ -3,17 +3,27 @@ Daily OHLCV loader.
 
 For each symbol: resolve security_id, compute the incremental window from the
 watermark (minus an overlap to catch late corrections), fetch raw bars, land the
-raw payload, validate each bar at the boundary, quarantine bad bars (never drop),
-upsert good bars idempotently, and advance the watermark.
+raw payload, set aside bars dated on days the venue did not trade, validate each
+remaining bar at the boundary, quarantine bad bars (never drop), upsert good bars
+idempotently, and advance the watermark.
+
+NON-SESSION DATES. FMP returns bars for weekends and holidays for some symbols:
+money-market funds strike a NAV seven days a week, and a ticker shared with another
+instrument can carry that instrument's weekend prints (PI's ~$0.09 Saturday bars
+between $150 closes). None of them is a session of the venue the security is
+listed on, so they are not bars of *this* security and are not stored -- and they
+are not quarantined either, because a quarantine is a claim that a real session's
+bar was bad. The raw payload still lands in full. See :func:`_drop_non_session`.
 
 NAV-PRICED SECURITIES. An open-end mutual fund has one price a day and no volume:
-FMP returns a bar carrying a close and no open/high/low. That shape is a correct
-bar for a fund and a defect for an equity, so the allowance is gated on the
-security's own ``asset_type`` rather than on what the payload happens to omit --
-see :data:`NAV_ASSET_TYPES` and :func:`_validate_bar`. Everything downstream is
-unchanged: the expanded row satisfies every constraint on core.daily_price as
-written, and a distribution back-adjusts through core.adjustment_factor exactly as
-a cash dividend does. See doc/adr/0006-curated-fund-universe.md.
+FMP returns a bar carrying a close and either no open/high/low or synthetic ones.
+Either shape is a correct bar for a fund and a defect for an equity, so the
+allowance is gated on the security (``asset_type`` or ``is_fund``) rather than on
+what the payload happens to omit -- see :func:`_is_nav_priced` and
+:func:`_validate_bar`. Everything downstream is unchanged: the expanded row
+satisfies every constraint on core.daily_price as written, and a distribution
+back-adjusts through core.adjustment_factor exactly as a cash dividend does. See
+doc/adr/0006-curated-fund-universe.md.
 """
 
 from __future__ import annotations
@@ -41,10 +51,20 @@ LEGACY_SPLIT_ADJUSTED_ENDPOINT = "historical-price-eod/full"
 # for review, but ingestion is allowed to advance past it).
 MAX_QUARANTINE_HOLDS = 5
 
+# The calendar used when a security's own venue has none. Funds carry pseudo-venues
+# that ref.trading_calendar does not seed; the US equity sessions are the right
+# answer for every venue this project loads.
+CALENDAR_FALLBACK_EXCHANGE = "NASDAQ"
+
 # Asset types priced at a single daily NAV rather than traded through a session.
 # For these, a bar with a close and no open/high/low is the whole truth about the
 # day, not a payload with three fields missing.
 NAV_ASSET_TYPES = frozenset({"fund"})
+
+# Asset types that trade through an exchange session even when the vendor also
+# marks them as funds: an ETF has real OHLCV, so ``is_fund`` must not turn its bars
+# into NAV strikes. See _is_nav_priced.
+SESSION_TRADED_ASSET_TYPES = frozenset({"etf"})
 
 # A stored bar whose OHLC the money column's scale flattened to one value. It shares
 # the `price_` prefix because that is the family an operator globs for
@@ -57,7 +77,9 @@ NAV_ASSET_TYPES = frozenset({"fund"})
 # open = high = low = close. That one is correct and must never be flagged: a fund
 # strikes one price a day, and there was no range to lose. _scale_collapse_detail
 # tells them apart by reading the SOURCE bar -- a NAV payload has no open/high/low
-# to compare, so it cannot show the range this check requires evidence of.
+# to compare, so it cannot show the range this check requires evidence of -- and,
+# for a NAV strike whose payload does carry open/high/low, by being told so: those
+# fields are synthetic and are not read (see _is_nav_strike).
 SCALE_COLLAPSE_CHECK = "price_scale_collapse"
 
 # What core.daily_price can actually store (sql/migrations/0005_daily_price.up.sql):
@@ -194,7 +216,9 @@ def _source_price(bar: dict, field: str) -> Optional[Decimal]:
     return None
 
 
-def _scale_collapse_detail(bar: dict, row: dict) -> Optional[dict]:
+def _scale_collapse_detail(
+    bar: dict, row: dict, *, nav_strike: bool = False
+) -> Optional[dict]:
     """Evidence that quantizing flattened a bar that had a real range, else None.
 
     The loud failure -- a price below the column's resolution -- is quarantined by
@@ -209,8 +233,11 @@ def _scale_collapse_detail(bar: dict, row: dict) -> Optional[dict]:
 
     A bar whose *source* high and low are already equal is a real flat session and is
     not flagged: the test is that the range existed and the column lost it, not that
-    the stored bar is flat.
+    the stored bar is flat. Nor is a NAV strike (``nav_strike``): its open/high/low
+    are synthetic and were never read, so they are no evidence of a range.
     """
+    if nav_strike:
+        return None
     if len({row["open"], row["high"], row["low"], row["close"]}) != 1:
         return None
     source = [_source_price(bar, f) for f in ("open", "high", "low", "close")]
@@ -263,6 +290,32 @@ def _ohlc(bar: dict, field: str) -> tuple[Optional[Decimal], Optional[str]]:
     return None, _reject_reason(present)
 
 
+def _is_nav_priced(asset_type: Optional[str], is_fund: Optional[bool]) -> bool:
+    """Whether a security is priced at a daily NAV rather than traded in a session.
+
+    ``asset_type`` alone is not enough: the security master stores every fund as
+    ``asset_type = 'equity'`` with ``is_fund = true`` (5,097 of them in production,
+    and not one row carries 'fund'), so gating on :data:`NAV_ASSET_TYPES` alone
+    left the NAV allowance applying to nothing.
+    """
+    if asset_type in NAV_ASSET_TYPES:
+        return True
+    return bool(is_fund) and asset_type not in SESSION_TRADED_ASSET_TYPES
+
+
+def _is_nav_strike(bar: dict, nav_only: bool) -> bool:
+    """Whether this bar is a NAV strike: a NAV-priced security's bar with no volume.
+
+    Volume is the tell, not the security alone, so a traded bar on a security the
+    vendor also calls a fund -- a closed-end fund with real volume -- is still read
+    as a session. An absent volume counts as zero, as it does in validation.
+    """
+    if not nav_only:
+        return False
+    raw = next((bar.get(k) for k in _VOLUME_ALIASES if bar.get(k) not in (None, "")), 0)
+    return _as_volume(raw) == 0
+
+
 def _validate_bar(
     bar: dict, *, nav_only: bool = False
 ) -> tuple[Optional[dict], Optional[str]]:
@@ -272,37 +325,49 @@ def _validate_bar(
     handing psycopg a float would reintroduce a coercion after validation -- exactly
     where the sub-resolution bug lived. What is checked here is what gets stored.
 
-    ``nav_only`` admits the NAV shape for a security that has no intraday session
-    (see :data:`NAV_ASSET_TYPES`): a bar carrying only a close becomes
-    ``open = high = low = close``, which is what a single daily strike actually
-    means. It is an allowance, not a repair -- a field that IS present is still read
-    and still faces the cross-field CHECKs below, so a fund bar with a genuinely
-    inconsistent high is quarantined like any other. The close itself is never
-    synthesized: without it there is no price, and the bar is rejected for every
-    asset type alike.
+    ``nav_only`` marks a security priced at a daily NAV (see :func:`_is_nav_priced`).
+    Its zero-volume bars are NAV strikes (:func:`_is_nav_strike`) and are built from
+    the close alone: ``open = high = low = close``, which is what a single daily
+    strike means. Vendor open/high/low on a strike are ignored even when present,
+    because they are not prices anyone traded at: TDEAX's 1990 backfill had 3,773 of
+    4,712 bars quarantined as cross_field_violation because FMP filled open/high/low
+    with a distribution-adjusted NAV and close with the raw one (2006-01-03:
+    o = h = l = 8.35, c = 12.91), and reading them threw away the fund's real
+    history. The close itself is never synthesized and still faces every check: a
+    zero, sub-resolution or out-of-range close is quarantined on any asset type.
+
+    A NAV-priced security's bar WITH volume is read as a session, with one
+    allowance: an absent open/high/low stands in as the close.
     """
     trade_date = _parse_date(bar.get("date"))
     if trade_date is None:
         return None, "unparseable_date"
-    # Close first, so it is available to stand in for the others under nav_only.
-    # It is also the field whose absence is fatal on any asset type: without a close
-    # there is no price, and nothing to stand in WITH.
-    prices: dict[str, Decimal] = {}
-    for field in ("close", "open", "high", "low"):
-        price, reason = _ohlc(bar, field)
+    if _is_nav_strike(bar, nav_only):
+        c, reason = _ohlc(bar, "close")
         if reason:
-            # Only an ABSENT field is stood in for. A field that is present but
-            # unusable -- zero, negative, sub-resolution, out of range -- is bad
-            # data on a fund exactly as on an equity, and laundering it into three
-            # copies of the close would hide the very thing the quarantine exists
-            # to surface.
-            if not (
-                nav_only and field != "close" and reason == "missing_or_nonnumeric_ohlc"
-            ):
-                return None, reason
-            price = prices["close"]
-        prices[field] = price
-    o, h, lo, c = prices["open"], prices["high"], prices["low"], prices["close"]
+            return None, reason
+        o = h = lo = c
+    else:
+        # Close first, so it is available to stand in for the others under nav_only.
+        # It is also the field whose absence is fatal on any asset type: without a
+        # close there is no price, and nothing to stand in WITH.
+        prices: dict[str, Decimal] = {}
+        for field in ("close", "open", "high", "low"):
+            price, reason = _ohlc(bar, field)
+            if reason:
+                # Only an ABSENT field is stood in for. A field that is present but
+                # unusable -- zero, negative, sub-resolution, out of range -- is bad
+                # data on a traded bar whatever the security, and laundering it into
+                # copies of the close would hide what the quarantine exists to show.
+                if not (
+                    nav_only
+                    and field != "close"
+                    and reason == "missing_or_nonnumeric_ohlc"
+                ):
+                    return None, reason
+                price = prices["close"]
+            prices[field] = price
+        o, h, lo, c = prices["open"], prices["high"], prices["low"], prices["close"]
 
     raw_volume = 0
     for key in _VOLUME_ALIASES:
@@ -330,6 +395,76 @@ def _validate_bar(
     }, None
 
 
+def _session_calendar(
+    db: Database, exchange_code: Optional[str], bars: list[dict]
+) -> Optional[tuple[frozenset, date, date]]:
+    """The venue calendar covering these bars, or None when there is none to judge by.
+
+    Read once per symbol, bounded by the bars' own dates, so a nightly run reads a
+    handful of rows and a backfill one span. Falls back to
+    :data:`CALENDAR_FALLBACK_EXCHANGE` when the security's venue has no calendar.
+    """
+    dates = [d for d in (_parse_date(b.get("date")) for b in bars) if d is not None]
+    if not dates:
+        return None
+    start, end = min(dates), max(dates)
+    for code in dict.fromkeys(
+        c for c in (exchange_code, CALENDAR_FALLBACK_EXCHANGE) if c
+    ):
+        calendar = repo.open_sessions(db, code, start, end)
+        if calendar is not None:
+            return calendar
+    return None
+
+
+def _drop_non_session(
+    bars: list[dict], calendar: Optional[tuple[frozenset, date, date]]
+) -> tuple[list[dict], int]:
+    """Split off bars dated on days the venue was closed. Returns (kept, dropped).
+
+    A date counts as closed only when the calendar covers it and has no open session
+    for it: the seed writes open days only, so inside the calendar's span a missing
+    row is a weekend, a holiday or a closure, while outside it (past the
+    ensure-horizon range) nothing is known and the bar is kept. An unparseable date
+    is kept too -- :func:`_validate_bar` quarantines it with the precise reason.
+    """
+    if calendar is None:
+        return list(bars), 0
+    open_dates, first, last = calendar
+    kept: list[dict] = []
+    dropped = 0
+    for bar in bars:
+        d = _parse_date(bar.get("date"))
+        if d is not None and first <= d <= last and d not in open_dates:
+            dropped += 1
+            continue
+        kept.append(bar)
+    return kept, dropped
+
+
+def _window_start(
+    start_date: Optional[date],
+    watermark: Optional[date],
+    overlap_days: int,
+    backfill_start: Optional[date],
+) -> Optional[date]:
+    """The first date to ask the vendor for.
+
+    An explicit window wins; a symbol with a watermark resumes from it, less the
+    overlap that catches late corrections; a symbol with neither is being loaded for
+    the first time and starts at ``backfill_start``. Asking with no start at all is
+    not "everything": FMP applies its own default window of about five years, which
+    is how GBF, DDI and MRT -- loaded after the initial backfill, without ``--from``
+    -- came to hold histories starting 2021-08-30..09-02 while their dividends went
+    back decades. None only when the caller gave no ``backfill_start`` either.
+    """
+    if start_date is not None:
+        return start_date
+    if watermark is not None:
+        return watermark - timedelta(days=overlap_days)
+    return backfill_start
+
+
 def load_symbol_prices(
     db: Database,
     fmp: FMPClient,
@@ -340,12 +475,14 @@ def load_symbol_prices(
     end_date: Optional[date] = None,
     overlap_days: int = 5,
     stats: Optional[dict] = None,
+    backfill_start: Optional[date] = None,
 ) -> int:
     """Load one symbol's prices within the (incremental) window.
 
     Returns rows upserted. ``stats``, when given, accumulates outcomes that only mean
     something in aggregate -- see :func:`load_prices`, which uses them to tell a
-    genuinely empty load apart from a successful one.
+    genuinely empty load apart from a successful one. ``backfill_start`` is where a
+    symbol with no watermark starts (see :func:`_window_start`).
     """
 
     def _tally(key: str) -> None:
@@ -358,15 +495,15 @@ def load_symbol_prices(
         _tally("unknown")
         return 0
 
-    # Read the asset type once per symbol, not once per bar: what shape of payload
-    # counts as a valid bar is a property of the security, and a fund's whole
-    # history goes through this loop.
-    nav_only = repo.security_asset_type(db, sec_id) in NAV_ASSET_TYPES
+    # Read the security once per symbol, not once per bar: what shape of payload
+    # counts as a valid bar, and which calendar says a date was a session, are
+    # properties of the security, and a fund's whole history goes through this loop.
+    profile = repo.security_price_profile(db, sec_id) or {}
+    nav_only = _is_nav_priced(profile.get("asset_type"), profile.get("is_fund"))
 
     if start_date is None:
         wm = repo.get_watermark(db, "fmp", ENDPOINT, sec_id)
-        if wm is not None:
-            start_date = wm - timedelta(days=overlap_days)
+        start_date = _window_start(None, wm, overlap_days, backfill_start)
 
     bars = fmp.eod_raw(
         symbol,
@@ -397,6 +534,16 @@ def load_symbol_prices(
         # backfill. Only the caller can tell which, so record and move on.
         _tally("empty")
         logger.debug("No bars returned for %s (from=%s)", symbol, start_date)
+
+    bars, off_session = _drop_non_session(
+        bars, _session_calendar(db, profile.get("exchange_code"), bars)
+    )
+    if off_session:
+        if stats is not None:
+            stats["non_session"] = stats.get("non_session", 0) + off_session
+        logger.debug(
+            "%s: set aside %d bar(s) dated on non-session days", symbol, off_session
+        )
 
     clean: list[dict] = []
     quarantined_dates: list[date] = []
@@ -437,7 +584,9 @@ def load_symbol_prices(
         # the same bar on the next overlap must not add a second row. Nothing counts
         # its repeats the way count_price_quarantines counts the quarantine flags'
         # -- which is exactly why that function now excludes this check by name.
-        collapse = _scale_collapse_detail(bar, row)
+        collapse = _scale_collapse_detail(
+            bar, row, nav_strike=_is_nav_strike(bar, nav_only)
+        )
         if collapse is not None:
             repo.add_dq_flag_once(
                 db,
@@ -543,8 +692,12 @@ def load_prices(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     overlap_days: int = 5,
+    backfill_start: Optional[date] = None,
 ) -> int:
     """Load prices for many symbols.
+
+    ``backfill_start`` is where a symbol loaded for the first time (no watermark, no
+    explicit window) starts; the CLI passes the configured calendar_start_year.
 
     Raises rather than returning a quiet zero when the load cannot have worked.
     A run that reports success having written nothing is the most expensive kind
@@ -579,6 +732,7 @@ def load_prices(
                 end_date=end_date,
                 overlap_days=overlap_days,
                 stats=stats,
+                backfill_start=backfill_start,
             )
             # One symbol -- its landing payload, bars, DQ flags and watermark --
             # is the unit of work. Committing here is what makes the backfill
@@ -613,6 +767,12 @@ def load_prices(
                 "%d of %d symbols returned no bars in the requested window",
                 empty,
                 len(symbols),
+            )
+        non_session = stats.get("non_session", 0)
+        if non_session:
+            logger.info(
+                "Set aside %d bars dated on non-session days (weekends, holidays)",
+                non_session,
             )
         logger.info("Loaded %d price rows across %d symbols", total, len(symbols))
         return total

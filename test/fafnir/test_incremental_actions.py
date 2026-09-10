@@ -86,7 +86,24 @@ def stub_repo(monkeypatch):
         "landed": [],  # every land_payload call
         "flags": [],  # every add_dq_flag_once call
         "resolve": {},  # symbol -> security_id
+        "deleted": [],  # every row delete_corporate_action removed
+        "recomputed": [],  # every security whose factors were recomputed inline
     }
+
+    def delete(db, *, security_id, action_type, ex_date):
+        removed = (
+            state["actions"].get(security_id, {}).pop((action_type, ex_date), None)
+        )
+        if removed is not None:
+            state["deleted"].append((security_id, action_type, ex_date))
+        return removed is not None
+
+    monkeypatch.setattr(ca.repo, "delete_corporate_action", delete)
+    monkeypatch.setattr(
+        ca.adjustments,
+        "compute_for_security",
+        lambda db, security_id: state["recomputed"].append(security_id) or [],
+    )
 
     def upsert(db, *, security_id, action_type, ex_date, **kw):
         rows = state["actions"].setdefault(security_id, {})
@@ -568,6 +585,207 @@ def test_reconciliation_reports_an_action_the_source_withdrew(stub_repo):
     assert flag["detail"]["withdrawn_by_source"] == ["dividend 2026-06-15"]
     # Reported, not acted on: fafnir does not silently discard corporate actions.
     assert ("dividend", date(2026, 6, 15)) in stub_repo["actions"][11]
+
+
+def _stored_dividend(amount):
+    return {
+        "split_numerator": None,
+        "split_denominator": None,
+        "dividend_amount": amount,
+        "record_date": None,
+        "payment_date": None,
+        "declaration_date": None,
+    }
+
+
+def test_reconciliation_removes_a_dividend_the_feed_has_re_dated(stub_repo):
+    """PRGMX and RPSIX in production: one distribution, stored on two dates.
+
+    The calendar sweep stored August's dividend on 08-31; the per-symbol feed reports
+    it on 08-28. The upsert kept both, so every adjusted price before them carried
+    the dividend twice -- and neither mode would ever have removed the extra one.
+    """
+    stub_repo["resolve"]["PRGMX"] = 11
+    stub_repo["actions"][11] = {
+        ("dividend", date(2026, 6, 30)): _stored_dividend(0.023823)
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(dividends={"PRGMX": [{"date": "2026-06-26", "dividend": 0.0238}]}),
+        [{"security_id": 11, "symbol": "PRGMX"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert set(stub_repo["actions"][11]) == {("dividend", date(2026, 6, 26))}
+    assert stub_repo["deleted"] == [(11, "dividend", date(2026, 6, 30))]
+    (flag,) = stub_repo["flags"]
+    assert flag["detail"]["redated"] == ["dividend 2026-06-30 -> 2026-06-26"]
+    # Explained, so no longer reported as withdrawn -- but the feed's date was
+    # still absent from the warehouse, so the coverage gap is reported too.
+    assert flag["detail"]["withdrawn_by_source"] == []
+    assert flag["detail"]["missing_from_calendar"] == ["dividend 2026-06-26"]
+    # A delete leaves no row stamped with the run, so `adjust --changed` cannot
+    # see it: the factors are recomputed here instead.
+    assert stub_repo["recomputed"] == [11]
+    assert 11 in result.changed_security_ids
+
+
+def test_a_re_dated_copy_is_removed_even_when_the_feed_date_was_stored_earlier(
+    stub_repo,
+):
+    """The state production is in now: an earlier pass inserted 08-28, kept 08-31."""
+    stub_repo["resolve"]["RPSIX"] = 11
+    stub_repo["actions"][11] = {
+        ("dividend", date(2026, 6, 26)): _stored_dividend(0.0487),
+        ("dividend", date(2026, 6, 30)): _stored_dividend(0.048694),
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(dividends={"RPSIX": [{"date": "2026-06-26", "dividend": 0.0487}]}),
+        [{"security_id": 11, "symbol": "RPSIX"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert set(stub_repo["actions"][11]) == {("dividend", date(2026, 6, 26))}
+    (flag,) = stub_repo["flags"]
+    assert flag["detail"]["redated"] == ["dividend 2026-06-30 -> 2026-06-26"]
+    assert flag["detail"]["missing_from_calendar"] == []
+    assert stub_repo["recomputed"] == [11]
+
+
+def test_a_withdrawn_dividend_with_no_matching_feed_row_is_kept(stub_repo):
+    """TLT in production: the feed dropped a real dividend, the warehouse was right.
+
+    The July distribution vanished from the per-symbol payload while a different
+    distribution with a different amount sat a month later. Deleting on
+    disagreement would have removed a correct row.
+    """
+    stub_repo["resolve"]["TLT"] = 11
+    stub_repo["actions"][11] = {
+        ("dividend", date(2026, 7, 1)): _stored_dividend(0.33045)
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(dividends={"TLT": [{"date": "2026-07-30", "dividend": 0.31469}]}),
+        [{"security_id": 11, "symbol": "TLT"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert ("dividend", date(2026, 7, 1)) in stub_repo["actions"][11]
+    assert stub_repo["deleted"] == []
+    assert stub_repo["recomputed"] == []
+    (flag,) = stub_repo["flags"]
+    assert flag["detail"]["withdrawn_by_source"] == ["dividend 2026-07-01"]
+    assert flag["detail"]["redated"] == []
+
+
+def test_a_nearby_dividend_of_a_different_amount_is_not_a_re_dated_copy(stub_repo):
+    stub_repo["resolve"]["KO"] = 11
+    stub_repo["actions"][11] = {("dividend", date(2026, 6, 30)): _stored_dividend(0.50)}
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(dividends={"KO": [{"date": "2026-06-27", "dividend": 0.40}]}),
+        [{"security_id": 11, "symbol": "KO"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=ca.ActionsResult(),
+    )
+
+    assert ("dividend", date(2026, 6, 30)) in stub_repo["actions"][11]
+    assert stub_repo["deleted"] == []
+
+
+def test_an_unsettled_dividend_is_never_removed(stub_repo):
+    """Inside the settle window the feeds are allowed to disagree -- same rule as
+    drift, and for the same reason: they do not update in lockstep."""
+    stub_repo["resolve"]["KO"] = 11
+    recent = TODAY - timedelta(days=2)
+    stub_repo["actions"][11] = {("dividend", recent): _stored_dividend(0.48)}
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(
+            dividends={
+                "KO": [
+                    {"date": (recent - timedelta(days=2)).isoformat(), "dividend": 0.48}
+                ]
+            }
+        ),
+        [{"security_id": 11, "symbol": "KO"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=ca.ActionsResult(),
+    )
+
+    assert ("dividend", recent) in stub_repo["actions"][11]
+    assert stub_repo["deleted"] == []
+
+
+def test_redated_dividends_pairs_only_close_dates_with_matching_amounts():
+    withdrawn = {
+        date(2026, 8, 31): 0.023823,  # PRGMX: moved three days
+        date(2026, 7, 1): 0.33045,  # TLT: nothing close enough
+        date(2026, 6, 10): 0.50,  # amount disagrees by 20%
+    }
+    feed = {
+        date(2026, 8, 28): 0.0238,
+        date(2026, 7, 30): 0.31469,
+        date(2026, 6, 12): 0.40,
+    }
+    assert ca._redated_dividends(withdrawn, feed) == {
+        date(2026, 8, 31): date(2026, 8, 28)
+    }
+
+
+def test_redated_dividends_declines_an_ambiguous_pairing():
+    """Two candidates in the window are not evidence of a re-dating.
+
+    A fund accruing daily has a matching neighbour on either side of any dividend
+    the feed drops, so picking the nearest would delete a real distribution. This is
+    the only inference in the reconciliation that deletes; it only runs on a pair.
+    """
+    assert (
+        ca._redated_dividends(
+            {date(2026, 9, 7): 0.95334},
+            {date(2026, 9, 3): 0.95, date(2026, 9, 8): 0.95},
+        )
+        == {}
+    )
+
+
+def test_redated_dividends_still_pairs_a_lone_match_at_the_same_distance():
+    """The guard is about ambiguity, not distance: one candidate still pairs."""
+    assert ca._redated_dividends(
+        {date(2026, 9, 7): 0.95334}, {date(2026, 9, 3): 0.95}
+    ) == {date(2026, 9, 7): date(2026, 9, 3)}
+
+
+def test_redated_dividends_respects_the_window_and_tolerance_edges():
+    base = date(2026, 6, 30)
+    edge = base - timedelta(days=ca.REDATE_WINDOW_DAYS)
+    beyond = base - timedelta(days=ca.REDATE_WINDOW_DAYS + 1)
+    assert ca._redated_dividends({base: 1.0}, {edge: 1.0}) == {base: edge}
+    assert ca._redated_dividends({base: 1.0}, {beyond: 1.0}) == {}
+    assert ca._redated_dividends({base: 1.0}, {edge: 0.995}) == {base: edge}
+    assert ca._redated_dividends({base: 1.0}, {edge: 0.98}) == {}
 
 
 def test_reconciliation_reports_a_settled_amendment_the_overlap_should_have_caught(

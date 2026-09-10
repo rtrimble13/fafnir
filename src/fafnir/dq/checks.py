@@ -83,8 +83,109 @@ GAP_MIN_SESSIONS_FOR_DENSITY = 60
 # exact failure the once-per-occurrence rule exists to prevent, reintroduced by a
 # security whose price is simply published later. Delaying the whole nightly job for
 # a handful of symbols would be the more expensive fix.
+#
+# The allowance is also granted to any security whose master row carries is_fund,
+# unless its asset_type trades in sessions (SESSION_TRADED_ASSET_TYPES, below). The
+# screener stores funds as 'equity' -- all 5,097 on this warehouse -- so an allowance
+# keyed on asset_type alone never fired for any of them.
 NAV_LAGGING_ASSET_TYPES = ("fund",)
 NAV_LAG_TRADING_DAYS = 1
+
+# Open sessions a security must be missing -- counting the market's latest -- before
+# check_freshness calls it stale. NAV-priced securities get NAV_LAG_TRADING_DAYS on
+# top of this.
+#
+# One was too few. FMP posts the bar for a thin warrant, unit or ETF a night late
+# often enough that a one-session threshold turned the vendor's publishing lag into a
+# queue: about 300 stale flags a night, 128 of the 173 still stuck on 2026-09-10 had
+# missed exactly one session, and the 2026-09-09 sweep closed 15,391 that had simply
+# taken the later bar. A queue that refills with the vendor's lag every night hides
+# the few securities the loader has genuinely stopped reaching. Two is the smallest
+# threshold the lag cannot meet on its own, and a security the nightly has really
+# lost is two sessions behind one night later.
+STALE_MIN_SESSIONS_BEHIND = 2
+
+
+def stale_sessions_required(nav_priced: bool) -> int:
+    """Open sessions a security must be missing before it counts as stale.
+
+    Shared by :func:`check_freshness` and ``dq recheck`` through
+    :func:`freshness_cutoff_params`, so the check and its negation cannot disagree
+    about what "stale" means.
+    """
+    return STALE_MIN_SESSIONS_BEHIND + (NAV_LAG_TRADING_DAYS if nav_priced else 0)
+
+
+# The reference dates check_freshness judges against, as CTEs to follow a WITH.
+# Shared verbatim with ``dq recheck`` for the same reason as the constants above.
+#
+# ``cutoff`` holds, per class, the oldest last_date a security may carry and still be
+# current: the Nth open session back from the market's latest date, N being
+# :func:`stale_sessions_required`. Measured in sessions off the calendar rather than
+# calendar days -- a Monday-morning run must not treat the weekend as lateness.
+# Binds :func:`freshness_cutoff_params`.
+FRESHNESS_CUTOFF_CTES = """
+market_latest AS (
+    -- Restricted to open sessions on the venue calendar. A money-market fund
+    -- strikes a NAV seven days a week, so an unrestricted max(trade_date) lands on
+    -- a Saturday whenever one of them is loaded -- and then every security whose
+    -- last bar is Friday's is "behind the market" and the whole universe is
+    -- flagged stale at once.
+    SELECT max(p.trade_date) AS d
+      FROM core.daily_price p
+      JOIN ref.trading_calendar c
+        ON c.trade_date = p.trade_date
+       AND c.exchange_code = %s AND c.is_open
+),
+cutoff AS (
+    SELECT COALESCE(
+               (SELECT min(c.trade_date)
+                  FROM (SELECT trade_date
+                          FROM ref.trading_calendar
+                         WHERE exchange_code = %s AND is_open
+                           AND trade_date <= (SELECT d FROM market_latest)
+                         ORDER BY trade_date DESC
+                         LIMIT %s) c),
+               (SELECT d FROM market_latest)
+           ) AS listed_d,
+           COALESCE(
+               (SELECT min(c.trade_date)
+                  FROM (SELECT trade_date
+                          FROM ref.trading_calendar
+                         WHERE exchange_code = %s AND is_open
+                           AND trade_date <= (SELECT d FROM market_latest)
+                         ORDER BY trade_date DESC
+                         LIMIT %s) c),
+               (SELECT d FROM market_latest)
+           ) AS nav_d
+)
+"""
+
+# Asset types that trade in exchange sessions even when the master also marks the
+# row is_fund: an ETF prints a session close, not a NAV struck after it. Kept equal
+# to fafnir.ingest.daily_price.SESSION_TRADED_ASSET_TYPES -- a test pins the two --
+# so the loader and this check agree on which securities are NAV-priced.
+SESSION_TRADED_ASSET_TYPES = ("etf",)
+
+# Whether the security aliased ``s`` is priced at a NAV: a NAV asset type, or is_fund
+# on anything that does not trade in sessions -- the loader's _is_nav_priced rule.
+# COALESCE keeps a fund with no asset_type NAV-priced here as it is there. Binds the
+# NAV asset types; the session-traded types are literals from the constant above.
+NAV_PRICED_PREDICATE = (
+    "(s.asset_type = ANY(%s::text[]) OR (s.is_fund AND COALESCE(s.asset_type, '') "
+    "NOT IN (" + ", ".join(f"'{t}'" for t in SESSION_TRADED_ASSET_TYPES) + ")))"
+)
+
+
+def freshness_cutoff_params(exchange_code: str) -> tuple:
+    """The values :data:`FRESHNESS_CUTOFF_CTES` binds, in placeholder order."""
+    return (
+        exchange_code,
+        exchange_code,
+        stale_sessions_required(False),
+        exchange_code,
+        stale_sessions_required(True),
+    )
 
 
 def check_gaps(
@@ -311,51 +412,27 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     an unrestricted max(trade_date) onto a weekend and make every other security
     in the universe look a session behind.
 
-    Securities priced at a NAV struck after the equity close get
-    :data:`NAV_LAG_TRADING_DAYS` of slack, measured in trading days off the
-    calendar rather than calendar days -- a Monday-morning run must not treat the
-    weekend as three days of lateness. See :data:`NAV_LAGGING_ASSET_TYPES`.
+    A security is stale once it is missing :data:`STALE_MIN_SESSIONS_BEHIND` open
+    sessions, counting the market's latest. Securities priced at a NAV struck after
+    the equity close -- :data:`NAV_LAGGING_ASSET_TYPES`, or ``is_fund`` -- get
+    :data:`NAV_LAG_TRADING_DAYS` more. The reference dates are
+    :data:`FRESHNESS_CUTOFF_CTES`, which ``dq recheck`` negates.
     """
     row = db.fetchone(
-        """
-        WITH market_latest AS (
-            -- Restricted to open sessions on the venue calendar. A money-market
-            -- fund strikes a NAV seven days a week, so an unrestricted
-            -- max(trade_date) lands on a Saturday whenever one of them is loaded
-            -- -- and then every security whose last bar is Friday's is "behind
-            -- the market" and the whole universe is flagged stale at once.
-            SELECT max(p.trade_date) AS d
-              FROM core.daily_price p
-              JOIN ref.trading_calendar c
-                ON c.trade_date = p.trade_date
-               AND c.exchange_code = %s AND c.is_open
-        ),
-        allowance AS (
-            -- The oldest last_date a NAV-priced security may carry and still be
-            -- considered current: NAV_LAG_TRADING_DAYS open sessions back from the
-            -- market's latest date.
-            SELECT COALESCE(
-                (SELECT min(c.trade_date)
-                   FROM (SELECT trade_date
-                           FROM ref.trading_calendar
-                          WHERE exchange_code = %s AND is_open
-                            AND trade_date <= (SELECT d FROM market_latest)
-                          ORDER BY trade_date DESC
-                          LIMIT %s) c),
-                (SELECT d FROM market_latest)
-            ) AS d
-        ),
+        f"""
+        WITH {FRESHNESS_CUTOFF_CTES},
         detected AS (
             SELECT s.security_id, max(p.trade_date) AS last_date, ml.d AS market_date
             FROM core.security s
             JOIN core.daily_price p ON p.security_id = s.security_id
             CROSS JOIN market_latest ml
-            CROSS JOIN allowance al
+            CROSS JOIN cutoff co
             WHERE s.is_actively_trading
-            GROUP BY s.security_id, s.asset_type, ml.d, al.d
+            GROUP BY s.security_id, s.asset_type, s.is_fund,
+                     ml.d, co.listed_d, co.nav_d
             HAVING max(p.trade_date) < CASE
-                       WHEN s.asset_type = ANY(%s::text[]) THEN al.d
-                       ELSE ml.d
+                       WHEN {NAV_PRICED_PREDICATE} THEN co.nav_d
+                       ELSE co.listed_d
                    END
         ),
         written AS (
@@ -387,12 +464,7 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
         SELECT (SELECT count(*) FROM detected) AS detected,
                (SELECT count(*) FROM written)  AS flagged
         """,
-        (
-            exchange_code,
-            exchange_code,
-            NAV_LAG_TRADING_DAYS + 1,
-            list(NAV_LAGGING_ASSET_TYPES),
-        ),
+        (*freshness_cutoff_params(exchange_code), list(NAV_LAGGING_ASSET_TYPES)),
     )
     logger.info(
         "freshness check: %d stale securities, %d newly flagged",

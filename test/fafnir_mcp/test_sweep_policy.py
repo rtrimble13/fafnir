@@ -60,9 +60,16 @@ def test_never_auto_matches_the_skill():
 
 
 def test_rule_5_states_the_count_it_lists():
-    """'Five checks' and five checks. A stale count is how the list rots."""
+    """'Five checks' and five checks. A stale count is how the list rots.
+
+    "auto-resolve", not "close": `dq accept` and `security merge` also close a
+    flag, and for three of these checks one of them is the *right* answer. The
+    rule bars the bulk resolve, which is what NEVER_AUTO_RESOLVE gates.
+    """
     text = SKILL.read_text()
-    match = re.search(r"^5\. \*\*(\w+) checks are never yours to close", text, re.M)
+    match = re.search(
+        r"^5\. \*\*(\w+) checks are never yours to auto-resolve", text, re.M
+    )
     assert match, "rule 5 no longer opens with a spelled-out count"
     words = {"Three": 3, "Four": 4, "Five": 5, "Six": 6, "Seven": 7}
     stated = words.get(match.group(1))

@@ -227,6 +227,32 @@ def is_retired_listing(
     return None
 
 
+# Nasdaq's test issues: ZXZZT ("SuperMontage TEST"), ZVZZT, ZWZZT, ZBZZT, ZJZZT.
+_TEST_ISSUE_SYMBOL = re.compile(r"^Z[A-Z]ZZT$")
+# A venue name that, next to the word TEST, marks an exchange's own test security.
+_TEST_ISSUE_VENUE_WORDS = frozenset(
+    {"NASDAQ", "SUPERMONTAGE", "NYSE", "ARCA", "CBOE", "BATS"}
+)
+
+
+def is_exchange_test_issue(symbol: Optional[str], company_name: Optional[str]) -> bool:
+    """True for a venue's synthetic test security rather than a listing.
+
+    Exchanges keep test issues trading in production so member firms can exercise
+    order routing end to end, and the screener serves them like any other listing.
+    ZXZZT sat in this warehouse as an active security with 4,400 synthetic bars back
+    to 2003 and produced 2,286 outlier flags -- moves in a price nobody trades.
+
+    The symbol pattern is Nasdaq's convention. The name test is the second net, for
+    venues whose test tickers follow no pattern, and it needs both the word TEST and
+    a venue's name: "Test Systems Inc." is a company, "SuperMontage TEST" is not.
+    """
+    if _TEST_ISSUE_SYMBOL.match((symbol or "").strip().upper()):
+        return True
+    words = set(re.findall(r"[A-Z]+", (company_name or "").upper()))
+    return "TEST" in words and bool(words & _TEST_ISSUE_VENUE_WORDS)
+
+
 class SecurityLoadResult(NamedTuple):
     """Outcome of a security-master load.
 
@@ -239,11 +265,15 @@ class SecurityLoadResult(NamedTuple):
     handful is normal -- the vendor lags a delisting by weeks. A number that climbs
     every night means the delisting sweep and the screener disagree about the
     universe, which is worth seeing rather than inferring from a row count.
+
+    ``skipped_test_issues`` are the exchanges' own test securities, which are not
+    listings at all (:func:`is_exchange_test_issue`).
     """
 
     total: int
     new_symbols: list[str]
     skipped_retired: list[str]
+    skipped_test_issues: list[str]
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:
@@ -414,6 +444,7 @@ def load_securities(
         retired = repo.delisted_securities(db)
         new_symbols: list[str] = []
         skipped_retired: list[str] = []
+        skipped_test_issues: list[str] = []
         # Memoised for the run. get_or_create_* is two round-trips (an
         # ON CONFLICT DO NOTHING insert, then a select), and the screener carries
         # a classification on every one of ~21k entries drawn from a taxonomy of
@@ -438,6 +469,11 @@ def load_securities(
             if not symbol:
                 continue
             company_name = entry.get("name") or entry.get("companyName")
+            if is_exchange_test_issue(symbol, company_name):
+                # Not a listing at all: nothing written, nothing flagged. A row
+                # already minted for one stays until an operator removes it.
+                skipped_test_issues.append(symbol)
+                continue
             previous = listed.get(symbol)
             # Before anything is written or flagged: a name this warehouse has
             # already retired, still being served by the vendor, is not a listing.
@@ -543,7 +579,15 @@ def load_securities(
                 "with --limit, consider `scripts/initial_backfill.sh` instead.",
                 len(new_symbols),
             )
-        return SecurityLoadResult(count, new_symbols, skipped_retired)
+        if skipped_test_issues:
+            logger.info(
+                "%d exchange test issue(s) skipped: %s",
+                len(skipped_test_issues),
+                ", ".join(skipped_test_issues[:20]),
+            )
+        return SecurityLoadResult(
+            count, new_symbols, skipped_retired, skipped_test_issues
+        )
 
 
 def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int:

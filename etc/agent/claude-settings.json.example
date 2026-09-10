@@ -22,10 +22,10 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "allow": [
-      "Bash(sudo -u fafnir fafnir status:*)",
-      "Bash(sudo -u fafnir fafnir db status)",
-      "Bash(sudo -u fafnir fafnir dq list:*)",
-      "Bash(sudo -u fafnir fafnir track list:*)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir status:*)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db status)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir dq list:*)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir track list:*)",
       "Bash(duk -S db:*)",
       "Bash(fafnir-mcp --check:*)",
       "Bash(scripts/monitor.sh:*)",
@@ -40,8 +40,8 @@
     ],
     "deny": [
       "Bash(scripts/reset_data.sh:*)",
-      "Bash(sudo -u fafnir fafnir db migrate:*)",
-      "Bash(sudo -u fafnir fafnir db rollback:*)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db migrate:*)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db rollback:*)",
       "Bash(psql:*)",
       "Bash(pg_dump:*)",
       "Bash(pg_restore:*)",

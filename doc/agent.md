@@ -20,7 +20,8 @@ ADR for *why*; this is *how*.
                  │      │                                        │         ops landing meta
                  │      │                                        │         SELECT only
                  │      └── Bash (allowlisted) ──►               │
-                 │            sudo -u fafnir fafnir … ───────────┼──► fafnir_ingest
+                 │            sudo -u fafnir \                    │
+                 │              /opt/fafnir/.venv/bin/fafnir … ───┼──► fafnir_ingest
                  └──────────────────────────────────────────────┘         (peer auth)
 ```
 
@@ -51,7 +52,7 @@ just works and this step is a no-op. Running it is harmless either way:
 ```bash
 # "role already exists" here means nothing to fix -- carry on to migrate.
 sudo -u postgres psql -d fafnir -c 'CREATE ROLE fafnir_ops NOLOGIN;'
-sudo -u fafnir fafnir db migrate           # applies 0021
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db migrate           # applies 0021
 ```
 
 `fafnir_ops` is `NOLOGIN` on purpose: it is a group that holds grants, never a
@@ -177,7 +178,7 @@ absent, for exactly this reason.
 
 | | |
 |---|---|
-| **Reads, unattended** | every MCP tool; `scripts/monitor.sh`; `systemctl status`/`list-timers`; `journalctl -u fafnir-*`; `sudo -u fafnir fafnir status`/`dq list`/`db status`; `duk -S db …` |
+| **Reads, unattended** | every MCP tool; `scripts/monitor.sh`; `systemctl status`/`list-timers`; `journalctl -u fafnir-*`; `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir status`/`dq list`/`db status`; `duk -S db …` |
 | **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
@@ -274,7 +275,7 @@ Neither disturbs the nightly job, any other person's access, or the other tier.
 | `fafnir-mcp: no DSN` | `FAFNIR_DSN` missing from the MCP `env` block | step 5; `~/.fafnirrc` is deliberately not a fallback |
 | `--check`: *no USAGE on core, ops, landing, meta* | the role is not a member of `fafnir_ops` | `GRANT fafnir_ops TO claude_ops;` |
 | *the role cannot authenticate* | the `pg_hba` peer rule landed **below** `local all all peer`, or `pg_ident` lacks the mapping | step 3 — order is first-match-wins |
-| Tools work, `sudo -u fafnir fafnir …` does not | sudoers rule absent, or the binary path differs | step 4; check `/opt/fafnir/.venv/bin/fafnir` exists |
+| Tools work, `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir …` does not | sudoers rule absent, or the binary path differs | step 4; check `/opt/fafnir/.venv/bin/fafnir` exists |
 | `sql_read`: *refused: that statement writes* | a `SELECT … INTO`, or a data-modifying CTE | intended — changes go through the CLI |
 | `sql_read`: *exceeded the role's statement_timeout* | an unbounded query | narrow it: a date range, a `security_id`, or an aggregate |
 | Agent reports a screen that looks stale | `mart.security_latest` is materialized | `fafnir db refresh-marts`; or read `mart.v_security_profile`, which is live |
