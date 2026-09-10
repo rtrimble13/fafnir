@@ -464,9 +464,9 @@ def test_a_fund_one_day_behind_the_market_is_not_stale(db):
     from fafnir.dq import checks
 
     # The calendar the test fixture seeds covers 2023-2024.
-    days = _trading_days(db, 3, through=dt.date(2024, 12, 31))
-    assert len(days) == 3, "the seeded trading calendar is needed for this test"
-    older, yesterday, today = days
+    days = _trading_days(db, 4, through=dt.date(2024, 12, 31))
+    assert len(days) == 4, "the seeded trading calendar is needed for this test"
+    oldest, older, yesterday, today = days
 
     equity = repo.upsert_security(
         db, primary_symbol="AAA", company_name="Test", asset_type="equity"
@@ -480,11 +480,21 @@ def test_a_fund_one_day_behind_the_market_is_not_stale(db):
 
     assert checks.check_freshness(db) == 0
 
-    # Two sessions behind is past the allowance, and is a real problem.
+    # Two sessions behind is still inside a NAV's allowance: the base threshold
+    # plus NAV_LAG_TRADING_DAYS.
     _price_on(db, fund, older)
     db.execute(
         "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
         (fund, yesterday),
+    )
+    db.commit()
+    assert checks.check_freshness(db) == 0
+
+    # Three is past it, and is a real problem.
+    _price_on(db, fund, oldest)
+    db.execute(
+        "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
+        (fund, older),
     )
     db.commit()
     assert checks.check_freshness(db) == 1
@@ -494,12 +504,15 @@ def test_a_fund_one_day_behind_the_market_is_not_stale(db):
     assert flagged == fund
 
 
-def test_an_equity_one_day_behind_is_still_stale(db):
-    """The allowance is gated on asset_type, not granted to everything."""
+def test_an_equity_is_stale_two_sessions_behind_not_one(db):
+    """One late session is the vendor's publishing lag; two is a lost security.
+
+    And the NAV allowance is gated on NAV pricing, not granted to everything: the
+    equity is flagged a session earlier than the fund above.
+    """
     from fafnir.dq import checks
 
-    days = _trading_days(db, 2, through=dt.date(2024, 12, 31))
-    yesterday, today = days
+    older, yesterday, today = _trading_days(db, 3, through=dt.date(2024, 12, 31))
 
     leader = repo.upsert_security(
         db, primary_symbol="AAA", company_name="Test", asset_type="equity"
@@ -511,7 +524,52 @@ def test_an_equity_one_day_behind_is_still_stale(db):
     _price_on(db, leader, today)
     _price_on(db, laggard, yesterday)
 
+    assert checks.check_freshness(db) == 0
+
+    _price_on(db, laggard, older)
+    db.execute(
+        "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
+        (laggard, yesterday),
+    )
+    db.commit()
     assert checks.check_freshness(db) == 1
+
+
+def test_a_fund_stored_as_equity_still_gets_the_nav_allowance(db):
+    """The screener types every fund 'equity'; is_fund is what says it is a NAV.
+
+    Keyed on asset_type alone, the allowance fired for none of the 5,097 funds on
+    the production warehouse.
+    """
+    from fafnir.dq import checks
+
+    older, yesterday, today = _trading_days(db, 3, through=dt.date(2024, 12, 31))
+
+    leader = repo.upsert_security(
+        db, primary_symbol="AAA", company_name="Test", asset_type="equity"
+    )
+    fund = repo.upsert_security(
+        db,
+        primary_symbol=FUND,
+        company_name="Fund",
+        asset_type="equity",
+        is_fund=True,
+    )
+    plain = repo.upsert_security(
+        db, primary_symbol="BBB", company_name="Test", asset_type="equity"
+    )
+    db.commit()
+    _price_on(db, leader, today)
+    _price_on(db, fund, older)  # two behind: inside a NAV's allowance
+    _price_on(db, plain, older)  # two behind: stale
+
+    assert checks.check_freshness(db) == 1
+    assert (
+        db.fetchval(
+            "SELECT security_id FROM ops.data_quality_flag WHERE check_name = 'stale'"
+        )
+        == plain
+    )
 
 
 def test_a_bar_on_a_closed_day_does_not_make_the_universe_stale(db):
@@ -527,7 +585,7 @@ def test_a_bar_on_a_closed_day_does_not_make_the_universe_stale(db):
     """
     from fafnir.dq import checks
 
-    yesterday, today = _trading_days(db, 2, through=dt.date(2024, 12, 31))
+    older, yesterday, today = _trading_days(db, 3, through=dt.date(2024, 12, 31))
     closed_day = today + dt.timedelta(days=1)
     assert not db.fetchval(
         "SELECT count(*) FROM ref.trading_calendar "
@@ -551,9 +609,9 @@ def test_a_bar_on_a_closed_day_does_not_make_the_universe_stale(db):
     # The equity is current: its last bar is the last *session*.
     assert checks.check_freshness(db) == 0
 
-    # And a security that really is a session behind is still caught, so the
-    # narrower reference point has not blunted the check.
-    _price_on(db, equity, yesterday)
+    # And a security that really is behind -- two sessions, the threshold -- is
+    # still caught, so the narrower reference point has not blunted the check.
+    _price_on(db, equity, older)
     db.execute(
         "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
         (equity, today),
