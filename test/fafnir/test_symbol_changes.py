@@ -54,6 +54,10 @@ class _FakeDB:
         self.flags: list[str] = []
         # (check_name, record_key) already open, so the dedupe guard can be faked.
         self.open_flags: set[tuple] = set()
+        # (check_name, record_key) -> open flag ids, for the lookups that close one.
+        self.open_ids: dict[tuple, list[int]] = {}
+        # (flag_ids, note, resolved_by) per resolve the loader made.
+        self.resolved: list[tuple] = []
         self.commits = 0
 
     def commit(self) -> None:
@@ -102,11 +106,32 @@ def patched(monkeypatch):
         db.flags.append(check_name)
         return True
 
+    def open_ids(db, *, check_name, record_key):
+        return list(db.open_ids.get(_key(check_name, record_key), []))
+
+    def resolve(db, filt, *, note=None, resolved_by=None):
+        ids = tuple(filt.flag_ids)
+        db.resolved.append((ids, note, resolved_by))
+        for key, open_now in db.open_ids.items():
+            db.open_ids[key] = [i for i in open_now if i not in ids]
+        return list(ids)
+
     monkeypatch.setattr(mod.repo, "symbol_change_status", status)
     monkeypatch.setattr(mod.repo, "apply_symbol_change", apply)
     monkeypatch.setattr(mod.repo, "record_symbol_change", record)
     monkeypatch.setattr(mod.repo, "add_dq_flag_once", flag_once)
+    monkeypatch.setattr(mod.repo, "open_dq_flag_ids_for_record", open_ids)
+    monkeypatch.setattr(mod.repo, "resolve_dq_flags", resolve)
     return mod
+
+
+def _key(check_name, record_key):
+    return (check_name, tuple(sorted(record_key.items())))
+
+
+_MATR_CONFLICT = _key(
+    "symbol_change_conflict", {"old_symbol": "MAPP", "new_symbol": "MATR"}
+)
 
 
 def test_parse_date_handles_the_feed_and_junk():
@@ -191,6 +216,62 @@ def test_already_applied_renames_are_skipped(patched):
 
     assert (counts["skipped"], counts["applied"]) == (1, 0)
     assert db.applied == []
+    # Nothing was open against it, so the straggler sweep has nothing to commit.
+    assert (db.resolved, db.commits) == ([], 0)
+
+
+def test_a_retry_that_applies_closes_the_conflict_flag(patched):
+    """MAPP->MATR: conflicted on 2026-09-01, applied on the 09-02 retry.
+
+    The flag describing the conflict stopped being true the moment the retry
+    applied, and before this nothing closed it -- it sat open for nine days.
+    """
+    db = _FakeDB(
+        outcomes={("MAPP", "MATR"): SymbolChangeOutcome(CHANGE_APPLIED, 18821)},
+        recorded={("MAPP", "MATR", date(2026, 8, 31)): CHANGE_CONFLICT},
+    )
+    db.open_ids[_MATR_CONFLICT] = [876928]
+    fmp = _FakeFMP([{"date": "2026-08-31", "oldSymbol": "MAPP", "newSymbol": "MATR"}])
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert (counts["applied"], counts["conflicts_closed"]) == (1, 1)
+    ((ids, note, by),) = db.resolved
+    assert ids == (876928,)
+    assert by == "fafnir"
+    assert "MAPP -> MATR" in note and "security 18821" in note
+    assert db.commits == 1, "closed in the same unit of work as the rename"
+
+
+def test_an_already_applied_rename_closes_a_straggling_conflict_flag(patched):
+    """The row that was applied before the fix: terminal, skipped, flag still open.
+
+    The skip is the only place the sweep ever sees that row again, so it is where
+    the leftover flag has to be closed.
+    """
+    db = _FakeDB(recorded={("MAPP", "MATR", date(2026, 8, 31)): CHANGE_APPLIED})
+    db.open_ids[_MATR_CONFLICT] = [876928]
+    fmp = _FakeFMP([{"date": "2026-08-31", "oldSymbol": "MAPP", "newSymbol": "MATR"}])
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert (counts["skipped"], counts["conflicts_closed"]) == (1, 1)
+    assert db.applied == [], "an applied rename is never re-applied"
+    assert db.resolved[0][0] == (876928,)
+    assert db.commits == 1
+
+
+def test_a_dismissed_rename_leaves_its_conflict_flag_alone(patched):
+    # Dismissal is the operator's call and `dismiss-rename` closes its own flags;
+    # the straggler sweep is for renames that applied, and only for those.
+    db = _FakeDB(recorded={("MAPP", "MATR", date(2026, 8, 31)): CHANGE_DISMISSED})
+    db.open_ids[_MATR_CONFLICT] = [876928]
+    fmp = _FakeFMP([{"date": "2026-08-31", "oldSymbol": "MAPP", "newSymbol": "MATR"}])
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert (counts["skipped"], counts["conflicts_closed"]) == (1, 0)
+    assert db.resolved == []
 
 
 def test_conflicts_are_flagged_and_left_unapplied(patched):
