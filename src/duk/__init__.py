@@ -9,8 +9,7 @@ from duk.indicators import (
     calculate_ema,
     calculate_sma,
 )
-
-__version__ = "1.1.0"
+from fafnir import __version__  # one repository, one version -- see ADR 0011
 
 __all__ = [
     "__version__",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fafnir"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A research-grade financial market data warehouse on PostgreSQL, with the duk data-access CLI"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -63,6 +63,15 @@ fafnir-mcp = "fafnir_mcp.cli:main"
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+# The version is read from the one place it is written, src/fafnir/__init__.py, so
+# the distribution metadata and `fafnir --version` cannot disagree. setuptools parses
+# that attribute statically, so keep it a plain literal. ADR 0011 explains why the
+# number lives in source rather than being derived from the git tag: this warehouse
+# is deployed by `git pull` into an editable install, and a version baked at install
+# time reports whenever pip last ran rather than the code that is running.
+[tool.setuptools.dynamic]
+version = { attr = "fafnir.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 # NOTE: SQL migrations/seeds live in sql/ at the repo root (so they can also be
@@ -74,6 +83,12 @@ where = ["src"]
 testpaths = ["test"]
 markers = [
     "integration: requires a PostgreSQL database (set FAFNIR_TEST_DSN)",
+    # Distribution metadata is written by pip, not by the source tree, so it is
+    # only in step with src/fafnir/__init__.py until something edits that constant.
+    # A release does exactly that, which is why scripts/release.sh deselects these:
+    # between the bump and the next `pip install -e .` a mismatch is expected, not a
+    # defect. CI installs before it tests, so there the check always means something.
+    "needs_fresh_install: only meaningful when pip has run since the version changed",
 ]
 
 [tool.black]

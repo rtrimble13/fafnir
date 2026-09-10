@@ -94,6 +94,18 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
   blocked** — re-ingests, backfills, re-fetching a bad bar. The probe costs 3
   requests and fails fast. Say so in the *first* report, not when a repair fails
   halfway through a plan.
+- **Know which version is deployed** before concluding a defect is unfixed. A fix
+  that is merged is not a fix that is running — `/opt/fafnir` is upgraded by a
+  `git pull` somebody has to do.
+
+  ```bash
+  sudo -u fafnir /opt/fafnir/.venv/bin/fafnir --version   # the code on disk
+  git -C /opt/fafnir describe --tags                      # the commit, e.g. v0.2.0
+  ```
+
+  `describe` ending `-3-gabc1234` means the host is three commits past that tag,
+  between releases. `pip show fafnir` is the one number not to trust here: it
+  records the last install, not the last pull. See ADR 0011.
 - **Read the actions mode from the data**, not from `automations.md`: `params.mode`
   on the latest `corporate-actions` `ops.ingestion_run`.
 - **`journalctl` needs the `adm` or `systemd-journal` group**, which `claude` is

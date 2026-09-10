@@ -28,6 +28,9 @@ read through the `duk` CLI.
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation
 - [Nightly Report Email](nightly_report.md) — the agent's morning summary of the
   automations and the DQ queue: schedule, mail transport, what it can and cannot see
+- [Releasing and Upgrading](releasing.md) — cutting a `vX.Y.Z` release with
+  `make release`, deploying it to the host, and which of `--version`,
+  `git describe` and `pip show` answers which question
 
 ## Growing it
 
@@ -55,6 +58,7 @@ read through the `duk` CLI.
   - [ADR 0008 — Remote `duk` under per-person credentials, and a local stdio MCP server](adr/0008-remote-duk-access-and-mcp.md)
   - [ADR 0009 — `mart` is the whole read seam, and definer-rights views are how](adr/0009-mart-is-the-read-seam.md)
   - [ADR 0010 — An on-host operations agent: a fourth read tier, and mutations stay on the CLI](adr/0010-on-host-operations-agent.md)
+  - [ADR 0011 — One version, written in source, tagged `vX.Y.Z`](adr/0011-versioning.md)
 
 ## Reference
 
