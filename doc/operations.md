@@ -366,7 +366,7 @@ registration — the whole procedure, with the audit and revocation queries, is
 >
 > ```bash
 > sudo -u postgres psql -d fafnir -c 'CREATE ROLE fafnir_ops NOLOGIN;'
-> sudo -u fafnir fafnir db migrate
+> sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db migrate
 > ```
 
 ## Working the DQ queue

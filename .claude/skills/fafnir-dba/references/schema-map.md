@@ -38,6 +38,16 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `landing.fmp_raw` | `raw_id` — endpoint + symbol + `fetched_at` |
 | `meta.schema_migration` | `version` |
 
+**What landing actually keeps.** `landing.fmp_raw` holds the payloads for prices,
+dividends, splits, both corporate-action calendars and symbol changes. It does
+**not** hold `stock-list` (the screener) or `delisted-companies` — those two
+loaders never call `land_payload`. So neither the screener nor the delisted sweep
+can be audited after the fact, and **a join against landing for a screener or
+delisting question returns nothing and looks like a finding**. On 2026-09-10 that
+produced a confident "173/173 off-screener" that was an artefact of the missing
+rows. To ask whether the screener still lists a name, read
+`core.security.updated_at`, which the nightly load stamps.
+
 ## The mart seam
 
 | Relation | What it is | Live or lagged |
@@ -47,9 +57,17 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `mart.v_symbol_lookup` | ticker → `security_id` over time (passthrough of `symbol_xref`) | live |
 | `mart.v_security_profile` | descriptive facts, one row per security | **live** |
 | `mart.security_latest` | the screening contract | **materialized, lagged** |
-| `mart.v_security_price_coverage` | span, bar count, close range, zero-volume bars | live |
+| `mart.v_security_price_coverage` | span, bar count, close range, zero-volume bars | live — **use this, not a per-security probe** |
 | `mart.v_security_action_summary` | split/dividend counts and boundaries, factor state | live |
 | `mart.v_security_dq_open` | open flags: counts, keys, dates — **never `detail`** | live |
+
+**`core.daily_price` is partitioned by year.** A per-security probe of it —
+`min`/`max(trade_date)`, a bar count, a median — touches every partition and hits
+the role's `statement_timeout`. Two ways round it, in order of preference: read
+`mart.v_security_price_coverage`, which already holds first and last trade date,
+bar count and zero-volume bars; or bound the query with `trade_date >= …` so the
+planner can prune. An unbounded median volume times out; the same query with a
+date bound returns.
 
 The resolution ladder is **in the client**, not in `v_symbol_lookup` (which is a
 passthrough, deliberately not a resolver): live ticker → primary symbol →

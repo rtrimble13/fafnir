@@ -72,18 +72,33 @@ SELECT date_trunc('month', started_at) AS m, sum(bytes_downloaded)
 ```
 
 **Requests** — the actual constraint on the nightly window, and dominated by one
-step. `ingest actions` ships in `symbol` mode: a full split and dividend history
-for every active security, every night. That is ~16,000 requests and about an hour
-to capture a few hundred changed rows.
+step. `ingest actions` *ships* in `symbol` mode: a full split and dividend history
+for every active security, every night — ~16,000 requests and about an hour to
+capture a few hundred changed rows. The alternative (`actions_mode = "auto"`,
+ADR 0007) costs ~2 requests plus a first-load for anything newly minted and a 1/30
+reconciliation slice.
 
-The alternative (`actions_mode = "auto"`, ADR 0007) costs ~2 requests plus a
-first-load for anything newly minted and a 1/30 reconciliation slice.
+**Never assume which mode is running.** The shipped default is not the deployed
+setting: this warehouse has been on `auto` since 2026-09-01, and reading the mode
+from this file instead of from the data nearly cost the most important finding of
+the 2026-09-10 session. Read it from the run:
+
+```sql
+SELECT started_at, params->>'mode' AS mode
+  FROM ops.ingestion_run
+ WHERE job_name = 'corporate-actions'
+ ORDER BY started_at DESC LIMIT 1;
+```
+
+Under `auto`, `corporate_action_drift` is the 30-night evaluation of that mode, and
+its drift rate — about 2% of each nightly reconciliation slice — is an
+operator-facing number, not queue noise. Report it as evidence, not as flags.
 
 **You may run the probe. You may not flip the switch.**
 
 ```bash
-sudo -u fafnir fafnir source probe-actions   # 2 + 2N requests, writes nothing
-sudo -u fafnir fafnir source probe-fund <SYM>  # only if funds are held
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-actions   # 2 + 2N requests, writes nothing
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-fund <SYM>  # only if funds are held
 ```
 
 Report the verdict. Only `calendar_complete` justifies the change, and the change
@@ -111,13 +126,25 @@ refresh.
 ## What you may and may not do
 
 **May, freely** — every read: `monitor.sh`, `systemctl status`,
-`list-timers`, `journalctl`, `fafnir status`, `fafnir dq list`, `fafnir db status`,
+`list-timers`, `fafnir status`, `fafnir dq list`, `fafnir db status`,
 `duk -S db …`, and all the MCP read tools.
+
+**Not `journalctl`, despite the example above.** Reading another unit's journal
+needs the `adm` or `systemd-journal` group and `claude` is in neither, so
+`journalctl -u fafnir-daily` is a dead end rather than a permission to be asked
+for. Use `ops.ingestion_run` for what ran, how long it took and how it ended;
+propose the `journalctl` line for the operator when only the journal will do.
 
 **May, with the dry run shown first** — repairs in scope of the flag being worked:
 `ingest prices --symbols`, `ingest actions --symbols`, `ingest delisted`,
 `ingest symbol-changes`, `adjust --symbol`, `db refresh-marts`, `dq resolve`,
-`track rm --closed`, `security merge-rename` / `dismiss-rename`.
+`dq accept`, `dq recheck`, `dq reopen`, `track rm --closed`, `security merge` /
+`merge-rename` / `dismiss-rename` / `dedupe`.
+
+**A first load has no `--from` default of its own on a warehouse predating the
+2026-09-10 DQ fixes**: `ingest prices` asked FMP with no start date, and the vendor
+answered with its own ~5-year window. Always pass an explicit `--from` when
+re-backfilling a truncated history, whichever version is deployed.
 
 **Propose, never run** — `scripts/reset_data.sh`, `fafnir db rollback`,
 `fafnir db migrate`, edits to `~/.fafnirrc`, timer and unit changes,
@@ -151,5 +178,5 @@ migrate normally (both are operator commands: propose, do not run):
 
 ```bash
 sudo -u postgres psql -d fafnir -c 'CREATE ROLE fafnir_ops NOLOGIN;'
-sudo -u fafnir fafnir db migrate
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db migrate
 ```

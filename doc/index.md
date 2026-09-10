@@ -40,6 +40,10 @@ read through the `duk` CLI.
     comprehension; the `fafnir_ops` read tier and the three-tier privilege model
     (**implemented** — see [agent.md](agent.md) and
     [ADR 0010](adr/0010-on-host-operations-agent.md))
+  - [fafnir-dba skill enhancements](plans/fafnir-dba-skill-enhancements.md) — what
+    the 2026-09-10 DQ session got wrong or had to derive from source, and the skill
+    changes that followed: the flag-durability matrix, the environment check, the
+    operator-directed bulk mode (**applied**)
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
