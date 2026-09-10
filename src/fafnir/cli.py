@@ -297,7 +297,8 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
         click.echo(f"New to the universe: {shown}{more}")
         click.echo(
             "Their price history loads on the next `fafnir ingest prices` "
-            "(no watermark yet -- the first pull is a full backfill)."
+            "(no watermark yet, so the first pull starts at "
+            f"{cfg.calendar_start_year}-01-01)."
         )
 
 
@@ -325,7 +326,8 @@ def ingest_tracked(ctx):
         click.echo(f"New to the master: {', '.join(result.minted)}")
         click.echo(
             "Their price history loads on the next `fafnir ingest prices` "
-            "(no watermark yet -- the first pull is a full backfill)."
+            "(no watermark yet, so the first pull starts at "
+            f"{cfg.calendar_start_year}-01-01)."
         )
     for old, new in result.renamed:
         click.echo(f"Followed a rename: {old} -> {new} (declaration updated).")

@@ -10,6 +10,18 @@ research-grade.
 - **Validate at the boundary.** Each row is typed and sanity-checked (cross-field,
   ranges, nulls). Failures are **quarantined** into `ops.data_quality_flag`, never
   silently dropped.
+- **A bar dated on a day the venue was shut is not this security's bar.** Before
+  validation, `daily_price._drop_non_session` sets aside any bar whose date falls
+  inside the venue calendar's span and is not an open session there. Set aside, not
+  quarantined: a quarantine claims a real session's bar was bad, and there was no
+  session. The raw payload still lands in full, and the count appears in the run
+  stats as `non_session`. FMP returns weekend and holiday bars for some symbols —
+  money-market funds strike a NAV seven days a week, and a ticker shared with
+  another instrument can carry that instrument's weekend prints. The calendar is
+  the security's own `exchange_code`, falling back to `CALENDAR_FALLBACK_EXCHANGE`
+  when the venue has none, and is read once per symbol. Dates *outside* the
+  calendar's span are unknown rather than closed — the seed writes open days only —
+  so those bars are kept.
 - **Idempotent.** Loads upsert on the natural key (`ON CONFLICT ... DO UPDATE`).
   Re-pulling a window converges to the same state.
 - **Incremental & resumable.** Per-symbol watermarks (`ops.load_watermark`) bound
@@ -81,16 +93,33 @@ that stand for a symbol that appears in both universes.
 
 Three things follow from the fund grain, and each is handled where it arises:
 
-- **NAV bars.** A fund payload carries a close and no open/high/low. `_validate_bar`
-  expands it to `open = high = low = close` **only** when the security's `asset_type`
-  is in `NAV_ASSET_TYPES` — for an equity a missing OHLC field is still a defect and
-  still quarantines. A field that is *present but unusable* (zero, sub-resolution) is
-  quarantined on either.
+- **NAV bars.** A fund payload carries a close and either no open/high/low or
+  synthetic ones. On a **NAV strike** — a NAV-priced security's bar with no volume —
+  `_validate_bar` builds `open = high = low = close` from the close and ignores the
+  vendor's open/high/low even when they are present. FMP fills them with a
+  distribution-adjusted NAV while the close carries the raw one, and reading them
+  quarantined 3,773 of TDEAX's 4,712 bars as cross-field violations. The close itself
+  is never synthesized and still faces every check, so a zero, sub-resolution or
+  out-of-range close quarantines on any asset type; a fund bar *with* volume (a
+  closed-end fund) is read as a session, keeping only the older allowance that an
+  absent open/high/low stands in as the close.
+
+  **Which securities are NAV-priced** is `_is_nav_priced`: `asset_type` in
+  `NAV_ASSET_TYPES`, or `is_fund` on anything whose `asset_type` is not in
+  `SESSION_TRADED_ASSET_TYPES` (`etf` — an ETF prints a session close however the
+  vendor labels it). `asset_type` alone was not enough: the screener stores every
+  fund as `equity` with `is_fund`, so a rule keyed on `asset_type` matched nothing.
 - **Evening NAV.** Fund NAV is struck at 4pm ET and posted that evening, later than
   equity EOD, so a nightly run timed for equities finds funds a day behind.
-  `check_freshness` gives `NAV_LAGGING_ASSET_TYPES` one **trading day** of slack —
-  without it the queue would grow by one row per fund per night forever, since the
-  flag's `record_key` is the security's own last date and changes daily.
+  `check_freshness` calls a security stale once it is missing
+  `STALE_MIN_SESSIONS_BEHIND` (2) open sessions counting the market's latest, and
+  gives a NAV-priced one `NAV_LAG_TRADING_DAYS` (1) more — three in total, measured
+  in sessions off the calendar so a Monday run does not count the weekend as
+  lateness. Two is the base because one was met by FMP's own publishing lag on thin
+  names: it wrote about 300 self-clearing flags a night. The check reads
+  NAV-pricing the same way the loader does, through `NAV_PRICED_PREDICATE`, and a
+  test pins the two constants together. `dq recheck` negates the same CTEs, so a
+  flag written under an older threshold clears on the next recheck.
 - **Distributions.** Income dividends and capital-gain distributions both drop NAV by
   the distributed amount on the ex-date — arithmetically identical to a cash dividend
   — so they load as `action_type = 'dividend'`. No new action type, no change to the
@@ -229,6 +258,28 @@ Only ex-dates older than `actions_overlap_days` are judged: the two feeds do not
 in lockstep, and flagging inside that window would file a row for every security that
 just went ex, every night.
 
+The drift detail separates four kinds. `missing_from_calendar` is an event the sweep
+never saw; `amended` is one whose values moved; `withdrawn_by_source` is a stored
+event the feed no longer carries — **reported and kept**, because the feed drops real
+events too, and a loader that deleted on every disagreement would be trusting the
+vendor on its worst day. TLT's July distribution vanished from its per-symbol payload
+while the warehouse held it correctly.
+
+`redated` is the one exception, and the only place the reconciliation deletes.
+When the calendar sweep and the per-symbol feed date one distribution differently,
+the upsert stores the feed's date and keeps the sweep's, so the dividend sits in
+the factor chain twice and no actions mode would ever remove it: PRGMX carried
+August 2026 on both 08-31 (0.023823) and 08-28 (0.0238). A settled stored dividend
+the feed no longer carries is treated as a re-dated copy only when the feed carries
+**exactly one** dividend within `REDATE_WINDOW_DAYS` (5) whose amount agrees within
+`REDATE_AMOUNT_TOLERANCE` (1%). Exactly one, not the nearest of several: a fund
+accruing daily has a matching neighbour on either side of any dividend the feed
+happens to drop, and picking the nearest would delete a real distribution. Two
+candidates decline, and the row stays withdrawn. A match is deleted through
+`repository.delete_corporate_action` and the security's factors are recomputed
+inline — a delete leaves no row stamped with the run, so `adjust --changed` cannot
+see it.
+
 ## The adjustment step
 
 `fafnir adjust` recomputes `core.adjustment_factor` from `core.corporate_action`:
@@ -262,11 +313,31 @@ symbol-changes  →  securities  →  delisted  →  prices ...
 
 **New listings.** `ingest securities` re-reads the screener nightly, so an IPO, a
 spin-off or a new ETF enters scope on its listing day. The upsert mints a
-`security_id`; because that security has no `ops.load_watermark` row, the price
-step in the same run leaves its window unbounded and pulls the symbol's whole
-available history (§*Watermarks*). Nothing has to be scheduled per security. The
-loader reports which tickers were new — `Loaded 21412 securities (3 new)` — so the
-nightly log distinguishes a refresh from an arrival.
+`security_id`; because that security has no `ops.load_watermark` row, the price step
+in the same run starts its window at `backfill_start` and pulls the symbol's whole
+history (§*Watermarks*). Nothing has to be scheduled per security. The loader
+reports which tickers were new — `Loaded 21412 securities (3 new)` — so the nightly
+log distinguishes a refresh from an arrival.
+
+`backfill_start` is not decoration. Asking FMP with no start date is not "the whole
+history": the vendor applies its own default window of about five years. Every
+security that entered the universe after the initial backfill therefore got a
+truncated first load — GBF, DDI and MRT hold bars only from 2021 — and each
+dividend older than that raised a `dividend_no_prior_close` flag with no price
+behind it. `fafnir ingest prices` passes `date(calendar_start_year, 1, 1)`, so the
+first load asks for the window the operator configured. An explicit `--from` still
+wins, and a security with a watermark still resumes from it less the overlap. This
+does not repair a history already truncated; that needs an explicit re-backfill.
+
+**Exchange test issues.** Venues keep synthetic securities trading in production so
+member firms can exercise order routing, and the screener serves them like any
+listing — ZXZZT ("SuperMontage TEST") sat here as an active security with 4,400
+synthetic bars and 2,286 outlier flags. `is_exchange_test_issue` skips an entry
+whose symbol matches Nasdaq's `^Z[A-Z]ZZT$` or whose name carries the word TEST
+*together with* a venue's name (both words, so "Test Systems Inc." is a company).
+Skipped entries are neither written nor flagged, and are counted in
+`SecurityLoadResult.skipped_test_issues`. A row already minted for one stays until
+an operator removes it.
 
 A venue transfer (NYSE → NASDAQ) is *not* a new listing and does not fork the
 security: the exchange is an attribute of the listing, not part of identity, so the
@@ -303,6 +374,20 @@ what turns a rename that *cannot* be applied into durable evidence:
 | `conflict` | the new ticker already belongs to another **listed** security that carries history — a human decides; retried every sweep |
 | `ignored` | the old ticker belongs to a delisted issuer, so this is ticker *reuse*, not a rename (0009 already handles it) |
 
+A `conflict` is retried on every sweep because the obstruction can clear itself: the
+duplicate that blocked it is merged away, or the old ticker's holder is marked
+delisted. When a retry succeeds, the `symbol_change_conflict` flag describing the
+conflict stops being true, so the applied branch **closes it in the same unit of
+work as the rename**, resolved as `fafnir`, matched on the `(old, new)` record_key
+the flag was written with. Nothing else could: the sweep skips a terminal row for
+good afterwards, `security merge-rename` refuses once the old ticker is retired,
+`dismiss-rename` would record something false (the rename is real), and `dq recheck`
+never touches a `NEVER_AUTO_RESOLVE` check. MAPP→MATR sat open for nine days after
+its retry applied. The terminal-skip path closes leftovers from before this
+existed — that skip is the only place the sweep sees such a row again — and
+dismissed and ignored rows are left exactly as they are. The count is reported as
+`conflicts_closed`.
+
 A rename for a ticker fafnir does not track is counted and dropped, not recorded:
 the feed is global across every venue, and the audit table is not a copy of it.
 
@@ -326,8 +411,26 @@ one correction the rename step forces: it resolves a feed row through
 `active_security_for_symbol`, not `resolve_security_id`. The read path deliberately
 falls back to a ticker a company used to trade under, and a delisted feed reports
 retired tickers -- so resolving that way would let a row for the retired `FB` stamp
-a one-way delisting on the live `META` security. Prices precede actions so dividend adjustment can value
-against fresh closes. `scripts/daily_update.sh` encodes this order.
+a one-way delisting on the live `META` security.
+
+Resolving to the security *currently* trading under a ticker is necessary and not
+sufficient, because a ticker outlives its issuer: FMP's list still carries the 2018
+delisting of an earlier CMDT, and applied by ticker it landed on the PIMCO fund
+trading as CMDT today. That fund left the active universe, the next security-master
+load minted it a second row, and the ticker forked — four of the six
+`security_duplicate_identity` flags left open after the 2026-09-10 cleanup, none of
+which any command could fold. `mark_delisted` is one-way, so before it runs the
+loader reads the security's own bar span and **declines** a delisting that precedes
+the first bar (it describes an earlier holder) or that the security kept printing
+bars more than `TRADED_AFTER_GRACE_DAYS` (30) past. The grace covers the normal lag
+between a delisting and the feed reporting it. A name that left the exchange and
+kept trading under the same ticker elsewhere is declined too, and goes on loading —
+the cheaper error, and the per-row warning names it for a human. A security with no
+bars contradicts nothing and is marked as before. Declined rows are counted in the
+run's `rows_quarantined`.
+
+Prices precede actions so dividend adjustment can value against fresh closes.
+`scripts/daily_update.sh` encodes this order.
 
 Within `ingest actions` the order matters for the same kind of reason: first-loads,
 then the calendar sweep, then the reconciliation. First-loads go first because a
