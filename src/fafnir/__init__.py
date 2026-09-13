@@ -16,6 +16,6 @@ server (fast-follow).
 #: Keep it a plain string literal. setuptools reads this attribute *statically*
 #: (by parsing, not importing) when it can, and anything computed here would force
 #: an import of this package at build time.
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = ["__version__"]
