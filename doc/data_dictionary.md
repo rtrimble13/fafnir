@@ -176,8 +176,8 @@ happened (ADR 0007).
 | `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. |
 | `currency` | TEXT | |
-| `source` | TEXT | |
-| `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. |
+| `source` | TEXT | `fmp`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). The loaders never overwrite an `operator` row, and the reconciliation does not compare it against the feed. |
+| `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 
 ### `core.adjustment_factor` — derived back-adjustment factors
@@ -413,6 +413,26 @@ The `corporate-actions` row is a presence flag as much as a date: its *absence* 
 puts a newly minted security on the full-history path, so it is stamped with the run
 date rather than the security's last ex-date (a security that has never paid anything
 must still stop being re-pulled).
+
+### `ops.operator_override` — operator corrections. **Grain:** `override_id`.
+Written by `fafnir actions add|delete|redate` and `fafnir prices delete`; undone by
+`fafnir override revoke` (migration 0025). Active means `revoked_at IS NULL`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `override_id` | BIGINT IDENTITY PK | |
+| `security_id` | BIGINT | No FK, so merges and folds are not blocked; `security merge` retargets a victim's overrides. |
+| `target` | TEXT CHECK | `corporate_action` or `daily_price`. |
+| `action_type` | TEXT | `split` / `dividend` for a corporate action; NULL for a bar. |
+| `key_date` | DATE | `ex_date` for an action, `trade_date` for a bar. |
+| `operation` | TEXT CHECK | `delete`: the row was removed, and while active the loaders set aside a vendor row at this key. `add`: the operator wrote the row (`source = operator`). Bars are only ever deleted. |
+| `detail` | JSONB | `delete`: the row as it stood. `add`: the values written. A re-date pair names the other half (`redated_to_override` / `redated_from_override`). |
+| `note` / `created_by` / `created_at` | TEXT / TEXT / TIMESTAMPTZ | The evidence and the owner. `note` may not be blank. |
+| `revoked_at` / `revoked_by` / `revoked_note` | | Set by `override revoke`. Revoking a `delete` lifts the suppression only; revoking an `add` removes the operator's row. |
+
+At most one active override per `(security_id, target, action_type, key_date,
+operation)`: a `delete` and an `add` may share a key, which is how a wrong vendor row
+is replaced by a corrected one.
 
 ---
 
