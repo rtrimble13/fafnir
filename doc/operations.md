@@ -434,6 +434,44 @@ slot in `ux_dq_flag_open_condition`, so if the problem is still in the data the 
 not a bug. Fix the data (backfill the gap, load the missing corporate action) if you
 want it to stay closed.
 
+### Correcting what the vendor has wrong
+
+When the feed itself is wrong — a duplicate or misdated split, a split it never
+reported, a bar that belongs to another instrument — a re-fetch returns the same
+thing, and a hand-written `DELETE` comes back on the next load. These commands make
+the correction and record it in `ops.operator_override`, which the loaders consult:
+
+```bash
+fafnir actions list --symbol KEEX --type split                # ids, dates, source
+fafnir actions delete 820263 -m "pre-announced duplicate of the 09-09 split" --dry-run
+fafnir actions add --symbol OSCX --ex-date 2026-09-03 --split 1:3 -m "..." --dry-run
+fafnir actions redate 3637912 --ex-date 2026-09-03 -m "..." --dry-run
+fafnir prices delete --symbol MMSRX --non-session -m "weekend NAV echoes" --dry-run
+fafnir prices delete --symbol OSCX --date 2026-09-08 -m "stale pre-split print" --dry-run
+fafnir override list                                          # the record
+fafnir override revoke 14 -m "FMP corrected it"               # undo one
+```
+
+- **Durable.** A deleted key is set aside by the calendar sweep, the per-symbol pull,
+  the reconciliation and the price loader for as long as the override is active. An
+  added or re-dated action is stored with `source = operator`; the loaders never
+  overwrite it, and the reconciliation does not report it as withdrawn.
+- **Recorded.** `--note` is required. A delete keeps the row as it stood in
+  `detail`, so nothing is lost that `override list --json` cannot show.
+- **Dry run is the real thing, rolled back.** It performs the edit — every refusal
+  and constraint included — prints the factor change, and rolls back.
+- **Factors are recomputed** in the same transaction. Follow with
+  `fafnir dq recheck --check outlier` for the flags the correction settles, then
+  `fafnir db refresh-marts`.
+- **Deleting a bar on a real session** leaves a hole that `fafnir dq run` reports as a
+  gap, and the loader will not refill it while the override stands. Do it only when
+  no bar is better than the one stored; non-session bars (`--non-session`) have no
+  such cost.
+- **Revoking a delete does not write the row back** — run
+  `fafnir ingest actions --symbols SYM` or `fafnir ingest prices --symbols SYM --from
+  D --to D` to fetch the vendor's current version. A re-date is two overrides;
+  revoke both.
+
 ## Reconciliation
 
 `scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the

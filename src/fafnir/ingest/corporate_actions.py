@@ -104,6 +104,7 @@ class ActionsResult:
     calendar_rows: int = 0  # rows seen on the market-wide feeds
     unresolved_rows: int = 0  # of those, symbols this warehouse does not hold
     future_skipped: int = 0  # declared but not yet ex -- correctly not stored
+    suppressed: int = 0  # at a key an operator deleted -- set aside, not stored
     reconciled: int = 0  # securities checked by the rotating reconciliation
     drift: int = 0  # of those, securities where the feed disagreed
 
@@ -116,6 +117,7 @@ class ActionsResult:
         self.calendar_rows += other.calendar_rows
         self.unresolved_rows += other.unresolved_rows
         self.future_skipped += other.future_skipped
+        self.suppressed += other.suppressed
 
 
 def _parse_date(value) -> Optional[date]:
@@ -173,11 +175,13 @@ def _apply_split(
     run: RunLog,
     as_of: date,
     result: ActionsResult,
+    suppressed: frozenset = frozenset(),
 ) -> Optional[Applied]:
     """Validate and upsert one split row.
 
-    Returns what was stored, or None when the row was not -- invalid (quarantined) or
-    declared but not yet ex.
+    Returns what was stored, or None when the row was not -- invalid (quarantined),
+    declared but not yet ex, or at a key an operator deleted (``suppressed``, see
+    repository.suppressed_action_keys).
     """
     ex_date = _parse_date(rec.get("date"))
     num, den = _split_ratio(rec)
@@ -194,6 +198,9 @@ def _apply_split(
         return None
     if not _within_horizon(ex_date, as_of):
         result.future_skipped += 1
+        return None
+    if (security_id, "split", ex_date) in suppressed:
+        result.suppressed += 1
         return None
     changed = repo.upsert_corporate_action(
         db,
@@ -220,11 +227,12 @@ def _apply_dividend(
     run: RunLog,
     as_of: date,
     result: ActionsResult,
+    suppressed: frozenset = frozenset(),
 ) -> Optional[Applied]:
     """Validate and upsert one dividend row.
 
-    Returns what was stored, or None when the row was not -- invalid (quarantined) or
-    declared but not yet ex.
+    Returns what was stored, or None when the row was not -- invalid (quarantined),
+    declared but not yet ex, or at a key an operator deleted.
     """
     ex_date = _parse_date(rec.get("date"))
     amount = _dividend_amount(rec)
@@ -241,6 +249,9 @@ def _apply_dividend(
         return None
     if not _within_horizon(ex_date, as_of):
         result.future_skipped += 1
+        return None
+    if (security_id, "dividend", ex_date) in suppressed:
+        result.suppressed += 1
         return None
     changed = repo.upsert_corporate_action(
         db,
@@ -307,6 +318,7 @@ def load_symbol_actions(
     its cash amount. :func:`reconcile` needs it to tell a dividend the feed has
     merely moved to another date from one it has dropped (:func:`_redated_dividends`).
     """
+    suppressed = frozenset(repo.suppressed_action_keys(db, security_id))
     splits = fmp.splits(symbol)
     repo.land_payload(
         db,
@@ -328,6 +340,7 @@ def load_symbol_actions(
             run=run,
             as_of=as_of,
             result=result,
+            suppressed=suppressed,
         )
         if seen is not None and applied is not None:
             seen[applied.key] = applied.changed
@@ -353,6 +366,7 @@ def load_symbol_actions(
             run=run,
             as_of=as_of,
             result=result,
+            suppressed=suppressed,
         )
         if seen is not None and applied is not None:
             seen[applied.key] = applied.changed
@@ -494,6 +508,8 @@ def sweep_calendar(
     # used to trade under. A second implementation of that precedence is a second
     # thing to keep correct.
     resolved: dict[str, Optional[int]] = {}
+    # Every operator-deleted key, read once: a few rows, against a feed of thousands.
+    suppressed = frozenset(repo.suppressed_action_keys(db))
 
     def _resolve(symbol: str) -> Optional[int]:
         if symbol not in resolved:
@@ -537,6 +553,7 @@ def sweep_calendar(
                 run=run,
                 as_of=as_of,
                 result=result,
+                suppressed=suppressed,
             )
 
     # Only now, with both feeds transformed, is the window actually covered.
@@ -642,11 +659,23 @@ def reconcile(
     for sec in securities:
         symbol, sec_id = sec["symbol"], sec["security_id"]
         before = repo.corporate_actions_for(db, sec_id)
-        stored_before = {(r["action_type"], r["ex_date"]) for r in before}
+        # An operator's row is not the feed's to confirm or withdraw: it exists
+        # because the feed has that event wrong or missing, so comparing it against
+        # the feed would report the correction as drift every time this security's
+        # turn comes round. Leave its key out of both sides.
+        operator_keys = {
+            (r["action_type"], r["ex_date"])
+            for r in before
+            if r.get("source") == repo.OPERATOR_SOURCE
+        }
+        stored_before = {
+            (r["action_type"], r["ex_date"]) for r in before
+        } - operator_keys
         stored_amounts = {
             r["ex_date"]: r["dividend_amount"]
             for r in before
             if r["action_type"] == "dividend"
+            and (r["action_type"], r["ex_date"]) not in operator_keys
         }
         on_feed: dict = {}
         feed_amounts: dict = {}
@@ -665,7 +694,7 @@ def reconcile(
         result.absorb(marker)
         result.reconciled += 1
 
-        settled_feed = {k for k in on_feed if k[1] <= cutoff}
+        settled_feed = {k for k in on_feed if k[1] <= cutoff and k not in operator_keys}
         settled_stored = {k for k in stored_before if k[1] <= cutoff}
         # On the feed and not in the warehouse: an event the sweep missed. This is the
         # coverage gap the rotation exists to find.

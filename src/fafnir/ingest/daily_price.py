@@ -442,6 +442,29 @@ def _drop_non_session(
     return kept, dropped
 
 
+def non_session_dates(
+    db: Database, exchange_code: Optional[str], dates: Iterable[date]
+) -> set[date]:
+    """Which of these dates the loader would set aside as non-session for a venue.
+
+    The same calendar and the same rule as :func:`_drop_non_session`, for dates
+    already stored -- so `fafnir prices delete --non-session` and the set-aside on
+    arrival cannot disagree about what a session is.
+    """
+    bars = [{"date": d.isoformat()} for d in dates]
+    kept, _ = _drop_non_session(bars, _session_calendar(db, exchange_code, bars))
+    kept_dates = {b["date"] for b in kept}
+    return {_parse_date(b["date"]) for b in bars if b["date"] not in kept_dates}
+
+
+def _drop_suppressed(bars: list[dict], suppressed: frozenset) -> tuple[list[dict], int]:
+    """Split off bars on dates an operator deleted. Returns (kept, dropped)."""
+    if not suppressed:
+        return list(bars), 0
+    kept = [b for b in bars if _parse_date(b.get("date")) not in suppressed]
+    return kept, len(bars) - len(kept)
+
+
 def _window_start(
     start_date: Optional[date],
     watermark: Optional[date],
@@ -543,6 +566,20 @@ def load_symbol_prices(
             stats["non_session"] = stats.get("non_session", 0) + off_session
         logger.debug(
             "%s: set aside %d bar(s) dated on non-session days", symbol, off_session
+        )
+
+    # A bar an operator deleted (ops.operator_override) is set aside the same way:
+    # the vendor that sent it still serves it, so without this the overlap window
+    # re-inserts it on the next run. Like a non-session bar it is not a quarantine,
+    # and it does not hold the watermark.
+    bars, removed = _drop_suppressed(bars, repo.suppressed_price_dates(db, sec_id))
+    if removed:
+        if stats is not None:
+            stats["suppressed"] = stats.get("suppressed", 0) + removed
+        logger.info(
+            "%s: set aside %d bar(s) an operator deleted (fafnir override list)",
+            symbol,
+            removed,
         )
 
     clean: list[dict] = []

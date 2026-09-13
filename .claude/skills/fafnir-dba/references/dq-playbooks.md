@@ -198,17 +198,35 @@ the raw series and already skips a split's exact ex-date, so a split is not a
 generic explanation:
 
 - **A near-miss split** — a matching ratio 1–5 days off the ex-date — is a
-  *misdated* split, not a market move. Correct the ex-date; do not accept.
+  *misdated* split, not a market move. Correct the ex-date with
+  `fafnir actions redate <id> --ex-date <d>`; do not accept.
+- **A split the feed never reported** — a clean ×k or ÷k jump on normal volume that
+  does not revert, with no action within ±5 days and none on the feed — is added with
+  `fafnir actions add --symbol <SYM> --ex-date <d> --split N:D`. A ratio near an
+  integer is not evidence on its own: check the volume and that the price stays.
+- **A duplicate split** — the same ratio twice, days apart, one at a pre-announced
+  date — is removed with `fafnir actions delete <id>`. A bare SQL `DELETE` is
+  re-inserted by the next load while the feed still carries the row.
 - **Spike-and-revert clusters** are corrupt vendor history: two instruments mixed
   under one ticker. Pair each outlier with the next one on the same security
   (`lead(close)`, `lead(prev_close)`) and treat it as a spike when the next flag's
   `prev_close` equals this `close` and the price returns within 25%. That found
   about 10,000 flags across 516 securities (PRG, BXMT, PLA, REA).
 - **An isolated bad bar** can be re-fetched: the loader overwrites bars on
-  re-ingest. Needs the FMP key — check it before planning the repair.
+  re-ingest. Needs the FMP key — check it before planning the repair. When the
+  vendor re-serves the same bad value, `fafnir prices delete --symbol <SYM> --date
+  <d>` removes it and keeps it out; the session then reads as a gap, to accept.
+- **A bar on a non-session day** (a weekend print of another instrument, a
+  money-market fund's weekend NAV stored before the loader set these aside) is
+  removed with `fafnir prices delete --symbol <SYM> --non-session`.
 
-**Close with:** `repair-then-recheck` for a missing action or a re-fetchable bar
-(`dq recheck --check outlier`); `accept` for a verified market fact or corrupt
+Every one of these is `--dry-run` first, `--note` always, and recorded in
+`ops.operator_override` (`fafnir override list`). They need migration 0025 on the
+host — check `schema_state` before planning with them.
+
+**Close with:** `repair-then-recheck` for a missing or misdated action, a duplicate,
+a re-fetchable or deleted bar (`dq recheck --check outlier` — a deleted bar or a
+split on the flag's date closes it); `accept` for a verified market fact or corrupt
 vendor history nobody will re-fetch.
 
 ---
