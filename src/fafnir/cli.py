@@ -17,6 +17,8 @@ Examples
     fafnir dq run
     fafnir dq list --detail --check gap --symbol AAPL
     fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
+    fafnir actions delete 820263 -m "pre-announced duplicate split" --dry-run
+    fafnir prices delete --symbol MMSRX --non-session -m "weekend NAV echoes"
     fafnir status
 """
 
@@ -514,6 +516,11 @@ def ingest_actions(ctx, symbols, mode, include_inactive, reconcile_buckets, as_o
         click.echo(
             f"{result.future_skipped} declared action(s) had not gone ex yet and "
             "were not stored -- they load on their ex-date."
+        )
+    if result.suppressed:
+        click.echo(
+            f"{result.suppressed} action(s) the feed still carries were set aside: an "
+            "operator deleted them (`fafnir override list`)."
         )
     if result.reconciled:
         click.echo(
@@ -1513,6 +1520,783 @@ def security_dismiss_rename(
     )
     click.echo(f"Resolved {_plural(len(closed), 'DQ flag')}.")
     click.echo("The nightly sweep will not retry this rename again.")
+
+
+# ---------------------------------------------------------------------------
+# Operator corrections: actions, prices, override (migration 0025)
+# ---------------------------------------------------------------------------
+def _resolve_one_security(database, symbol, security_id) -> tuple[int, str]:
+    """``(security_id, primary_symbol)`` from exactly one of --symbol / --security-id.
+
+    An id is the unambiguous form. A ticker resolves the way the loaders resolve one,
+    which is the wrong row exactly when a ticker has been re-minted -- so the error
+    for a missing security says to use the id.
+    """
+    from fafnir.db import repository as repo
+
+    if (symbol is None) == (security_id is None):
+        raise click.ClickException("Give exactly one of --symbol or --security-id.")
+    if symbol is not None:
+        security_id = repo.resolve_security_id(database, symbol.strip().upper())
+        if security_id is None:
+            raise click.ClickException(
+                f"No security for {symbol.upper()}. Pass --security-id if the ticker "
+                "has more than one row or has changed."
+            )
+    row = database.fetchone(
+        "SELECT security_id, primary_symbol FROM core.security WHERE security_id = %s",
+        (security_id,),
+    )
+    if row is None:
+        raise click.ClickException(f"No such security: {security_id}")
+    return int(row["security_id"]), row["primary_symbol"]
+
+
+def _fmt_action_value(row) -> str:
+    if row["action_type"] == "split":
+        return (
+            f"{_fmt_num(row['split_numerator'])}:{_fmt_num(row['split_denominator'])}"
+        )
+    return _fmt_num(row["dividend_amount"])
+
+
+def _fmt_num(value) -> str:
+    """A NUMERIC without its storage padding: 10.000000 -> 10, 0.480000 -> 0.48."""
+    from decimal import Decimal
+
+    if value is None:
+        return "-"
+    text = format(Decimal(str(value)).normalize(), "f")
+    return text
+
+
+def _parse_split(value: str):
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        num, den = (Decimal(p.strip()) for p in value.split(":"))
+    except (ValueError, InvalidOperation):
+        raise click.BadParameter(
+            f"{value!r} is not N:D -- a 2-for-1 split is 2:1, a 1-for-10 reverse "
+            "split is 1:10.",
+            param_hint="--split",
+        )
+    if num <= 0 or den <= 0:
+        raise click.BadParameter("both sides of a split must be positive.", "--split")
+    return num, den
+
+
+def _factor_summary(database, security_id: int) -> str:
+    row = database.fetchone(
+        """
+        SELECT count(*) AS n, min(cumulative_price_factor) AS lowest
+          FROM core.adjustment_factor WHERE security_id = %s
+        """,
+        (security_id,),
+    )
+    if not row or not row["n"]:
+        return "no factors"
+    return (
+        f"{_plural(int(row['n']), 'factor')}, lowest cumulative price factor "
+        f"{float(row['lowest']):.6g}"
+    )
+
+
+def _echo_price_context(database, security_id: int, ex_date, split=None) -> None:
+    """The raw closes either side of an ex-date, so a ratio can be checked by eye.
+
+    A split's ex-date is the first session at the new share count, so the close
+    before it and the close on it should differ by the ratio. Printed, never
+    enforced: a split coinciding with a real move is still a split.
+    """
+    before = database.fetchone(
+        """
+        SELECT trade_date, close FROM core.daily_price
+         WHERE security_id = %s AND trade_date < %s
+         ORDER BY trade_date DESC LIMIT 1
+        """,
+        (security_id, ex_date),
+    )
+    on = database.fetchone(
+        """
+        SELECT trade_date, close FROM core.daily_price
+         WHERE security_id = %s AND trade_date >= %s
+         ORDER BY trade_date LIMIT 1
+        """,
+        (security_id, ex_date),
+    )
+    if not before or not on or not before["close"]:
+        click.echo("Raw closes: no bar on both sides of the ex-date to compare.")
+        return
+    move = float(on["close"]) / float(before["close"])
+    line = (
+        f"Raw close {_fmt_num(before['close'])} on {before['trade_date']} -> "
+        f"{_fmt_num(on['close'])} on {on['trade_date']} (x{move:.4g})"
+    )
+    if split is not None:
+        line += f"; a {_fmt_num(split[0])}:{_fmt_num(split[1])} split implies " + (
+            f"x{float(split[1]) / float(split[0]):.4g}"
+        )
+    click.echo(line + ".")
+
+
+_OVERRIDE_HINT = (
+    "Run `fafnir dq recheck --check outlier` for the flags this settles, then "
+    "`fafnir db refresh-marts`."
+)
+
+
+@main.group()
+def actions():
+    """Correct corporate actions the vendor has wrong or missing.
+
+    Every change is recorded in ops.operator_override with its note, and the
+    loaders honour it: a deleted action is not re-inserted by the next sweep or
+    reconciliation, and an added one is not overwritten or reported as drift.
+    `fafnir override list` shows the record; `fafnir override revoke` undoes one.
+    """
+
+
+@actions.command("list")
+@click.option("--symbol", help="Security by ticker.")
+@click.option("--security-id", type=int, help="Security by id (unambiguous).")
+@click.option(
+    "--type", "action_type", type=click.Choice(["split", "dividend"]), help="One kind."
+)
+@click.option("--from", "from_date", metavar="YYYY-MM-DD", help="Ex-date on or after.")
+@click.option("--to", "to_date", metavar="YYYY-MM-DD", help="Ex-date on or before.")
+@click.pass_context
+def actions_list(ctx, symbol, security_id, action_type, from_date, to_date):
+    """Show a security's corporate actions, with the ids the other commands take.
+
+    \b
+      fafnir actions list --symbol KEEX --type split
+      fafnir actions list --security-id 420196 --from 2026-08-01
+    """
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        rows = repo.list_corporate_actions(
+            database,
+            sid,
+            action_type=action_type,
+            from_date=_parse_date(from_date),
+            to_date=_parse_date(to_date),
+        )
+        overrides = repo.list_operator_overrides(database, security_id=sid)
+
+    click.echo(f"{sym} (security {sid})")
+    if not rows:
+        click.echo("No corporate actions match.")
+    _echo_table(
+        ["ID", "EX_DATE", "TYPE", "VALUE", "SOURCE", "LOADED"],
+        [
+            [
+                str(r["corporate_action_id"]),
+                str(r["ex_date"]),
+                r["action_type"],
+                _fmt_action_value(r),
+                r["source"],
+                _fmt_stamp(r["loaded_at"]),
+            ]
+            for r in rows
+        ],
+        right=(0,),
+    )
+    if overrides:
+        click.echo(
+            f"{_plural(len(overrides), 'active override')} on this security: "
+            f"`fafnir override list --security-id {sid}`."
+        )
+
+
+@actions.command("add")
+@click.option("--symbol", help="Security by ticker.")
+@click.option("--security-id", type=int, help="Security by id (unambiguous).")
+@click.option("--ex-date", required=True, metavar="YYYY-MM-DD", help="The ex-date.")
+@click.option(
+    "--split", "split_ratio", metavar="N:D", help="A split: 2:1 forward, 1:10 reverse."
+)
+@click.option("--dividend", metavar="AMOUNT", help="A cash dividend per share.")
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence the feed is wrong. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def actions_add(
+    ctx,
+    symbol,
+    security_id,
+    ex_date,
+    split_ratio,
+    dividend,
+    note,
+    created_by,
+    dry_run,
+    yes,
+):
+    """Add a corporate action the feed never reported.
+
+    \b
+      fafnir actions add --symbol OSCX --ex-date 2026-09-03 --split 1:3 \\
+          -m "price 102.55 -> 38.35 on 2026-09-03 on normal volume; FMP has no split" \\
+          --dry-run
+
+    The row is stored with source = operator. The loaders never overwrite it and the
+    reconciliation does not report it as withdrawn, so it survives every nightly.
+    Adjustment factors are recomputed in the same transaction.
+
+    A key that already holds a row is refused: delete that row first, so the record
+    says what was replaced. To move a misdated action use `fafnir actions redate`.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    if (split_ratio is None) == (dividend is None):
+        raise click.ClickException("Give exactly one of --split or --dividend.")
+    split = _parse_split(split_ratio) if split_ratio else None
+    amount = None
+    if dividend is not None:
+        try:
+            amount = Decimal(dividend)
+        except InvalidOperation:
+            raise click.BadParameter(f"{dividend!r} is not a number.", "--dividend")
+    ex = _parse_date(ex_date)
+    created_by = created_by or _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        kind = "split" if split else "dividend"
+        value = f"{_fmt_num(split[0])}:{_fmt_num(split[1])}" if split else amount
+        click.echo(f"{sym} (security {sid}): add {kind} {value} on {ex}")
+        _echo_price_context(database, sid, ex, split)
+        before = _factor_summary(database, sid)
+        if not dry_run and not yes:
+            click.confirm(f"Add this {kind}?", abort=True)
+        try:
+            action_id, override_id = repo.add_operator_action(
+                database,
+                security_id=sid,
+                action_type=kind,
+                ex_date=ex,
+                split_numerator=split[0] if split else None,
+                split_denominator=split[1] if split else None,
+                dividend_amount=amount,
+                note=note,
+                created_by=created_by,
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        adjustments.compute_for_security(database, sid)
+        after = _factor_summary(database, sid)
+        if dry_run:
+            database.rollback()
+            click.echo(f"Factors: {before} -> {after}.")
+            click.echo("Dry run: nothing changed.")
+            return
+        database.commit()
+
+    click.echo(
+        f"Added corporate action {action_id} (override {override_id}) as {created_by}."
+    )
+    click.echo(f"Factors: {before} -> {after}.")
+    click.echo(_OVERRIDE_HINT)
+
+
+@actions.command("delete")
+@click.argument("action_ids", nargs=-1, type=int, required=True, metavar="ID...")
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why the feed's row is wrong. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def actions_delete(ctx, action_ids, note, created_by, dry_run, yes):
+    """Delete corporate actions by id, and keep the feed from putting them back.
+
+    \b
+      fafnir actions list --symbol KEEX --type split
+      fafnir actions delete 820263 --dry-run \\
+          -m "duplicate of the 09-09 4:1 split, loaded at its pre-announced date"
+
+    The row as it stood is kept in ops.operator_override, and while that override
+    is active the calendar sweep and the reconciliation set the vendor's copy aside
+    instead of re-inserting it. Adjustment factors are recomputed in the same
+    transaction.
+
+    To undo a row an operator added, use `fafnir override revoke` instead: deleting
+    it here would also suppress the key against the vendor.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    created_by = created_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = []
+        for aid in dict.fromkeys(action_ids):
+            row = repo.corporate_action_by_id(database, aid)
+            if row is None:
+                raise click.ClickException(f"No corporate action {aid}.")
+            rows.append(row)
+        _echo_table(
+            ["ID", "SYMBOL", "SECURITY", "EX_DATE", "TYPE", "VALUE", "SOURCE"],
+            [
+                [
+                    str(r["corporate_action_id"]),
+                    r["primary_symbol"],
+                    str(r["security_id"]),
+                    str(r["ex_date"]),
+                    r["action_type"],
+                    _fmt_action_value(r),
+                    r["source"],
+                ]
+                for r in rows
+            ],
+            right=(0, 2),
+        )
+        securities = list(dict.fromkeys(int(r["security_id"]) for r in rows))
+        before = {sid: _factor_summary(database, sid) for sid in securities}
+        if not dry_run and not yes:
+            click.confirm(
+                f"Delete {_plural(len(rows), 'corporate action')} and suppress "
+                "their keys?",
+                abort=True,
+            )
+        override_ids = []
+        try:
+            for r in rows:
+                override_ids.append(
+                    repo.delete_operator_action(
+                        database,
+                        corporate_action_id=int(r["corporate_action_id"]),
+                        note=note,
+                        created_by=created_by,
+                    )
+                )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        for sid in securities:
+            adjustments.compute_for_security(database, sid)
+        after = {sid: _factor_summary(database, sid) for sid in securities}
+        if dry_run:
+            database.rollback()
+            for sid in securities:
+                click.echo(f"Security {sid} factors: {before[sid]} -> {after[sid]}.")
+            click.echo(
+                f"Dry run: {_plural(len(rows), 'corporate action')} would be deleted. "
+                "Nothing changed."
+            )
+            return
+        database.commit()
+
+    click.echo(
+        f"Deleted {_plural(len(rows), 'corporate action')} as {created_by} "
+        f"(overrides {', '.join(map(str, override_ids))})."
+    )
+    for sid in securities:
+        click.echo(f"Security {sid} factors: {before[sid]} -> {after[sid]}.")
+    click.echo(_OVERRIDE_HINT)
+
+
+@actions.command("redate")
+@click.argument("action_id", type=int)
+@click.option(
+    "--ex-date", required=True, metavar="YYYY-MM-DD", help="The correct ex-date."
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence for the correct date. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def actions_redate(ctx, action_id, ex_date, note, created_by, dry_run, yes):
+    """Move a misdated corporate action to its real ex-date.
+
+    \b
+      fafnir actions redate 3637912 --ex-date 2026-09-03 \\
+          -m "price halves 09-02 -> 09-03 on 2x volume; feed dates it 09-09" --dry-run
+
+    Recorded as two overrides that name each other: a delete of the old date, which
+    keeps the feed's misdated copy from coming back, and an operator row at the new
+    one. Revoke both to undo it. Adjustment factors are recomputed in the same
+    transaction.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    new_date = _parse_date(ex_date)
+    created_by = created_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        row = repo.corporate_action_by_id(database, action_id)
+        if row is None:
+            raise click.ClickException(f"No corporate action {action_id}.")
+        sid = int(row["security_id"])
+        split = (
+            (row["split_numerator"], row["split_denominator"])
+            if row["action_type"] == "split"
+            else None
+        )
+        click.echo(
+            f"{row['primary_symbol']} (security {sid}): {row['action_type']} "
+            f"{_fmt_action_value(row)} from {row['ex_date']} to {new_date}"
+        )
+        click.echo("At the current date:")
+        _echo_price_context(database, sid, row["ex_date"], split)
+        click.echo("At the new date:")
+        _echo_price_context(database, sid, new_date, split)
+        before = _factor_summary(database, sid)
+        if not dry_run and not yes:
+            click.confirm("Re-date it?", abort=True)
+        try:
+            new_id, delete_id, add_id = repo.redate_operator_action(
+                database,
+                corporate_action_id=action_id,
+                new_ex_date=new_date,
+                note=note,
+                created_by=created_by,
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        adjustments.compute_for_security(database, sid)
+        after = _factor_summary(database, sid)
+        if dry_run:
+            database.rollback()
+            click.echo(f"Factors: {before} -> {after}.")
+            click.echo("Dry run: nothing changed.")
+            return
+        database.commit()
+
+    click.echo(
+        f"Re-dated as corporate action {new_id} (overrides {delete_id} and {add_id}) "
+        f"as {created_by}."
+    )
+    click.echo(f"Factors: {before} -> {after}.")
+    click.echo(_OVERRIDE_HINT)
+
+
+@main.group()
+def prices():
+    """Remove bars the vendor has wrong. See `fafnir actions` for the record kept."""
+
+
+@prices.command("delete")
+@click.option("--symbol", help="Security by ticker.")
+@click.option("--security-id", type=int, help="Security by id (unambiguous).")
+@click.option(
+    "--date",
+    "dates",
+    multiple=True,
+    metavar="YYYY-MM-DD",
+    help="A bar to delete. Repeatable.",
+)
+@click.option(
+    "--non-session",
+    is_flag=True,
+    help="Every stored bar dated on a day the security's venue was closed.",
+)
+@click.option("--from", "from_date", metavar="YYYY-MM-DD", help="With --non-session.")
+@click.option("--to", "to_date", metavar="YYYY-MM-DD", help="With --non-session.")
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why the bars are wrong. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def prices_delete(
+    ctx,
+    symbol,
+    security_id,
+    dates,
+    non_session,
+    from_date,
+    to_date,
+    note,
+    created_by,
+    dry_run,
+    yes,
+):
+    """Delete bars, and keep the price loader from putting them back.
+
+    \b
+      fafnir prices delete --symbol MMSRX --non-session -m "weekend NAV echoes" --dry-run
+      fafnir prices delete --symbol OSCX --date 2026-09-08 \\
+          -m "stale pre-split print: 120.87 on 348 shares between 38.36 and 36.97"
+
+    Non-session bars are what the loader already sets aside on arrival; this removes
+    the ones stored before it did. A bar on a real session is different: removing it
+    leaves a hole `fafnir dq run` reports as a gap, and while the override is active
+    the loader will not fill it -- delete a session bar only when no bar is better
+    than the one stored, and accept the gap that follows.
+
+    Each bar as it stood is kept in ops.operator_override. Adjustment factors are
+    recomputed when the security has corporate actions, because a dividend is valued
+    against the close before it.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+    from fafnir.ingest import daily_price as dp
+
+    if not dates and not non_session:
+        raise click.ClickException("Nothing selected. Pass --date or --non-session.")
+    if (from_date or to_date) and not non_session:
+        raise click.ClickException("--from/--to narrow --non-session only.")
+    created_by = created_by or _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        reasons: dict = {}
+        for d in dates:
+            reasons[_parse_date(d)] = "requested"
+        if non_session:
+            stored = database.fetchall(
+                """
+                SELECT trade_date FROM core.daily_price
+                 WHERE security_id = %s
+                   AND trade_date >= COALESCE(%s::date, DATE '1900-01-01')
+                   AND trade_date <= COALESCE(%s::date, DATE '9999-12-31')
+                """,
+                (sid, _parse_date(from_date), _parse_date(to_date)),
+            )
+            profile = repo.security_price_profile(database, sid) or {}
+            for d in dp.non_session_dates(
+                database,
+                profile.get("exchange_code"),
+                [r["trade_date"] for r in stored],
+            ):
+                reasons.setdefault(d, "non-session")
+
+        bars = {
+            r["trade_date"]: r
+            for r in database.fetchall(
+                """
+                SELECT trade_date, open, high, low, close, volume
+                  FROM core.daily_price
+                 WHERE security_id = %s AND trade_date = ANY(%s)
+                """,
+                (sid, list(reasons)),
+            )
+        }
+        missing = sorted(d for d in reasons if d not in bars)
+        click.echo(f"{sym} (security {sid})")
+        _echo_table(
+            ["TRADE_DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME", "WHY"],
+            [
+                [
+                    str(d),
+                    _fmt_num(b["open"]),
+                    _fmt_num(b["high"]),
+                    _fmt_num(b["low"]),
+                    _fmt_num(b["close"]),
+                    str(b["volume"]),
+                    reasons[d],
+                ]
+                for d, b in sorted(bars.items())
+            ],
+            right=(1, 2, 3, 4, 5),
+        )
+        for d in missing:
+            click.echo(f"No stored bar on {d}; skipping it.")
+        if not bars:
+            click.echo("Nothing to delete.")
+            return
+        sessions = sorted(d for d in bars if reasons[d] == "requested")
+        if sessions:
+            _echo_wrapped(
+                f"{_plural(len(sessions), 'bar')} requested by date. Any that falls "
+                "on an open session becomes a gap for `fafnir dq run`, and the loader "
+                "will not refill it while the override is active."
+            )
+        has_actions = bool(
+            database.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM core.corporate_action "
+                "WHERE security_id = %s)",
+                (sid,),
+            )
+        )
+        if not dry_run and not yes:
+            click.confirm(f"Delete {_plural(len(bars), 'bar')}?", abort=True)
+        override_ids = repo.delete_operator_bars(
+            database,
+            security_id=sid,
+            trade_dates=list(bars),
+            note=note,
+            created_by=created_by,
+        )
+        if has_actions:
+            adjustments.compute_for_security(database, sid)
+        if dry_run:
+            database.rollback()
+            click.echo(
+                f"Dry run: {_plural(len(override_ids), 'bar')} would be deleted. "
+                "Nothing changed."
+            )
+            return
+        database.commit()
+
+    click.echo(f"Deleted {_plural(len(override_ids), 'bar')} as {created_by}.")
+    if has_actions:
+        click.echo("Adjustment factors recomputed.")
+    click.echo(_OVERRIDE_HINT)
+
+
+@main.group()
+def override():
+    """The record of operator corrections, and how to undo one."""
+
+
+@override.command("list")
+@click.option("--symbol", help="Security by ticker.")
+@click.option("--security-id", type=int, help="Security by id (unambiguous).")
+@click.option("--all", "include_revoked", is_flag=True, help="Include revoked ones.")
+@click.option("--json", "as_json", is_flag=True, help="Every field, as JSON.")
+@click.pass_context
+def override_list(ctx, symbol, security_id, include_revoked, as_json):
+    """List operator overrides: what was changed, by whom, and why.
+
+    \b
+      fafnir override list
+      fafnir override list --symbol KEEX --all
+    """
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid = None
+        if symbol is not None or security_id is not None:
+            sid, _ = _resolve_one_security(database, symbol, security_id)
+        rows = repo.list_operator_overrides(
+            database, security_id=sid, include_revoked=include_revoked
+        )
+
+    if as_json:
+        _dq_json(rows)
+        return
+    if not rows:
+        click.echo("No overrides." if include_revoked else "No active overrides.")
+        return
+    _echo_table(
+        ["ID", "SYMBOL", "TARGET", "KEY", "OP", "BY", "CREATED", "STATE", "NOTE"],
+        [
+            [
+                str(r["override_id"]),
+                r["primary_symbol"] or str(r["security_id"]),
+                "action" if r["target"] == "corporate_action" else "bar",
+                (
+                    f"{r['action_type']} {r['key_date']}"
+                    if r["action_type"]
+                    else str(r["key_date"])
+                ),
+                r["operation"],
+                r["created_by"],
+                _fmt_stamp(r["created_at"]),
+                "active" if r["revoked_at"] is None else "revoked",
+                r["note"],
+            ]
+            for r in rows
+        ],
+        right=(0,),
+    )
+
+
+@override.command("revoke")
+@click.argument("override_ids", nargs=-1, type=int, required=True, metavar="ID...")
+@click.option(
+    "--note", "-m", required=True, help="Why the correction no longer stands."
+)
+@click.option("--by", "revoked_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
+    """Undo operator corrections, keeping their record.
+
+    \b
+      fafnir override revoke 14 -m "FMP now dates the split correctly"
+
+    Revoking a delete lifts the suppression; it does not write the removed row back.
+    The next load brings back whatever the vendor serves for that key -- or run
+    `fafnir ingest actions --symbols SYM`, or `fafnir ingest prices --symbols SYM
+    --from D --to D`, to fetch it now. Revoking an add removes the operator's row.
+    A re-date is two overrides; revoke both to undo it.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    revoked_by = revoked_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        if not dry_run and not yes:
+            click.confirm(
+                f"Revoke {_plural(len(override_ids), 'override')}?", abort=True
+            )
+        revoked = []
+        try:
+            for oid in dict.fromkeys(override_ids):
+                revoked.append(
+                    repo.revoke_operator_override(
+                        database, override_id=oid, note=note, revoked_by=revoked_by
+                    )
+                )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        for sid in dict.fromkeys(
+            int(r["security_id"]) for r in revoked if r["target"] == "corporate_action"
+        ):
+            adjustments.compute_for_security(database, sid)
+        if dry_run:
+            database.rollback()
+        else:
+            database.commit()
+
+    for r in revoked:
+        key = (
+            f"{r['action_type']} {r['key_date']}"
+            if r["action_type"]
+            else f"bar {r['key_date']}"
+        )
+        effect = (
+            "suppression lifted"
+            if r["operation"] == "delete"
+            else "operator row removed"
+        )
+        click.echo(
+            f"Override {r['override_id']} (security {r['security_id']}, {key}): "
+            f"{effect}."
+        )
+    if dry_run:
+        click.echo("Dry run: nothing changed.")
+        return
+    click.echo(f"Revoked {_plural(len(revoked), 'override')} as {revoked_by}.")
+    if any(r["target"] == "corporate_action" for r in revoked):
+        click.echo("Adjustment factors recomputed. " + _OVERRIDE_HINT)
 
 
 # ---------------------------------------------------------------------------
