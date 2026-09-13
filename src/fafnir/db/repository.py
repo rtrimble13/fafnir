@@ -1029,6 +1029,31 @@ def merge_security(
         (survivor_id, victim_id),
     )
 
+    # Operator overrides (0025) follow the rows they describe, or the loaders would
+    # start re-inserting what an operator removed from the victim's history. Where
+    # the survivor already carries an active edit of the same kind on the same key,
+    # the survivor's wins, like everything else here: the victim's is revoked (kept
+    # as a record) rather than colliding with ux_operator_override_active.
+    db.execute(
+        """
+        UPDATE ops.operator_override v
+           SET revoked_at = now(), revoked_by = 'merge',
+               revoked_note = 'superseded by the same edit on security ' || %s
+         WHERE v.security_id = %s AND v.revoked_at IS NULL
+           AND EXISTS (SELECT 1 FROM ops.operator_override s
+                        WHERE s.security_id = %s AND s.revoked_at IS NULL
+                          AND s.target = v.target
+                          AND s.action_type IS NOT DISTINCT FROM v.action_type
+                          AND s.key_date = v.key_date
+                          AND s.operation = v.operation)
+        """,
+        (survivor_id, victim_id, survivor_id),
+    )
+    db.execute(
+        "UPDATE ops.operator_override SET security_id = %s WHERE security_id = %s",
+        (survivor_id, victim_id),
+    )
+
     # The victim's watermark is usually the *fresher* of the two -- it is the row the
     # daily load has been feeding since the duplicate was minted. Taking the later
     # date per endpoint stops the next incremental load from re-fetching a tail the
@@ -1754,6 +1779,11 @@ def upsert_corporate_action(
 
     ``ingestion_run_id`` is updated too (it was not before), so it names the run
     that last *changed* the row -- the question anyone reading lineage is asking.
+
+    A row an operator wrote (``source = 'operator'``, see :func:`add_operator_action`)
+    is never overwritten: the operator wrote it because the feed has this event wrong
+    or missing, and a vendor copy arriving at the same key is the thing being
+    corrected, not a correction.
     """
     return (
         db.execute(
@@ -1773,7 +1803,8 @@ def upsert_corporate_action(
             currency = EXCLUDED.currency,
             ingestion_run_id = EXCLUDED.ingestion_run_id,
             loaded_at = now()
-        WHERE (core.corporate_action.record_date,
+        WHERE core.corporate_action.source <> 'operator'
+          AND (core.corporate_action.record_date,
                core.corporate_action.payment_date,
                core.corporate_action.declaration_date,
                core.corporate_action.split_numerator,
@@ -1811,7 +1842,8 @@ def upsert_corporate_action(
 def corporate_actions_for(db: Database, security_id: int) -> list[dict]:
     return db.fetchall(
         """
-        SELECT action_type, ex_date, split_numerator, split_denominator, dividend_amount
+        SELECT action_type, ex_date, split_numerator, split_denominator,
+               dividend_amount, source
         FROM core.corporate_action
         WHERE security_id = %s
         ORDER BY ex_date ASC
@@ -1842,6 +1874,523 @@ def delete_corporate_action(
         )
         > 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Operator overrides (migration 0025): corrections to vendor rows that the loaders
+# must not undo
+# ---------------------------------------------------------------------------
+
+OPERATOR_SOURCE = "operator"
+
+
+class OverrideRefused(RuntimeError):
+    """An operator edit that would leave the rows, or their record, ambiguous."""
+
+
+def _jsonable(row: dict) -> dict:
+    """A row as JSON-safe scalars: exact decimals as strings, dates as ISO."""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, Decimal):
+            out[k] = str(v)
+        elif isinstance(v, date):  # datetime is a date subclass
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+def _insert_override(
+    db: Database,
+    *,
+    security_id: int,
+    target: str,
+    action_type: Optional[str],
+    key_date: date,
+    operation: str,
+    detail: dict,
+    note: str,
+    created_by: str,
+) -> int:
+    import json
+
+    return int(
+        db.fetchval(
+            """
+            INSERT INTO ops.operator_override
+                (security_id, target, action_type, key_date, operation, detail,
+                 note, created_by)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING override_id
+            """,
+            (
+                security_id,
+                target,
+                action_type,
+                key_date,
+                operation,
+                json.dumps(detail, default=str),
+                note,
+                created_by,
+            ),
+        )
+    )
+
+
+def corporate_action_by_id(db: Database, corporate_action_id: int) -> Optional[dict]:
+    return db.fetchone(
+        """
+        SELECT ca.corporate_action_id, ca.security_id, s.primary_symbol,
+               ca.action_type, ca.ex_date, ca.record_date, ca.payment_date,
+               ca.declaration_date, ca.split_numerator, ca.split_denominator,
+               ca.dividend_amount, ca.currency, ca.source, ca.ingestion_run_id,
+               ca.loaded_at
+          FROM core.corporate_action ca
+          JOIN core.security s USING (security_id)
+         WHERE ca.corporate_action_id = %s
+        """,
+        (corporate_action_id,),
+    )
+
+
+def corporate_action_at(
+    db: Database, *, security_id: int, action_type: str, ex_date: date
+) -> Optional[dict]:
+    return db.fetchone(
+        """
+        SELECT corporate_action_id, action_type, ex_date, split_numerator,
+               split_denominator, dividend_amount, source
+          FROM core.corporate_action
+         WHERE security_id = %s AND action_type = %s AND ex_date = %s
+        """,
+        (security_id, action_type, ex_date),
+    )
+
+
+def list_corporate_actions(
+    db: Database,
+    security_id: int,
+    *,
+    action_type: Optional[str] = None,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+) -> list[dict]:
+    """A security's actions with the ids the operator commands take."""
+    clauses, params = ["security_id = %s"], [security_id]
+    if action_type:
+        clauses.append("action_type = %s")
+        params.append(action_type)
+    if from_date:
+        clauses.append("ex_date >= %s")
+        params.append(from_date)
+    if to_date:
+        clauses.append("ex_date <= %s")
+        params.append(to_date)
+    return db.fetchall(
+        f"""
+        SELECT corporate_action_id, action_type, ex_date, split_numerator,
+               split_denominator, dividend_amount, currency, source, loaded_at
+          FROM core.corporate_action
+         WHERE {' AND '.join(clauses)}
+         ORDER BY ex_date, action_type
+        """,
+        params,
+    )
+
+
+def suppressed_action_keys(
+    db: Database, security_id: Optional[int] = None
+) -> set[tuple[int, str, date]]:
+    """``(security_id, action_type, ex_date)`` for every action an operator deleted.
+
+    The loaders set a vendor row at one of these keys aside instead of upserting it.
+    The table holds a handful of rows, so the calendar sweep reads it whole once and
+    the per-symbol path reads one security's slice.
+    """
+    sql = """
+        SELECT security_id, action_type, key_date
+          FROM ops.operator_override
+         WHERE target = 'corporate_action' AND operation = 'delete'
+           AND revoked_at IS NULL
+    """
+    params: list[Any] = []
+    if security_id is not None:
+        sql += " AND security_id = %s"
+        params.append(security_id)
+    return {
+        (int(r["security_id"]), r["action_type"], r["key_date"])
+        for r in db.fetchall(sql, params)
+    }
+
+
+def suppressed_price_dates(db: Database, security_id: int) -> frozenset[date]:
+    """Trade dates of this security's bars an operator deleted. The price loader
+    sets a vendor bar on one of these dates aside instead of upserting it."""
+    return frozenset(
+        r["key_date"]
+        for r in db.fetchall(
+            """
+            SELECT key_date FROM ops.operator_override
+             WHERE target = 'daily_price' AND operation = 'delete'
+               AND revoked_at IS NULL AND security_id = %s
+            """,
+            (security_id,),
+        )
+    )
+
+
+def _active_override(
+    db: Database,
+    *,
+    security_id: int,
+    target: str,
+    action_type: Optional[str],
+    key_date: date,
+    operation: str,
+) -> Optional[dict]:
+    return db.fetchone(
+        """
+        SELECT override_id, note, created_by, created_at
+          FROM ops.operator_override
+         WHERE security_id = %s AND target = %s
+           AND action_type IS NOT DISTINCT FROM %s
+           AND key_date = %s AND operation = %s AND revoked_at IS NULL
+        """,
+        (security_id, target, action_type, key_date, operation),
+    )
+
+
+def delete_operator_action(
+    db: Database,
+    *,
+    corporate_action_id: int,
+    note: str,
+    created_by: str,
+    detail_extra: Optional[dict] = None,
+) -> int:
+    """Remove a corporate action and suppress its key. Returns the override id.
+
+    Does not recompute adjustment factors: the caller does, once per security, after
+    every edit in the batch has landed.
+    """
+    row = corporate_action_by_id(db, corporate_action_id)
+    if row is None:
+        raise OverrideRefused(f"No corporate action {corporate_action_id}.")
+    if row["source"] == OPERATOR_SOURCE:
+        added = _active_override(
+            db,
+            security_id=row["security_id"],
+            target="corporate_action",
+            action_type=row["action_type"],
+            key_date=row["ex_date"],
+            operation="add",
+        )
+        if added is not None:
+            # Deleting it here would also suppress the key against the vendor,
+            # which is not what undoing an addition means.
+            raise OverrideRefused(
+                f"Corporate action {corporate_action_id} was written by an operator "
+                f"(override {added['override_id']}). Undo it with "
+                f"`fafnir override revoke {added['override_id']}`."
+            )
+    override_id = _insert_override(
+        db,
+        security_id=row["security_id"],
+        target="corporate_action",
+        action_type=row["action_type"],
+        key_date=row["ex_date"],
+        operation="delete",
+        detail={"row": _jsonable(row), **(detail_extra or {})},
+        note=note,
+        created_by=created_by,
+    )
+    db.execute(
+        "DELETE FROM core.corporate_action WHERE corporate_action_id = %s",
+        (corporate_action_id,),
+    )
+    return override_id
+
+
+def add_operator_action(
+    db: Database,
+    *,
+    security_id: int,
+    action_type: str,
+    ex_date: date,
+    split_numerator: Optional[Decimal] = None,
+    split_denominator: Optional[Decimal] = None,
+    dividend_amount: Optional[Decimal] = None,
+    currency: str = "USD",
+    note: str,
+    created_by: str,
+    detail_extra: Optional[dict] = None,
+) -> tuple[int, int]:
+    """Write a corporate action the feed has wrong or missing.
+
+    Returns ``(corporate_action_id, override_id)``. Refuses a key that already holds
+    a row -- delete that one first, so the record says what was replaced -- and a
+    future ex-date, for the reason the loader refuses one (see the module docstring of
+    fafnir.ingest.corporate_actions).
+    """
+    if action_type == "split":
+        if not (
+            split_numerator
+            and split_denominator
+            and split_numerator > 0
+            and split_denominator > 0
+        ):
+            raise OverrideRefused("A split needs a positive numerator and denominator.")
+        dividend_amount = None
+    elif action_type == "dividend":
+        if dividend_amount is None or dividend_amount <= 0:
+            raise OverrideRefused("A dividend needs a positive amount.")
+        split_numerator = split_denominator = None
+    else:
+        raise OverrideRefused(f"Unknown action type {action_type!r}.")
+    if ex_date > date.today():
+        raise OverrideRefused(
+            f"{ex_date} is in the future. A future ex-date back-adjusts today's "
+            "prices for an event that has not happened; add it once it has gone ex."
+        )
+    existing = corporate_action_at(
+        db, security_id=security_id, action_type=action_type, ex_date=ex_date
+    )
+    if existing is not None:
+        raise OverrideRefused(
+            f"Security {security_id} already has a {action_type} on {ex_date} "
+            f"(corporate action {existing['corporate_action_id']}, source "
+            f"{existing['source']}). Delete it first with `fafnir actions delete`."
+        )
+    action_id = int(
+        db.fetchval(
+            """
+            INSERT INTO core.corporate_action
+                (security_id, action_type, ex_date, split_numerator,
+                 split_denominator, dividend_amount, currency, source, loaded_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+            RETURNING corporate_action_id
+            """,
+            (
+                security_id,
+                action_type,
+                ex_date,
+                split_numerator,
+                split_denominator,
+                dividend_amount,
+                currency,
+                OPERATOR_SOURCE,
+            ),
+        )
+    )
+    override_id = _insert_override(
+        db,
+        security_id=security_id,
+        target="corporate_action",
+        action_type=action_type,
+        key_date=ex_date,
+        operation="add",
+        detail={
+            "row": _jsonable(
+                {
+                    "corporate_action_id": action_id,
+                    "split_numerator": split_numerator,
+                    "split_denominator": split_denominator,
+                    "dividend_amount": dividend_amount,
+                    "currency": currency,
+                }
+            ),
+            **(detail_extra or {}),
+        },
+        note=note,
+        created_by=created_by,
+    )
+    return action_id, override_id
+
+
+def redate_operator_action(
+    db: Database,
+    *,
+    corporate_action_id: int,
+    new_ex_date: date,
+    note: str,
+    created_by: str,
+) -> tuple[int, int, int]:
+    """Move a corporate action to another ex-date.
+
+    A delete of the old key (suppressed, so the feed's misdated copy cannot return)
+    and an operator row at the new one, each naming the other. Returns
+    ``(new_corporate_action_id, delete_override_id, add_override_id)``.
+    """
+    import json
+
+    row = corporate_action_by_id(db, corporate_action_id)
+    if row is None:
+        raise OverrideRefused(f"No corporate action {corporate_action_id}.")
+    if row["ex_date"] == new_ex_date:
+        raise OverrideRefused(
+            f"Corporate action {corporate_action_id} is already on {new_ex_date}."
+        )
+    # Checked before anything is written, so a refusal leaves no half of the pair.
+    if new_ex_date > date.today():
+        raise OverrideRefused(
+            f"{new_ex_date} is in the future. A future ex-date back-adjusts today's "
+            "prices for an event that has not happened."
+        )
+    clash = corporate_action_at(
+        db,
+        security_id=row["security_id"],
+        action_type=row["action_type"],
+        ex_date=new_ex_date,
+    )
+    if clash is not None:
+        raise OverrideRefused(
+            f"Security {row['security_id']} already has a {row['action_type']} on "
+            f"{new_ex_date} (corporate action {clash['corporate_action_id']}). If "
+            f"{corporate_action_id} is a duplicate of it, delete {corporate_action_id} "
+            "instead of re-dating it."
+        )
+    delete_id = delete_operator_action(
+        db,
+        corporate_action_id=corporate_action_id,
+        note=note,
+        created_by=created_by,
+        detail_extra={"redated_to": new_ex_date.isoformat()},
+    )
+    new_id, add_id = add_operator_action(
+        db,
+        security_id=row["security_id"],
+        action_type=row["action_type"],
+        ex_date=new_ex_date,
+        split_numerator=row["split_numerator"],
+        split_denominator=row["split_denominator"],
+        dividend_amount=row["dividend_amount"],
+        currency=row["currency"],
+        note=note,
+        created_by=created_by,
+        detail_extra={
+            "redated_from": row["ex_date"].isoformat(),
+            "redated_from_override": delete_id,
+        },
+    )
+    db.execute(
+        "UPDATE ops.operator_override SET detail = detail || %s WHERE override_id = %s",
+        (json.dumps({"redated_to_override": add_id}), delete_id),
+    )
+    return new_id, delete_id, add_id
+
+
+def delete_operator_bars(
+    db: Database,
+    *,
+    security_id: int,
+    trade_dates: Sequence[date],
+    note: str,
+    created_by: str,
+) -> list[int]:
+    """Remove bars and suppress their dates. Returns one override id per bar removed.
+
+    A date with no stored bar is skipped rather than suppressed: there is nothing to
+    record the removal of, and suppressing a date the vendor has never sent would be
+    a decision nobody made.
+    """
+    ids: list[int] = []
+    for d in sorted(set(trade_dates)):
+        bar = db.fetchone(
+            """
+            SELECT trade_date, open, high, low, close, volume, vwap, source,
+                   ingestion_run_id, loaded_at
+              FROM core.daily_price WHERE security_id = %s AND trade_date = %s
+            """,
+            (security_id, d),
+        )
+        if bar is None:
+            continue
+        ids.append(
+            _insert_override(
+                db,
+                security_id=security_id,
+                target="daily_price",
+                action_type=None,
+                key_date=d,
+                operation="delete",
+                detail={"row": _jsonable(bar)},
+                note=note,
+                created_by=created_by,
+            )
+        )
+        db.execute(
+            "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
+            (security_id, d),
+        )
+    return ids
+
+
+def list_operator_overrides(
+    db: Database,
+    *,
+    security_id: Optional[int] = None,
+    include_revoked: bool = False,
+) -> list[dict]:
+    clauses, params = ["TRUE"], []
+    if security_id is not None:
+        clauses.append("o.security_id = %s")
+        params.append(security_id)
+    if not include_revoked:
+        clauses.append("o.revoked_at IS NULL")
+    return db.fetchall(
+        f"""
+        SELECT o.override_id, o.security_id, s.primary_symbol, o.target,
+               o.action_type, o.key_date, o.operation, o.detail, o.note,
+               o.created_by, o.created_at, o.revoked_at, o.revoked_by,
+               o.revoked_note
+          FROM ops.operator_override o
+          LEFT JOIN core.security s USING (security_id)
+         WHERE {' AND '.join(clauses)}
+         ORDER BY o.override_id
+        """,
+        params,
+    )
+
+
+def revoke_operator_override(
+    db: Database, *, override_id: int, note: str, revoked_by: str
+) -> dict:
+    """Undo one edit, keeping its record. Returns the override as it stood.
+
+    Revoking a 'delete' only lifts the suppression: the removed row is not written
+    back, because the next load writes whatever the vendor serves for that key and a
+    restored copy would be a second, competing version of it. Revoking an 'add'
+    removes the operator's row. Adjustment factors are the caller's to recompute.
+    """
+    row = db.fetchone(
+        "SELECT * FROM ops.operator_override WHERE override_id = %s", (override_id,)
+    )
+    if row is None:
+        raise OverrideRefused(f"No override {override_id}.")
+    if row["revoked_at"] is not None:
+        raise OverrideRefused(
+            f"Override {override_id} was already revoked by {row['revoked_by']} "
+            f"at {row['revoked_at']}."
+        )
+    if row["operation"] == "add":
+        db.execute(
+            """
+            DELETE FROM core.corporate_action
+             WHERE security_id = %s AND action_type = %s AND ex_date = %s
+               AND source = %s
+            """,
+            (row["security_id"], row["action_type"], row["key_date"], OPERATOR_SOURCE),
+        )
+    db.execute(
+        """
+        UPDATE ops.operator_override
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE override_id = %s
+        """,
+        (revoked_by, note, override_id),
+    )
+    return row
 
 
 def close_before(db: Database, security_id: int, d: date) -> Optional[Decimal]:

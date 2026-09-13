@@ -88,7 +88,16 @@ def stub_repo(monkeypatch):
         "resolve": {},  # symbol -> security_id
         "deleted": [],  # every row delete_corporate_action removed
         "recomputed": [],  # every security whose factors were recomputed inline
+        "suppressed": set(),  # (security_id, type, ex_date) an operator deleted
     }
+
+    monkeypatch.setattr(
+        ca.repo,
+        "suppressed_action_keys",
+        lambda db, security_id=None: {
+            k for k in state["suppressed"] if security_id in (None, k[0])
+        },
+    )
 
     def delete(db, *, security_id, action_type, ex_date):
         removed = (
@@ -818,6 +827,143 @@ def test_reconciliation_reports_a_settled_amendment_the_overlap_should_have_caug
     (flag,) = stub_repo["flags"]
     assert flag["detail"]["amended"] == ["dividend 2026-06-15"]
     assert flag["detail"]["missing_from_calendar"] == []
+
+
+# ---------------------------------------------------------------------------
+# Operator overrides (migration 0025)
+# ---------------------------------------------------------------------------
+
+
+def test_the_per_symbol_pull_does_not_re_insert_a_split_an_operator_deleted(stub_repo):
+    """The reason the override table exists: DAMD's duplicate 1:10 split dated
+    2026-09-10 was still on FMP's per-symbol feed, so a hand-written DELETE came
+    straight back on the next pull. The real split beside it must still load."""
+    stub_repo["resolve"]["DAMD"] = 21
+    stub_repo["suppressed"].add((21, "split", date(2026, 8, 10)))
+    result = ca.ActionsResult()
+    fmp = _FakeFMP(
+        splits={
+            "DAMD": [
+                {"date": "2026-07-19", "numerator": 1, "denominator": 10},
+                {"date": "2026-08-10", "numerator": 1, "denominator": 10},
+            ]
+        }
+    )
+
+    ca.load_symbol_actions(
+        _FakeDB(), fmp, "DAMD", 21, run=_FakeRun(), as_of=TODAY, result=result
+    )
+
+    assert set(stub_repo["actions"][21]) == {("split", date(2026, 7, 19))}
+    assert result.suppressed == 1
+    assert result.upserted == 1
+
+
+def test_the_calendar_sweep_sets_aside_an_operator_deleted_action(stub_repo):
+    stub_repo["resolve"].update({"DAMD": 21, "KO": 11})
+    stub_repo["watermarks"][(ca.SWEEP_ENDPOINT, 0)] = date(2026, 8, 25)
+    stub_repo["suppressed"].add((21, "split", date(2026, 8, 28)))
+    result = ca.ActionsResult()
+    fmp = _FakeFMP(
+        cal_splits=[
+            {"symbol": "DAMD", "date": "2026-08-28", "numerator": 1, "denominator": 10}
+        ],
+        cal_divs=[{"symbol": "KO", "date": "2026-08-28", "dividend": 0.51}],
+    )
+
+    ca.sweep_calendar(
+        _FakeDB(), fmp, run=_FakeRun(), as_of=TODAY, overlap_days=3, result=result
+    )
+
+    assert 21 not in stub_repo["actions"]
+    assert ("dividend", date(2026, 8, 28)) in stub_repo["actions"][11]
+    assert result.suppressed == 1
+
+
+def test_a_suppressed_key_is_not_reported_missing_by_the_reconciliation(stub_repo):
+    """The feed carrying a key an operator deleted is the expected state, not drift
+    the sweep should have caught."""
+    stub_repo["resolve"]["DAMD"] = 21
+    stub_repo["suppressed"].add((21, "split", date(2026, 6, 10)))
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(
+            splits={"DAMD": [{"date": "2026-06-10", "numerator": 1, "denominator": 10}]}
+        ),
+        [{"security_id": 21, "symbol": "DAMD"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert result.drift == 0
+    assert stub_repo["flags"] == []
+    assert 21 not in stub_repo["actions"]
+
+
+def test_reconciliation_does_not_call_an_operator_row_withdrawn(stub_repo):
+    """A split the feed never reported, added by an operator. The feed not carrying
+    it is the whole reason it was added; flagging that every rotation would put the
+    correction back in the queue once a month."""
+    stub_repo["resolve"]["OSCX"] = 31
+    stub_repo["actions"][31] = {
+        ("split", date(2026, 6, 3)): {
+            "split_numerator": 3,
+            "split_denominator": 1,
+            "dividend_amount": None,
+            "source": "operator",
+        }
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(splits={"OSCX": []}),
+        [{"security_id": 31, "symbol": "OSCX"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert result.drift == 0
+    assert stub_repo["flags"] == []
+    assert stub_repo["deleted"] == []
+
+
+def test_reconciliation_does_not_call_an_operator_key_the_feed_also_carries_missing(
+    stub_repo,
+):
+    """An operator row replacing the feed's copy at the same key (a corrected
+    ratio): the pair differs by design and is not an amendment or a gap."""
+    stub_repo["resolve"]["OSCX"] = 31
+    stub_repo["actions"][31] = {
+        ("split", date(2026, 6, 3)): {
+            "split_numerator": 3,
+            "split_denominator": 1,
+            "dividend_amount": None,
+            "source": "operator",
+        }
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(
+            splits={"OSCX": [{"date": "2026-06-03", "numerator": 2, "denominator": 1}]}
+        ),
+        [{"security_id": 31, "symbol": "OSCX"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert result.drift == 0
+    assert stub_repo["flags"] == []
 
 
 # ---------------------------------------------------------------------------
