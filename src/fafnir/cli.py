@@ -1582,7 +1582,9 @@ def _parse_split(value: str):
             param_hint="--split",
         )
     if num <= 0 or den <= 0:
-        raise click.BadParameter("both sides of a split must be positive.", "--split")
+        raise click.BadParameter(
+            "both sides of a split must be positive.", param_hint="--split"
+        )
     return num, den
 
 
@@ -1770,7 +1772,9 @@ def actions_add(
         try:
             amount = Decimal(dividend)
         except InvalidOperation:
-            raise click.BadParameter(f"{dividend!r} is not a number.", "--dividend")
+            raise click.BadParameter(
+                f"{dividend!r} is not a number.", param_hint="--dividend"
+            )
     ex = _parse_date(ex_date)
     created_by = created_by or _os_user()
 
