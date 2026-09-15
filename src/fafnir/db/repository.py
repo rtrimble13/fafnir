@@ -8,9 +8,9 @@ them into the DataFrame contracts the CLI expects.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, NamedTuple, Optional, Sequence
+from typing import Any, Iterable, NamedTuple, Optional, Sequence
 
 import psycopg
 
@@ -2025,15 +2025,21 @@ def suppressed_action_keys(
 
 
 def suppressed_price_dates(db: Database, security_id: int) -> frozenset[date]:
-    """Trade dates of this security's bars an operator deleted. The price loader
-    sets a vendor bar on one of these dates aside instead of upserting it."""
+    """Trade dates of this security's bars an operator edited. The price loader sets
+    a vendor bar on one of these dates aside instead of upserting it.
+
+    Both operations count. A 'delete' keeps a removed bar out. An 'add' is a bar an
+    operator re-dated or re-scaled (`fafnir prices shift|rescale`, migration 0026):
+    the vendor still serves its own copy of that date -- the wrong-scale original, or
+    whatever it has on the date a bar was moved to -- and upserting it would silently
+    undo the correction.
+    """
     return frozenset(
         r["key_date"]
         for r in db.fetchall(
             """
-            SELECT key_date FROM ops.operator_override
-             WHERE target = 'daily_price' AND operation = 'delete'
-               AND revoked_at IS NULL AND security_id = %s
+            SELECT DISTINCT key_date FROM ops.operator_override
+             WHERE target = 'daily_price' AND revoked_at IS NULL AND security_id = %s
             """,
             (security_id,),
         )
@@ -2293,7 +2299,21 @@ def delete_operator_bars(
     A date with no stored bar is skipped rather than suppressed: there is nothing to
     record the removal of, and suppressing a date the vendor has never sent would be
     a decision nobody made.
+
+    A bar an operator wrote (`prices shift|rescale`) is refused, for the reason
+    `delete_operator_action` refuses an operator action: deleting it here would leave
+    its edit half-undone. `fafnir override revoke` undoes the edit instead.
     """
+    written = active_price_adds(db, security_id, trade_dates)
+    if written:
+        first = min(written)
+        raise OverrideRefused(
+            f"{len(written)} bar(s) of security {security_id} "
+            f"({', '.join(str(d) for d in sorted(written)[:5])}"
+            f"{', ...' if len(written) > 5 else ''}) were written by an operator "
+            f"(edit {written[first]['edit']}). Undo the edit with "
+            f"`fafnir override revoke {written[first]['edit']}`."
+        )
     ids: list[int] = []
     for d in sorted(set(trade_dates)):
         bar = db.fetchone(
@@ -2324,6 +2344,359 @@ def delete_operator_bars(
             (security_id, d),
         )
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Bar transforms: `fafnir prices shift|rescale` (migration 0026)
+# ---------------------------------------------------------------------------
+PRICE_TRANSFORM_KINDS = ("shift", "rescale")
+
+_BAR_COLUMNS = (
+    "trade_date, open, high, low, close, volume, vwap, source, ingestion_run_id, "
+    "loaded_at"
+)
+
+
+def stored_bars(
+    db: Database, security_id: int, from_date: date, to_date: date
+) -> list[dict]:
+    """A security's stored bars in ``[from_date, to_date]``, every column, by date."""
+    return db.fetchall(
+        f"""
+        SELECT {_BAR_COLUMNS} FROM core.daily_price
+         WHERE security_id = %s AND trade_date BETWEEN %s AND %s
+         ORDER BY trade_date
+        """,
+        (security_id, from_date, to_date),
+    )
+
+
+def active_price_adds(
+    db: Database, security_id: int, trade_dates: Iterable[date]
+) -> dict[date, dict]:
+    """``{trade_date: {"override_id", "edit", "kind"}}`` for the operator-written bars
+    among these dates -- the ones a vendor load, a delete or a second transform must
+    leave alone."""
+    dates = sorted(set(trade_dates))
+    if not dates:
+        return {}
+    rows = db.fetchall(
+        """
+        SELECT key_date, override_id,
+               (detail->'transform'->>'edit')::bigint AS edit,
+               detail->'transform'->>'kind' AS kind
+          FROM ops.operator_override
+         WHERE security_id = %s AND target = 'daily_price' AND operation = 'add'
+           AND revoked_at IS NULL AND key_date = ANY(%s)
+        """,
+        (security_id, dates),
+    )
+    return {
+        r["key_date"]: {
+            "override_id": int(r["override_id"]),
+            "edit": int(r["edit"]) if r["edit"] is not None else None,
+            "kind": r["kind"],
+        }
+        for r in rows
+    }
+
+
+def active_price_overrides_on(
+    db: Database, security_id: int, trade_dates: Iterable[date]
+) -> dict[date, list[dict]]:
+    """Every active bar override on these dates, of either operation."""
+    dates = sorted(set(trade_dates))
+    if not dates:
+        return {}
+    out: dict[date, list[dict]] = {}
+    for r in db.fetchall(
+        """
+        SELECT key_date, override_id, operation
+          FROM ops.operator_override
+         WHERE security_id = %s AND target = 'daily_price' AND revoked_at IS NULL
+           AND key_date = ANY(%s)
+         ORDER BY override_id
+        """,
+        (security_id, dates),
+    ):
+        out.setdefault(r["key_date"], []).append(dict(r))
+    return out
+
+
+def replace_operator_bars(
+    db: Database,
+    *,
+    security_id: int,
+    kind: str,
+    params: dict,
+    changes: Sequence[tuple[dict, dict]],
+    note: str,
+    created_by: str,
+) -> tuple[int, list[int]]:
+    """Replace vendor bars with transformed copies, recorded as one edit.
+
+    ``changes`` pairs each stored bar (as :func:`stored_bars` returns it) with the row
+    to write in its place -- same date for a rescale, another date for a shift. Every
+    pair becomes a 'delete' override at the old date (the row as it stood) and an
+    'add' at the new one (the row written, ``source = operator``), both carrying
+    ``detail.transform`` with ``kind``, ``params``, the other half's id and ``edit``:
+    the id of the edit's first override, which is how `override revoke` finds the
+    rest. Returns ``(edit_id, override_ids)``.
+
+    Validation is the caller's (fafnir.ingest.price_edits plans and checks every
+    row); this writes what it is given. All old rows are removed before any new one
+    is written, so a shift whose targets overlap its sources does not collide with
+    itself on the primary key.
+    """
+    import json
+
+    if kind not in PRICE_TRANSFORM_KINDS:
+        raise OverrideRefused(f"Unknown bar transform {kind!r}.")
+    if not changes:
+        raise OverrideRefused("No bars to replace.")
+    olds = [old for old, _ in changes]
+    news = [new for _, new in changes]
+    if len({o["trade_date"] for o in olds}) != len(olds) or len(
+        {n["trade_date"] for n in news}
+    ) != len(news):
+        raise OverrideRefused("Two bars of one edit share a date.")
+
+    transform = {"kind": kind, **params}
+    delete_rows = db.fetchall(
+        """
+        INSERT INTO ops.operator_override
+            (security_id, target, action_type, key_date, operation, detail, note,
+             created_by)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'delete', x.detail, %s, %s
+          FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
+         ORDER BY x.key_date
+        RETURNING override_id, key_date
+        """,
+        (
+            security_id,
+            note,
+            created_by,
+            json.dumps(
+                [
+                    {
+                        "key_date": o["trade_date"].isoformat(),
+                        "detail": {"row": _jsonable(o), "transform": transform},
+                    }
+                    for o in olds
+                ],
+                default=str,
+            ),
+        ),
+    )
+    delete_ids = {r["key_date"]: int(r["override_id"]) for r in delete_rows}
+    edit_id = min(delete_ids.values())
+
+    db.execute(
+        "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = ANY(%s)",
+        (security_id, [o["trade_date"] for o in olds]),
+    )
+    db.executemany(
+        """
+        INSERT INTO core.daily_price
+            (security_id, trade_date, open, high, low, close, volume, vwap, source,
+             ingestion_run_id, loaded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, NULL, now())
+        """,
+        [
+            (
+                security_id,
+                n["trade_date"],
+                n["open"],
+                n["high"],
+                n["low"],
+                n["close"],
+                n["volume"],
+                n.get("vwap"),
+                OPERATOR_SOURCE,
+            )
+            for n in news
+        ],
+    )
+
+    add_rows = db.fetchall(
+        """
+        INSERT INTO ops.operator_override
+            (security_id, target, action_type, key_date, operation, detail, note,
+             created_by)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'add', x.detail, %s, %s
+          FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
+         ORDER BY x.key_date
+        RETURNING override_id, key_date
+        """,
+        (
+            security_id,
+            note,
+            created_by,
+            json.dumps(
+                [
+                    {
+                        "key_date": new["trade_date"].isoformat(),
+                        "detail": {
+                            "row": _jsonable(
+                                {k: v for k, v in new.items() if k != "security_id"}
+                            ),
+                            "transform": {
+                                **transform,
+                                "edit": edit_id,
+                                "from_date": old["trade_date"].isoformat(),
+                                "from_override": delete_ids[old["trade_date"]],
+                            },
+                        },
+                    }
+                    for old, new in changes
+                ],
+                default=str,
+            ),
+        ),
+    )
+    add_ids = {r["key_date"]: int(r["override_id"]) for r in add_rows}
+    db.execute(
+        """
+        UPDATE ops.operator_override o
+           SET detail = jsonb_set(o.detail, '{transform}',
+                                  (o.detail->'transform') || x.extra)
+          FROM jsonb_to_recordset(%s::jsonb) AS x(override_id bigint, extra jsonb)
+         WHERE o.override_id = x.override_id
+        """,
+        (
+            json.dumps(
+                [
+                    {
+                        "override_id": delete_ids[old["trade_date"]],
+                        "extra": {
+                            "edit": edit_id,
+                            "to_date": new["trade_date"].isoformat(),
+                            "to_override": add_ids[new["trade_date"]],
+                        },
+                    }
+                    for old, new in changes
+                ]
+            ),
+        ),
+    )
+    return edit_id, sorted([*delete_ids.values(), *add_ids.values()])
+
+
+def override_by_id(db: Database, override_id: int) -> Optional[dict]:
+    return db.fetchone(
+        "SELECT * FROM ops.operator_override WHERE override_id = %s", (override_id,)
+    )
+
+
+def price_edit_of(override: dict) -> Optional[int]:
+    """The edit a bar-transform override belongs to, or None for any other override."""
+    if override.get("target") != "daily_price":
+        return None
+    transform = (override.get("detail") or {}).get("transform")
+    if not transform or transform.get("edit") is None:
+        return None
+    return int(transform["edit"])
+
+
+def price_edit_overrides(
+    db: Database, *, security_id: int, edit_id: int, include_revoked: bool = False
+) -> list[dict]:
+    """Every override of one bar-transform edit, oldest first."""
+    return db.fetchall(
+        f"""
+        SELECT * FROM ops.operator_override
+         WHERE security_id = %s AND target = 'daily_price'
+           AND (detail->'transform'->>'edit')::bigint = %s
+           {'' if include_revoked else 'AND revoked_at IS NULL'}
+         ORDER BY override_id
+        """,
+        (security_id, edit_id),
+    )
+
+
+def revoke_price_edit(
+    db: Database, *, security_id: int, edit_id: int, note: str, revoked_by: str
+) -> list[dict]:
+    """Undo a whole `prices shift|rescale` edit, restoring the vendor bars it replaced.
+
+    Unlike revoking a plain 'delete', this writes the removed rows back. A plain delete
+    removed a bar the operator judged worthless, so leaving the key for the vendor to
+    refill is the undo. A transform removed a bar only to put a corrected copy of it
+    in its place; lifting the suppression without restoring the original would turn
+    the undo into a deletion of the history, and the vendor overlap never re-reads an
+    old window to refill it. The restored row is the vendor's own, as it stood, so a
+    later load of that key writes the same values over it -- there is no second,
+    competing version.
+
+    The operator bars are removed first and the originals written after, so a shift
+    whose targets overlap its sources restores cleanly. A key another edit has since
+    written a bar onto is refused rather than overwritten. Returns the overrides
+    revoked. Adjustment factors are the caller's to recompute.
+    """
+    rows = price_edit_overrides(db, security_id=security_id, edit_id=edit_id)
+    if not rows:
+        raise OverrideRefused(
+            f"No active overrides of bar edit {edit_id} on security {security_id}."
+        )
+    adds = [r for r in rows if r["operation"] == "add"]
+    deletes = [r for r in rows if r["operation"] == "delete"]
+    db.execute(
+        """
+        DELETE FROM core.daily_price
+         WHERE security_id = %s AND trade_date = ANY(%s) AND source = %s
+        """,
+        (security_id, [r["key_date"] for r in adds], OPERATOR_SOURCE),
+    )
+    restore_dates = [r["key_date"] for r in deletes]
+    blocking = db.fetchall(
+        """
+        SELECT trade_date, source FROM core.daily_price
+         WHERE security_id = %s AND trade_date = ANY(%s)
+         ORDER BY trade_date
+        """,
+        (security_id, restore_dates),
+    )
+    if blocking:
+        raise OverrideRefused(
+            f"Cannot restore {len(blocking)} bar(s) of edit {edit_id}: security "
+            f"{security_id} already has a bar on "
+            f"{', '.join(str(b['trade_date']) for b in blocking[:5])}"
+            f"{', ...' if len(blocking) > 5 else ''} (source "
+            f"{blocking[0]['source']}). Revoke the edit that wrote it first."
+        )
+    db.executemany(
+        """
+        INSERT INTO core.daily_price
+            (security_id, trade_date, open, high, low, close, volume, vwap, source,
+             ingestion_run_id, loaded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        [
+            (
+                security_id,
+                r["detail"]["row"]["trade_date"],
+                r["detail"]["row"]["open"],
+                r["detail"]["row"]["high"],
+                r["detail"]["row"]["low"],
+                r["detail"]["row"]["close"],
+                r["detail"]["row"].get("volume", 0),
+                r["detail"]["row"].get("vwap"),
+                r["detail"]["row"].get("source") or "fmp",
+                r["detail"]["row"].get("ingestion_run_id"),
+                r["detail"]["row"].get("loaded_at") or datetime.now().isoformat(),
+            )
+            for r in deletes
+        ],
+    )
+    db.execute(
+        """
+        UPDATE ops.operator_override
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE override_id = ANY(%s)
+        """,
+        (revoked_by, note, [int(r["override_id"]) for r in rows]),
+    )
+    return rows
 
 
 def list_operator_overrides(
@@ -2372,6 +2745,16 @@ def revoke_operator_override(
         raise OverrideRefused(
             f"Override {override_id} was already revoked by {row['revoked_by']} "
             f"at {row['revoked_at']}."
+        )
+    edit = price_edit_of(row)
+    if edit is not None:
+        # One half of a re-dated or re-scaled bar. Revoking it alone would either
+        # strand the operator's bar without its record or lift the suppression under
+        # it; the edit is undone whole, by revoke_price_edit.
+        raise OverrideRefused(
+            f"Override {override_id} is part of bar edit {edit} "
+            f"({row['detail']['transform'].get('kind')}); it is undone as a whole with "
+            "revoke_price_edit (`fafnir override revoke` does this for you)."
         )
     if row["operation"] == "add":
         db.execute(

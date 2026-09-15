@@ -458,7 +458,7 @@ def non_session_dates(
 
 
 def _drop_suppressed(bars: list[dict], suppressed: frozenset) -> tuple[list[dict], int]:
-    """Split off bars on dates an operator deleted. Returns (kept, dropped)."""
+    """Split off bars on dates an operator deleted or corrected. Returns (kept, dropped)."""
     if not suppressed:
         return list(bars), 0
     kept = [b for b in bars if _parse_date(b.get("date")) not in suppressed]
@@ -568,16 +568,19 @@ def load_symbol_prices(
             "%s: set aside %d bar(s) dated on non-session days", symbol, off_session
         )
 
-    # A bar an operator deleted (ops.operator_override) is set aside the same way:
-    # the vendor that sent it still serves it, so without this the overlap window
-    # re-inserts it on the next run. Like a non-session bar it is not a quarantine,
-    # and it does not hold the watermark.
+    # A bar on a date an operator edited (ops.operator_override) is set aside the
+    # same way. For a deleted bar, the vendor that sent it still serves it, so
+    # without this the overlap window re-inserts it on the next run. For a re-dated or
+    # re-scaled one (`prices shift|rescale`), the vendor's copy of that date is the
+    # wrong version the operator replaced. Like a non-session bar it is not a
+    # quarantine, and it does not hold the watermark.
     bars, removed = _drop_suppressed(bars, repo.suppressed_price_dates(db, sec_id))
     if removed:
         if stats is not None:
             stats["suppressed"] = stats.get("suppressed", 0) + removed
         logger.info(
-            "%s: set aside %d bar(s) an operator deleted (fafnir override list)",
+            "%s: set aside %d bar(s) on dates an operator deleted or corrected "
+            "(fafnir override list)",
             symbol,
             removed,
         )
