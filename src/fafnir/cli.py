@@ -2428,6 +2428,17 @@ def prices_delete(
         if not bars:
             click.echo("Nothing to delete.")
             return
+        written = repo.active_price_adds(database, sid, list(bars))
+        if written:
+            edits = sorted({w["edit"] for w in written.values()})
+            raise click.ClickException(
+                f"{_plural(len(written), 'bar')} of these "
+                f"({', '.join(str(d) for d in sorted(written)[:5])}"
+                f"{', ...' if len(written) > 5 else ''}) were written by `fafnir prices "
+                f"shift|rescale` (edit {', '.join(map(str, edits))}). Deleting one "
+                "would leave its edit half-undone; undo the edit with "
+                f"`fafnir override revoke {edits[0]}` instead."
+            )
         sessions = sorted(d for d in bars if reasons[d] == "requested")
         if sessions:
             _echo_wrapped(
@@ -2444,13 +2455,16 @@ def prices_delete(
         )
         if not dry_run and not yes:
             click.confirm(f"Delete {_plural(len(bars), 'bar')}?", abort=True)
-        override_ids = repo.delete_operator_bars(
-            database,
-            security_id=sid,
-            trade_dates=list(bars),
-            note=note,
-            created_by=created_by,
-        )
+        try:
+            override_ids = repo.delete_operator_bars(
+                database,
+                security_id=sid,
+                trade_dates=list(bars),
+                note=note,
+                created_by=created_by,
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
         if has_actions:
             adjustments.compute_for_security(database, sid)
         if dry_run:
@@ -2466,6 +2480,354 @@ def prices_delete(
     if has_actions:
         click.echo("Adjustment factors recomputed.")
     click.echo(_OVERRIDE_HINT)
+
+
+_BAR_EDIT_HINT = (
+    "Run `fafnir dq recheck --check outlier --check gap` for the flags this settles, "
+    "then `fafnir db refresh-marts`."
+)
+
+
+def _range_option_dates(from_date, to_date):
+    start, end = _parse_date(from_date), _parse_date(to_date)
+    if start > end:
+        raise click.BadParameter(
+            f"--from {start} is after --to {end}.", param_hint="--from"
+        )
+    return start, end
+
+
+def _factor_option(value: str, hint: str):
+    from fafnir.ingest import price_edits
+
+    try:
+        return price_edits.parse_factor(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint=hint)
+
+
+def _echo_plan_refusals(plan) -> None:
+    for note in plan.notes:
+        _echo_wrapped(f"Note: {note}")
+    if plan.refusals:
+        for refusal in plan.refusals:
+            _echo_wrapped(f"Refused: {refusal}")
+        raise click.ClickException(
+            f"The {plan.kind} was refused ({_plural(len(plan.refusals), 'reason')} "
+            "above). Nothing changed."
+        )
+
+
+def _has_actions(database, security_id: int) -> bool:
+    return bool(
+        database.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM core.corporate_action WHERE security_id = %s)",
+            (security_id,),
+        )
+    )
+
+
+@prices.command("rescale")
+@click.option("--symbol", help="Security by ticker.")
+@click.option("--security-id", type=int, help="Security by id (unambiguous).")
+@click.option(
+    "--from", "from_date", required=True, metavar="YYYY-MM-DD", help="First bar."
+)
+@click.option("--to", "to_date", required=True, metavar="YYYY-MM-DD", help="Last bar.")
+@click.option(
+    "--factor",
+    required=True,
+    metavar="F",
+    help="Multiply open/high/low/close/vwap by F: 20, 0.05 or 1/20.",
+)
+@click.option(
+    "--volume-factor",
+    default="1",
+    show_default=True,
+    metavar="V",
+    help="Multiply volume by V (rounded to a whole share).",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence for the factor. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def prices_rescale(
+    ctx,
+    symbol,
+    security_id,
+    from_date,
+    to_date,
+    factor,
+    volume_factor,
+    note,
+    created_by,
+    dry_run,
+    yes,
+):
+    """Re-scale a block of bars the vendor stores at the wrong scale.
+
+    \b
+      fafnir prices rescale --symbol EQC --from 1990-01-02 --to 1997-10-16 \\
+          --factor 20 --volume-factor 1/20 \\
+          -m "pre-1997-10-17 bars are 1/20 of the traded price; volume ~20x" --dry-run
+
+    Every bar in the range is replaced by a copy with its prices multiplied by
+    --factor and its volume by --volume-factor. Each is recorded as a delete of the
+    vendor's bar (kept whole, so the edit can be undone exactly) and an operator bar
+    in its place, and the price loader sets the vendor's copy of those dates aside
+    from then on. The dry run prints the closes either side of both ends of the
+    range, before and after, so the factor can be checked against the sessions it
+    has to join.
+
+    A bar the loader would refuse -- a price below the column's resolution, past its
+    range, or a range the rounding would flatten -- refuses the whole edit, naming
+    the dates. So does a bar an operator already edited: revoke that edit first.
+
+    When the vendor also fabricated a split to match the wrong scale (HUN, 2014),
+    delete it with `fafnir actions delete` as part of the same repair, or the
+    adjusted series applies the scale twice. Adjustment factors are recomputed.
+    Undo with `fafnir override revoke`, which restores the vendor's bars.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments, price_edits
+
+    start, end = _range_option_dates(from_date, to_date)
+    price_factor = _factor_option(factor, "--factor")
+    vol_factor = _factor_option(volume_factor, "--volume-factor")
+    created_by = created_by or _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        plan = price_edits.plan_rescale(
+            database, sid, start, end, price_factor, vol_factor
+        )
+        n = len(plan.changes)
+        click.echo(
+            f"{sym} (security {sid}): rescale {_plural(n, 'bar')} {start}..{end}, "
+            f"prices x{_fmt_num(price_factor)}, volume x{_fmt_num(vol_factor)}"
+        )
+        for line in price_edits.boundary_lines(database, plan):
+            click.echo(line)
+        _echo_plan_refusals(plan)
+        has_actions = _has_actions(database, sid)
+        before = _factor_summary(database, sid) if has_actions else None
+        if not dry_run and not yes:
+            click.confirm(f"Rescale {_plural(n, 'bar')}?", abort=True)
+        try:
+            edit_id, override_ids, _ = price_edits.apply_plan(
+                database, plan, note=note, created_by=created_by
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        if has_actions:
+            adjustments.compute_for_security(database, sid)
+            after = _factor_summary(database, sid)
+        if dry_run:
+            database.rollback()
+            if has_actions:
+                click.echo(f"Factors: {before} -> {after}.")
+            click.echo(
+                f"Dry run: {_plural(n, 'bar')} would be rescaled. Nothing changed."
+            )
+            return
+        database.commit()
+
+    click.echo(
+        f"Rescaled {_plural(n, 'bar')} as {created_by} (edit {edit_id}, "
+        f"{_plural(len(override_ids), 'override')})."
+    )
+    if has_actions:
+        click.echo(f"Factors: {before} -> {after}.")
+    click.echo(f"Undo with `fafnir override revoke {edit_id}`. " + _BAR_EDIT_HINT)
+
+
+@prices.command("shift")
+@click.option("--symbol", help="Security by ticker.")
+@click.option("--security-id", type=int, help="Security by id (unambiguous).")
+@click.option(
+    "--from", "from_date", required=True, metavar="YYYY-MM-DD", help="First bar."
+)
+@click.option("--to", "to_date", required=True, metavar="YYYY-MM-DD", help="Last bar.")
+@click.option(
+    "--days",
+    required=True,
+    type=int,
+    help="Calendar days to move each bar: 1 = one day later, -1 = one day earlier.",
+)
+@click.option(
+    "--allow-non-session",
+    is_flag=True,
+    help="Allow bars to land on days the venue calendar marks closed.",
+)
+@click.option(
+    "--with-actions",
+    is_flag=True,
+    help="Re-date the corporate actions in the range by the same number of days.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence for the new dates. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def prices_shift(
+    ctx,
+    symbol,
+    security_id,
+    from_date,
+    to_date,
+    days,
+    allow_non_session,
+    with_actions,
+    note,
+    created_by,
+    dry_run,
+    yes,
+):
+    """Re-date a block of bars the vendor dates wrong.
+
+    \b
+      fafnir prices shift --symbol WLL --from 2004-01-01 --to 2022-07-01 --days 1 \\
+          -m "whole history one day early: no Friday bars, Sunday bars are Monday" \\
+          --dry-run
+
+    Every bar in the range moves by --days calendar days, prices untouched. Each is
+    recorded as a delete of the vendor's bar at its old date (kept whole) and an
+    operator bar at the new one; the price loader sets the vendor's copies of both
+    dates aside from then on, so a re-fetch of the misdated payload changes nothing.
+    The dry run prints the bars per weekday before and after: a one-day misdating
+    shows as bars on Sundays and none on Fridays, and a correct shift as five
+    weekdays.
+
+    Refused, naming the dates: a bar landing on a date that already has a bar outside
+    the range, or on a day the venue calendar has no session (--allow-non-session
+    overrides that one -- the calendar marks MLK Day 1990-1997 closed although NYSE
+    traded), or in the future. Corporate actions stay put unless --with-actions; the
+    dry run lists the ones in the range so you can see whether they are misdated too.
+
+    Adjustment factors are recomputed. Undo with `fafnir override revoke`, which
+    restores the vendor's bars at their original dates.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments, price_edits
+
+    start, end = _range_option_dates(from_date, to_date)
+    created_by = created_by or _os_user()
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        plan = price_edits.plan_shift(
+            database,
+            sid,
+            start,
+            end,
+            days,
+            allow_non_session=allow_non_session,
+            with_actions=with_actions,
+        )
+        n = len(plan.changes)
+        click.echo(
+            f"{sym} (security {sid}): shift {_plural(n, 'bar')} {start}..{end} by "
+            f"{days:+d} {'day' if abs(days) == 1 else 'days'}"
+        )
+        if plan.changes:
+            before_days = price_edits.weekday_counts(
+                old["trade_date"] for old, _ in plan.changes
+            )
+            after_days = price_edits.weekday_counts(
+                new["trade_date"] for _, new in plan.changes
+            )
+            _echo_table(
+                ["BARS", *price_edits.WEEKDAYS],
+                [
+                    ["before", *map(str, before_days)],
+                    ["after", *map(str, after_days)],
+                ],
+                right=tuple(range(1, 8)),
+            )
+        if plan.actions:
+            click.echo(
+                f"{_plural(len(plan.actions), 'corporate action')} in the range "
+                + (
+                    f"move by {days:+d} too:"
+                    if with_actions
+                    else "stay where they are (pass --with-actions to move them):"
+                )
+            )
+            _echo_table(
+                ["ID", "EX_DATE", "DAY", "TYPE", "VALUE", "SOURCE"],
+                [
+                    [
+                        str(a["corporate_action_id"]),
+                        str(a["ex_date"]),
+                        price_edits.WEEKDAYS[a["ex_date"].weekday()],
+                        a["action_type"],
+                        _fmt_action_value(a),
+                        a["source"],
+                    ]
+                    for a in plan.actions
+                ],
+                right=(0,),
+            )
+        _echo_plan_refusals(plan)
+        has_actions = _has_actions(database, sid)
+        before = _factor_summary(database, sid) if has_actions else None
+        if not dry_run and not yes:
+            click.confirm(f"Shift {_plural(n, 'bar')}?", abort=True)
+        try:
+            edit_id, override_ids, moved = price_edits.apply_plan(
+                database,
+                plan,
+                note=note,
+                created_by=created_by,
+                with_actions=with_actions,
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        if has_actions:
+            adjustments.compute_for_security(database, sid)
+            after = _factor_summary(database, sid)
+        if dry_run:
+            database.rollback()
+            if has_actions:
+                click.echo(f"Factors: {before} -> {after}.")
+            click.echo(
+                f"Dry run: {_plural(n, 'bar')} would be shifted"
+                + (
+                    f" and {_plural(len(moved), 'corporate action')} re-dated"
+                    if moved
+                    else ""
+                )
+                + ". Nothing changed."
+            )
+            return
+        database.commit()
+
+    click.echo(
+        f"Shifted {_plural(n, 'bar')} as {created_by} (edit {edit_id}, "
+        f"{_plural(len(override_ids), 'override')})."
+    )
+    for new_id, delete_id, add_id in moved:
+        click.echo(
+            f"Re-dated a corporate action as {new_id} (overrides {delete_id} and {add_id})."
+        )
+    if has_actions:
+        click.echo(f"Factors: {before} -> {after}.")
+    click.echo(f"Undo with `fafnir override revoke {edit_id}`. " + _BAR_EDIT_HINT)
 
 
 @main.group()
@@ -2514,7 +2876,12 @@ def override_list(ctx, symbol, security_id, include_revoked, as_json):
                     if r["action_type"]
                     else str(r["key_date"])
                 ),
-                r["operation"],
+                r["operation"]
+                + (
+                    f" ({r['detail']['transform'].get('kind')})"
+                    if isinstance(r["detail"], dict) and r["detail"].get("transform")
+                    else ""
+                ),
                 r["created_by"],
                 _fmt_stamp(r["created_at"]),
                 "active" if r["revoked_at"] is None else "revoked",
@@ -2547,30 +2914,74 @@ def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
     The next load brings back whatever the vendor serves for that key -- or run
     `fafnir ingest actions --symbols SYM`, or `fafnir ingest prices --symbols SYM
     --from D --to D`, to fetch it now. Revoking an add removes the operator's row.
-    A re-date is two overrides; revoke both to undo it.
+    A re-date is two overrides; revoke both.
+
+    A `prices shift` or `prices rescale` is undone whole: any override of the edit
+    revokes all of them, removes the operator's bars and writes the vendor's bars back
+    exactly as they stood, at their original dates.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
 
     revoked_by = revoked_by or _os_user()
     with Database(ctx.obj["config"].dsn) as database:
+        plain_ids: list[int] = []
+        edits: dict[tuple[int, int], list[int]] = {}
+        for oid in dict.fromkeys(override_ids):
+            row = repo.override_by_id(database, oid)
+            edit = repo.price_edit_of(row) if row else None
+            if edit is None or row["revoked_at"] is not None:
+                plain_ids.append(oid)
+            else:
+                edits.setdefault((int(row["security_id"]), edit), []).append(oid)
+        for (sid, edit), requested in edits.items():
+            n = len(repo.price_edit_overrides(database, security_id=sid, edit_id=edit))
+            _echo_wrapped(
+                f"Override {', '.join(map(str, requested))} belongs to bar edit {edit} "
+                f"on security {sid}: all {_plural(n, 'override')} of it are revoked "
+                "together, and the vendor's bars are restored."
+            )
         if not dry_run and not yes:
+            total = len(plain_ids) + len(edits)
             click.confirm(
-                f"Revoke {_plural(len(override_ids), 'override')}?", abort=True
+                (
+                    f"Revoke {_plural(len(plain_ids), 'override')}"
+                    + (f" and {_plural(len(edits), 'bar edit')}" if edits else "")
+                    + "?"
+                    if total
+                    else "Revoke?"
+                ),
+                abort=True,
             )
         revoked = []
+        edit_results = []
         try:
-            for oid in dict.fromkeys(override_ids):
+            for oid in plain_ids:
                 revoked.append(
                     repo.revoke_operator_override(
                         database, override_id=oid, note=note, revoked_by=revoked_by
                     )
                 )
+            for sid, edit in edits:
+                edit_results.append(
+                    (
+                        sid,
+                        edit,
+                        repo.revoke_price_edit(
+                            database,
+                            security_id=sid,
+                            edit_id=edit,
+                            note=note,
+                            revoked_by=revoked_by,
+                        ),
+                    )
+                )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
-        for sid in dict.fromkeys(
+        recompute = [
             int(r["security_id"]) for r in revoked if r["target"] == "corporate_action"
-        ):
+        ] + [sid for sid, _, _ in edit_results if _has_actions(database, sid)]
+        for sid in dict.fromkeys(recompute):
             adjustments.compute_for_security(database, sid)
         if dry_run:
             database.rollback()
@@ -2592,12 +3003,25 @@ def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
             f"Override {r['override_id']} (security {r['security_id']}, {key}): "
             f"{effect}."
         )
+    for sid, edit, rows in edit_results:
+        kind = rows[0]["detail"]["transform"].get("kind", "bar")
+        bars = sum(1 for r in rows if r["operation"] == "delete")
+        click.echo(
+            f"Bar edit {edit} (security {sid}, {kind} of {_plural(bars, 'bar')}): "
+            f"{_plural(len(rows), 'override')} revoked, vendor bars restored."
+        )
     if dry_run:
         click.echo("Dry run: nothing changed.")
         return
-    click.echo(f"Revoked {_plural(len(revoked), 'override')} as {revoked_by}.")
-    if any(r["target"] == "corporate_action" for r in revoked):
+    click.echo(
+        f"Revoked {_plural(len(revoked), 'override')}"
+        + (f" and {_plural(len(edit_results), 'bar edit')}" if edit_results else "")
+        + f" as {revoked_by}."
+    )
+    if recompute:
         click.echo("Adjustment factors recomputed. " + _OVERRIDE_HINT)
+    elif edit_results:
+        click.echo(_BAR_EDIT_HINT)
 
 
 # ---------------------------------------------------------------------------
