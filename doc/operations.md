@@ -508,9 +508,9 @@ traded price. The vendor's payload has the same defect, so a re-fetch changes no
   `edit` id. The price loader sets aside vendor bars on both dates. `fafnir override
   revoke <any id of the edit>` undoes the whole edit and writes the vendor bars back
   exactly as they stood — unlike a plain delete, whose undo leaves the key empty.
-- **An operator bar is not a target for other edits.** `prices delete`, and a second
-  shift or rescale over it, are refused until the edit is revoked; plan one edit from
-  the vendor's bars.
+- **An operator bar is not a target for other edits.** `prices delete`, a second
+  shift or rescale over it, and a `security split-history` range that covers it are
+  refused until the edit is revoked; plan one edit from the vendor's bars.
 - **Follow with** `fafnir dq recheck --check outlier --check gap` (a shift can open or
   close gaps), then `fafnir db refresh-marts`. Adjustment factors are recomputed in
   the same transaction when the security has corporate actions.
@@ -552,8 +552,9 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
 - **`--restore-deleted`** also moves bars in the range that `prices delete` had
   already removed (their rows are in the overrides). Those deletes stay in force.
 - **Refused:** a range holding every bar the source has (that is `security merge`
-  or a rename), a range that has not finished, one already split off, and a blank
-  note.
+  or a rename), a range that has not finished, one already split off, one holding a
+  bar or action an operator re-dated or re-scaled (revoke that edit first — see
+  above), and a blank note.
 - **Undo** reverses exactly what the split recorded and deletes a minted destination
   left empty. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.

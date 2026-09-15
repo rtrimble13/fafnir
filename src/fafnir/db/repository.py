@@ -2972,6 +2972,33 @@ def plan_history_split(
             "overlap it."
         )
 
+    # A bar or action edited by `prices shift|rescale` already holds an active
+    # 'delete' override of the vendor's row at a key that still carries a stored
+    # row (the operator's). Moving it would write a second 'delete' at that key and
+    # hit ux_operator_override_active, and there is no sound way to move half an
+    # edit: revoking it afterwards restores the vendor's row onto the source while
+    # the operator's copy sits on the destination. Refuse, and name the dates.
+    edited = db.fetchall(
+        """
+        SELECT DISTINCT key_date
+          FROM ops.operator_override
+         WHERE security_id = %s AND revoked_at IS NULL
+           AND detail ? 'transform'
+           AND key_date BETWEEN %s AND %s
+         ORDER BY key_date
+        """,
+        (source_id, lo, to_date),
+    )
+    if edited:
+        dates = ", ".join(r["key_date"].isoformat() for r in edited[:10])
+        more = "" if len(edited) <= 10 else f" (and {len(edited) - 10} more)"
+        raise OverrideRefused(
+            f"{len(edited)} key(s) of security {source_id} in this range were "
+            f"re-dated or re-scaled by an operator: {dates}{more}. Revoke that edit "
+            "first (`fafnir override revoke <id>` undoes the whole edit), then split; "
+            "re-apply the edit on the destination afterwards if it is still needed."
+        )
+
     bars = db.fetchall(
         """
         SELECT trade_date, open, high, low, close, volume, vwap, source,

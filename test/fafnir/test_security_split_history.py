@@ -667,3 +667,109 @@ def test_undo_into_an_existing_security_leaves_its_own_sessions(two_issuers):
     assert _bars(db, qsi) == {"2024-01-03": 36.0, "2024-07-01": 12.0}
     assert _actions(db, qsi) == []
     assert db.fetchval("SELECT count(*) FROM core.security") == 2
+
+
+# ---------------------------------------------------------------------------
+# Bars an operator re-dated or re-scaled (migration 0026)
+# ---------------------------------------------------------------------------
+
+
+def test_a_split_over_a_rescaled_range_is_refused(two_issuers):
+    """`prices rescale` leaves an active 'delete' of the vendor's row at a key that
+    still holds a row -- the operator's. A split would write a second 'delete' there
+    and hit ux_operator_override_active, so it is refused by name before anything is
+    written, not by the unique index."""
+    db, sid = two_issuers
+    assert (
+        _run(
+            "prices",
+            "rescale",
+            "--symbol",
+            "BID",
+            "--from",
+            "2024-01-02",
+            "--to",
+            "2024-01-03",
+            "--factor",
+            "20",
+            "-m",
+            "stored at 1/20 scale",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+
+    out = _split_off("--yes")
+
+    assert out.exit_code != 0
+    assert "re-dated or re-scaled" in out.output
+    assert "2024-01-02" in out.output and "2024-01-03" in out.output
+    assert "override revoke" in out.output
+    # Nothing was written: no destination, and the source keeps every bar.
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    assert set(_bars(db, sid)) == set(OLD) | set(NEW)
+
+
+def test_a_split_over_a_shifted_range_is_refused_with_restore_deleted(two_issuers):
+    """The same holds for a shift, and `--restore-deleted` does not smuggle it past:
+    the vendor's pre-shift rows sit in 'delete' overrides that the restore would
+    otherwise rebuild on the destination, undoing the correction."""
+    db, sid = two_issuers
+    assert (
+        _run(
+            "prices",
+            "shift",
+            "--symbol",
+            "BID",
+            "--from",
+            "2024-01-02",
+            "--to",
+            "2024-01-05",
+            "--days",
+            "1",
+            "--allow-non-session",
+            "-m",
+            "dated a day early",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+
+    out = _split_off("--restore-deleted", "--yes")
+
+    assert out.exit_code != 0
+    assert "re-dated or re-scaled" in out.output
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+
+
+def test_a_split_clear_of_the_edited_range_still_works(two_issuers):
+    """The refusal is scoped to the range asked for: an edit outside it is no bar to
+    splitting, and a plain `prices delete` inside it still restores as before."""
+    db, sid = two_issuers
+    # Re-scale a bar belonging to the *new* issuer, well outside the split range.
+    assert (
+        _run(
+            "prices",
+            "rescale",
+            "--symbol",
+            "BID",
+            "--from",
+            "2024-06-04",
+            "--to",
+            "2024-06-04",
+            "--factor",
+            "2",
+            "-m",
+            "wrong scale on one bar",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+
+    out = _split_off("--yes")
+
+    assert out.exit_code == 0, out.output
+    dest = _dest(db, sid)
+    assert _bars(db, dest) == {k: float(v) for k, v in OLD.items()}
+    # The edited bar stayed on the source, still at the operator's scale.
+    assert _bars(db, sid)["2024-06-04"] == pytest.approx(20.2)
