@@ -773,3 +773,49 @@ def test_a_split_clear_of_the_edited_range_still_works(two_issuers):
     assert _bars(db, dest) == {k: float(v) for k, v in OLD.items()}
     # The edited bar stayed on the source, still at the operator's scale.
     assert _bars(db, sid)["2024-06-04"] == pytest.approx(20.2)
+
+
+def test_revoking_one_key_of_a_split_is_refused(two_issuers):
+    """A split's overrides are what hold the moved keys off the source. Revoking one
+    on its own lifts that suppression while the destination keeps its copy, so the
+    next load of the ticker puts the vendor's row back and the same session is held
+    by two securities -- and `--undo`, which reads the active markers, can no longer
+    see the key to put it right. The split is undone whole."""
+    db, sid = two_issuers
+    assert _split_off("--yes").exit_code == 0
+    dest = _dest(db, sid)
+    oid = db.fetchval(
+        "SELECT min(override_id) FROM ops.operator_override "
+        "WHERE security_id=%s AND detail ? 'split' AND revoked_at IS NULL",
+        (sid,),
+    )
+
+    out = _run("override", "revoke", str(oid), "-m", "oops", "--yes")
+
+    assert out.exit_code != 0
+    assert "undone" in out.output.lower() or "undo the split" in out.output.lower()
+    assert "--undo" in out.output
+    assert str(dest) in out.output
+    # Still suppressed, so a reload cannot put the moved bar back on the source.
+    assert db.fetchval(
+        "SELECT revoked_at IS NULL FROM ops.operator_override WHERE override_id=%s",
+        (oid,),
+    )
+    _load(db, "BID", {**OLD, **NEW})
+    assert set(_bars(db, sid)) == set(NEW)
+    # And the whole-split undo still works, returning every key.
+    undo = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--into-security-id",
+        str(dest),
+        "--undo",
+        "-m",
+        "undo",
+        "--yes",
+    )
+    assert undo.exit_code == 0, undo.output
+    assert set(_bars(db, sid)) == set(OLD) | set(NEW)
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1

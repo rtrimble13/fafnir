@@ -2759,6 +2759,23 @@ def revoke_operator_override(
             f"({row['detail']['transform'].get('kind')}); it is undone as a whole with "
             "revoke_price_edit (`fafnir override revoke` does this for you)."
         )
+    split = (row["detail"] or {}).get("split")
+    if split:
+        # One key of a history split. Revoking it alone lifts the suppression while
+        # the destination keeps its copy, so the next load of the ticker's full
+        # history puts the vendor's row back on the source and the same session is
+        # then held by two securities. `--undo` reads the active split markers, so it
+        # can no longer see this key to put it right either. A split is undone whole.
+        src, dest = split.get("source_security_id"), split.get(
+            "destination_security_id"
+        )
+        raise OverrideRefused(
+            f"Override {override_id} is one key of the history split that moved "
+            f"security {src}'s history to {dest}; revoking it alone would leave the "
+            "same session on both securities. Undo the split as a whole: "
+            f"`fafnir security split-history --security-id {src} "
+            f"--into-security-id {dest} --undo -m '<why>'`."
+        )
     if row["operation"] == "add":
         db.execute(
             """

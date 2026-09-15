@@ -556,7 +556,9 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   bar or action an operator re-dated or re-scaled (revoke that edit first — see
   above), and a blank note.
 - **Undo** reverses exactly what the split recorded and deletes a minted destination
-  left empty. Then run `fafnir dq recheck --check outlier --check gap --check
+  left empty. It is the only way back: `override revoke` on one of the split's own
+  overrides is refused, because lifting one key's suppression while the destination
+  keeps its copy would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.
 
 ## Reconciliation
