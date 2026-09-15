@@ -241,6 +241,38 @@ or a "duplicate" found by pattern, gets a spot check first. Two duplication
 hypotheses and one "173/173 off-screener" finding were retracted on 2026-09-10,
 each of which a single spot check would have caught before it was said out loud.
 
+**Spot-check a class against the rows before accepting it, too.** The test that
+defines a class is not the test that it is safe to close. A batch of 28 "split
+explains the move" outliers held five securities whose split rows matched a
+fabricated price scale (AKR's closes reached 149,613,176); one glance at each row's
+price range pulled them. For outliers, `references/outlier-classification.md` is
+the full sort order, with the queries.
+
+## Mechanics that cost time
+
+- **Big results go to a file, never retyped.** `sql_read` caps at 500 rows and
+  returns smaller results inline. To get a long id or date list into a file, return
+  it as `string_agg` rows and pad the result past the inline limit (`repeat('#',
+  4000) AS pad`) so it is saved; parse the saved JSON with `python3` (there is no
+  `jq`), assert the counts, and build the command from the file (`--date` and ids
+  are repeatable). Copying hundreds of dates by hand is how a batch goes wrong.
+- **Long commands run in the background, and nothing follows until they finish.**
+  `db refresh-marts` followed by a recheck passed the two-minute foreground limit
+  on 2026-09-15. Chain the refresh and the recheck dry run in one background
+  command writing to files, wait with an
+  `until grep -q ...; do sleep 2; done` loop, and read the output before proposing
+  the real run.
+- **Cross-security matches on a date time out.** `WHERE o.trade_date = X AND
+  o.close = Y` across every security scans a whole partition per probe. To find
+  another row holding an instrument's history, search `core.security.company_name`
+  and `core.symbol_xref` instead.
+- **`ingest prices` has no `--dry-run`.** Probe what the vendor serves first
+  (`source probe-prices`, full output — `bar compared:` is the date it matched), and
+  verify the load by its `ingestion_run_id` on the rows afterwards.
+- **A `prices delete` dry run prints every bar.** Count the `requested` rows in the
+  output file against the dates you passed; a date with no stored bar is skipped
+  with only a one-line `No stored bar on …` notice.
+
 ## Reference
 
 - `references/dq-playbooks.md` — every `check_name`: what it means, how to tell a
@@ -249,6 +281,9 @@ each of which a single spot check would have caught before it was said out loud.
 - `references/sweep-policy.md` — the three tiers, the per-check preconditions,
   batch caps and stop conditions for working the queue in bulk. **Read this
   before a proactive sweep.**
+- `references/outlier-classification.md` — the order to sort outlier flags in, the
+  query for each cause, the survivorship check before deleting a segment, and the
+  shapes to leave open. **Read this before the first outlier batch.**
 - `references/data-semantics.md` — the traps that produce confidently wrong
   answers. Read before answering questions about the data.
 - `references/automations.md` — the nightly job, timers, budgets, backups.
@@ -264,4 +299,12 @@ out — the value is in the eliminations, not the conclusion.
 **Say what will come back.** A batch report that does not name the flags the next
 nightly will re-write leaves the operator to discover it as a surprise. The usual
 ones: `price_*` re-reads, money-market weekend zeros on a warehouse predating the
-non-session fix, and new `stale` flags for anything the vendor publishes late.
+non-session fix, and new `stale` flags for anything the vendor publishes late. After
+bar deletes, add the `gap` flag each deleted interior session will get, and the
+`sparse_coverage` flag a security gets once it holds bars for under 80% of its
+sessions.
+
+**Own a mistake in the report it is found in.** When a later check shows an earlier
+batch was wrong — a deleted segment that was the only copy of a company, a
+prediction that did not add up — say so plainly, say what recovers it, and record it
+in memory. The operator decides what to do about it only if they hear about it.

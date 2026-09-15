@@ -155,7 +155,12 @@ the bound the query walks every partition and times out.
   That is two issuers sharing one row: the security master let a new listing take
   over a row whose old issuer was never marked delisted. The row needs splitting,
   which is an operator decision and has no command. 79 securities in this state as
-  of 2026-09-10.
+  of 2026-09-10. Do not "fix" it with `prices delete` unless the earlier segment is
+  junk: it is often the only copy of a delisted company (see the survivorship check
+  in `outlier-classification.md`). When a new listing's pre-launch segment *is*
+  junk, deleting it (bars before the first real bar create no `gap` flags) lets
+  `dq recheck --check sparse_coverage` close this flag — CAPA, PBL and HBTC on
+  2026-09-15.
 - **Leave open** — a heavily traded name near 0.80 by median volume since a recent
   date. Per the escalation above, the per-session check was silenced for a security
   that should have it.
@@ -175,11 +180,20 @@ SELECT action_type, ex_date, split_numerator, split_denominator
 
 Then compare the two series over the date with `price_history`. **The decisive
 test:** if the *raw* series jumps and the *adjusted* one does not, the action is
-loaded and the factor is right — resolve. If **both** jump, the corporate action
-is missing.
+loaded and the factor is right. If **both** jump, the corporate action is missing.
 
-**Resolve when** a real corporate event on/near the date explains it and the
-adjusted series is smooth.
+**The check skips a split only on the flagged bar's exact date** (`ca.ex_date =
+m.trade_date`). A split dated on a weekend, a holiday or a session with no stored
+bar sits between two bars and is flagged every night while the adjusted series is
+correct — so **accept** it, never resolve: a resolve is re-written by the next
+`dq run`.
+
+**Accept when** a real corporate event between the previous bar and this one
+explains it, the adjusted series is smooth, **and the price levels are plausible**.
+A vendor split row can be as fabricated as the history it matches: AKR's raw closes
+reached 149,613,176 and HUN carried a "10:1 split" it never had, both with a smooth
+adjusted series. Read `min_close`/`max_close` in `mart.v_security_price_coverage`
+before accepting. `references/outlier-classification.md` has the full sort order.
 
 **Repair when** both series jump: load the action, then re-adjust.
 
@@ -193,17 +207,25 @@ A genuine 50%+ move with no action (a biotech readout, a takeover collapse) is a
 market fact — **accept**, and say in the note that no action exists and none
 should. A resolve on a market fact is re-written the next night.
 
-**Three shapes worth knowing before you classify one at scale.** The check reads
-the raw series and already skips a split's exact ex-date, so a split is not a
-generic explanation:
+**The shapes worth knowing before you classify them at scale.** The check reads the
+raw series and skips only a split's exact ex-date, so a split is not a generic
+explanation. The queries and thresholds for each are in
+`references/outlier-classification.md`:
 
-- **A near-miss split** — a matching ratio 1–5 days off the ex-date — is a
-  *misdated* split, not a market move. Correct the ex-date with
-  `fafnir actions redate <id> --ex-date <d>`; do not accept.
-- **A split the feed never reported** — a clean ×k or ÷k jump on normal volume that
-  does not revert, with no action within ±5 days and none on the feed — is added with
+- **A near-miss split** — one jump of the split's ratio on a session 1–5 days off
+  the ex-date, and the price holds — is a *misdated* split, not a market move.
+  Correct the ex-date with `fafnir actions redate <id> --ex-date <d>`; do not accept.
+  **Two** jumps of the split's size a few days apart are not a misdate: the pre-split
+  history is mis-adjusted, and moving the date fixes neither.
+- **A split the feed never reported** — a clean ×k or ÷k jump (within 3%) that holds
+  for 40 sessions, never reverts, with volume moving the opposite way by 2× or more
+  and no action within ±120 days — is added with
   `fafnir actions add --symbol <SYM> --ex-date <d> --split N:D`. A ratio near an
-  integer is not evidence on its own: check the volume and that the price stays.
+  integer is not evidence on its own. Flat identical prices on heavy volume before
+  the jump (EQC 1997: 0.9475 for days on millions of shares) mean the vendor stored
+  older bars at the wrong scale — a split row would disguise that, so leave it open.
+- **A one-tick move on a sub-dime price** (1/16 → 3/16, 0.01 → 0.03) is a market fact
+  whose percentage is large only because the price is. Accept.
 - **A duplicate split** — the same ratio twice, days apart, one at a pre-announced
   date — is removed with `fafnir actions delete <id>`. A bare SQL `DELETE` is
   re-inserted by the next load while the feed still carries the row.
@@ -211,23 +233,52 @@ generic explanation:
   under one ticker. Pair each outlier with the next one on the same security
   (`lead(close)`, `lead(prev_close)`) and treat it as a spike when the next flag's
   `prev_close` equals this `close` and the price returns within 25%. That found
-  about 10,000 flags across 516 securities (PRG, BXMT, PLA, REA).
+  about 10,000 flags across 516 securities (PRG, BXMT, PLA, REA). The pairing rule
+  misses edges, so a leftover open flag is often **the other half of a pair already
+  accepted** — find the partner in any state before treating it as new, and look at
+  the window: most are two or three scales alternating day by day, not a clean block.
 - **An isolated bad bar** can be re-fetched: the loader overwrites bars on
-  re-ingest. Needs the FMP key — check it before planning the repair. When the
-  vendor re-serves the same bad value, `fafnir prices delete --symbol <SYM> --date
-  <d>` removes it and keeps it out; the session then reads as a gap, to accept.
+  re-ingest. **Probe first** (`source probe-prices --symbol <SYM> --date <d>`, read
+  the whole output): when FMP has corrected it, re-fetch with `ingest prices
+  --symbols <SYM> --from <d> --to <d>` and keep the session (GEVX, 251,705 → 20.57).
+  When the vendor re-serves the same bad value, `fafnir prices delete --symbol <SYM>
+  --date <d>` removes it and keeps it out; the session then reads as a gap, to
+  accept. Scan the security's whole history for other bars far from their
+  neighbours first, so one delete batch takes them all (RUSS: 11 zero-volume bars at
+  ~5×, none after 2011).
 - **A bar on a non-session day** (a weekend print of another instrument, a
   money-market fund's weekend NAV stored before the loader set these aside) is
-  removed with `fafnir prices delete --symbol <SYM> --non-session`.
+  removed with `fafnir prices delete --symbol <SYM> --non-session`. Check the
+  weekday distribution first: a history dated one day early (FVI, WLL — no Fridays,
+  Sunday bars that are Monday sessions) would lose every Monday. And
+  `ref.trading_calendar` marks MLK Day 1990–1997 closed although NYSE traded, so
+  real bars on those dates look non-session.
+- **The first bar of a new listing after years of silence** is usually a fund or SPAC
+  that took a ticker whose earlier history FMP still serves under it. Earlier
+  segments that are junk (sub-penny on zero volume, stray bars after delisting) can
+  be deleted. **An earlier segment that is a real delisted company may be the only
+  copy the warehouse has** (Sotheby's under BID, Thoratec under THOR): look for another
+  row holding it by name and `core.symbol_xref` before deleting anything, and when
+  there is none keep both histories and accept the boundary.
+- **The newest bar of some ETFs** is provisional and FMP restates it the next night,
+  sometimes from or to the wrong scale. Recheck the next day; never delete a newest
+  bar on its first night.
 
 Every one of these is `--dry-run` first, `--note` always, and recorded in
-`ops.operator_override` (`fafnir override list`). They need migration 0025 on the
-host — check `schema_state` before planning with them.
+`ops.operator_override` (`fafnir override list`). A deleted bar survives only in its
+override's `detail.row`: `override revoke` lifts the suppression but **does not write
+the row back** — the next load, or an explicit `ingest prices`, does. They need
+migration 0025 on the host — check `schema_state` before planning with them.
 
 **Close with:** `repair-then-recheck` for a missing or misdated action, a duplicate,
-a re-fetchable or deleted bar (`dq recheck --check outlier` — a deleted bar or a
-split on the flag's date closes it); `accept` for a verified market fact or corrupt
-vendor history nobody will re-fetch.
+a re-fetchable or deleted bar (`dq recheck --check outlier` — a deleted bar, a
+deleted previous bar, or a split on the flag's date closes it; run `db refresh-marts`
+first and read the dry run's count against the flags you changed); `accept` for a
+verified market fact, a split sitting between two stored bars, the unpaired half of
+an accepted spike-and-revert, a two-issuer boundary whose earlier history must be
+kept, or corrupt vendor history nobody will re-fetch. **Leave open**, with the reason
+in the report, an off-scale history a fabricated split makes look smooth, a scale you
+cannot prove, and corruption that continues into the newest bars.
 
 ---
 

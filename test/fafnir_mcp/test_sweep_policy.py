@@ -89,6 +89,22 @@ def test_sweep_policy_never_tier_matches():
     assert _backticked_checks(row) == set(NEVER_AUTO_RESOLVE)
 
 
+def test_every_reference_is_linked_from_the_skill():
+    """A reference file SKILL.md never names is a file the agent never opens.
+
+    The skill is loaded whole; its references are read only when SKILL.md points at
+    them. A new reference added without that pointer is dead weight that looks, in
+    review, like guidance the agent has.
+    """
+    text = SKILL.read_text()
+    unlinked = sorted(
+        p.name
+        for p in (SKILL_DIR / "references").glob("*.md")
+        if f"references/{p.name}" not in text
+    )
+    assert not unlinked, f"references not named in SKILL.md: {unlinked}"
+
+
 @pytest.mark.parametrize("check", sorted(NEVER_AUTO_RESOLVE))
 def test_every_never_check_has_a_playbook(check):
     """A check nobody may close still needs an entry saying why."""

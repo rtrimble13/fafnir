@@ -47,6 +47,11 @@ read through the `duk` CLI.
     the 2026-09-10 DQ session got wrong or had to derive from source, and the skill
     changes that followed: the flag-durability matrix, the environment check, the
     operator-directed bulk mode (**applied**)
+  - [fafnir-dba skill enhancements, 2026-09-15](plans/fafnir-dba-skill-enhancements-2026-09-15.md)
+    — what the outlier session got wrong or nearly got wrong, and the skill changes
+    that followed: the outlier classification order, the plausibility gate, the
+    survivorship check before deleting a segment, computed dry-run predictions
+    (**applied**)
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
