@@ -138,8 +138,10 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
 5. decide, per condition:
      data defect  → repair (ingest / adjust / refresh-marts), THEN dq recheck
      market fact  → dq accept, with the evidence in --note (a resolve returns)
-     wrong shape  → the command that fixes it (security merge, track rm --closed)
-     vendor wrong → the correction (actions add|delete|redate, prices delete),
+     wrong shape  → the command that fixes it (security merge, track rm --closed,
+                    security split-history for two issuers on one row)
+     vendor wrong → the correction (actions add|delete|redate, prices delete, or
+                    prices shift|rescale for a real price at the wrong date/scale),
                     then dq recheck -- a SQL DELETE comes back on the next load
      neither      → escalate; leave it open
 6. sudo -u fafnir $F <disposition> <ids> --by claude --note "<evidence>"

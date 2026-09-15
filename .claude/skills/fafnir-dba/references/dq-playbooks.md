@@ -259,7 +259,9 @@ explanation. The queries and thresholds for each are in
   be deleted. **An earlier segment that is a real delisted company may be the only
   copy the warehouse has** (Sotheby's under BID, Thoratec under THOR): look for another
   row holding it by name and `core.symbol_xref` before deleting anything, and when
-  there is none keep both histories and accept the boundary.
+  there is none move the earlier history onto its own security with `security
+  split-history` rather than deleting it — or, where the boundary is not clean enough
+  for that, keep both histories and accept the boundary.
 - **The newest bar of some ETFs** is provisional and FMP restates it the next night,
   sometimes from or to the wrong scale. Recheck the next day; never delete a newest
   bar on its first night.
@@ -267,8 +269,11 @@ explanation. The queries and thresholds for each are in
 Every one of these is `--dry-run` first, `--note` always, and recorded in
 `ops.operator_override` (`fafnir override list`). A deleted bar survives only in its
 override's `detail.row`: `override revoke` lifts the suppression but **does not write
-the row back** — the next load, or an explicit `ingest prices`, does. They need
-migration 0025 on the host — check `schema_state` before planning with them.
+the row back** — the next load, or an explicit `ingest prices`, does. A bar *edited* by
+`prices shift|rescale` is the exception: revoking any override of that edit removes
+the operator's bars and writes the vendor's back exactly as they stood, because the
+edit replaced them rather than judging them worthless. Deletes need migration 0025
+on the host and bar edits need 0026 — check `schema_state` before planning with them.
 
 **Close with:** `repair-then-recheck` for a missing or misdated action, a duplicate,
 a re-fetchable or deleted bar (`dq recheck --check outlier` — a deleted bar, a
@@ -276,9 +281,11 @@ deleted previous bar, or a split on the flag's date closes it; run `db refresh-m
 first and read the dry run's count against the flags you changed); `accept` for a
 verified market fact, a split sitting between two stored bars, the unpaired half of
 an accepted spike-and-revert, a two-issuer boundary whose earlier history must be
-kept, or corrupt vendor history nobody will re-fetch. **Leave open**, with the reason
-in the report, an off-scale history a fabricated split makes look smooth, a scale you
-cannot prove, and corruption that continues into the newest bars.
+kept, or corrupt vendor history nobody will re-fetch. `prices shift|rescale` (then recheck) for real
+prices stored at the wrong date or the wrong scale, including an off-scale era a
+fabricated split makes look smooth — rescale the era and delete the split together.
+**Leave open**, with the reason in the report, a scale you cannot prove, and
+corruption that continues into the newest bars.
 
 ---
 

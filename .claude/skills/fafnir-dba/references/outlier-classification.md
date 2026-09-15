@@ -242,11 +242,52 @@ identify the issuer and look for another row holding it — by name
 matching closes across securities on a date (that times out). QSI held HighCape's
 2020–21 history, so deleting it from CAPA lost nothing; the 2003–08 CAPA issuer
 was held nowhere, and deleting it was a mistake that only the override record
-recovers. When the earlier segment is the only copy, keep both histories and accept
-the boundary flag with a note that says so, or move the history to its own security
-if a command for that is deployed.
+recovers. When the earlier segment is the only copy, move it onto its own
+security with `security split-history` (runbook: "Separating two issuers held on one
+security"). It keeps the delisted company's bars, stops the vendor putting them back,
+and leaves the live ticker resolving to the current issuer; recheck the boundary
+afterwards. Only where that is wrong — the boundary date is not clean, or the two
+issuers cannot be told apart — keep both histories on the one row and accept the
+boundary flag with a note that says so.
 
-### 2i. Leave open, with the reason
+### 2i. Bars at the wrong date or the wrong scale → `prices shift` / `prices rescale`
+
+Real prices filed under the wrong key. Deleting throws the history away and a
+re-fetch returns the same defect, because the vendor's payload carries it too. Both
+commands are `--dry-run` first, and both record the edit so a load cannot undo it
+(runbook: "Bars at the wrong date or the wrong scale").
+
+- **A whole history dated a day early** (FVI, WLL — no Friday bars, Sunday bars that
+  are Monday sessions): check the weekday distribution first; `prices delete
+  --non-session` would delete every real Monday. `prices shift --days 1` re-dates the
+  range. Read the dry run's weekday table: a correct shift turns `Sun Mon Tue Wed Thu`
+  into five weekdays. Fridays in the *before* row mean only part of the history slipped
+  — narrow the range. Check the listed corporate actions for the same slip before
+  adding `--with-actions`. FVI also switches scale between bars, so a shift alone may
+  not be the whole repair.
+- **An era stored at the wrong scale** (EQC before 1997-10-17 at 1/20 of the traded
+  price, volume ~25x): `prices rescale --factor 20 --volume-factor 1/25`. The dry run
+  prints the closes either side of both ends; a correct factor turns both joins into
+  ordinary sessions.
+- **A pre-split era multiplied by a split applied backwards** (AKR, whose raw closes
+  reach 149,613,176; HUN's pre-2014 bars 10x beside a 10:1 split row; JKL): the repair
+  is *both* commands — `prices rescale` the era back to as-traded, then `actions
+  delete` the fabricated split. Doing one without the other applies the scale twice in
+  the adjusted series. If the split was real and only the bars are wrong, keep the
+  split; the raw jump on the ex-date tells you which case it is.
+- **A history back-adjusted by the vendor** (WZRD at 30,000–108,000 in 2023 on ~1M
+  shares, then 808 → 0.88; SMUP opening at 6,229 on 46 shares): FMP has applied later
+  reverse splits to its "unadjusted" feed. A delete loses real trading, a split row
+  double-counts. A rescale is the repair, but **confirm the scale against an outside
+  source before applying a factor** — leave it open until you can.
+- **Not for a live defect.** A security still trading whose vendor keeps sending new
+  bars misdated or mis-scaled is not fixed by editing the past; new bars arrive on
+  dates the edit does not cover. Those belong in 2j.
+
+Follow either with `dq recheck --check outlier --check gap` (a shift can open or close
+gaps), then `db refresh-marts`.
+
+### 2j. Leave open, with the reason
 
 - **Alternating scales on a new ETF where you cannot prove which is right** (KEO
   25 / 3.2; ENTL, where FMP's close matched but its volume did not).
@@ -255,13 +296,6 @@ if a command for that is deployed.
 - **The newest bar of an ETF FMP restates** (XNDX, MILK, MSEP, NODE): FMP serves a
   provisional last bar, sometimes at the wrong scale, and restates it the next night.
   Recheck tomorrow; never delete a newest bar on the first night.
-- **A history back-adjusted by the vendor** (WZRD at 30,000–108,000 in 2023 on ~1M
-  shares, then 808 → 0.88; SMUP opening at 6,229 on 46 shares): FMP has applied later
-  reverse splits to its "unadjusted" feed. A delete loses real trading, a split row
-  double-counts. Needs a rescale.
-- **A whole history dated a day early** (FVI, WLL — no Friday bars, Sunday bars that
-  are Monday sessions): check the weekday distribution. `prices delete --non-session`
-  would delete every Monday. Needs a date shift.
 - **Bars on MLK Day 1990–1997.** `ref.trading_calendar` marks them closed; NYSE was
   open until 1998. They are real bars.
 
