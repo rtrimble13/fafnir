@@ -707,6 +707,17 @@ def test_revoking_a_with_actions_shift_takes_the_action_back_too(cli_db):
         )
         == 0
     )
+    # And the factors were recomputed against the restored ex-date (2024-06-04), not
+    # the date the shift had moved it to (2024-06-05). An adjusted series out by one
+    # session is the damage this guards.
+    assert [
+        str(r["effective_date"])
+        for r in db.fetchall(
+            "SELECT effective_date FROM core.adjustment_factor WHERE security_id=%s "
+            "ORDER BY effective_date",
+            (sid,),
+        )
+    ] == ["2024-06-04"]
 
 
 def _shift_args(sid):
