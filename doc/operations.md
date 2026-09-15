@@ -488,7 +488,9 @@ traded price. The vendor's payload has the same defect, so a re-fetch changes no
   partly misdated shows Fridays in the *before* row; narrow the range. Refused, naming
   the dates: a bar landing on a stored bar outside the range, on a day the venue
   calendar has no session (`--allow-non-session` overrides it; the calendar marks MLK
-  Day 1990-1997 closed although NYSE traded), or in the future. Corporate actions stay
+  Day 1990-1997 closed although NYSE traded), in the future, or outside the venue
+  calendar's span altogether — which `--allow-non-session` does *not* override, since
+  a date the calendar has never heard of is a mistyped `--days`, not a holiday. Corporate actions stay
   where they are unless `--with-actions`; the dry run lists the ones in the range with
   their weekdays, so you can see whether the vendor misdated them too.
 - **`prices rescale --factor F [--volume-factor V]`** multiplies every price (and
@@ -507,7 +509,9 @@ traded price. The vendor's payload has the same defect, so a re-fetch changes no
   whole) and an operator `add` in its place (`source = operator`), all sharing one
   `edit` id. The price loader sets aside vendor bars on both dates. `fafnir override
   revoke <any id of the edit>` undoes the whole edit and writes the vendor bars back
-  exactly as they stood — unlike a plain delete, whose undo leaves the key empty.
+  exactly as they stood — unlike a plain delete, whose undo leaves the key empty. A
+  `--with-actions` shift is undone with them: the corporate actions it re-dated go
+  back to their own ex-dates too, so the adjusted series cannot be left a session out.
 - **An operator bar is not a target for other edits.** `prices delete`, a second
   shift or rescale over it, and a `security split-history` range that covers it are
   refused until the edit is revoked; plan one edit from the vendor's bars.
@@ -542,8 +546,10 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
 - **Where to.** `--new-symbol`/`--new-name` mints a delisted security with
   `source = operator` and a closed ticker period; the live ticker still resolves to
   the source. `--into-security-id` moves into a security that already exists; a
-  session it already holds must have the same OHLC (it is then only removed from the
-  source) or the split is refused.
+  session it already holds must match on every field — prices, volume and vwap — for
+  the split to treat it as the same bar and only remove it from the source. Any
+  difference refuses the split, because the source's row is the one that would be
+  deleted.
 - **Durable.** Each moved key stays suppressed on the source by a `delete` override,
   so a load of the ticker's full history does not put it back. A minted destination
   is never fed: every loader universe excludes `source = operator`, and an explicit
@@ -556,9 +562,11 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   bar or action an operator re-dated or re-scaled (revoke that edit first — see
   above), and a blank note.
 - **Undo** reverses exactly what the split recorded and deletes a minted destination
-  left empty. It is the only way back: `override revoke` on one of the split's own
-  overrides is refused, because lifting one key's suppression while the destination
-  keeps its copy would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
+  left empty. It takes back **one split**: where two disjoint ranges were moved to the
+  same destination, it undoes the most recent, so run it again for the one before. It
+  is the only way back — `override revoke` on one of the split's own overrides is
+  refused, because lifting one key's suppression while the destination keeps its copy
+  would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.
 
 ## Reconciliation

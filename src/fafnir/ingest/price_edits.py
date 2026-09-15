@@ -135,6 +135,12 @@ def rescale_row(
         return None, reason
     if dp._scale_collapse_detail(bar, clean) is not None:
         return None, "scale_collapse"
+    if bar["vwap"] is not None and clean.get("vwap") is None:
+        # _as_vwap drops a vwap it cannot store rather than refusing the bar, which is
+        # right for a vendor row (the bar is still worth keeping) and wrong for an
+        # edit: the operator asked for a scaled copy of this bar, and silently writing
+        # it without its vwap is not that. Refuse, as for any other field.
+        return None, "vwap_out_of_range"
     return clean, None
 
 
@@ -321,6 +327,30 @@ def plan_shift(
             )
 
     exchange = (repo.security_price_profile(db, security_id) or {}).get("exchange_code")
+
+    # A target outside the calendar's span is not a session question, and
+    # --allow-non-session does not cover it: "no row" means closed inside the span and
+    # unknown outside it, so the session check below cannot see these at all. A typed
+    # --days is the way they arise (--days -40000 dates a 2024 bar to 1914), and the
+    # bar lands in core.daily_price_default, which then blocks ensure_year_partition
+    # for that year until someone finds it. This command exists for a misdating of a
+    # day or two.
+    span = (
+        repo.open_sessions(db, exchange, min(targets), max(targets))
+        if exchange
+        else None
+    )
+    if span is not None:
+        _, cal_first, cal_last = span
+        off_calendar = sorted(t for t in targets if t < cal_first or t > cal_last)
+        if off_calendar:
+            plan.refusals.append(
+                f"{len(off_calendar)} bar(s) would be dated outside the venue "
+                f"calendar's span ({cal_first}..{cal_last}): "
+                f"{_listed([str(t) for t in off_calendar])}. Check --days "
+                f"{days}."
+            )
+
     closed = sorted(dp.non_session_dates(db, exchange, targets))
     if closed:
         mlk = [d for d in closed if is_calendar_mlk_gap(d)]
@@ -412,15 +442,26 @@ def apply_plan(
         # Move the far end first, so an action never lands on one not yet moved.
         ordered = sorted(plan.actions, key=lambda a: a["ex_date"], reverse=days > 0)
         for a in ordered:
-            moved.append(
-                repo.redate_operator_action(
-                    db,
-                    corporate_action_id=int(a["corporate_action_id"]),
-                    new_ex_date=a["ex_date"] + timedelta(days=days),
-                    note=f"{note} [moved with bar edit {edit_id}]",
-                    created_by=created_by,
-                )
+            pair = repo.redate_operator_action(
+                db,
+                corporate_action_id=int(a["corporate_action_id"]),
+                new_ex_date=a["ex_date"] + timedelta(days=days),
+                note=f"{note} [moved with bar edit {edit_id}]",
+                created_by=created_by,
             )
+            # Both halves join the edit. Without this the note is the only thing
+            # tying them to it, and `override revoke` -- which the command itself
+            # tells the operator to use -- restored the bars while leaving the action
+            # a day away from them and the true ex-date still suppressed, then
+            # recomputed the adjustment factors into that state.
+            repo.mark_action_override_edit(
+                db,
+                override_ids=pair[1:],
+                edit_id=edit_id,
+                kind=plan.kind,
+                days=days,
+            )
+            moved.append(pair)
     return edit_id, override_ids, moved
 
 

@@ -80,6 +80,25 @@ def _split(runner, *extra):
         ),
         (["--undo"], "--undo needs"),
         (["--undo", "--into-security-id", "2", "--to", "2020-01-01"], "--undo reads"),
+        # --restore-deleted was accepted and silently ignored under --undo, although
+        # every other option that describes a split is rejected there.
+        (
+            ["--undo", "--into-security-id", "2", "--restore-deleted"],
+            "--undo reads",
+        ),
+        # --asset-type describes a minted destination, so it cannot apply to one that
+        # already exists. It carries a default, so the check compares against it.
+        (
+            [
+                "--to",
+                "2020-01-01",
+                "--into-security-id",
+                "2",
+                "--asset-type",
+                "etf",
+            ],
+            "do not apply with --into-security-id",
+        ),
     ],
 )
 def test_split_history_rejects_an_incoherent_request_before_the_database(

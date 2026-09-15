@@ -2617,6 +2617,44 @@ def price_edit_overrides(
     )
 
 
+def mark_action_override_edit(
+    db: Database,
+    *,
+    override_ids: Sequence[int],
+    edit_id: int,
+    kind: str,
+    days: int,
+) -> None:
+    """Join a re-dated corporate action's override pair to the bar edit that moved it,
+    so `override revoke` takes the action back with the bars."""
+    import json
+
+    db.execute(
+        "UPDATE ops.operator_override SET detail = detail || %s "
+        "WHERE override_id = ANY(%s)",
+        (
+            json.dumps({"transform": {"kind": kind, "edit": edit_id, "days": days}}),
+            [int(o) for o in override_ids],
+        ),
+    )
+
+
+def price_edit_action_overrides(
+    db: Database, *, security_id: int, edit_id: int
+) -> list[dict]:
+    """The corporate-action overrides of one bar edit, oldest first."""
+    return db.fetchall(
+        """
+        SELECT * FROM ops.operator_override
+         WHERE security_id = %s AND target = 'corporate_action'
+           AND (detail->'transform'->>'edit')::bigint = %s
+           AND revoked_at IS NULL
+         ORDER BY override_id
+        """,
+        (security_id, edit_id),
+    )
+
+
 def revoke_price_edit(
     db: Database, *, security_id: int, edit_id: int, note: str, revoked_by: str
 ) -> list[dict]:
@@ -2691,15 +2729,65 @@ def revoke_price_edit(
             for r in deletes
         ],
     )
+    # A `--with-actions` shift re-dated corporate actions in the same command. They
+    # are part of the edit, so they come back with it: leaving them behind put the
+    # action a day away from the bars it adjusts, kept the true ex-date suppressed
+    # against `ingest actions`, and left the wrong date baked into
+    # core.adjustment_factor.
+    action_rows = price_edit_action_overrides(
+        db, security_id=security_id, edit_id=edit_id
+    )
+    for r in [a for a in action_rows if a["operation"] == "add"]:
+        db.execute(
+            """
+            DELETE FROM core.corporate_action
+             WHERE security_id = %s AND action_type = %s AND ex_date = %s
+               AND source = %s
+            """,
+            (security_id, r["action_type"], r["key_date"], OPERATOR_SOURCE),
+        )
+    for r in [a for a in action_rows if a["operation"] == "delete"]:
+        row = (r["detail"] or {}).get("row") or {}
+        db.execute(
+            """
+            INSERT INTO core.corporate_action
+                (security_id, action_type, ex_date, record_date, payment_date,
+                 declaration_date, split_numerator, split_denominator,
+                 dividend_amount, currency, source, ingestion_run_id, loaded_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s::numeric,%s::numeric,%s::numeric,%s,%s,%s,
+                    COALESCE(%s::timestamptz, now()))
+            ON CONFLICT (security_id, action_type, ex_date) DO NOTHING
+            """,
+            (
+                security_id,
+                r["action_type"],
+                r["key_date"],
+                row.get("record_date"),
+                row.get("payment_date"),
+                row.get("declaration_date"),
+                row.get("split_numerator"),
+                row.get("split_denominator"),
+                row.get("dividend_amount"),
+                row.get("currency") or "USD",
+                row.get("source") or "fmp",
+                row.get("ingestion_run_id"),
+                row.get("loaded_at"),
+            ),
+        )
     db.execute(
         """
         UPDATE ops.operator_override
            SET revoked_at = now(), revoked_by = %s, revoked_note = %s
          WHERE override_id = ANY(%s)
         """,
-        (revoked_by, note, [int(r["override_id"]) for r in rows]),
+        (
+            revoked_by,
+            note,
+            [int(r["override_id"]) for r in rows]
+            + [int(r["override_id"]) for r in action_rows],
+        ),
     )
-    return rows
+    return rows + action_rows
 
 
 def list_operator_overrides(
@@ -2777,6 +2865,18 @@ def revoke_operator_override(
             f"--into-security-id {dest} --undo -m '<why>'`."
         )
     if row["operation"] == "add":
+        if row["target"] == "daily_price":
+            # Only reachable from a row written before 0026 required an `edit`, or by
+            # hand. The branch below deletes a corporate action, so taking it would
+            # report the operator's bar removed, remove nothing, and then revoke the
+            # override that was recording and protecting the bar.
+            raise OverrideRefused(
+                f"Override {override_id} adds a bar but names no edit, so there is "
+                "nothing to undo it against. Remove the bar with `fafnir prices "
+                "delete` if it should not be there, and report the override: a bar "
+                "add is written only by `prices shift|rescale`, which always names "
+                "its edit."
+            )
         db.execute(
             """
             DELETE FROM core.corporate_action
@@ -3718,12 +3818,15 @@ def undo_history_split(
                         "WHERE security_id = %s AND trade_date = %s",
                         (destination_id, d),
                     )
+                    # Only a key the split materialised is taken off the destination.
+                    # A duplicate-restored one was already the destination's own bar,
+                    # which stays, so counting it overstated what the undo removed.
+                    bars_unrestored += 1
                 db.execute(
                     "UPDATE ops.operator_override SET detail = detail - 'split' "
                     "WHERE override_id = %s",
                     (o["override_id"],),
                 )
-                bars_unrestored += 1
                 returned_dates.append(d)
                 continue
             db.execute(

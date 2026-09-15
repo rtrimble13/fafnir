@@ -96,6 +96,16 @@ def test_rescale_refuses_a_price_below_the_columns_resolution():
     assert reason == "subresolution_price"
 
 
+def test_rescale_refuses_a_vwap_the_column_can_no_longer_hold():
+    """_as_vwap drops a vwap it cannot store rather than quarantining the bar, which is
+    right for a vendor row and wrong for an edit: the operator asked for a scaled copy
+    of this bar, and a copy written without its vwap is not that. It used to succeed,
+    silently, and report nothing."""
+    new, reason = pe.rescale_row(_row(vwap="10000000000000"), Decimal(20), Decimal(1))
+    assert new is None
+    assert reason == "vwap_out_of_range"
+
+
 def test_rescale_refuses_a_price_past_the_columns_range():
     new, reason = pe.rescale_row(_row(), Decimal(10) ** 14, Decimal(1))
     assert (new, reason) == (None, "price_out_of_range")

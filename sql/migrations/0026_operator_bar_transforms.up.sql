@@ -40,11 +40,21 @@ ALTER TABLE ops.operator_override
 -- A bar may be deleted, or added as a recorded transform of a vendor bar. Never a
 -- bare add: the check is on the record, so a hand-written INSERT without the
 -- transform is refused by the table, not only by the command.
+--
+-- The transform must name its `edit`, because that is what makes the record
+-- undoable: `revoke_price_edit` finds an edit's halves by it, and a bar add without
+-- one is a row the revoke path cannot resolve -- it would report the operator's bar
+-- removed, delete nothing, and leave that bar in core.daily_price with no active
+-- override recording or protecting it.
+--
+-- Written as `#> IS NOT NULL` rather than `detail->'transform' ? 'edit'`: `->` on a
+-- missing key yields SQL NULL, `?` on NULL yields NULL, and a CHECK that evaluates to
+-- NULL passes. The `#>` form is false for a missing key and for a NULL detail alike.
 ALTER TABLE ops.operator_override
     ADD CONSTRAINT ck_operator_override_price_delete_or_transform CHECK (
         target <> 'daily_price'
         OR operation = 'delete'
-        OR (operation = 'add' AND detail ? 'transform')
+        OR (operation = 'add' AND detail #> '{transform,edit}' IS NOT NULL)
     );
 
 COMMENT ON TABLE ops.operator_override IS

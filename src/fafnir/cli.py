@@ -1412,6 +1412,11 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
+# The minted destination's default asset type, in one place: the option's default and
+# the "this describes a new security" check have to agree about what "not given" is.
+_SPLIT_ASSET_TYPE_DEFAULT = "equity"
+
+
 @security.command("split-history")
 @click.option("--symbol", help="Source security by ticker.")
 @click.option("--security-id", type=int, help="Source security by id (unambiguous).")
@@ -1432,7 +1437,7 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
 @click.option(
     "--asset-type",
     type=click.Choice(["equity", "etf", "fund", "other"]),
-    default="equity",
+    default=_SPLIT_ASSET_TYPE_DEFAULT,
     show_default=True,
     help="Asset type of the minted destination.",
 )
@@ -1522,9 +1527,19 @@ def security_split_history(
     if not note.strip():
         raise click.ClickException("--note may not be blank.")
     if undo:
-        if any(
-            v is not None
-            for v in (from_date, to_date, new_symbol, new_name, exchange, delisted_date)
+        if (
+            any(
+                v is not None
+                for v in (
+                    from_date,
+                    to_date,
+                    new_symbol,
+                    new_name,
+                    exchange,
+                    delisted_date,
+                )
+            )
+            or restore_deleted
         ):
             raise click.ClickException(
                 "--undo reads what the split recorded; it takes only the source, "
@@ -1581,10 +1596,12 @@ def security_split_history(
             "Give exactly one destination: --new-symbol (with --new-name) or "
             "--into-security-id."
         )
-    if into_security_id is not None and (new_name or exchange or delisted_date):
+    if into_security_id is not None and (
+        new_name or exchange or delisted_date or asset_type != _SPLIT_ASSET_TYPE_DEFAULT
+    ):
         raise click.ClickException(
-            "--new-name, --exchange and --delisted-date describe a new security; "
-            "they do not apply with --into-security-id."
+            "--new-name, --exchange, --delisted-date and --asset-type describe a new "
+            "security; they do not apply with --into-security-id."
         )
     kwargs = dict(
         to_date=_parse_date(to_date),
@@ -1640,7 +1657,9 @@ def security_split_history(
     click.echo(
         f"Security {sid} factors: {before.get(sid, 'no factors')} -> {after_src}."
     )
-    click.echo(f"Security {dest} factors: -> {after_dest}.")
+    click.echo(
+        f"Security {dest} factors: {before.get(dest, 'no factors')} -> {after_dest}."
+    )
     if dry_run:
         click.echo("Dry run: nothing changed.")
         return
@@ -3005,17 +3024,40 @@ def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
         )
     for sid, edit, rows in edit_results:
         kind = rows[0]["detail"]["transform"].get("kind", "bar")
-        bars = sum(1 for r in rows if r["operation"] == "delete")
+        bars = sum(
+            1
+            for r in rows
+            if r["operation"] == "delete" and r["target"] == "daily_price"
+        )
+        acts = sum(
+            1
+            for r in rows
+            if r["operation"] == "delete" and r["target"] == "corporate_action"
+        )
         click.echo(
             f"Bar edit {edit} (security {sid}, {kind} of {_plural(bars, 'bar')}): "
-            f"{_plural(len(rows), 'override')} revoked, vendor bars restored."
+            f"{_plural(len(rows), 'override')} revoked, vendor bars restored"
+            + (
+                f" and {_plural(acts, 'corporate action')} put back on its own ex-date"
+                if acts
+                else ""
+            )
+            + "."
         )
     if dry_run:
         click.echo("Dry run: nothing changed.")
         return
+    # `revoked` holds only the plain overrides, so undoing a six-override bar edit
+    # used to read "Revoked 0 overrides and 1 bar edit". Count the edit's own.
+    in_edits = sum(len(rows) for _, _, rows in edit_results)
     click.echo(
         f"Revoked {_plural(len(revoked), 'override')}"
-        + (f" and {_plural(len(edit_results), 'bar edit')}" if edit_results else "")
+        + (
+            f" and {_plural(len(edit_results), 'bar edit')} "
+            f"({_plural(in_edits, 'override')})"
+            if edit_results
+            else ""
+        )
         + f" as {revoked_by}."
     )
     if recompute:

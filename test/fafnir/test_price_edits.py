@@ -597,6 +597,47 @@ def test_shift_refuses_a_future_date(cli_db):
     assert "in the future" in out.output
 
 
+def test_a_shift_off_the_end_of_the_calendar_is_refused(cli_db):
+    """`--days` was unbounded, and a typed one is how a century-long shift arises. The
+    session check cannot catch it: "no calendar row" means closed inside the calendar's
+    span and unknown outside it, so a 1914 target read as a session. The bar landed in
+    core.daily_price_default, which then blocks ensure_year_partition for that year."""
+    db = cli_db
+    sid = _mk(db, "FAR")
+    _store_early(db, sid)
+
+    out = _run(
+        "prices",
+        "shift",
+        "--symbol",
+        "FAR",
+        "--from",
+        "2024-06-03",
+        "--to",
+        "2024-06-05",
+        "--days",
+        "-40000",
+        "--allow-non-session",
+        "-m",
+        "typo",
+        "--yes",
+    )
+
+    assert out.exit_code != 0
+    assert "outside the venue calendar's span" in out.output
+    assert "1914" in out.output
+    # Nothing was written, and no bar escaped into the default partition.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id=%s "
+            "AND trade_date < '2000-01-01'",
+            (sid,),
+        )
+        == 0
+    )
+    assert db.fetchval("SELECT count(*) FROM ops.operator_override") == 0
+
+
 def test_shift_leaves_corporate_actions_unless_asked(cli_db):
     db = cli_db
     sid = _mk(db, "ACTS")
@@ -622,6 +663,50 @@ def test_shift_leaves_corporate_actions_unless_asked(cli_db):
             (sid,),
         )
     ] == [("2024-06-05", "operator")]
+
+
+def test_revoking_a_with_actions_shift_takes_the_action_back_too(cli_db):
+    """The command tells the operator to undo with `override revoke`, and the runbook
+    says that undoes the whole edit. It used to restore the bars and leave the action
+    a calendar day away from them, with the true ex-date still suppressed against
+    `ingest actions` and the wrong date already baked into core.adjustment_factor --
+    an adjusted series silently out by one session, which is the damage 0025 and 0026
+    exist to prevent."""
+    db = cli_db
+    sid = _mk(db, "ACTS")
+    _store_early(db, sid)
+    repo.upsert_corporate_action(
+        db,
+        security_id=sid,
+        action_type="split",
+        ex_date=dt.date(2024, 6, 4),
+        split_numerator=2,
+        split_denominator=1,
+    )
+    assert _run(*_shift_args(sid), "--with-actions", "--yes").exit_code == 0
+    edit = db.fetchval(
+        "SELECT min(override_id) FROM ops.operator_override "
+        "WHERE target='daily_price' AND revoked_at IS NULL"
+    )
+
+    out = _run("override", "revoke", str(edit), "-m", "wrong call", "--yes")
+
+    assert out.exit_code == 0, out.output
+    # The action is back on its own ex-date, as the vendor's row.
+    assert [
+        (str(r["ex_date"]), r["source"])
+        for r in db.fetchall(
+            "SELECT ex_date, source FROM core.corporate_action WHERE security_id=%s",
+            (sid,),
+        )
+    ] == [("2024-06-04", "fmp")]
+    # Nothing is left suppressed, so a later `ingest actions` behaves normally.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.operator_override WHERE revoked_at IS NULL"
+        )
+        == 0
+    )
 
 
 def _shift_args(sid):
@@ -825,10 +910,29 @@ def test_a_bar_add_carrying_its_transform_is_accepted_by_the_table(db):
         "INSERT INTO ops.operator_override "
         "(security_id, target, key_date, operation, detail, note, created_by) "
         "VALUES (%s, 'daily_price', '2024-06-05', 'add', "
-        "'{\"transform\": {\"kind\": \"rescale\"}}', 'n', 'x')",
+        '\'{"transform": {"kind": "rescale", "edit": 1}}\', \'n\', \'x\')',
         (sid,),
     )
     assert dt.date(2024, 6, 5) in repo.suppressed_price_dates(db, sid)
+
+
+def test_a_bar_add_whose_transform_names_no_edit_is_refused_by_the_table(db):
+    """`edit` is what makes the record undoable: `revoke_price_edit` finds an edit's
+    halves by it. A bar add without one is a row the revoke path cannot resolve -- it
+    reported the operator's bar removed, deleted nothing (the branch it took deletes a
+    corporate action), and then revoked the override that was protecting the bar,
+    leaving it in core.daily_price with nothing recording it."""
+    sid = _mk(db)
+    with pytest.raises(
+        Exception, match="ck_operator_override_price_delete_or_transform"
+    ):
+        db.execute(
+            "INSERT INTO ops.operator_override "
+            "(security_id, target, key_date, operation, detail, note, created_by) "
+            "VALUES (%s, 'daily_price', '2024-06-05', 'add', "
+            "'{\"transform\": {\"kind\": \"rescale\"}}', 'n', 'x')",
+            (sid,),
+        )
 
 
 def test_the_down_migration_refuses_while_bar_transforms_exist(db, migrated_dsn):
@@ -841,7 +945,7 @@ def test_the_down_migration_refuses_while_bar_transforms_exist(db, migrated_dsn)
         "INSERT INTO ops.operator_override "
         "(security_id, target, key_date, operation, detail, note, created_by) "
         "VALUES (%s, 'daily_price', '2024-06-05', 'add', "
-        "'{\"transform\": {\"kind\": \"shift\"}}', 'n', 'x')",
+        '\'{"transform": {"kind": "shift", "edit": 1}}\', \'n\', \'x\')',
         (sid,),
     )
     migrations = Path(__file__).resolve().parents[2] / "sql" / "migrations"
