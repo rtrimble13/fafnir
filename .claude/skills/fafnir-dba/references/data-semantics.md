@@ -138,3 +138,47 @@ is normal and is not a data-quality problem.
 A deep forward-split history multiplies volume by the cumulative split ratio, and
 it can exceed int64 — which is why the adjusted path falls back to exact Python
 ints. Adjusted volume is not "shares that traded that day"; raw volume is.
+
+## 14. One ticker's vendor history can span several issuers
+
+FMP serves a ticker's whole history, whoever used it. A new ETF or SPAC minted with
+a full backfill therefore arrives carrying the bars of every earlier instrument on
+that ticker: CAPA (a 2026 ETF) held a 2003–08 stock and the 2020–21 HighCape SPAC;
+BID (a 2026 SPAC) holds Sotheby's 2003–2019.
+
+> **Wrong answer:** "Tribeca Strategic Acquisition has traded since 2003", or
+> deleting the earlier bars as junk when they are the warehouse's only copy of a
+> delisted company.
+
+The first bar of the real listing is usually ~$25 for an ETF and ~$10 for a SPAC,
+after a gap of months or years. Split the history at gaps before reading any
+statistic across it.
+
+## 15. The "unadjusted" feed is sometimes adjusted, and a split row can be invented
+
+Some histories arrive already back-adjusted for later reverse splits — a leveraged
+ETF opening at 6,229 on 46 shares (SMUP), or trading at 30,000–108,000 (WZRD). And
+FMP has stored split rows that exactly match a history it holds at the wrong scale
+(HUN's "10:1 split" in 2014; AKR's closes up to 149,613,176), so the adjusted series
+is smooth and both series are wrong.
+
+> **Wrong answer:** "the adjusted series is smooth, so the split is real." Check the
+> price levels against what the instrument could have traded at.
+
+## 16. The trading calendar is wrong for MLK Day 1990–1997
+
+`ref.trading_calendar` marks Martin Luther King Jr. Day closed from 1990, but NYSE
+first closed for it in 1998. Real bars exist on those dates (BXMT, ALNT, AIRT, PRG,
+ASRV, ARWR, UEIC).
+
+> **Wrong answer:** treating those bars as non-session prints to delete. The
+> loader's non-session set-aside also drops them on any backfill.
+
+## 17. Some ETFs' newest bar is provisional
+
+For several thinly traded ETFs FMP serves a last bar that it restates the next night,
+sometimes from or to the wrong scale (XNDX, MILK, MSEP, NODE; VDG's *restated* bar was
+the bad one).
+
+> **Wrong answer:** an outlier on the newest bar read as a market move, or deleted
+> as a bad bar, on its first night. Recheck it after the next load.
