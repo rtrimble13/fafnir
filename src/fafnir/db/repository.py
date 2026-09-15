@@ -2834,6 +2834,15 @@ _FLAG_DATE_SQL = (
 )
 
 _SPLIT_PRICE_FIELDS = ("open", "high", "low", "close")
+_SPLIT_VOLUME_FIELDS = ("volume", "vwap")
+
+
+def _bar_field(value) -> Optional[Decimal]:
+    """A bar field as a comparable number, NULL-safe. NULL is not zero: a vendor that
+    sends no vwap and one that sends 0 disagree, and neither is the other's copy."""
+    return None if value is None else Decimal(str(value))
+
+
 _SPLIT_ACTION_FIELDS = (
     "split_numerator",
     "split_denominator",
@@ -2914,6 +2923,68 @@ def _split_marker(source_id: int, destination_id: int, kind: str) -> dict:
     }
 
 
+def _refuse_keys_already_overridden(
+    db: Database,
+    *,
+    source_id: int,
+    bar_dates: Sequence[date],
+    action_keys: Sequence[tuple[str, date]],
+) -> None:
+    """Refuse a split over a key that already holds an active 'delete' override.
+
+    Named by date, and with the remedy that fits: a bar edit (0026) is revoked whole,
+    anything else one override at a time.
+    """
+    rows = db.fetchall(
+        """
+        SELECT override_id, target, action_type, key_date,
+               (detail ? 'transform') AS is_edit,
+               detail->'transform'->>'edit' AS edit
+          FROM ops.operator_override
+         WHERE security_id = %s AND revoked_at IS NULL AND operation = 'delete'
+           AND (
+                (target = 'daily_price' AND key_date = ANY(%s))
+             OR (target = 'corporate_action'
+                 AND (action_type, key_date) IN (
+                     SELECT t.a, t.d
+                       FROM unnest(%s::text[], %s::date[]) AS t(a, d)))
+               )
+         ORDER BY key_date, target
+        """,
+        (
+            source_id,
+            list(bar_dates),
+            [t for t, _ in action_keys],
+            [d for _, d in action_keys],
+        ),
+    )
+    if not rows:
+        return
+    edits = sorted({r["edit"] for r in rows if r["is_edit"] and r["edit"]})
+    named = ", ".join(
+        f"{r['key_date']}"
+        + (f" ({r['action_type']})" if r["action_type"] else "")
+        + f" [override {r['override_id']}]"
+        for r in rows[:8]
+    )
+    more = "" if len(rows) <= 8 else f" (and {len(rows) - 8} more)"
+    if edits:
+        remedy = (
+            "Those written by `prices shift|rescale` are revoked whole -- "
+            f"`fafnir override revoke <any id of edit {', '.join(edits)}>`. "
+        )
+    else:
+        remedy = ""
+    raise OverrideRefused(
+        f"{len(rows)} key(s) of security {source_id} in this range already carry an "
+        f"active operator 'delete' while still holding a row: {named}{more}. Moving "
+        "one would write a second suppression at the same key. "
+        + remedy
+        + "Revoke the override (`fafnir override revoke <id>`), or choose a range "
+        "that does not cover these keys."
+    )
+
+
 def plan_history_split(
     db: Database,
     *,
@@ -2989,33 +3060,6 @@ def plan_history_split(
             "overlap it."
         )
 
-    # A bar or action edited by `prices shift|rescale` already holds an active
-    # 'delete' override of the vendor's row at a key that still carries a stored
-    # row (the operator's). Moving it would write a second 'delete' at that key and
-    # hit ux_operator_override_active, and there is no sound way to move half an
-    # edit: revoking it afterwards restores the vendor's row onto the source while
-    # the operator's copy sits on the destination. Refuse, and name the dates.
-    edited = db.fetchall(
-        """
-        SELECT DISTINCT key_date
-          FROM ops.operator_override
-         WHERE security_id = %s AND revoked_at IS NULL
-           AND detail ? 'transform'
-           AND key_date BETWEEN %s AND %s
-         ORDER BY key_date
-        """,
-        (source_id, lo, to_date),
-    )
-    if edited:
-        dates = ", ".join(r["key_date"].isoformat() for r in edited[:10])
-        more = "" if len(edited) <= 10 else f" (and {len(edited) - 10} more)"
-        raise OverrideRefused(
-            f"{len(edited)} key(s) of security {source_id} in this range were "
-            f"re-dated or re-scaled by an operator: {dates}{more}. Revoke that edit "
-            "first (`fafnir override revoke <id>` undoes the whole edit), then split; "
-            "re-apply the edit on the destination afterwards if it is still needed."
-        )
-
     bars = db.fetchall(
         """
         SELECT trade_date, open, high, low, close, volume, vwap, source,
@@ -3080,6 +3124,23 @@ def plan_history_split(
     first = min(dates + action_dates)
     last = max(dates + action_dates)
 
+    # Every key the split moves gets a fresh 'delete' override on the source. A key
+    # that already carries an active one collides with ux_operator_override_active,
+    # and the split dies mid-transaction on a psycopg UniqueViolation rather than
+    # refusing. Two routes reach that state, and both are ordinary:
+    #   * `actions delete` then `actions add` -- the documented way to replace a wrong
+    #     vendor row, which leaves a 'delete' override under a live operator row;
+    #   * `prices shift|rescale` (0026), whose 'delete' of the vendor's bar sits under
+    #     the operator's replacement.
+    # A restorable key is not one of these: it reuses its own override rather than
+    # writing a second, which is why only stored rows are checked here.
+    _refuse_keys_already_overridden(
+        db,
+        source_id=source_id,
+        bar_dates=[b["trade_date"] for b in bars],
+        action_keys=[(a["action_type"], a["ex_date"]) for a in actions],
+    )
+
     duplicate_bar_dates: list[date] = []
     duplicate_action_keys: list[tuple[str, date]] = []
     if destination_id is not None:
@@ -3087,7 +3148,8 @@ def plan_history_split(
             r["trade_date"]: r
             for r in db.fetchall(
                 """
-                SELECT trade_date, open, high, low, close FROM core.daily_price
+                SELECT trade_date, open, high, low, close, volume, vwap
+                  FROM core.daily_price
                  WHERE security_id = %s AND trade_date = ANY(%s)
                 """,
                 (destination_id, dates),
@@ -3100,22 +3162,38 @@ def plan_history_split(
         clashes = []
         for d, t in sorted(theirs.items()):
             mine = ours[d]
-            if all(
-                t[f] is not None
-                and mine.get(f) is not None
-                and Decimal(str(t[f])) == Decimal(str(mine[f]))
+            differs = [
+                f
                 for f in _SPLIT_PRICE_FIELDS
-            ):
+                if t[f] is None
+                or mine.get(f) is None
+                or Decimal(str(t[f])) != Decimal(str(mine[f]))
+            ]
+            # volume and vwap decide it too. A session the destination holds with a
+            # different volume is not "already held identically": calling it a
+            # duplicate deletes the source's row and keeps the destination's, so the
+            # warehouse's only copy would silently become the worse one. `security
+            # merge` surfaces exactly this as its volume_only bucket rather than
+            # picking a side, and a split has no more right to pick one.
+            differs += [
+                f
+                for f in _SPLIT_VOLUME_FIELDS
+                if _bar_field(t.get(f)) != _bar_field(mine.get(f))
+            ]
+            if not differs:
                 duplicate_bar_dates.append(d)
             else:
+                shown = differs[0]
                 clashes.append(
-                    f"{d}: destination close {t['close']} vs source {mine.get('close')}"
+                    f"{d}: destination {shown} {t.get(shown)} vs source "
+                    f"{mine.get(shown)}"
                 )
         if clashes:
             raise OverrideRefused(
                 f"{len(clashes)} session(s) are already held by security "
-                f"{destination_id} with different prices, so these are not the same "
-                "instrument's bars: " + "; ".join(clashes[:5])
+                f"{destination_id} with different values, so they are not the same "
+                "bars: " + "; ".join(clashes[:5]) + ". Correct one side first, or "
+                "narrow the range."
             )
         held = {
             (r["action_type"], r["ex_date"]): r
@@ -3293,6 +3371,7 @@ def split_security_history(
         else _mint_operator_security(db, plan)
     )
     override_ids: list[int] = []
+    restored_ids: list[int] = []
     duplicates = set(plan.duplicate_bar_dates)
 
     moved = 0
@@ -3375,6 +3454,7 @@ def split_security_history(
             "WHERE override_id = %s",
             (json.dumps(_split_marker(source_id, dest, kind)), r["override_id"]),
         )
+        restored_ids.append(int(r["override_id"]))
 
     dup_actions = set(plan.duplicate_action_keys)
     actions_moved = 0
@@ -3443,10 +3523,31 @@ def split_security_history(
         )
         actions_moved += 1
 
+    # Every override this split touched is stamped with one batch id, and the flags
+    # it moves carry the same mark. Without it `--undo` keys only on the pair of
+    # securities, so a second, disjoint split into the same destination is taken back
+    # by an undo meant for the first; and it returns flags by the dates it happened to
+    # put back, which both strands a flag about a date holding no row (a `gap` flag
+    # keyed on the missing session) and hands over flags the destination raised
+    # itself. `at` orders the batches: a restore-only split's ids are older than the
+    # overrides it reuses, so ids alone do not say which split came last.
+    batch = min(override_ids) if override_ids else min(restored_ids)
+    db.execute(
+        """
+        UPDATE ops.operator_override
+           SET detail = jsonb_set(
+                   jsonb_set(detail, '{split,batch}', to_jsonb(%s::bigint)),
+                   '{split,at}', to_jsonb(now()))
+         WHERE override_id = ANY(%s)
+        """,
+        (batch, override_ids + restored_ids),
+    )
+
     flags_dropped, flags_moved = _move_dated_flags(
         db,
         from_id=source_id,
         to_id=dest,
+        stamp=batch,
         first=plan.first_date,
         last=plan.last_date,
     )
@@ -3472,16 +3573,26 @@ def _move_dated_flags(
     first: Optional[date] = None,
     last: Optional[date] = None,
     dates: Optional[Sequence[date]] = None,
+    stamp: Optional[int] = None,
+    stamped: Optional[int] = None,
 ) -> tuple[int, int]:
-    """Repoint flags about a date (in [first, last], or in ``dates``) to another
-    security. Returns ``(dropped, moved)``.
+    """Repoint flags to another security. Returns ``(dropped, moved)``.
+
+    Which flags: those about a date in [first, last], or in ``dates``, or -- with
+    ``stamped`` -- exactly the ones a split batch moved, whatever their date. ``stamp``
+    marks the moved flags with the batch that moved them, so the undo can ask for them
+    back by name rather than by date: a `gap` flag is keyed on a session that holds no
+    row, so it has no date among the rows an undo returns, and a flag the destination
+    raised itself shares its dates with the ones it was handed.
 
     Same rule as :func:`merge_security`: an open flag the destination already
     carries for the same condition is dropped rather than repointed, or the repoint
     would violate ux_dq_flag_open_condition (0016). price_* is never dropped -- its
     repeats are counted.
     """
-    if dates is not None:
+    if stamped is not None:
+        where, params = "f.detail->>'split_batch' = %s", [str(stamped)]
+    elif dates is not None:
         where, params = f"{_FLAG_DATE_SQL} = ANY(%s)", [list(dates)]
     else:
         where, params = f"{_FLAG_DATE_SQL} BETWEEN %s AND %s", [first, last]
@@ -3499,12 +3610,23 @@ def _move_dated_flags(
         """,
         [from_id, *params, to_id],
     )
+    if stamp is not None:
+        set_detail = (
+            ", detail = jsonb_set(COALESCE(f.detail, '{}'::jsonb), "
+            "'{split_batch}', to_jsonb(%s::bigint))"
+        )
+        set_params = [stamp]
+    elif stamped is not None:
+        set_detail = ", detail = COALESCE(f.detail, '{}'::jsonb) - 'split_batch'"
+        set_params = []
+    else:
+        set_detail, set_params = "", []
     moved = db.execute(
         f"""
-        UPDATE ops.data_quality_flag f SET security_id = %s
+        UPDATE ops.data_quality_flag f SET security_id = %s{set_detail}
          WHERE f.security_id = %s AND {where}
         """,
-        [to_id, from_id, *params],
+        [to_id, *set_params, from_id, *params],
     )
     return dropped, moved
 
@@ -3537,6 +3659,23 @@ def undo_history_split(
     """
     if not note or not note.strip():
         raise OverrideRefused("An undo needs a note.")
+    # One split, not every split between this pair. Two disjoint ranges may be moved
+    # to the same destination -- the planner only refuses an overlapping one -- and an
+    # undo of the second used to take the first back with it, silently and with no way
+    # to ask for either alone. The newest batch is the one being taken back.
+    batch = db.fetchval(
+        """
+        SELECT (detail->'split'->>'batch')::bigint
+          FROM ops.operator_override
+         WHERE revoked_at IS NULL
+           AND detail->'split'->>'source_security_id' = %s
+           AND detail->'split'->>'destination_security_id' = %s
+         ORDER BY detail->'split'->>'at' DESC NULLS LAST,
+                  (detail->'split'->>'batch')::bigint DESC NULLS LAST
+         LIMIT 1
+        """,
+        (str(source_id), str(destination_id)),
+    )
     rows = db.fetchall(
         """
         SELECT override_id, security_id, target, action_type, key_date, operation,
@@ -3545,9 +3684,10 @@ def undo_history_split(
          WHERE revoked_at IS NULL
            AND detail->'split'->>'source_security_id' = %s
            AND detail->'split'->>'destination_security_id' = %s
+           AND (detail->'split'->>'batch')::bigint IS NOT DISTINCT FROM %s
          ORDER BY override_id
         """,
-        (str(source_id), str(destination_id)),
+        (str(source_id), str(destination_id), batch),
     )
     if not rows:
         raise OverrideRefused(
@@ -3661,7 +3801,7 @@ def undo_history_split(
             returned_dates.append(d)
 
     _, flags_returned = _move_dated_flags(
-        db, from_id=destination_id, to_id=source_id, dates=returned_dates
+        db, from_id=destination_id, to_id=source_id, stamped=batch
     )
 
     deleted = False

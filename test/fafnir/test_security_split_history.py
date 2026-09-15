@@ -388,7 +388,8 @@ def test_into_an_existing_security_refuses_a_disagreeing_session(two_issuers):
     )
 
     assert out.exit_code != 0
-    assert "different prices" in out.output
+    assert "different values" in out.output
+    assert "open 99" in out.output
     assert len(_bars(db, sid)) == len(OLD) + len(NEW)
     assert _bars(db, qsi) == {"2024-01-03": 99.0}
 
@@ -702,9 +703,10 @@ def test_a_split_over_a_rescaled_range_is_refused(two_issuers):
     out = _split_off("--yes")
 
     assert out.exit_code != 0
-    assert "re-dated or re-scaled" in out.output
+    assert "already carry an active operator 'delete'" in out.output
     assert "2024-01-02" in out.output and "2024-01-03" in out.output
     assert "override revoke" in out.output
+    assert "edit 1" in out.output  # the bar edit is named, so the remedy is exact
     # Nothing was written: no destination, and the source keeps every bar.
     assert db.fetchval("SELECT count(*) FROM core.security") == 1
     assert set(_bars(db, sid)) == set(OLD) | set(NEW)
@@ -738,7 +740,7 @@ def test_a_split_over_a_shifted_range_is_refused_with_restore_deleted(two_issuer
     out = _split_off("--restore-deleted", "--yes")
 
     assert out.exit_code != 0
-    assert "re-dated or re-scaled" in out.output
+    assert "already carry an active operator 'delete'" in out.output
     assert db.fetchval("SELECT count(*) FROM core.security") == 1
 
 
@@ -819,3 +821,293 @@ def test_revoking_one_key_of_a_split_is_refused(two_issuers):
     assert undo.exit_code == 0, undo.output
     assert set(_bars(db, sid)) == set(OLD) | set(NEW)
     assert db.fetchval("SELECT count(*) FROM core.security") == 1
+
+
+def test_a_split_over_a_replaced_action_is_refused(two_issuers):
+    """`actions delete` then `actions add` is the documented way to replace a wrong
+    vendor row, and it leaves an active 'delete' override under a live operator
+    action. Splitting that key would write a second suppression at it; the split used
+    to die on ux_operator_override_active with a psycopg traceback instead."""
+    db, sid = two_issuers
+    aid = db.fetchval(
+        "SELECT corporate_action_id FROM core.corporate_action WHERE security_id=%s",
+        (sid,),
+    )
+    assert (
+        _run("actions", "delete", str(aid), "-m", "wrong amount", "--yes").exit_code
+        == 0
+    )
+    assert (
+        _run(
+            "actions",
+            "add",
+            "--symbol",
+            "BID",
+            "--ex-date",
+            "2024-01-04",
+            "--dividend",
+            "1",
+            "-m",
+            "corrected",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+
+    out = _split_off("--yes")
+
+    assert out.exit_code != 0
+    assert "already carry an active operator 'delete'" in out.output
+    assert "2024-01-04" in out.output and "dividend" in out.output
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    # The operator's corrected dividend is untouched.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM core.corporate_action WHERE security_id=%s "
+            "AND ex_date='2024-01-04'",
+            (sid,),
+        )
+        == 1
+    )
+
+
+def test_a_session_held_with_a_different_volume_is_not_a_duplicate(two_issuers):
+    """A "duplicate" deletes the source's row and keeps the destination's, so matching
+    on OHLC alone would silently leave the warehouse's only copy of a session with the
+    worse volume. `security merge` reports the same disagreement as its volume_only
+    bucket rather than picking a side; a split has no more right to pick one."""
+    db, sid = two_issuers
+    qsi = _mk(db, "QSI", "Quantum-Si")
+    for d, c in OLD.items():
+        db.execute(
+            "INSERT INTO core.daily_price (security_id, trade_date, open, high, low, "
+            "close, volume, source, loaded_at) VALUES (%s,%s,%s,%s,%s,%s,0,'fmp',now())",
+            (qsi, d, c, c, c, c),
+        )
+
+    out = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--to",
+        "2024-01-31",
+        "--into-security-id",
+        str(qsi),
+        "-m",
+        "n",
+        "--yes",
+    )
+
+    assert out.exit_code != 0
+    assert "different values" in out.output and "volume" in out.output
+    # The source keeps every bar, at its own volume.
+    assert set(_bars(db, sid)) == set(OLD) | set(NEW)
+    assert (
+        db.fetchval(
+            "SELECT volume FROM core.daily_price WHERE security_id=%s AND "
+            "trade_date='2024-01-02'",
+            (sid,),
+        )
+        == 1000
+    )
+
+
+# ---------------------------------------------------------------------------
+# One split at a time, and the flags that belong to it
+# ---------------------------------------------------------------------------
+
+
+def _flag(db, sid, check, trade_date):
+    db.execute(
+        "INSERT INTO ops.data_quality_flag (security_id, table_name, check_name, "
+        "severity, record_key, detail, detected_at) VALUES "
+        "(%s,'core.daily_price',%s,'warn',%s::jsonb,'{}'::jsonb,now())",
+        (sid, check, '{"trade_date":"%s"}' % trade_date),
+    )
+
+
+def _flags(db):
+    return sorted(
+        (r["security_id"], r["check_name"], r["record_key"]["trade_date"])
+        for r in db.fetchall(
+            "SELECT security_id, check_name, record_key FROM ops.data_quality_flag"
+        )
+    )
+
+
+def test_undo_returns_a_flag_about_a_date_that_holds_no_bar(two_issuers):
+    """The `gap` check keys a flag on the session that is *missing*, so its date is
+    never among the rows an undo puts back. Returning flags by those dates stranded it
+    on the destination, where no recheck can ever close it: `_GAP_SQL` joins
+    core.daily_price, and the destination has no history there."""
+    db, sid = two_issuers
+    qsi = _mk(db, "QSI", "Quantum-Si")
+    _flag(db, sid, "gap", "2024-01-03")
+
+    assert (
+        _run(
+            "security",
+            "split-history",
+            "--symbol",
+            "BID",
+            "--to",
+            "2024-01-31",
+            "--into-security-id",
+            str(qsi),
+            "-m",
+            "split",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+    dest_id = qsi
+    assert _flags(db) == [(dest_id, "gap", "2024-01-03")]
+
+    out = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--into-security-id",
+        str(qsi),
+        "--undo",
+        "-m",
+        "undo",
+        "--yes",
+    )
+
+    assert out.exit_code == 0, out.output
+    assert "1 flag returned" in out.output
+    assert _flags(db) == [(sid, "gap", "2024-01-03")]
+
+
+def test_undo_leaves_the_destinations_own_flags_alone(two_issuers):
+    """A flag the destination raised itself shares its dates with the ones it was
+    handed, so returning by date gave the source a flag about a bar it never had
+    flagged. The undo returns only what the split marked as moved."""
+    db, sid = two_issuers
+    qsi = _mk(db, "QSI", "Quantum-Si")
+    for d, c in OLD.items():
+        db.execute(
+            "INSERT INTO core.daily_price (security_id, trade_date, open, high, low, "
+            "close, volume, source, loaded_at) VALUES "
+            "(%s,%s,%s,%s,%s,%s,1000,'fmp',now())",
+            (qsi, d, c, c, c, c),
+        )
+    _flag(db, qsi, "outlier", "2024-01-03")
+
+    assert (
+        _run(
+            "security",
+            "split-history",
+            "--symbol",
+            "BID",
+            "--to",
+            "2024-01-31",
+            "--into-security-id",
+            str(qsi),
+            "-m",
+            "split",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+    assert (
+        _run(
+            "security",
+            "split-history",
+            "--symbol",
+            "BID",
+            "--into-security-id",
+            str(qsi),
+            "--undo",
+            "-m",
+            "undo",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+
+    assert _flags(db) == [(qsi, "outlier", "2024-01-03")]
+
+
+def test_undo_takes_back_one_split_not_every_split_into_that_destination(two_issuers):
+    """Two disjoint ranges may go to the same destination -- the planner only refuses
+    an overlapping one -- and an undo meant for the second used to take the first back
+    with it, with no way to ask for either alone."""
+    db, sid = two_issuers
+    qsi = _mk(db, "QSI", "Quantum-Si")
+    _load(db, "BID", {**OLD, "2024-03-04": 20, "2024-03-05": 21, **NEW})
+
+    assert (
+        _run(
+            "security",
+            "split-history",
+            "--symbol",
+            "BID",
+            "--to",
+            "2024-01-31",
+            "--into-security-id",
+            str(qsi),
+            "-m",
+            "first",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+    assert (
+        _run(
+            "security",
+            "split-history",
+            "--symbol",
+            "BID",
+            "--from",
+            "2024-03-01",
+            "--to",
+            "2024-03-31",
+            "--into-security-id",
+            str(qsi),
+            "-m",
+            "second",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+    assert set(_bars(db, qsi)) == set(OLD) | {"2024-03-04", "2024-03-05"}
+
+    out = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--into-security-id",
+        str(qsi),
+        "--undo",
+        "-m",
+        "undo the second",
+        "--yes",
+    )
+
+    assert out.exit_code == 0, out.output
+    # Only the March range came back; January is still split off.
+    assert set(_bars(db, qsi)) == set(OLD)
+    assert set(_bars(db, sid)) == {"2024-03-04", "2024-03-05"} | set(NEW)
+    # A second undo takes the first split back too.
+    assert (
+        _run(
+            "security",
+            "split-history",
+            "--symbol",
+            "BID",
+            "--into-security-id",
+            str(qsi),
+            "--undo",
+            "-m",
+            "undo the first",
+            "--yes",
+        ).exit_code
+        == 0
+    )
+    assert _bars(db, qsi) == {}
+    assert set(_bars(db, sid)) == set(OLD) | {"2024-03-04", "2024-03-05"} | set(NEW)
