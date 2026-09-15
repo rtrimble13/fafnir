@@ -449,6 +449,14 @@ def load_actions(
             if sec_id is None:
                 logger.warning("Unknown symbol %s; skipping actions", symbol)
                 continue
+            if repo.is_operator_security(db, sec_id):
+                # See daily_price.load_symbol_prices: the ticker is another issuer's.
+                logger.warning(
+                    "%s resolves to operator-minted security %s; skipping actions",
+                    symbol,
+                    sec_id,
+                )
+                continue
             securities.append({"security_id": sec_id, "symbol": symbol})
         _load_securities(db, fmp, securities, run=run, as_of=as_of, result=result)
         if owns_run:
@@ -513,7 +521,12 @@ def sweep_calendar(
 
     def _resolve(symbol: str) -> Optional[int]:
         if symbol not in resolved:
-            resolved[symbol] = repo.resolve_security_id(db, symbol)
+            sec_id = repo.resolve_security_id(db, symbol)
+            # An operator-minted security holds a split-off history under a ticker
+            # that is now another issuer's; the calendar's events are not its own.
+            if sec_id is not None and repo.is_operator_security(db, sec_id):
+                sec_id = None
+            resolved[symbol] = sec_id
         return resolved[symbol]
 
     for endpoint, fetch, apply in (

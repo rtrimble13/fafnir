@@ -55,8 +55,14 @@ leave it open. "I could not check" is not "it is fine".
 - A `core.corporate_action` row exists within ±5 days of the date, **and**
 - the raw series jumps while the adjusted one does not. Both halves. If both
   series jump, the action is missing: repair, do not resolve.
+- **and the price levels are plausible** — `min_close`/`max_close` from
+  `mart.v_security_price_coverage` for a real instrument. A fabricated split
+  matching a mis-scaled history passes the first two lines (AKR, HUN, JKL).
 - A genuine 50%+ move with no action qualifies too, but the note must say that
   no action exists **and none should** — which means you checked.
+- The disposition is **accept**, not resolve: the check skips only a split on the
+  bar's exact date, so a resolved flag on a split between two bars is re-written.
+  `references/outlier-classification.md` is the sort order for the rest.
 
 ### `stale`
 Only the two determinate branches:
@@ -112,6 +118,21 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 5. **Always `--by claude`.** It is what makes
    `WHERE resolved_by LIKE 'claude%'` the complete record, and `dq reopen` the
    undo.
+6. **Predict every dry-run count by computing it, never by adding in your head.**
+   Count the ids in the file or the query that built the batch, and state that
+   number before the dry run. On 2026-09-15 a hand-summed "11" met a dry run of 14;
+   the ids listed were right and the sum was wrong, and only the stop rule caught
+   it. When a count differs, enumerate what the command would close with an
+   independent query of its predicate — the dry run prints only a total.
+7. **The dry run and the real command are the same command, note included.** Put
+   `--by` and `-m` on the dry run too, so what was shown is what runs. A recheck's
+   `-m` is prepended to the per-check reason; say so if you add one only at run time.
+8. **Take destructive repairs one security at a time, with the evidence on screen.**
+   Before a `prices delete` of more than a few bars: probe the vendor (a corrected
+   bar is a re-fetch, not a delete), scan the whole history so one batch takes every
+   bad bar, and for any segment that could be another company run the survivorship
+   check in `outlier-classification.md`. Generate long date lists from SQL into a
+   file and build the command from the file; never retype dates.
 
 ---
 
@@ -142,7 +163,15 @@ outlier queue", "close it all"), never on a general "tidy things up".
   than as a policy violation — a bulk closure with no such marker is
   indistinguishable from an agent that ignored the caps.
 - Every batch still shows its own `--dry-run` first, and nothing runs for real
-  without an explicit yes.
+  without an explicit yes. **A yes that arrives before the dry run's output has been
+  shown is not a yes to that output**: a long command (`refresh-marts` then a
+  recheck) can still be running in the background when the operator answers. Wait
+  for it, show the count, and run only if it matches the prediction.
+- A class the operator accepts in bulk is accepted **whole**: when a rule pairs
+  flags (spike-and-revert), include both edges, and when a later session finds an
+  unpaired edge of an accepted class, it is the same decision — say so in the note.
+- A note that relies on the vendor states what was **not** checked (for example
+  "Not checked: that the vendor's split itself is real").
 - Every effect is still verified in SQL afterwards (standing rule 10).
 - **Flags pointing at a repairable defect stay open**, and the report says why.
   "Clear the queue" is an instruction about the flags the operator has judged, not

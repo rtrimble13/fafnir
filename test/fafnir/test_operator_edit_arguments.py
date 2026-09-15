@@ -55,3 +55,55 @@ def test_a_dividend_that_is_not_a_number_is_a_usage_error(runner):
     out = _add(runner, "--dividend", "abc")
     assert out.exit_code == 2, out.output
     assert "Invalid value for --dividend" in out.output
+
+
+def _split(runner, *extra):
+    return runner.invoke(
+        cli.main,
+        ["security", "split-history", "--security-id", "1", "-m", "x"] + list(extra),
+        catch_exceptions=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--new-symbol", "BID", "--new-name", "x"], "--to is required"),
+        (["--to", "2020-01-01"], "exactly one destination"),
+        (
+            ["--to", "2020-01-01", "--new-symbol", "B", "--into-security-id", "2"],
+            "exactly one destination",
+        ),
+        (
+            ["--to", "2020-01-01", "--into-security-id", "2", "--new-name", "x"],
+            "do not apply with --into-security-id",
+        ),
+        (["--undo"], "--undo needs"),
+        (["--undo", "--into-security-id", "2", "--to", "2020-01-01"], "--undo reads"),
+        # --restore-deleted was accepted and silently ignored under --undo, although
+        # every other option that describes a split is rejected there.
+        (
+            ["--undo", "--into-security-id", "2", "--restore-deleted"],
+            "--undo reads",
+        ),
+        # --asset-type describes a minted destination, so it cannot apply to one that
+        # already exists. It carries a default, so the check compares against it.
+        (
+            [
+                "--to",
+                "2020-01-01",
+                "--into-security-id",
+                "2",
+                "--asset-type",
+                "etf",
+            ],
+            "do not apply with --into-security-id",
+        ),
+    ],
+)
+def test_split_history_rejects_an_incoherent_request_before_the_database(
+    runner, extra, message
+):
+    out = _split(runner, *extra)
+    assert out.exit_code == 1, out.output
+    assert message in out.output

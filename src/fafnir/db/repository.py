@@ -8,9 +8,9 @@ them into the DataFrame contracts the CLI expects.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, NamedTuple, Optional, Sequence
+from typing import Any, Iterable, NamedTuple, Optional, Sequence
 
 import psycopg
 
@@ -592,9 +592,11 @@ def duplicate_symbol_groups(
     over 18,000 rows.
     """
     params: list[Any] = []
-    symbol_clause = ""
+    # An operator-minted security (`security split-history`) shares its ticker with
+    # the issuer it was split off by design; it is not a duplicate of anything.
+    symbol_clause = f"WHERE s.{VENDOR_FED_SECURITY}"
     if symbol:
-        symbol_clause = "WHERE s.primary_symbol = %s"
+        symbol_clause += " AND s.primary_symbol = %s"
         params.append(symbol.upper())
     limit_clause = f"LIMIT {int(limit)}" if limit else ""
 
@@ -613,6 +615,7 @@ def duplicate_symbol_groups(
             SELECT s.security_id, s.primary_symbol, s.first_seen_at::date AS seen,
                    s.delisted_date, s.company_name
               FROM core.security s JOIN dup USING (primary_symbol)
+             WHERE s.{VENDOR_FED_SECURITY}
         )
         SELECT r.security_id, r.primary_symbol, r.seen, r.delisted_date,
                r.company_name,
@@ -2025,15 +2028,21 @@ def suppressed_action_keys(
 
 
 def suppressed_price_dates(db: Database, security_id: int) -> frozenset[date]:
-    """Trade dates of this security's bars an operator deleted. The price loader
-    sets a vendor bar on one of these dates aside instead of upserting it."""
+    """Trade dates of this security's bars an operator edited. The price loader sets
+    a vendor bar on one of these dates aside instead of upserting it.
+
+    Both operations count. A 'delete' keeps a removed bar out. An 'add' is a bar an
+    operator re-dated or re-scaled (`fafnir prices shift|rescale`, migration 0026):
+    the vendor still serves its own copy of that date -- the wrong-scale original, or
+    whatever it has on the date a bar was moved to -- and upserting it would silently
+    undo the correction.
+    """
     return frozenset(
         r["key_date"]
         for r in db.fetchall(
             """
-            SELECT key_date FROM ops.operator_override
-             WHERE target = 'daily_price' AND operation = 'delete'
-               AND revoked_at IS NULL AND security_id = %s
+            SELECT DISTINCT key_date FROM ops.operator_override
+             WHERE target = 'daily_price' AND revoked_at IS NULL AND security_id = %s
             """,
             (security_id,),
         )
@@ -2293,7 +2302,21 @@ def delete_operator_bars(
     A date with no stored bar is skipped rather than suppressed: there is nothing to
     record the removal of, and suppressing a date the vendor has never sent would be
     a decision nobody made.
+
+    A bar an operator wrote (`prices shift|rescale`) is refused, for the reason
+    `delete_operator_action` refuses an operator action: deleting it here would leave
+    its edit half-undone. `fafnir override revoke` undoes the edit instead.
     """
+    written = active_price_adds(db, security_id, trade_dates)
+    if written:
+        first = min(written)
+        raise OverrideRefused(
+            f"{len(written)} bar(s) of security {security_id} "
+            f"({', '.join(str(d) for d in sorted(written)[:5])}"
+            f"{', ...' if len(written) > 5 else ''}) were written by an operator "
+            f"(edit {written[first]['edit']}). Undo the edit with "
+            f"`fafnir override revoke {written[first]['edit']}`."
+        )
     ids: list[int] = []
     for d in sorted(set(trade_dates)):
         bar = db.fetchone(
@@ -2324,6 +2347,447 @@ def delete_operator_bars(
             (security_id, d),
         )
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Bar transforms: `fafnir prices shift|rescale` (migration 0026)
+# ---------------------------------------------------------------------------
+PRICE_TRANSFORM_KINDS = ("shift", "rescale")
+
+_BAR_COLUMNS = (
+    "trade_date, open, high, low, close, volume, vwap, source, ingestion_run_id, "
+    "loaded_at"
+)
+
+
+def stored_bars(
+    db: Database, security_id: int, from_date: date, to_date: date
+) -> list[dict]:
+    """A security's stored bars in ``[from_date, to_date]``, every column, by date."""
+    return db.fetchall(
+        f"""
+        SELECT {_BAR_COLUMNS} FROM core.daily_price
+         WHERE security_id = %s AND trade_date BETWEEN %s AND %s
+         ORDER BY trade_date
+        """,
+        (security_id, from_date, to_date),
+    )
+
+
+def active_price_adds(
+    db: Database, security_id: int, trade_dates: Iterable[date]
+) -> dict[date, dict]:
+    """``{trade_date: {"override_id", "edit", "kind"}}`` for the operator-written bars
+    among these dates -- the ones a vendor load, a delete or a second transform must
+    leave alone."""
+    dates = sorted(set(trade_dates))
+    if not dates:
+        return {}
+    rows = db.fetchall(
+        """
+        SELECT key_date, override_id,
+               (detail->'transform'->>'edit')::bigint AS edit,
+               detail->'transform'->>'kind' AS kind
+          FROM ops.operator_override
+         WHERE security_id = %s AND target = 'daily_price' AND operation = 'add'
+           AND revoked_at IS NULL AND key_date = ANY(%s)
+        """,
+        (security_id, dates),
+    )
+    return {
+        r["key_date"]: {
+            "override_id": int(r["override_id"]),
+            "edit": int(r["edit"]) if r["edit"] is not None else None,
+            "kind": r["kind"],
+        }
+        for r in rows
+    }
+
+
+def active_price_overrides_on(
+    db: Database, security_id: int, trade_dates: Iterable[date]
+) -> dict[date, list[dict]]:
+    """Every active bar override on these dates, of either operation."""
+    dates = sorted(set(trade_dates))
+    if not dates:
+        return {}
+    out: dict[date, list[dict]] = {}
+    for r in db.fetchall(
+        """
+        SELECT key_date, override_id, operation
+          FROM ops.operator_override
+         WHERE security_id = %s AND target = 'daily_price' AND revoked_at IS NULL
+           AND key_date = ANY(%s)
+         ORDER BY override_id
+        """,
+        (security_id, dates),
+    ):
+        out.setdefault(r["key_date"], []).append(dict(r))
+    return out
+
+
+def replace_operator_bars(
+    db: Database,
+    *,
+    security_id: int,
+    kind: str,
+    params: dict,
+    changes: Sequence[tuple[dict, dict]],
+    note: str,
+    created_by: str,
+) -> tuple[int, list[int]]:
+    """Replace vendor bars with transformed copies, recorded as one edit.
+
+    ``changes`` pairs each stored bar (as :func:`stored_bars` returns it) with the row
+    to write in its place -- same date for a rescale, another date for a shift. Every
+    pair becomes a 'delete' override at the old date (the row as it stood) and an
+    'add' at the new one (the row written, ``source = operator``), both carrying
+    ``detail.transform`` with ``kind``, ``params``, the other half's id and ``edit``:
+    the id of the edit's first override, which is how `override revoke` finds the
+    rest. Returns ``(edit_id, override_ids)``.
+
+    Validation is the caller's (fafnir.ingest.price_edits plans and checks every
+    row); this writes what it is given. All old rows are removed before any new one
+    is written, so a shift whose targets overlap its sources does not collide with
+    itself on the primary key.
+    """
+    import json
+
+    if kind not in PRICE_TRANSFORM_KINDS:
+        raise OverrideRefused(f"Unknown bar transform {kind!r}.")
+    if not changes:
+        raise OverrideRefused("No bars to replace.")
+    olds = [old for old, _ in changes]
+    news = [new for _, new in changes]
+    if len({o["trade_date"] for o in olds}) != len(olds) or len(
+        {n["trade_date"] for n in news}
+    ) != len(news):
+        raise OverrideRefused("Two bars of one edit share a date.")
+
+    transform = {"kind": kind, **params}
+    delete_rows = db.fetchall(
+        """
+        INSERT INTO ops.operator_override
+            (security_id, target, action_type, key_date, operation, detail, note,
+             created_by)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'delete', x.detail, %s, %s
+          FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
+         ORDER BY x.key_date
+        RETURNING override_id, key_date
+        """,
+        (
+            security_id,
+            note,
+            created_by,
+            json.dumps(
+                [
+                    {
+                        "key_date": o["trade_date"].isoformat(),
+                        "detail": {"row": _jsonable(o), "transform": transform},
+                    }
+                    for o in olds
+                ],
+                default=str,
+            ),
+        ),
+    )
+    delete_ids = {r["key_date"]: int(r["override_id"]) for r in delete_rows}
+    edit_id = min(delete_ids.values())
+
+    db.execute(
+        "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = ANY(%s)",
+        (security_id, [o["trade_date"] for o in olds]),
+    )
+    db.executemany(
+        """
+        INSERT INTO core.daily_price
+            (security_id, trade_date, open, high, low, close, volume, vwap, source,
+             ingestion_run_id, loaded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, NULL, now())
+        """,
+        [
+            (
+                security_id,
+                n["trade_date"],
+                n["open"],
+                n["high"],
+                n["low"],
+                n["close"],
+                n["volume"],
+                n.get("vwap"),
+                OPERATOR_SOURCE,
+            )
+            for n in news
+        ],
+    )
+
+    add_rows = db.fetchall(
+        """
+        INSERT INTO ops.operator_override
+            (security_id, target, action_type, key_date, operation, detail, note,
+             created_by)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'add', x.detail, %s, %s
+          FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
+         ORDER BY x.key_date
+        RETURNING override_id, key_date
+        """,
+        (
+            security_id,
+            note,
+            created_by,
+            json.dumps(
+                [
+                    {
+                        "key_date": new["trade_date"].isoformat(),
+                        "detail": {
+                            "row": _jsonable(
+                                {k: v for k, v in new.items() if k != "security_id"}
+                            ),
+                            "transform": {
+                                **transform,
+                                "edit": edit_id,
+                                "from_date": old["trade_date"].isoformat(),
+                                "from_override": delete_ids[old["trade_date"]],
+                            },
+                        },
+                    }
+                    for old, new in changes
+                ],
+                default=str,
+            ),
+        ),
+    )
+    add_ids = {r["key_date"]: int(r["override_id"]) for r in add_rows}
+    db.execute(
+        """
+        UPDATE ops.operator_override o
+           SET detail = jsonb_set(o.detail, '{transform}',
+                                  (o.detail->'transform') || x.extra)
+          FROM jsonb_to_recordset(%s::jsonb) AS x(override_id bigint, extra jsonb)
+         WHERE o.override_id = x.override_id
+        """,
+        (
+            json.dumps(
+                [
+                    {
+                        "override_id": delete_ids[old["trade_date"]],
+                        "extra": {
+                            "edit": edit_id,
+                            "to_date": new["trade_date"].isoformat(),
+                            "to_override": add_ids[new["trade_date"]],
+                        },
+                    }
+                    for old, new in changes
+                ]
+            ),
+        ),
+    )
+    return edit_id, sorted([*delete_ids.values(), *add_ids.values()])
+
+
+def override_by_id(db: Database, override_id: int) -> Optional[dict]:
+    return db.fetchone(
+        "SELECT * FROM ops.operator_override WHERE override_id = %s", (override_id,)
+    )
+
+
+def price_edit_of(override: dict) -> Optional[int]:
+    """The edit a bar-transform override belongs to, or None for any other override."""
+    if override.get("target") != "daily_price":
+        return None
+    transform = (override.get("detail") or {}).get("transform")
+    if not transform or transform.get("edit") is None:
+        return None
+    return int(transform["edit"])
+
+
+def price_edit_overrides(
+    db: Database, *, security_id: int, edit_id: int, include_revoked: bool = False
+) -> list[dict]:
+    """Every override of one bar-transform edit, oldest first."""
+    return db.fetchall(
+        f"""
+        SELECT * FROM ops.operator_override
+         WHERE security_id = %s AND target = 'daily_price'
+           AND (detail->'transform'->>'edit')::bigint = %s
+           {'' if include_revoked else 'AND revoked_at IS NULL'}
+         ORDER BY override_id
+        """,
+        (security_id, edit_id),
+    )
+
+
+def mark_action_override_edit(
+    db: Database,
+    *,
+    override_ids: Sequence[int],
+    edit_id: int,
+    kind: str,
+    days: int,
+) -> None:
+    """Join a re-dated corporate action's override pair to the bar edit that moved it,
+    so `override revoke` takes the action back with the bars."""
+    import json
+
+    db.execute(
+        "UPDATE ops.operator_override SET detail = detail || %s "
+        "WHERE override_id = ANY(%s)",
+        (
+            json.dumps({"transform": {"kind": kind, "edit": edit_id, "days": days}}),
+            [int(o) for o in override_ids],
+        ),
+    )
+
+
+def price_edit_action_overrides(
+    db: Database, *, security_id: int, edit_id: int
+) -> list[dict]:
+    """The corporate-action overrides of one bar edit, oldest first."""
+    return db.fetchall(
+        """
+        SELECT * FROM ops.operator_override
+         WHERE security_id = %s AND target = 'corporate_action'
+           AND (detail->'transform'->>'edit')::bigint = %s
+           AND revoked_at IS NULL
+         ORDER BY override_id
+        """,
+        (security_id, edit_id),
+    )
+
+
+def revoke_price_edit(
+    db: Database, *, security_id: int, edit_id: int, note: str, revoked_by: str
+) -> list[dict]:
+    """Undo a whole `prices shift|rescale` edit, restoring the vendor bars it replaced.
+
+    Unlike revoking a plain 'delete', this writes the removed rows back. A plain delete
+    removed a bar the operator judged worthless, so leaving the key for the vendor to
+    refill is the undo. A transform removed a bar only to put a corrected copy of it
+    in its place; lifting the suppression without restoring the original would turn
+    the undo into a deletion of the history, and the vendor overlap never re-reads an
+    old window to refill it. The restored row is the vendor's own, as it stood, so a
+    later load of that key writes the same values over it -- there is no second,
+    competing version.
+
+    The operator bars are removed first and the originals written after, so a shift
+    whose targets overlap its sources restores cleanly. A key another edit has since
+    written a bar onto is refused rather than overwritten. Returns the overrides
+    revoked. Adjustment factors are the caller's to recompute.
+    """
+    rows = price_edit_overrides(db, security_id=security_id, edit_id=edit_id)
+    if not rows:
+        raise OverrideRefused(
+            f"No active overrides of bar edit {edit_id} on security {security_id}."
+        )
+    adds = [r for r in rows if r["operation"] == "add"]
+    deletes = [r for r in rows if r["operation"] == "delete"]
+    db.execute(
+        """
+        DELETE FROM core.daily_price
+         WHERE security_id = %s AND trade_date = ANY(%s) AND source = %s
+        """,
+        (security_id, [r["key_date"] for r in adds], OPERATOR_SOURCE),
+    )
+    restore_dates = [r["key_date"] for r in deletes]
+    blocking = db.fetchall(
+        """
+        SELECT trade_date, source FROM core.daily_price
+         WHERE security_id = %s AND trade_date = ANY(%s)
+         ORDER BY trade_date
+        """,
+        (security_id, restore_dates),
+    )
+    if blocking:
+        raise OverrideRefused(
+            f"Cannot restore {len(blocking)} bar(s) of edit {edit_id}: security "
+            f"{security_id} already has a bar on "
+            f"{', '.join(str(b['trade_date']) for b in blocking[:5])}"
+            f"{', ...' if len(blocking) > 5 else ''} (source "
+            f"{blocking[0]['source']}). Revoke the edit that wrote it first."
+        )
+    db.executemany(
+        """
+        INSERT INTO core.daily_price
+            (security_id, trade_date, open, high, low, close, volume, vwap, source,
+             ingestion_run_id, loaded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        [
+            (
+                security_id,
+                r["detail"]["row"]["trade_date"],
+                r["detail"]["row"]["open"],
+                r["detail"]["row"]["high"],
+                r["detail"]["row"]["low"],
+                r["detail"]["row"]["close"],
+                r["detail"]["row"].get("volume", 0),
+                r["detail"]["row"].get("vwap"),
+                r["detail"]["row"].get("source") or "fmp",
+                r["detail"]["row"].get("ingestion_run_id"),
+                r["detail"]["row"].get("loaded_at") or datetime.now().isoformat(),
+            )
+            for r in deletes
+        ],
+    )
+    # A `--with-actions` shift re-dated corporate actions in the same command. They
+    # are part of the edit, so they come back with it: leaving them behind put the
+    # action a day away from the bars it adjusts, kept the true ex-date suppressed
+    # against `ingest actions`, and left the wrong date baked into
+    # core.adjustment_factor.
+    action_rows = price_edit_action_overrides(
+        db, security_id=security_id, edit_id=edit_id
+    )
+    for r in [a for a in action_rows if a["operation"] == "add"]:
+        db.execute(
+            """
+            DELETE FROM core.corporate_action
+             WHERE security_id = %s AND action_type = %s AND ex_date = %s
+               AND source = %s
+            """,
+            (security_id, r["action_type"], r["key_date"], OPERATOR_SOURCE),
+        )
+    for r in [a for a in action_rows if a["operation"] == "delete"]:
+        row = (r["detail"] or {}).get("row") or {}
+        db.execute(
+            """
+            INSERT INTO core.corporate_action
+                (security_id, action_type, ex_date, record_date, payment_date,
+                 declaration_date, split_numerator, split_denominator,
+                 dividend_amount, currency, source, ingestion_run_id, loaded_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s::numeric,%s::numeric,%s::numeric,%s,%s,%s,
+                    COALESCE(%s::timestamptz, now()))
+            ON CONFLICT (security_id, action_type, ex_date) DO NOTHING
+            """,
+            (
+                security_id,
+                r["action_type"],
+                r["key_date"],
+                row.get("record_date"),
+                row.get("payment_date"),
+                row.get("declaration_date"),
+                row.get("split_numerator"),
+                row.get("split_denominator"),
+                row.get("dividend_amount"),
+                row.get("currency") or "USD",
+                row.get("source") or "fmp",
+                row.get("ingestion_run_id"),
+                row.get("loaded_at"),
+            ),
+        )
+    db.execute(
+        """
+        UPDATE ops.operator_override
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE override_id = ANY(%s)
+        """,
+        (
+            revoked_by,
+            note,
+            [int(r["override_id"]) for r in rows]
+            + [int(r["override_id"]) for r in action_rows],
+        ),
+    )
+    return rows + action_rows
 
 
 def list_operator_overrides(
@@ -2373,7 +2837,46 @@ def revoke_operator_override(
             f"Override {override_id} was already revoked by {row['revoked_by']} "
             f"at {row['revoked_at']}."
         )
+    edit = price_edit_of(row)
+    if edit is not None:
+        # One half of a re-dated or re-scaled bar. Revoking it alone would either
+        # strand the operator's bar without its record or lift the suppression under
+        # it; the edit is undone whole, by revoke_price_edit.
+        raise OverrideRefused(
+            f"Override {override_id} is part of bar edit {edit} "
+            f"({row['detail']['transform'].get('kind')}); it is undone as a whole with "
+            "revoke_price_edit (`fafnir override revoke` does this for you)."
+        )
+    split = (row["detail"] or {}).get("split")
+    if split:
+        # One key of a history split. Revoking it alone lifts the suppression while
+        # the destination keeps its copy, so the next load of the ticker's full
+        # history puts the vendor's row back on the source and the same session is
+        # then held by two securities. `--undo` reads the active split markers, so it
+        # can no longer see this key to put it right either. A split is undone whole.
+        src, dest = split.get("source_security_id"), split.get(
+            "destination_security_id"
+        )
+        raise OverrideRefused(
+            f"Override {override_id} is one key of the history split that moved "
+            f"security {src}'s history to {dest}; revoking it alone would leave the "
+            "same session on both securities. Undo the split as a whole: "
+            f"`fafnir security split-history --security-id {src} "
+            f"--into-security-id {dest} --undo -m '<why>'`."
+        )
     if row["operation"] == "add":
+        if row["target"] == "daily_price":
+            # Only reachable from a row written before 0026 required an `edit`, or by
+            # hand. The branch below deletes a corporate action, so taking it would
+            # report the operator's bar removed, remove nothing, and then revoke the
+            # override that was recording and protecting the bar.
+            raise OverrideRefused(
+                f"Override {override_id} adds a bar but names no edit, so there is "
+                "nothing to undo it against. Remove the bar with `fafnir prices "
+                "delete` if it should not be there, and report the override: a bar "
+                "add is written only by `prices shift|rescale`, which always names "
+                "its edit."
+            )
         db.execute(
             """
             DELETE FROM core.corporate_action
@@ -2391,6 +2894,1090 @@ def revoke_operator_override(
         (revoked_by, note, override_id),
     )
     return row
+
+
+# ---------------------------------------------------------------------------
+# Splitting a security's history: two issuers on one row
+# ---------------------------------------------------------------------------
+#
+# The vendor serves a ticker's whole history, so a ticker that has been reused
+# arrives as one continuous series: Sotheby's 2003-2019 and a SPAC listed in 2026,
+# both on BID. The price loader resolves the ticker to the one security that holds
+# it and stores everything there. `security merge` is the repair for one instrument
+# held on two rows; this is the opposite repair, for two instruments held on one.
+#
+# A split moves a date range of bars and corporate actions to another security and
+# leaves an active 'delete' override (0025) on the source for every key it moved,
+# so the next load of the ticker's full history sets the vendor's copy aside instead
+# of putting it back. Each of those overrides carries a `split` marker in `detail`
+# naming both securities, which is what the undo reads.
+#
+# The destination is either an existing security (the old issuer is already held
+# elsewhere) or a row minted here with source = 'operator'. An operator-minted
+# security is never fed by the vendor loaders -- see VENDOR_FED_SECURITY -- because
+# the ticker it carries now belongs to someone else: a per-symbol pull for it would
+# fetch the new issuer's history into the old issuer's row.
+
+# The predicate every loader universe and every ticker-grouping check applies. An
+# operator-minted security holds a history the vendor serves under a ticker it has
+# since given to another issuer, so a per-symbol pull, a reconciliation or a
+# "two rows share this ticker" check has nothing true to say about it.
+VENDOR_FED_SECURITY = "source <> 'operator'"
+
+# What counts as the date a DQ flag is about. The per-session checks key on
+# trade_date, stale on last_date, the price loader's quarantines on date.
+_FLAG_DATE_SQL = (
+    "(CASE WHEN COALESCE(f.record_key->>'trade_date', f.record_key->>'date', "
+    "f.record_key->>'last_date') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
+    "THEN COALESCE(f.record_key->>'trade_date', f.record_key->>'date', "
+    "f.record_key->>'last_date')::date END)"
+)
+
+_SPLIT_PRICE_FIELDS = ("open", "high", "low", "close")
+_SPLIT_VOLUME_FIELDS = ("volume", "vwap")
+
+
+def _bar_field(value) -> Optional[Decimal]:
+    """A bar field as a comparable number, NULL-safe. NULL is not zero: a vendor that
+    sends no vwap and one that sends 0 disagree, and neither is the other's copy."""
+    return None if value is None else Decimal(str(value))
+
+
+_SPLIT_ACTION_FIELDS = (
+    "split_numerator",
+    "split_denominator",
+    "dividend_amount",
+    "currency",
+)
+
+
+def is_operator_security(db: Database, security_id: int) -> bool:
+    """True for a security minted by `security split-history`, which no loader feeds."""
+    return bool(
+        db.fetchval(
+            "SELECT source = %s FROM core.security WHERE security_id = %s",
+            (OPERATOR_SOURCE, security_id),
+        )
+    )
+
+
+class SplitPlan(NamedTuple):
+    """What a history split would move, read before anything is written.
+
+    ``new_security`` is the identity to mint (a dict of core.security columns) when
+    the destination does not exist yet; ``destination_id`` is None in that case.
+    """
+
+    source_id: int
+    source_symbol: str
+    destination_id: Optional[int]
+    destination_symbol: str
+    new_security: Optional[dict]
+    first_date: date
+    last_date: date
+    bars: list[dict]
+    restorable: list[dict]
+    actions: list[dict]
+    duplicate_bar_dates: list[date]
+    duplicate_action_keys: list[tuple[str, date]]
+    flags: int
+    bars_kept_before: Optional[dict]
+    bars_kept_after: Optional[dict]
+    remaining_bars: int
+
+    @property
+    def moves_anything(self) -> bool:
+        return bool(self.bars or self.restorable or self.actions)
+
+
+class SplitReport(NamedTuple):
+    plan: SplitPlan
+    destination_id: int
+    bars_moved: int
+    bars_restored: int
+    bars_duplicate: int
+    actions_moved: int
+    actions_duplicate: int
+    flags_moved: int
+    flags_dropped: int
+    override_ids: list[int]
+
+
+class UnsplitReport(NamedTuple):
+    source_id: int
+    destination_id: int
+    bars_returned: int
+    bars_unrestored: int
+    actions_returned: int
+    flags_returned: int
+    destination_deleted: bool
+
+
+def _split_marker(source_id: int, destination_id: int, kind: str) -> dict:
+    return {
+        "split": {
+            "source_security_id": source_id,
+            "destination_security_id": destination_id,
+            "kind": kind,
+        }
+    }
+
+
+def _refuse_keys_already_overridden(
+    db: Database,
+    *,
+    source_id: int,
+    bar_dates: Sequence[date],
+    action_keys: Sequence[tuple[str, date]],
+) -> None:
+    """Refuse a split over a key that already holds an active 'delete' override.
+
+    Named by date, and with the remedy that fits: a bar edit (0026) is revoked whole,
+    anything else one override at a time.
+    """
+    rows = db.fetchall(
+        """
+        SELECT override_id, target, action_type, key_date,
+               (detail ? 'transform') AS is_edit,
+               detail->'transform'->>'edit' AS edit
+          FROM ops.operator_override
+         WHERE security_id = %s AND revoked_at IS NULL AND operation = 'delete'
+           AND (
+                (target = 'daily_price' AND key_date = ANY(%s))
+             OR (target = 'corporate_action'
+                 AND (action_type, key_date) IN (
+                     SELECT t.a, t.d
+                       FROM unnest(%s::text[], %s::date[]) AS t(a, d)))
+               )
+         ORDER BY key_date, target
+        """,
+        (
+            source_id,
+            list(bar_dates),
+            [t for t, _ in action_keys],
+            [d for _, d in action_keys],
+        ),
+    )
+    if not rows:
+        return
+    edits = sorted({r["edit"] for r in rows if r["is_edit"] and r["edit"]})
+    named = ", ".join(
+        f"{r['key_date']}"
+        + (f" ({r['action_type']})" if r["action_type"] else "")
+        + f" [override {r['override_id']}]"
+        for r in rows[:8]
+    )
+    more = "" if len(rows) <= 8 else f" (and {len(rows) - 8} more)"
+    if edits:
+        remedy = (
+            "Those written by `prices shift|rescale` are revoked whole -- "
+            f"`fafnir override revoke <any id of edit {', '.join(edits)}>`. "
+        )
+    else:
+        remedy = ""
+    raise OverrideRefused(
+        f"{len(rows)} key(s) of security {source_id} in this range already carry an "
+        f"active operator 'delete' while still holding a row: {named}{more}. Moving "
+        "one would write a second suppression at the same key. "
+        + remedy
+        + "Revoke the override (`fafnir override revoke <id>`), or choose a range "
+        "that does not cover these keys."
+    )
+
+
+def plan_history_split(
+    db: Database,
+    *,
+    source_id: int,
+    to_date: date,
+    from_date: Optional[date] = None,
+    destination_id: Optional[int] = None,
+    new_symbol: Optional[str] = None,
+    new_name: Optional[str] = None,
+    exchange_code: Optional[str] = None,
+    asset_type: str = "equity",
+    delisted_date: Optional[date] = None,
+    restore_deleted: bool = False,
+) -> SplitPlan:
+    """Everything a split would do, and every reason it must not happen.
+
+    Writes nothing. Raises :class:`OverrideRefused` for a split that cannot be made
+    safely; the collision checks against an existing destination are part of that,
+    so the plan an operator approves is the check that runs.
+    """
+    src = db.fetchone(
+        "SELECT security_id, primary_symbol, exchange_code, source "
+        "FROM core.security WHERE security_id = %s",
+        (source_id,),
+    )
+    if src is None:
+        raise OverrideRefused(f"No such security: {source_id}")
+    if (destination_id is None) == (new_symbol is None):
+        raise OverrideRefused(
+            "Give exactly one destination: an existing security, or a new symbol."
+        )
+    if destination_id is not None and destination_id == source_id:
+        raise OverrideRefused("The destination is the source security.")
+    if to_date >= date.today():
+        raise OverrideRefused(
+            f"{to_date} is not in the past. A split moves a finished history; the "
+            "source keeps trading under its ticker."
+        )
+    if from_date is not None and from_date > to_date:
+        raise OverrideRefused(f"--from {from_date} is after --to {to_date}.")
+    lo = from_date or date(1900, 1, 1)
+
+    dest_row = None
+    if destination_id is not None:
+        dest_row = db.fetchone(
+            "SELECT security_id, primary_symbol FROM core.security "
+            "WHERE security_id = %s",
+            (destination_id,),
+        )
+        if dest_row is None:
+            raise OverrideRefused(f"No such security: {destination_id}")
+    else:
+        new_symbol = (new_symbol or "").strip().upper()
+        if not new_symbol:
+            raise OverrideRefused("A new security needs a symbol.")
+        if not (new_name or "").strip():
+            raise OverrideRefused(
+                "A new security needs a name: it is what tells the two issuers apart."
+            )
+
+    already = db.fetchval(
+        """
+        SELECT count(*) FROM ops.operator_override
+         WHERE security_id = %s AND revoked_at IS NULL AND detail ? 'split'
+           AND key_date BETWEEN %s AND %s
+        """,
+        (source_id, lo, to_date),
+    )
+    if already:
+        raise OverrideRefused(
+            f"{already} key(s) of security {source_id} in this range were already "
+            "split off. Undo that split first, or choose a range that does not "
+            "overlap it."
+        )
+
+    bars = db.fetchall(
+        """
+        SELECT trade_date, open, high, low, close, volume, vwap, source,
+               ingestion_run_id, loaded_at
+          FROM core.daily_price
+         WHERE security_id = %s AND trade_date BETWEEN %s AND %s
+         ORDER BY trade_date
+        """,
+        (source_id, lo, to_date),
+    )
+    actions = db.fetchall(
+        """
+        SELECT corporate_action_id, action_type, ex_date, record_date, payment_date,
+               declaration_date, split_numerator, split_denominator,
+               dividend_amount, currency, source, ingestion_run_id, loaded_at
+          FROM core.corporate_action
+         WHERE security_id = %s AND ex_date BETWEEN %s AND %s
+         ORDER BY ex_date, action_type
+        """,
+        (source_id, lo, to_date),
+    )
+    restorable: list[dict] = []
+    if restore_deleted:
+        stored = {b["trade_date"] for b in bars}
+        for o in db.fetchall(
+            """
+            SELECT override_id, key_date, detail FROM ops.operator_override
+             WHERE security_id = %s AND target = 'daily_price'
+               AND operation = 'delete' AND revoked_at IS NULL
+               AND key_date BETWEEN %s AND %s
+             ORDER BY key_date
+            """,
+            (source_id, lo, to_date),
+        ):
+            row = (o["detail"] or {}).get("row")
+            if row and o["key_date"] not in stored:
+                restorable.append(
+                    {"override_id": int(o["override_id"]), "row": row, **row}
+                )
+
+    remaining = int(
+        db.fetchval(
+            "SELECT count(*) FROM core.daily_price WHERE security_id = %s",
+            (source_id,),
+        )
+    ) - len(bars)
+    if bars and remaining == 0:
+        raise OverrideRefused(
+            f"Every bar security {source_id} holds is in this range. That is one "
+            "instrument under the wrong row -- `security merge` -- or a rename, not "
+            "two issuers to separate."
+        )
+
+    dates = [b["trade_date"] for b in bars] + [
+        date.fromisoformat(str(r["trade_date"])[:10]) for r in restorable
+    ]
+    action_dates = [a["ex_date"] for a in actions]
+    if not dates and not action_dates:
+        raise OverrideRefused(
+            f"Security {source_id} has nothing between {lo} and {to_date} to move."
+        )
+    first = min(dates + action_dates)
+    last = max(dates + action_dates)
+
+    # Every key the split moves gets a fresh 'delete' override on the source. A key
+    # that already carries an active one collides with ux_operator_override_active,
+    # and the split dies mid-transaction on a psycopg UniqueViolation rather than
+    # refusing. Two routes reach that state, and both are ordinary:
+    #   * `actions delete` then `actions add` -- the documented way to replace a wrong
+    #     vendor row, which leaves a 'delete' override under a live operator row;
+    #   * `prices shift|rescale` (0026), whose 'delete' of the vendor's bar sits under
+    #     the operator's replacement.
+    # A restorable key is not one of these: it reuses its own override rather than
+    # writing a second, which is why only stored rows are checked here.
+    _refuse_keys_already_overridden(
+        db,
+        source_id=source_id,
+        bar_dates=[b["trade_date"] for b in bars],
+        action_keys=[(a["action_type"], a["ex_date"]) for a in actions],
+    )
+
+    duplicate_bar_dates: list[date] = []
+    duplicate_action_keys: list[tuple[str, date]] = []
+    if destination_id is not None:
+        theirs = {
+            r["trade_date"]: r
+            for r in db.fetchall(
+                """
+                SELECT trade_date, open, high, low, close, volume, vwap
+                  FROM core.daily_price
+                 WHERE security_id = %s AND trade_date = ANY(%s)
+                """,
+                (destination_id, dates),
+            )
+        }
+        ours = {b["trade_date"]: b for b in bars}
+        ours.update(
+            {date.fromisoformat(str(r["trade_date"])[:10]): r for r in restorable}
+        )
+        clashes = []
+        for d, t in sorted(theirs.items()):
+            mine = ours[d]
+            differs = [
+                f
+                for f in _SPLIT_PRICE_FIELDS
+                if t[f] is None
+                or mine.get(f) is None
+                or Decimal(str(t[f])) != Decimal(str(mine[f]))
+            ]
+            # volume and vwap decide it too. A session the destination holds with a
+            # different volume is not "already held identically": calling it a
+            # duplicate deletes the source's row and keeps the destination's, so the
+            # warehouse's only copy would silently become the worse one. `security
+            # merge` surfaces exactly this as its volume_only bucket rather than
+            # picking a side, and a split has no more right to pick one.
+            differs += [
+                f
+                for f in _SPLIT_VOLUME_FIELDS
+                if _bar_field(t.get(f)) != _bar_field(mine.get(f))
+            ]
+            if not differs:
+                duplicate_bar_dates.append(d)
+            else:
+                shown = differs[0]
+                clashes.append(
+                    f"{d}: destination {shown} {t.get(shown)} vs source "
+                    f"{mine.get(shown)}"
+                )
+        if clashes:
+            raise OverrideRefused(
+                f"{len(clashes)} session(s) are already held by security "
+                f"{destination_id} with different values, so they are not the same "
+                "bars: " + "; ".join(clashes[:5]) + ". Correct one side first, or "
+                "narrow the range."
+            )
+        held = {
+            (r["action_type"], r["ex_date"]): r
+            for r in db.fetchall(
+                """
+                SELECT action_type, ex_date, split_numerator, split_denominator,
+                       dividend_amount, currency
+                  FROM core.corporate_action
+                 WHERE security_id = %s AND ex_date BETWEEN %s AND %s
+                """,
+                (destination_id, first, last),
+            )
+        }
+        action_clashes = []
+        for a in actions:
+            t = held.get((a["action_type"], a["ex_date"]))
+            if t is None:
+                continue
+            if all(t[f] == a[f] for f in _SPLIT_ACTION_FIELDS):
+                duplicate_action_keys.append((a["action_type"], a["ex_date"]))
+            else:
+                action_clashes.append(f"{a['action_type']} {a['ex_date']}")
+        if action_clashes:
+            raise OverrideRefused(
+                f"Security {destination_id} already has a different "
+                + ", ".join(action_clashes[:5])
+                + ". Correct one side with `fafnir actions` first."
+            )
+
+    flags = int(
+        db.fetchval(
+            f"""
+            SELECT count(*) FROM ops.data_quality_flag f
+             WHERE f.security_id = %s AND {_FLAG_DATE_SQL} BETWEEN %s AND %s
+            """,
+            (source_id, first, last),
+        )
+    )
+    before = db.fetchone(
+        """
+        SELECT trade_date, close FROM core.daily_price
+         WHERE security_id = %s AND trade_date < %s
+         ORDER BY trade_date DESC LIMIT 1
+        """,
+        (source_id, first),
+    )
+    after = db.fetchone(
+        """
+        SELECT trade_date, close FROM core.daily_price
+         WHERE security_id = %s AND trade_date > %s
+         ORDER BY trade_date LIMIT 1
+        """,
+        (source_id, last),
+    )
+
+    new_security = None
+    if destination_id is None:
+        exchange = exchange_code or src["exchange_code"]
+        new_security = {
+            "primary_symbol": new_symbol,
+            "company_name": (new_name or "").strip(),
+            "asset_type": asset_type,
+            "exchange_code": exchange,
+            "delisted_date": delisted_date or last,
+        }
+    return SplitPlan(
+        source_id=source_id,
+        source_symbol=src["primary_symbol"],
+        destination_id=destination_id,
+        destination_symbol=(
+            dest_row["primary_symbol"] if dest_row is not None else new_symbol
+        ),
+        new_security=new_security,
+        first_date=first,
+        last_date=last,
+        bars=bars,
+        restorable=restorable,
+        actions=actions,
+        duplicate_bar_dates=duplicate_bar_dates,
+        duplicate_action_keys=duplicate_action_keys,
+        flags=flags,
+        bars_kept_before=before,
+        bars_kept_after=after,
+        remaining_bars=remaining,
+    )
+
+
+def _mint_operator_security(db: Database, plan: SplitPlan) -> int:
+    new = plan.new_security or {}
+    ensure_exchange(db, new.get("exchange_code"))
+    sid = int(
+        db.fetchval(
+            """
+            INSERT INTO core.security
+                (primary_symbol, company_name, asset_type, exchange_code,
+                 is_actively_trading, is_etf, is_fund, delisted_date, source,
+                 updated_at)
+            VALUES (%s, %s, %s, %s, FALSE, %s, %s, %s, %s, now())
+            RETURNING security_id
+            """,
+            (
+                new["primary_symbol"],
+                new["company_name"],
+                new["asset_type"],
+                new.get("exchange_code"),
+                new["asset_type"] == "etf",
+                new["asset_type"] == "fund",
+                new["delisted_date"],
+                OPERATOR_SOURCE,
+            ),
+        )
+    )
+    # A CLOSED period only. XREF_RESOLVE_SQL reads open periods, so the live ticker
+    # keeps resolving to the source; this row records which ticker the old issuer
+    # traded under and when. Skipped, not forced, if that (symbol, valid_from) is
+    # already some other period's primary key.
+    db.execute(
+        """
+        INSERT INTO core.symbol_xref
+            (security_id, symbol, valid_from, valid_to, is_primary, source)
+        VALUES (%s, %s, %s, %s, TRUE, %s)
+        ON CONFLICT (symbol, valid_from) DO NOTHING
+        """,
+        (sid, new["primary_symbol"], plan.first_date, plan.last_date, OPERATOR_SOURCE),
+    )
+    return sid
+
+
+def split_security_history(
+    db: Database,
+    *,
+    source_id: int,
+    to_date: date,
+    note: str,
+    created_by: str,
+    from_date: Optional[date] = None,
+    destination_id: Optional[int] = None,
+    new_symbol: Optional[str] = None,
+    new_name: Optional[str] = None,
+    exchange_code: Optional[str] = None,
+    asset_type: str = "equity",
+    delisted_date: Optional[date] = None,
+    restore_deleted: bool = False,
+) -> SplitReport:
+    """Move a date range of one security's history onto another security.
+
+    Bars and corporate actions in the range move; every moved key is left suppressed
+    on the source by an active 'delete' override that names the destination, so a
+    load of the ticker's full history cannot re-insert them. A moved action is
+    stored on the destination as an operator row (source = 'operator', with an 'add'
+    override), so no reconciliation of the destination's own ticker treats it as
+    withdrawn; the source's override keeps the vendor's row exactly as it stood.
+
+    DQ flags about a date in the range follow the rows. Adjustment factors are the
+    caller's to recompute, for both securities. Does not commit.
+    """
+    if not note or not note.strip():
+        raise OverrideRefused("A split needs a note: it is the whole record.")
+    plan = plan_history_split(
+        db,
+        source_id=source_id,
+        to_date=to_date,
+        from_date=from_date,
+        destination_id=destination_id,
+        new_symbol=new_symbol,
+        new_name=new_name,
+        exchange_code=exchange_code,
+        asset_type=asset_type,
+        delisted_date=delisted_date,
+        restore_deleted=restore_deleted,
+    )
+    dest = (
+        destination_id
+        if destination_id is not None
+        else _mint_operator_security(db, plan)
+    )
+    override_ids: list[int] = []
+    restored_ids: list[int] = []
+    duplicates = set(plan.duplicate_bar_dates)
+
+    moved = 0
+    for bar in plan.bars:
+        d = bar["trade_date"]
+        kind = "duplicate" if d in duplicates else "moved"
+        if kind == "moved":
+            db.execute(
+                """
+                INSERT INTO core.daily_price
+                    (security_id, trade_date, open, high, low, close, volume, vwap,
+                     source, ingestion_run_id, loaded_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    dest,
+                    d,
+                    bar["open"],
+                    bar["high"],
+                    bar["low"],
+                    bar["close"],
+                    bar["volume"],
+                    bar["vwap"],
+                    bar["source"],
+                    bar["ingestion_run_id"],
+                    bar["loaded_at"],
+                ),
+            )
+            moved += 1
+        override_ids.append(
+            _insert_override(
+                db,
+                security_id=source_id,
+                target="daily_price",
+                action_type=None,
+                key_date=d,
+                operation="delete",
+                detail={"row": _jsonable(bar), **_split_marker(source_id, dest, kind)},
+                note=note,
+                created_by=created_by,
+            )
+        )
+        db.execute(
+            "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date = %s",
+            (source_id, d),
+        )
+
+    import json
+
+    restored = 0
+    for r in plan.restorable:
+        d = date.fromisoformat(str(r["trade_date"])[:10])
+        if d not in duplicates:
+            db.execute(
+                """
+                INSERT INTO core.daily_price
+                    (security_id, trade_date, open, high, low, close, volume, vwap,
+                     source, ingestion_run_id, loaded_at)
+                VALUES (%s,%s,%s::numeric,%s::numeric,%s::numeric,%s::numeric,%s,
+                        %s::numeric,%s,%s,COALESCE(%s::timestamptz, now()))
+                """,
+                (
+                    dest,
+                    d,
+                    r.get("open"),
+                    r.get("high"),
+                    r.get("low"),
+                    r.get("close"),
+                    r.get("volume"),
+                    r.get("vwap"),
+                    r.get("source") or "fmp",
+                    r.get("ingestion_run_id"),
+                    r.get("loaded_at"),
+                ),
+            )
+            restored += 1
+        kind = "duplicate-restored" if d in duplicates else "restored"
+        db.execute(
+            "UPDATE ops.operator_override SET detail = detail || %s "
+            "WHERE override_id = %s",
+            (json.dumps(_split_marker(source_id, dest, kind)), r["override_id"]),
+        )
+        restored_ids.append(int(r["override_id"]))
+
+    dup_actions = set(plan.duplicate_action_keys)
+    actions_moved = 0
+    for a in plan.actions:
+        key = (a["action_type"], a["ex_date"])
+        kind = "duplicate" if key in dup_actions else "moved"
+        override_ids.append(
+            _insert_override(
+                db,
+                security_id=source_id,
+                target="corporate_action",
+                action_type=a["action_type"],
+                key_date=a["ex_date"],
+                operation="delete",
+                detail={"row": _jsonable(a), **_split_marker(source_id, dest, kind)},
+                note=note,
+                created_by=created_by,
+            )
+        )
+        db.execute(
+            "DELETE FROM core.corporate_action WHERE corporate_action_id = %s",
+            (a["corporate_action_id"],),
+        )
+        if kind == "duplicate":
+            continue
+        new_id = int(
+            db.fetchval(
+                """
+                INSERT INTO core.corporate_action
+                    (security_id, action_type, ex_date, record_date, payment_date,
+                     declaration_date, split_numerator, split_denominator,
+                     dividend_amount, currency, source, loaded_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                RETURNING corporate_action_id
+                """,
+                (
+                    dest,
+                    a["action_type"],
+                    a["ex_date"],
+                    a["record_date"],
+                    a["payment_date"],
+                    a["declaration_date"],
+                    a["split_numerator"],
+                    a["split_denominator"],
+                    a["dividend_amount"],
+                    a["currency"],
+                    OPERATOR_SOURCE,
+                ),
+            )
+        )
+        override_ids.append(
+            _insert_override(
+                db,
+                security_id=dest,
+                target="corporate_action",
+                action_type=a["action_type"],
+                key_date=a["ex_date"],
+                operation="add",
+                detail={
+                    "row": _jsonable({**a, "corporate_action_id": new_id}),
+                    **_split_marker(source_id, dest, "moved"),
+                },
+                note=note,
+                created_by=created_by,
+            )
+        )
+        actions_moved += 1
+
+    # Every override this split touched is stamped with one batch id, and the flags
+    # it moves carry the same mark. Without it `--undo` keys only on the pair of
+    # securities, so a second, disjoint split into the same destination is taken back
+    # by an undo meant for the first; and it returns flags by the dates it happened to
+    # put back, which both strands a flag about a date holding no row (a `gap` flag
+    # keyed on the missing session) and hands over flags the destination raised
+    # itself. `at` orders the batches: a restore-only split's ids are older than the
+    # overrides it reuses, so ids alone do not say which split came last.
+    batch = min(override_ids) if override_ids else min(restored_ids)
+    db.execute(
+        """
+        UPDATE ops.operator_override
+           SET detail = jsonb_set(
+                   jsonb_set(detail, '{split,batch}', to_jsonb(%s::bigint)),
+                   '{split,at}', to_jsonb(now()))
+         WHERE override_id = ANY(%s)
+        """,
+        (batch, override_ids + restored_ids),
+    )
+
+    flags_dropped, flags_moved = _move_dated_flags(
+        db,
+        from_id=source_id,
+        to_id=dest,
+        stamp=batch,
+        first=plan.first_date,
+        last=plan.last_date,
+    )
+    return SplitReport(
+        plan=plan,
+        destination_id=dest,
+        bars_moved=moved,
+        bars_restored=restored,
+        bars_duplicate=len(duplicates),
+        actions_moved=actions_moved,
+        actions_duplicate=len(dup_actions),
+        flags_moved=flags_moved,
+        flags_dropped=flags_dropped,
+        override_ids=override_ids,
+    )
+
+
+def _move_dated_flags(
+    db: Database,
+    *,
+    from_id: int,
+    to_id: int,
+    first: Optional[date] = None,
+    last: Optional[date] = None,
+    dates: Optional[Sequence[date]] = None,
+    stamp: Optional[int] = None,
+    stamped: Optional[int] = None,
+) -> tuple[int, int]:
+    """Repoint flags to another security. Returns ``(dropped, moved)``.
+
+    Which flags: those about a date in [first, last], or in ``dates``, or -- with
+    ``stamped`` -- exactly the ones a split batch moved, whatever their date. ``stamp``
+    marks the moved flags with the batch that moved them, so the undo can ask for them
+    back by name rather than by date: a `gap` flag is keyed on a session that holds no
+    row, so it has no date among the rows an undo returns, and a flag the destination
+    raised itself shares its dates with the ones it was handed.
+
+    Same rule as :func:`merge_security`: an open flag the destination already
+    carries for the same condition is dropped rather than repointed, or the repoint
+    would violate ux_dq_flag_open_condition (0016). price_* is never dropped -- its
+    repeats are counted.
+    """
+    if stamped is not None:
+        where, params = "f.detail->>'split_batch' = %s", [str(stamped)]
+    elif dates is not None:
+        where, params = f"{_FLAG_DATE_SQL} = ANY(%s)", [list(dates)]
+    else:
+        where, params = f"{_FLAG_DATE_SQL} BETWEEN %s AND %s", [first, last]
+    dropped = db.execute(
+        f"""
+        DELETE FROM ops.data_quality_flag f
+         WHERE f.security_id = %s AND {where}
+           AND f.resolved_at IS NULL
+           AND f.check_name NOT LIKE 'price\\_%%'
+           AND EXISTS (
+                 SELECT 1 FROM ops.data_quality_flag s
+                  WHERE s.security_id = %s AND s.resolved_at IS NULL
+                    AND s.check_name = f.check_name
+                    AND s.record_key IS NOT DISTINCT FROM f.record_key)
+        """,
+        [from_id, *params, to_id],
+    )
+    if stamp is not None:
+        set_detail = (
+            ", detail = jsonb_set(COALESCE(f.detail, '{}'::jsonb), "
+            "'{split_batch}', to_jsonb(%s::bigint))"
+        )
+        set_params = [stamp]
+    elif stamped is not None:
+        set_detail = ", detail = COALESCE(f.detail, '{}'::jsonb) - 'split_batch'"
+        set_params = []
+    else:
+        set_detail, set_params = "", []
+    moved = db.execute(
+        f"""
+        UPDATE ops.data_quality_flag f SET security_id = %s{set_detail}
+         WHERE f.security_id = %s AND {where}
+        """,
+        [to_id, *set_params, from_id, *params],
+    )
+    return dropped, moved
+
+
+def undo_history_split(
+    db: Database,
+    *,
+    source_id: int,
+    destination_id: int,
+    note: str,
+    revoked_by: str,
+) -> UnsplitReport:
+    """Put back everything a split moved from ``source_id`` to ``destination_id``.
+
+    Driven entirely by the active overrides carrying the split marker, so it undoes
+    exactly what was moved and nothing the destination held before:
+
+    * a moved bar or action returns to the source as it stood (from the override's
+      ``detail.row``), the source's override is revoked, and the destination's copy
+      is removed;
+    * a key the destination already held identically ("duplicate") returns to the
+      source and the destination keeps its own copy;
+    * a bar restored from an earlier `prices delete` is removed from the destination
+      and its original override is left active -- the split did not create it, so
+      the undo does not lift it.
+
+    Flags about a returned date go back. An operator-minted destination left with no
+    history is deleted. Adjustment factors are the caller's to recompute. Does not
+    commit.
+    """
+    if not note or not note.strip():
+        raise OverrideRefused("An undo needs a note.")
+    # One split, not every split between this pair. Two disjoint ranges may be moved
+    # to the same destination -- the planner only refuses an overlapping one -- and an
+    # undo of the second used to take the first back with it, silently and with no way
+    # to ask for either alone. The newest batch is the one being taken back.
+    batch = db.fetchval(
+        """
+        SELECT (detail->'split'->>'batch')::bigint
+          FROM ops.operator_override
+         WHERE revoked_at IS NULL
+           AND detail->'split'->>'source_security_id' = %s
+           AND detail->'split'->>'destination_security_id' = %s
+         ORDER BY detail->'split'->>'at' DESC NULLS LAST,
+                  (detail->'split'->>'batch')::bigint DESC NULLS LAST
+         LIMIT 1
+        """,
+        (str(source_id), str(destination_id)),
+    )
+    rows = db.fetchall(
+        """
+        SELECT override_id, security_id, target, action_type, key_date, operation,
+               detail
+          FROM ops.operator_override
+         WHERE revoked_at IS NULL
+           AND detail->'split'->>'source_security_id' = %s
+           AND detail->'split'->>'destination_security_id' = %s
+           AND (detail->'split'->>'batch')::bigint IS NOT DISTINCT FROM %s
+         ORDER BY override_id
+        """,
+        (str(source_id), str(destination_id), batch),
+    )
+    if not rows:
+        raise OverrideRefused(
+            f"No active split from security {source_id} to {destination_id}."
+        )
+
+    def _revoke(oid: int) -> None:
+        db.execute(
+            """
+            UPDATE ops.operator_override
+               SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+             WHERE override_id = %s
+            """,
+            (revoked_by, note, oid),
+        )
+
+    bars_returned = bars_unrestored = actions_returned = 0
+    returned_dates: list[date] = []
+    for o in rows:
+        kind = o["detail"]["split"]["kind"]
+        row = o["detail"].get("row") or {}
+        d = o["key_date"]
+        if o["target"] == "daily_price":
+            if kind in ("restored", "duplicate-restored"):
+                if kind == "restored":
+                    db.execute(
+                        "DELETE FROM core.daily_price "
+                        "WHERE security_id = %s AND trade_date = %s",
+                        (destination_id, d),
+                    )
+                    # Only a key the split materialised is taken off the destination.
+                    # A duplicate-restored one was already the destination's own bar,
+                    # which stays, so counting it overstated what the undo removed.
+                    bars_unrestored += 1
+                db.execute(
+                    "UPDATE ops.operator_override SET detail = detail - 'split' "
+                    "WHERE override_id = %s",
+                    (o["override_id"],),
+                )
+                returned_dates.append(d)
+                continue
+            db.execute(
+                """
+                INSERT INTO core.daily_price
+                    (security_id, trade_date, open, high, low, close, volume, vwap,
+                     source, ingestion_run_id, loaded_at)
+                VALUES (%s,%s,%s::numeric,%s::numeric,%s::numeric,%s::numeric,%s,
+                        %s::numeric,%s,%s,COALESCE(%s::timestamptz, now()))
+                ON CONFLICT (security_id, trade_date) DO NOTHING
+                """,
+                (
+                    source_id,
+                    d,
+                    row.get("open"),
+                    row.get("high"),
+                    row.get("low"),
+                    row.get("close"),
+                    row.get("volume"),
+                    row.get("vwap"),
+                    row.get("source") or "fmp",
+                    row.get("ingestion_run_id"),
+                    row.get("loaded_at"),
+                ),
+            )
+            if kind == "moved":
+                db.execute(
+                    "DELETE FROM core.daily_price "
+                    "WHERE security_id = %s AND trade_date = %s",
+                    (destination_id, d),
+                )
+            _revoke(o["override_id"])
+            bars_returned += 1
+            returned_dates.append(d)
+        elif o["operation"] == "add":
+            # The destination's operator copy of a moved action.
+            db.execute(
+                """
+                DELETE FROM core.corporate_action
+                 WHERE security_id = %s AND action_type = %s AND ex_date = %s
+                   AND source = %s
+                """,
+                (destination_id, o["action_type"], d, OPERATOR_SOURCE),
+            )
+            _revoke(o["override_id"])
+        else:
+            db.execute(
+                """
+                INSERT INTO core.corporate_action
+                    (security_id, action_type, ex_date, record_date, payment_date,
+                     declaration_date, split_numerator, split_denominator,
+                     dividend_amount, currency, source, ingestion_run_id, loaded_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::numeric,%s::numeric,%s::numeric,%s,%s,
+                        %s, COALESCE(%s::timestamptz, now()))
+                ON CONFLICT (security_id, action_type, ex_date) DO NOTHING
+                """,
+                (
+                    source_id,
+                    o["action_type"],
+                    d,
+                    row.get("record_date"),
+                    row.get("payment_date"),
+                    row.get("declaration_date"),
+                    row.get("split_numerator"),
+                    row.get("split_denominator"),
+                    row.get("dividend_amount"),
+                    row.get("currency") or "USD",
+                    row.get("source") or "fmp",
+                    row.get("ingestion_run_id"),
+                    row.get("loaded_at"),
+                ),
+            )
+            _revoke(o["override_id"])
+            actions_returned += 1
+            returned_dates.append(d)
+
+    _, flags_returned = _move_dated_flags(
+        db, from_id=destination_id, to_id=source_id, stamped=batch
+    )
+
+    deleted = False
+    still_edited = db.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM ops.operator_override "
+        "WHERE security_id = %s AND revoked_at IS NULL)",
+        (destination_id,),
+    )
+    left = db.fetchone(
+        """
+        SELECT EXISTS (SELECT 1 FROM core.daily_price WHERE security_id = %s) AS bars,
+               EXISTS (SELECT 1 FROM core.corporate_action WHERE security_id = %s)
+                   AS actions
+        """,
+        (destination_id, destination_id),
+    )
+    if (
+        is_operator_security(db, destination_id)
+        and not still_edited
+        and not left["bars"]
+        and not left["actions"]
+    ):
+        # What is left on it is about the split itself (a coverage flag on the moved
+        # range); fold_empty_security's rule applies -- flags follow the survivor.
+        # Its revoked overrides stay as they are: the record of what was undone.
+        _move_remaining_flags(db, from_id=destination_id, to_id=source_id)
+        # Derived from the actions just returned; nothing is lost with them.
+        db.execute(
+            "DELETE FROM core.adjustment_factor WHERE security_id = %s",
+            (destination_id,),
+        )
+        db.execute(
+            "DELETE FROM ops.load_watermark WHERE security_id = %s", (destination_id,)
+        )
+        db.execute(
+            "DELETE FROM core.symbol_xref WHERE security_id = %s", (destination_id,)
+        )
+        db.execute(
+            "DELETE FROM core.company_profile WHERE security_id = %s",
+            (destination_id,),
+        )
+        db.execute(
+            "DELETE FROM core.security WHERE security_id = %s", (destination_id,)
+        )
+        deleted = True
+    return UnsplitReport(
+        source_id=source_id,
+        destination_id=destination_id,
+        bars_returned=bars_returned,
+        bars_unrestored=bars_unrestored,
+        actions_returned=actions_returned,
+        flags_returned=flags_returned,
+        destination_deleted=deleted,
+    )
+
+
+def _move_remaining_flags(db: Database, *, from_id: int, to_id: int) -> None:
+    db.execute(
+        """
+        DELETE FROM ops.data_quality_flag v
+         WHERE v.security_id = %s AND v.resolved_at IS NULL
+           AND v.check_name NOT LIKE 'price\\_%%'
+           AND EXISTS (SELECT 1 FROM ops.data_quality_flag s
+                        WHERE s.security_id = %s AND s.resolved_at IS NULL
+                          AND s.check_name = v.check_name
+                          AND s.record_key IS NOT DISTINCT FROM v.record_key)
+        """,
+        (from_id, to_id),
+    )
+    db.execute(
+        "UPDATE ops.data_quality_flag SET security_id = %s WHERE security_id = %s",
+        (to_id, from_id),
+    )
 
 
 def close_before(db: Database, security_id: int, d: date) -> Optional[Decimal]:
@@ -2506,6 +4093,7 @@ def securities_without_actions_watermark(
                 AND w.source = %s
                 AND w.endpoint = %s
          WHERE w.security_id IS NULL
+           AND s.{VENDOR_FED_SECURITY}
            {where}
          ORDER BY s.security_id
         """,
@@ -2527,9 +4115,10 @@ def universe_securities(db: Database, *, include_inactive: bool = False) -> list
     passes ``include_inactive`` because a universe of only the survivors is exactly
     what makes a history survivorship-biased.
     """
-    where = "WHERE is_actively_trading " if not include_inactive else ""
+    where = "AND is_actively_trading " if not include_inactive else ""
     rows = db.fetchall(f"""
         SELECT security_id, primary_symbol FROM core.security
+         WHERE {VENDOR_FED_SECURITY}
         {where}
         ORDER BY security_id
         """)
@@ -2555,6 +4144,7 @@ def securities_by_asset_type(
         f"""
         SELECT security_id, primary_symbol FROM core.security
          WHERE asset_type = ANY(%s)
+           AND {VENDOR_FED_SECURITY}
            {where}
          ORDER BY security_id
         """,
@@ -2583,6 +4173,7 @@ def actions_reconciliation_slice(
         f"""
         SELECT security_id, primary_symbol FROM core.security
          WHERE security_id %% %s = %s
+           AND {VENDOR_FED_SECURITY}
            {where}
          ORDER BY security_id
         """,

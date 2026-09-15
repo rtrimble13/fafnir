@@ -22,7 +22,18 @@ def test_all_migrations_apply(migrated_dsn):
 
 
 def test_rollback_then_remigrate(migrated_dsn):
-    # Roll back the last migration (marts) and re-apply; should converge.
+    # 0026's down refuses while any bar-transform record exists, which is the point of
+    # it -- rolling back would strand an operator's bar with nothing protecting it. So
+    # this test has to start from a database with none, or it is testing whatever the
+    # test that ran before it happened to leave behind. The `db` fixture truncates at
+    # setup rather than teardown, so a `prices rescale` test leaves its overrides
+    # standing; today that is harmless only because this file is collected first.
+    from fafnir.db.connection import Database
+
+    with Database(migrated_dsn, autocommit=True) as db:
+        db.execute("TRUNCATE ops.operator_override")
+
+    # Roll back the last migration and re-apply; should converge.
     rolled = m.rollback(migrated_dsn, steps=1)
     assert rolled, "nothing rolled back"
     after = dict((v, s) for v, _, s in m.status(migrated_dsn))
