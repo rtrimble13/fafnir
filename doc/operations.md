@@ -448,6 +448,9 @@ fafnir actions add --symbol OSCX --ex-date 2026-09-03 --split 1:3 -m "..." --dry
 fafnir actions redate 3637912 --ex-date 2026-09-03 -m "..." --dry-run
 fafnir prices delete --symbol MMSRX --non-session -m "weekend NAV echoes" --dry-run
 fafnir prices delete --symbol OSCX --date 2026-09-08 -m "stale pre-split print" --dry-run
+fafnir prices shift --symbol WLL --from 2004-01-01 --to 2022-07-01 --days 1 -m "..." --dry-run
+fafnir prices rescale --symbol EQC --from 1990-01-02 --to 1997-10-16 --factor 20 \
+    --volume-factor 1/20 -m "..." --dry-run
 fafnir override list                                          # the record
 fafnir override revoke 14 -m "FMP corrected it"               # undo one
 ```
@@ -471,6 +474,49 @@ fafnir override revoke 14 -m "FMP corrected it"               # undo one
   `fafnir ingest actions --symbols SYM` or `fafnir ingest prices --symbols SYM --from
   D --to D` to fetch the vendor's current version. A re-date is two overrides;
   revoke both.
+
+#### Bars at the wrong date or the wrong scale
+
+Deleting is the wrong repair for a history whose bars are real prices filed under the
+wrong key: FVI and WLL carry every bar one calendar day early (Sunday bars that are
+Monday's session, no Fridays), and EQC's pre-1997-10-17 decade is stored at 1/20 of the
+traded price. The vendor's payload has the same defect, so a re-fetch changes nothing.
+
+- **`prices shift --days N`** moves every bar in `--from..--to` by N calendar days,
+  prices untouched. The dry run prints bars per weekday before and after — a correct
+  one-day shift turns `Sun Mon Tue Wed Thu` into five weekdays. A history that is only
+  partly misdated shows Fridays in the *before* row; narrow the range. Refused, naming
+  the dates: a bar landing on a stored bar outside the range, on a day the venue
+  calendar has no session (`--allow-non-session` overrides it; the calendar marks MLK
+  Day 1990-1997 closed although NYSE traded), or in the future. Corporate actions stay
+  where they are unless `--with-actions`; the dry run lists the ones in the range with
+  their weekdays, so you can see whether the vendor misdated them too.
+- **`prices rescale --factor F [--volume-factor V]`** multiplies every price (and
+  vwap) in the range by F and volume by V, rounded to a share. The dry run prints the
+  closes either side of both ends of the range, before and after — a correct factor
+  turns both joins into ordinary sessions. Every rescaled bar goes through the price
+  loader's own validation; one the loader would quarantine (sub-resolution, out of
+  range) or flag (a range the rounding flattens) refuses the whole edit.
+- **The fabricated split.** Where the vendor scaled a pre-split era by the ratio and
+  also carries a split row to match (HUN 2014: bars 10x with a 10:1 split), the repair
+  is both commands: `prices rescale` the era back to as-traded, then
+  `actions delete` the split (or keep the split and leave the bars, if the split was
+  real and only the bars are wrong — the raw jump on the ex-date tells you which).
+  Doing one without the other applies the scale twice in the adjusted series.
+- **Durable and undoable.** Each bar becomes a `delete` of the vendor's row (kept
+  whole) and an operator `add` in its place (`source = operator`), all sharing one
+  `edit` id. The price loader sets aside vendor bars on both dates. `fafnir override
+  revoke <any id of the edit>` undoes the whole edit and writes the vendor bars back
+  exactly as they stood — unlike a plain delete, whose undo leaves the key empty.
+- **An operator bar is not a target for other edits.** `prices delete`, and a second
+  shift or rescale over it, are refused until the edit is revoked; plan one edit from
+  the vendor's bars.
+- **Follow with** `fafnir dq recheck --check outlier --check gap` (a shift can open or
+  close gaps), then `fafnir db refresh-marts`. Adjustment factors are recomputed in
+  the same transaction when the security has corporate actions.
+- **History only.** A security still trading whose vendor keeps misdating or
+  mis-scaling *new* bars is not fixed by an edit of the past; those arrive on dates
+  the edit does not cover.
 
 ## Reconciliation
 
