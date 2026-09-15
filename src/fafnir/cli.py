@@ -362,11 +362,15 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
         # never have another bar, so re-polling it burns requests forever. A
         # historical backfill wants everything, or the resulting history only
         # contains companies that happened to survive to today.
-        where = "" if include_inactive else "WHERE is_actively_trading "
+        where = "" if include_inactive else "AND is_actively_trading "
         syms = _split_symbols(symbols) or [
             r["primary_symbol"]
             for r in database.fetchall(
-                f"SELECT primary_symbol FROM core.security {where}"
+                # Never an operator-minted security (`security split-history`): its
+                # ticker now belongs to another issuer, and pulling it would fetch
+                # that issuer's history.
+                "SELECT primary_symbol FROM core.security "
+                f"WHERE source <> 'operator' {where}"
                 "ORDER BY security_id"
             )
         ]
@@ -873,7 +877,7 @@ def _echo_merge_plan(plan) -> None:
 
 @main.group()
 def security():
-    """Security-master repairs: merges and rename decisions a loader will not make."""
+    """Security-master repairs a loader will not make: merges, renames, splits."""
 
 
 @security.command("merge-rename")
@@ -1406,6 +1410,299 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("split-history")
+@click.option("--symbol", help="Source security by ticker.")
+@click.option("--security-id", type=int, help="Source security by id (unambiguous).")
+@click.option(
+    "--from",
+    "from_date",
+    metavar="YYYY-MM-DD",
+    help="First date to move  [default: the source's first bar]",
+)
+@click.option("--to", "to_date", metavar="YYYY-MM-DD", help="Last date to move.")
+@click.option(
+    "--new-symbol", help="Mint the destination under this ticker (usually the same)."
+)
+@click.option("--new-name", help="The old issuer's name, for the minted destination.")
+@click.option(
+    "--exchange", help="Venue of the minted destination  [default: the source's]"
+)
+@click.option(
+    "--asset-type",
+    type=click.Choice(["equity", "etf", "fund", "other"]),
+    default="equity",
+    show_default=True,
+    help="Asset type of the minted destination.",
+)
+@click.option(
+    "--delisted-date",
+    metavar="YYYY-MM-DD",
+    help="Delisting date of the minted destination  [default: the last date moved]",
+)
+@click.option(
+    "--into-security-id",
+    type=int,
+    help="Move into this existing security instead of minting one.",
+)
+@click.option(
+    "--restore-deleted",
+    is_flag=True,
+    help="Also move bars in the range that `prices delete` removed from the source.",
+)
+@click.option(
+    "--undo",
+    is_flag=True,
+    help="Put back what a split from --security-id into --into-security-id moved.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="How you know these are two issuers. Required -- it is the whole record.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_split_history(
+    ctx,
+    symbol,
+    security_id,
+    from_date,
+    to_date,
+    new_symbol,
+    new_name,
+    exchange,
+    asset_type,
+    delisted_date,
+    into_security_id,
+    restore_deleted,
+    undo,
+    note,
+    created_by,
+    dry_run,
+    yes,
+):
+    """Move one issuer's history off a row that holds two issuers.
+
+    \b
+      fafnir security split-history --security-id 6598 --to 2019-10-02 \\
+          --new-symbol BID --new-name "Sotheby's" \\
+          -m "Sotheby's to its 2019 take-private; Tribeca SPAC lists 2026-07-20" \\
+          --dry-run
+      fafnir security split-history --security-id 423773 --from 2020-11-13 \\
+          --to 2021-06-10 --into-security-id 7027 --restore-deleted -m "..." --dry-run
+      fafnir security split-history --security-id 6598 --into-security-id 900123 \\
+          --undo -m "wrong boundary" --dry-run
+
+    A reused ticker arrives from the vendor as one continuous history, and the
+    loader stores all of it on the security that holds the ticker today. This moves
+    the bars and corporate actions dated --from..--to to a security of their own:
+    a new one (--new-symbol/--new-name, minted delisted with source = operator and
+    a closed ticker period, and never fed by the vendor loaders), or an existing
+    one (--into-security-id), where a session it already holds must carry the same
+    OHLC or the split is refused.
+
+    Every moved key stays suppressed on the source by an active 'delete' override,
+    so the next load of the ticker's full history does not put it back. DQ flags
+    about a moved date follow it. Adjustment factors of both securities are
+    recomputed in the same transaction.
+
+    --undo reverses exactly what the split moved, read from those overrides, and
+    deletes a minted destination left empty.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    created_by = created_by or _os_user()
+    if not note.strip():
+        raise click.ClickException("--note may not be blank.")
+    if undo:
+        if any(
+            v is not None
+            for v in (from_date, to_date, new_symbol, new_name, exchange, delisted_date)
+        ):
+            raise click.ClickException(
+                "--undo reads what the split recorded; it takes only the source, "
+                "--into-security-id and a note."
+            )
+        if into_security_id is None or (symbol is None and security_id is None):
+            raise click.ClickException(
+                "--undo needs the source (--security-id) and the destination "
+                "(--into-security-id) of the split."
+            )
+        with Database(ctx.obj["config"].dsn) as database:
+            sid, sym = _resolve_one_security(database, symbol, security_id)
+            if not dry_run and not yes:
+                click.confirm(
+                    f"Undo the split from {sym} ({sid}) into {into_security_id}?",
+                    abort=True,
+                )
+            try:
+                report = repo.undo_history_split(
+                    database,
+                    source_id=sid,
+                    destination_id=into_security_id,
+                    note=note,
+                    revoked_by=created_by,
+                )
+            except repo.OverrideRefused as exc:
+                raise click.ClickException(str(exc)) from exc
+            adjustments.compute_for_security(database, sid)
+            if not report.destination_deleted:
+                adjustments.compute_for_security(database, into_security_id)
+            if dry_run:
+                database.rollback()
+            else:
+                database.commit()
+        click.echo(
+            f"{_plural(report.bars_returned, 'bar')} and "
+            f"{_plural(report.actions_returned, 'corporate action')} back on {sym} "
+            f"({sid}); {_plural(report.bars_unrestored, 'restored bar')} taken off "
+            f"{into_security_id} (their original deletes stand); "
+            f"{_plural(report.flags_returned, 'flag')} returned."
+        )
+        if report.destination_deleted:
+            click.echo(f"Security {into_security_id} was left empty and is deleted.")
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        click.echo(f"Undone as {created_by}.")
+        return
+
+    if to_date is None:
+        raise click.ClickException("--to is required.")
+    if (into_security_id is None) == (new_symbol is None):
+        raise click.ClickException(
+            "Give exactly one destination: --new-symbol (with --new-name) or "
+            "--into-security-id."
+        )
+    if into_security_id is not None and (new_name or exchange or delisted_date):
+        raise click.ClickException(
+            "--new-name, --exchange and --delisted-date describe a new security; "
+            "they do not apply with --into-security-id."
+        )
+    kwargs = dict(
+        to_date=_parse_date(to_date),
+        from_date=_parse_date(from_date),
+        destination_id=into_security_id,
+        new_symbol=new_symbol,
+        new_name=new_name,
+        exchange_code=exchange,
+        asset_type=asset_type,
+        delisted_date=_parse_date(delisted_date),
+        restore_deleted=restore_deleted,
+    )
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        try:
+            plan = repo.plan_history_split(database, source_id=sid, **kwargs)
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        _echo_split_plan(plan)
+        before = {s: _factor_summary(database, s) for s in (sid, into_security_id) if s}
+        if not dry_run and not yes:
+            click.confirm("Split this history off?", abort=True)
+        try:
+            report = repo.split_security_history(
+                database, source_id=sid, note=note, created_by=created_by, **kwargs
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        dest = report.destination_id
+        adjustments.compute_for_security(database, sid)
+        adjustments.compute_for_security(database, dest)
+        after_src = _factor_summary(database, sid)
+        after_dest = _factor_summary(database, dest)
+        if dry_run:
+            database.rollback()
+        else:
+            database.commit()
+
+    click.echo(
+        f"Moved {_plural(report.bars_moved, 'bar')}, restored "
+        f"{_plural(report.bars_restored, 'deleted bar')}, moved "
+        f"{_plural(report.actions_moved, 'corporate action')} and "
+        f"{_plural(report.flags_moved, 'DQ flag')} to security {dest}"
+        + (
+            f"; {report.bars_duplicate} bar(s) and {report.actions_duplicate} "
+            "action(s) it already held were only removed from the source"
+            if report.bars_duplicate or report.actions_duplicate
+            else ""
+        )
+        + "."
+    )
+    click.echo(
+        f"Security {sid} factors: {before.get(sid, 'no factors')} -> {after_src}."
+    )
+    click.echo(f"Security {dest} factors: -> {after_dest}.")
+    if dry_run:
+        click.echo("Dry run: nothing changed.")
+        return
+    click.echo(
+        f"Split recorded as {_plural(len(report.override_ids), 'override')} by "
+        f"{created_by}. Undo: `fafnir security split-history --security-id {sid} "
+        f"--into-security-id {dest} --undo -m ...`."
+    )
+    _echo_wrapped(
+        "Run `fafnir dq recheck --check outlier --check gap --check sparse_coverage` "
+        "for the flags this settles, then `fafnir db refresh-marts`."
+    )
+
+
+def _echo_split_plan(plan) -> None:
+    """What a split would move, and the prices either side of each boundary."""
+    if plan.new_security:
+        n = plan.new_security
+        target = (
+            f"a new security {n['primary_symbol']} \"{n['company_name']}\" "
+            f"({n['asset_type']}, {n['exchange_code'] or 'no venue'}, delisted "
+            f"{n['delisted_date']}, source operator)"
+        )
+    else:
+        target = f"security {plan.destination_id} ({plan.destination_symbol})"
+    click.echo(
+        f"{plan.source_symbol} (security {plan.source_id}): "
+        f"{plan.first_date}..{plan.last_date} -> {target}"
+    )
+    click.echo(
+        f"Moves {_plural(len(plan.bars), 'bar')}, "
+        f"{_plural(len(plan.restorable), 'previously deleted bar')}, "
+        f"{_plural(len(plan.actions), 'corporate action')} and "
+        f"{_plural(plan.flags, 'DQ flag')}; the source keeps "
+        f"{_plural(plan.remaining_bars, 'bar')}."
+    )
+    if plan.duplicate_bar_dates or plan.duplicate_action_keys:
+        click.echo(
+            f"Already held identically by the destination: "
+            f"{_plural(len(plan.duplicate_bar_dates), 'bar')}, "
+            f"{_plural(len(plan.duplicate_action_keys), 'action')}."
+        )
+    moved = sorted(
+        [(b["trade_date"], b["close"]) for b in plan.bars]
+        + [
+            (dt.date.fromisoformat(str(r["trade_date"])[:10]), r.get("close"))
+            for r in plan.restorable
+        ]
+    )
+    if plan.bars_kept_before:
+        b = plan.bars_kept_before
+        click.echo(
+            f"  kept    {b['trade_date']}  close {_fmt_num(b['close'])}  (source)"
+        )
+    if moved:
+        click.echo(f"  moved   {moved[0][0]}  close {_fmt_num(moved[0][1])}")
+        click.echo(f"  moved   {moved[-1][0]}  close {_fmt_num(moved[-1][1])}")
+    if plan.bars_kept_after:
+        b = plan.bars_kept_after
+        click.echo(
+            f"  kept    {b['trade_date']}  close {_fmt_num(b['close'])}  (source)"
+        )
 
 
 @security.command("dismiss-rename")

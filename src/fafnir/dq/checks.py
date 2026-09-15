@@ -504,6 +504,7 @@ def check_duplicate_identity(db: Database) -> int:
         WITH groups AS (
             SELECT primary_symbol
               FROM core.security
+             WHERE source <> 'operator'
              GROUP BY primary_symbol
             HAVING count(*) > 1
         ),
@@ -520,6 +521,7 @@ def check_duplicate_identity(db: Database) -> int:
               FROM core.security s
               JOIN groups g USING (primary_symbol)
               LEFT JOIN withbars b ON b.security_id = s.security_id
+             WHERE s.source <> 'operator'
              GROUP BY s.primary_symbol
         ),
         written AS (

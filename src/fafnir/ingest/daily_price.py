@@ -517,6 +517,17 @@ def load_symbol_prices(
         logger.warning("Unknown symbol %s; skipping (load securities first)", symbol)
         _tally("unknown")
         return 0
+    if repo.is_operator_security(db, sec_id):
+        # Split off another security's history by an operator (`fafnir security
+        # split-history`). Its ticker belongs to a different issuer now, so whatever
+        # the vendor serves under it is not this security's.
+        logger.warning(
+            "%s resolves to operator-minted security %s; not loading prices into it",
+            symbol,
+            sec_id,
+        )
+        _tally("operator")
+        return 0
 
     # Read the security once per symbol, not once per bar: what shape of payload
     # counts as a valid bar, and which calendar says a date was a session, are

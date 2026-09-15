@@ -89,7 +89,14 @@ def stub_repo(monkeypatch):
         "deleted": [],  # every row delete_corporate_action removed
         "recomputed": [],  # every security whose factors were recomputed inline
         "suppressed": set(),  # (security_id, type, ex_date) an operator deleted
+        "operator": set(),  # security_ids minted by `security split-history`
     }
+
+    monkeypatch.setattr(
+        ca.repo,
+        "is_operator_security",
+        lambda db, security_id: security_id in state["operator"],
+    )
 
     monkeypatch.setattr(
         ca.repo,
