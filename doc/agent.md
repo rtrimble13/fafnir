@@ -179,7 +179,7 @@ absent, for exactly this reason.
 | | |
 |---|---|
 | **Reads, unattended** | every MCP tool; `scripts/monitor.sh`; `systemctl status`/`list-timers`; `journalctl -u fafnir-*`; `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir status`/`dq list`/`db status`; `duk -S db …` |
-| **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename`, `actions add`/`delete`/`redate`, `prices delete`, `override revoke` — each after showing its `--dry-run` |
+| **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename`/`split-history`, `actions add`/`delete`/`redate`, `prices delete`, `override revoke` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
 ### The nightly report

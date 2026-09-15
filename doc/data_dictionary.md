@@ -37,7 +37,7 @@ on enrichment.
 | `is_etf` / `is_fund` | BOOLEAN | |
 | `ipo_date` | DATE | |
 | `delisted_date` | DATE | NULL while listed; set (never deleted) on delist. |
-| `source` | TEXT | Origin feed (default `fmp`). |
+| `source` | TEXT | Origin feed (default `fmp`). `operator` for a security minted by `fafnir security split-history` to hold one issuer's history split off a reused ticker: delisted, carrying a closed `symbol_xref` period, and never fed by the vendor loaders (their universes filter `source <> 'operator'`, and a per-symbol pull that resolves to one is refused). |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. |
 
 Soft natural key: `UNIQUE (source, primary_symbol) WHERE delisted_date IS NULL`
@@ -415,7 +415,7 @@ date rather than the security's last ex-date (a security that has never paid any
 must still stop being re-pulled).
 
 ### `ops.operator_override` — operator corrections. **Grain:** `override_id`.
-Written by `fafnir actions add|delete|redate` and `fafnir prices delete`; undone by
+Written by `fafnir actions add|delete|redate`, `fafnir prices delete` and `fafnir security split-history`; undone by
 `fafnir override revoke` (migration 0025). Active means `revoked_at IS NULL`.
 
 | Column | Type | Notes |
@@ -426,7 +426,7 @@ Written by `fafnir actions add|delete|redate` and `fafnir prices delete`; undone
 | `action_type` | TEXT | `split` / `dividend` for a corporate action; NULL for a bar. |
 | `key_date` | DATE | `ex_date` for an action, `trade_date` for a bar. |
 | `operation` | TEXT CHECK | `delete`: the row was removed, and while active the loaders set aside a vendor row at this key. `add`: the operator wrote the row (`source = operator`). Bars are only ever deleted. |
-| `detail` | JSONB | `delete`: the row as it stood. `add`: the values written. A re-date pair names the other half (`redated_to_override` / `redated_from_override`). |
+| `detail` | JSONB | `delete`: the row as it stood. `add`: the values written. A re-date pair names the other half (`redated_to_override` / `redated_from_override`). A key moved by `security split-history` carries `split` = `{source_security_id, destination_security_id, kind}`, where `kind` is `moved`, `duplicate` (the destination already held it identically), or `restored` (an earlier `prices delete`, now also materialised on the destination); `--undo` reads exactly these. |
 | `note` / `created_by` / `created_at` | TEXT / TEXT / TIMESTAMPTZ | The evidence and the owner. `note` may not be blank. |
 | `revoked_at` / `revoked_by` / `revoked_note` | | Set by `override revoke`. Revoking a `delete` lifts the suppression only; revoking an `add` removes the operator's row. |
 

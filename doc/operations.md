@@ -472,6 +472,46 @@ fafnir override revoke 14 -m "FMP corrected it"               # undo one
   D --to D` to fetch the vendor's current version. A re-date is two overrides;
   revoke both.
 
+### Separating two issuers held on one security
+
+A reused ticker arrives from the vendor as one continuous history — Sotheby's to
+2019 and a SPAC listed in 2026, both under `BID` — and the price loader stores all
+of it on the security that holds the ticker today. The outlier check then flags the
+jump where one issuer ends and the next begins, and `sparse_coverage` flags the
+years in between. Deleting the old issuer's bars would lose the only copy of a
+delisted company's history. Move them instead:
+
+```bash
+fafnir security split-history --security-id 6598 --to 2019-10-02 \
+    --new-symbol BID --new-name "Sotheby's" -m "..." --dry-run        # read the plan
+fafnir security split-history --security-id 423773 --from 2020-11-13 --to 2021-06-10 \
+    --into-security-id 7027 --restore-deleted -m "..." --dry-run      # already held
+fafnir security split-history --security-id 6598 --into-security-id 900123 \
+    --undo -m "wrong boundary" --dry-run                              # take it back
+```
+
+- **What moves.** Bars and corporate actions dated `--from`..`--to` (from the first
+  bar by default), and every DQ flag about one of those dates. Security-level flags
+  (`sparse_coverage`) stay, for `dq recheck` to judge.
+- **Where to.** `--new-symbol`/`--new-name` mints a delisted security with
+  `source = operator` and a closed ticker period; the live ticker still resolves to
+  the source. `--into-security-id` moves into a security that already exists; a
+  session it already holds must have the same OHLC (it is then only removed from the
+  source) or the split is refused.
+- **Durable.** Each moved key stays suppressed on the source by a `delete` override,
+  so a load of the ticker's full history does not put it back. A minted destination
+  is never fed: every loader universe excludes `source = operator`, and an explicit
+  `ingest prices --symbols` that resolves to one loads nothing. Moved actions are
+  stored on the destination as operator rows.
+- **`--restore-deleted`** also moves bars in the range that `prices delete` had
+  already removed (their rows are in the overrides). Those deletes stay in force.
+- **Refused:** a range holding every bar the source has (that is `security merge`
+  or a rename), a range that has not finished, one already split off, and a blank
+  note.
+- **Undo** reverses exactly what the split recorded and deletes a minted destination
+  left empty. Then run `fafnir dq recheck --check outlier --check gap --check
+  sparse_coverage` and `fafnir db refresh-marts`, as after any split.
+
 ## Reconciliation
 
 `scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the
