@@ -52,6 +52,11 @@ read through the `duk` CLI.
     that followed: the outlier classification order, the plausibility gate, the
     survivorship check before deleting a segment, computed dry-run predictions
     (**applied**)
+  - [Economic series, and a removal path for every db](plans/economic-series-and-removal.md)
+    — tidy, bitemporal, source-agnostic economic series (U.S. Treasury par and TIPS
+    real curves first, then FRED/BLS/BEA/FMP), the `mart` seam and `duk es` /
+    `duk yc -S db` that read them, the `economic_*` DQ checks, and a uniform
+    `fafnir remove` covering price history as well as economic data
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
