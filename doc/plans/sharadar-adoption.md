@@ -152,7 +152,7 @@ v1.1.0 at S07 (survivorship backfill, after the screener-default decision and DQ
 
 | Key | Issue | Title | Owner | Size | State | PR |
 |---|---|---|---|---|---|---|
-| `SA-0101` | [#42](https://github.com/rtrimble13/fafnir/issues/42) | Stand up the documentation machinery: living plan, PR template, docs-gate CI | Claude Code | M | 🔄 |  |
+| `SA-0101` | [#42](https://github.com/rtrimble13/fafnir/issues/42) | Stand up the documentation machinery: living plan, PR template, docs-gate CI | Claude Code | M | ✅ | [#134](https://github.com/rtrimble13/fafnir/pull/134) |
 | `SA-0102` | [#43](https://github.com/rtrimble13/fafnir/issues/43) | Send the licence questions to FMP and Sharadar; confirm personal-licence eligibility | Operator | S | ⬜ |  |
 | `SA-0103` | [#44](https://github.com/rtrimble13/fafnir/issues/44) | ADR 0012 — multi-vendor provenance, fill-only writes and per-vendor separability | Claude Code | M | ⬜ |  |
 | `SA-0104` | [#45](https://github.com/rtrimble13/fafnir/issues/45) | Scope every FMP loader, guard and ticker check to FMP-fed securities | Claude Code | M | ⬜ |  |
