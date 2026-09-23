@@ -52,6 +52,17 @@ read through the `duk` CLI.
     that followed: the outlier classification order, the plausibility gate, the
     survivorship check before deleting a segment, computed dry-run predictions
     (**applied**)
+  - [Sharadar adoption (COA 2-M)](plans/sharadar-adoption.md) — the living plan:
+    17 weekly sprints (S01–S17) adopting Sharadar as system of record while
+    downgrading, not cancelling, FMP; status by sprint, parallel-run evidence and
+    the decision log; tracked in [#41](https://github.com/rtrimble13/fafnir/issues/41)
+    (**in progress**)
+  - [Sharadar COA assessment](plans/sharadar-coa-assessment.md) — the courses of
+    action considered and why COA 2-M was chosen (reference)
+  - [Market-data vendor assessment](plans/fafnir-vendor-assessment.md) — the vendor
+    comparison the adoption plan cites (reference)
+  - [Fundamentals build prompt (FMP era)](plans/fundamentals-build-prompt-fmp.md) —
+    the original fundamentals build prompt, retargeted to SF1 in SA-0801 (reference)
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)
