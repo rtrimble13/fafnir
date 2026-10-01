@@ -337,6 +337,15 @@ def test_merge_rename_moves_the_ticker_and_closes_the_flag(db, duplicated):
         db.fetchval("SELECT status FROM core.symbol_change WHERE old_symbol = 'GREE'")
         == repo.CHANGE_APPLIED
     )
+    # The survivor's name as the old ticker knew it, for the security-master load
+    # to recognise the vendor's lingering GREE entry by (renamed_away_securities).
+    assert (
+        db.fetchval(
+            "SELECT detail->>'old_company_name' FROM core.symbol_change "
+            "WHERE old_symbol = 'GREE'"
+        )
+        == "GREE Inc"
+    )
     open_flags = repo.list_dq_flags(
         db, repo.DqFilter(checks=("symbol_change_conflict",)), limit=10
     )

@@ -1072,6 +1072,149 @@ def test_a_genuinely_reused_ticker_still_mints_a_new_security(db):
     assert new_sid is not None and new_sid != old_sid
 
 
+def _sweep(db, old, new, feed_name, date="2024-06-10"):
+    """One nightly rename sweep over a single feed row."""
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    return load_symbol_changes(
+        db,
+        _RenameFMP(
+            [
+                {
+                    "date": date,
+                    "oldSymbol": old,
+                    "newSymbol": new,
+                    "companyName": feed_name,
+                }
+            ]
+        ),
+    )
+
+
+def test_a_rename_reports_the_name_it_replaced(db):
+    sid = _mk_security(db, "FB", name="Facebook, Inc.")
+
+    outcome = repo.apply_symbol_change(
+        db,
+        old_symbol="FB",
+        new_symbol="META",
+        change_date=CHANGE_DATE,
+        company_name="Meta Platforms, Inc.",
+    )
+
+    assert outcome.status == repo.CHANGE_APPLIED and outcome.security_id == sid
+    # Read before the rename overwrote it -- the security now carries the new name.
+    assert outcome.old_company_name == "Facebook, Inc."
+
+
+def test_renamed_away_ticker_still_on_the_screener_does_not_mint_a_copy(db):
+    """The production failure behind 31 duplicate rows in five weeks.
+
+    The rename moved the company to its new ticker, and the vendor went on listing
+    the old one under the old name. Neither listed_securities (no listed row holds
+    the old ticker) nor delisted_securities (nothing was delisted) knew the name,
+    so every such entry minted a copy of the company -- nineteen of them with a full
+    vendor copy of its price history.
+    """
+    _load_rows(db, [_row("FB", "Facebook, Inc.")])
+    sid = repo.resolve_security_id(db, "FB")
+    _give_history(db, sid)
+
+    assert _sweep(db, "FB", "META", "Meta Platforms, Inc.")["applied"] == 1
+    assert (
+        db.fetchval("SELECT detail->>'old_company_name' FROM core.symbol_change")
+        == "Facebook, Inc."
+    )
+
+    # The next night the screener carries the new ticker -- and still the old one.
+    result = _load_rows(
+        db, [_row("META", "Meta Platforms, Inc."), _row("FB", "Facebook, Inc.")]
+    )
+
+    assert result.new_symbols == []
+    assert result.skipped_retired == ["FB"]
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    # Both tickers still reach the one security that holds the history.
+    assert repo.resolve_security_id(db, "META") == sid
+    assert repo.resolve_security_id(db, "FB") == sid
+
+
+def test_an_echo_under_the_renamed_companys_current_name_is_declined(db):
+    """A rename applied before old_company_name was recorded still has a name to
+    match: the vendor sometimes leaves the old ticker under the company's NEW name
+    (MBAV in production, listed as "Velos Acquisition I Corp." after MBAV->VLOS)."""
+    sid = _mk_security(db, "MBAV", name="M3-Brigade Acquisition V Corp.")
+    repo.apply_symbol_change(
+        db,
+        old_symbol="MBAV",
+        new_symbol="VLOS",
+        change_date=CHANGE_DATE,
+        company_name="Velos Acquisition I Corp.",
+    )
+    # Recorded as the code before this change did: no old_company_name.
+    repo.record_symbol_change(
+        db,
+        old_symbol="MBAV",
+        new_symbol="VLOS",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_APPLIED,
+        security_id=sid,
+        company_name="Velos Acquisition I Corp.",
+        detail={"old_symbol": "MBAV", "new_symbol": "VLOS"},
+    )
+
+    result = _load_rows(db, [_row("MBAV", "Velos Acquisition I Corp.")])
+
+    assert result.new_symbols == []
+    assert result.skipped_retired == ["MBAV"]
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+
+
+def test_a_different_issuer_taking_a_renamed_away_ticker_still_lists(db):
+    """The guard is the same strict name test as for a delisting, so a new company
+    on the freed ticker is a listing -- refusing it would cost it every bar."""
+    _load_rows(db, [_row("FB", "Facebook, Inc.")])
+    old_sid = repo.resolve_security_id(db, "FB")
+    _sweep(db, "FB", "META", "Meta Platforms, Inc.")
+
+    result = _load_rows(db, [_row("FB", "Fortune Brands Innovations, Inc.")])
+
+    assert result.new_symbols == ["FB"]
+    assert result.skipped_retired == []
+    new_sid = repo.resolve_security_id(db, "FB")
+    assert new_sid is not None and new_sid != old_sid
+
+
+def test_renamed_away_securities_skips_a_ticker_the_security_holds_again(db):
+    """A rename the security has reversed leaves its ticker listed, not retired.
+
+    Corgi's ETFs swapped tickers back and forth on 2026-08-20/21; whichever
+    security holds the ticker now is listed, and the old rename row must not offer
+    its name as a retirement of that ticker.
+    """
+    sid = _mk_security(db, "XVO", name="Corgi U.S. Mid-Cap 2x Daily ETF")
+    repo.record_symbol_change(
+        db,
+        old_symbol="XVO",
+        new_symbol="USMX",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_APPLIED,
+        security_id=sid,
+        detail={"old_symbol": "XVO", "new_symbol": "USMX"},
+    )
+    assert "XVO" not in repo.renamed_away_securities(db)
+
+    other = _mk_security(db, "CYCN", name="Cyclerion Therapeutics, Inc.")
+    _sweep(db, "CYCN", "KRSA", "Korsana Biosciences, Inc. Common Stock")
+    renamed = repo.renamed_away_securities(db)["CYCN"]
+    # One entry per distinct name the echo may carry, all pointing at the survivor.
+    assert {r["company_name"] for r in renamed} == {
+        "Cyclerion Therapeutics, Inc.",
+        "Korsana Biosciences, Inc. Common Stock",
+    }
+    assert {(r["security_id"], r["renamed_to"]) for r in renamed} == {(other, "KRSA")}
+
+
 # ---------------------------------------------------------------------------
 # Sector and industry: populated by the universe load, never erased by it
 # ---------------------------------------------------------------------------

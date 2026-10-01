@@ -251,6 +251,22 @@ def test_retired_listing_checks_every_retirement_for_the_ticker():
     assert is_retired_listing("Apple Inc.", retired)["security_id"] == 2
 
 
+def test_retired_listing_matches_a_ticker_renamed_away():
+    # A rename retires a ticker without delisting anything: the row carries the
+    # security it moved to, not a delisted_date. CYCN in production -- renamed to
+    # KRSA on 2026-09-09, still on the screener as Cyclerion the next night.
+    renamed = {
+        "company_name": "Cyclerion Therapeutics, Inc.",
+        "security_id": 9442,
+        "renamed_to": "KRSA",
+        "change_date": date(2026, 9, 9),
+    }
+    match = is_retired_listing("Cyclerion Therapeutics Inc", [renamed])
+    assert match is not None and match["renamed_to"] == "KRSA"
+    # And it is the same strict test: a different issuer on the ticker is not one.
+    assert is_retired_listing("Cyclone Holdings Inc.", [renamed]) is None
+
+
 @pytest.mark.parametrize(
     "symbol", ["ZXZZT", "ZVZZT", "ZWZZT", "ZBZZT", "ZJZZT", "zxzzt"]
 )

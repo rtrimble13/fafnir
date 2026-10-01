@@ -581,7 +581,12 @@ SELECT security_id, primary_symbol, company_name, delisted_date, first_seen_at,
   Keep the row with bars, delete the shells, re-point the xref period. The
   loader-side cause is fixed by `is_retired_listing` in
   `fafnir/ingest/security_master.py`; a warehouse still accumulating these is
-  running code that predates it.
+  running code that predates it. A ticker a *rename* moved away from is covered
+  too, by `repo.renamed_away_securities`, which weighs the echo against the
+  renamed security's former name (`core.symbol_change.detail.old_company_name`),
+  its current name and the rename feed's name. A rename applied before that was
+  recorded has no former name on file, so an echo under the old name still
+  re-mints.
 
 - **Names differ → genuine ticker reuse.** A new issuer took a dead ticker, and
   two rows is *correct* (0009). Nothing to repair. Say so and leave it open, or
@@ -597,8 +602,11 @@ that decide whether the merge is right:
   identifiers; the re-minted row holds neither.
 - **Check every victim's company name against the rows you keep.**
   `is_retired_listing` matches echoes against **delisted rows by normalised name**,
-  so folding every echo into a live *renamed* security invites the next load to
-  re-mint it. Keep one retired row per ticker.
+  and against a *renamed* security's names only where the rename recorded them.
+  Before merging a re-mint into a live renamed security, check that the victim's
+  name equals (normalised) the rename's `detail.old_company_name`, its
+  `company_name`, or the survivor's current name. If none does, the next load
+  re-mints it -- keep one retired row per ticker instead.
 
 `security dedupe` cannot fold a ticker whose rows name two different companies,
 which rules it out for most real cases; reach for `merge` by id instead.

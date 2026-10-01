@@ -192,6 +192,55 @@ def test_applies_a_rename_and_records_it(patched):
     assert db.commits == 1
 
 
+def test_an_applied_rename_records_the_name_it_replaced(patched):
+    # CYCN in production: renamed to KRSA on 2026-09-09, and the screener went on
+    # listing CYCN as "Cyclerion Therapeutics, Inc.". The rename overwrites that
+    # name on the security, so the audit row is the only place left to keep it.
+    db = _FakeDB(
+        outcomes={
+            ("CYCN", "KRSA"): SymbolChangeOutcome(
+                CHANGE_APPLIED, 9442, old_company_name="Cyclerion Therapeutics, Inc."
+            )
+        }
+    )
+    fmp = _FakeFMP(
+        [
+            {
+                "date": "2026-09-09",
+                "oldSymbol": "CYCN",
+                "newSymbol": "KRSA",
+                "companyName": "Korsana Biosciences, Inc. Common Stock",
+            }
+        ]
+    )
+
+    load_symbol_changes(db, fmp)
+
+    detail = db.audit[0]["detail"]
+    assert detail["old_company_name"] == "Cyclerion Therapeutics, Inc."
+    assert (detail["old_symbol"], detail["new_symbol"]) == ("CYCN", "KRSA")
+
+
+def test_a_rename_with_no_name_to_replace_records_none(patched):
+    # An outcome with no prior name (the rename was already in place) must not
+    # write an empty key the security-master load would then compare against.
+    db = _FakeDB(outcomes={("FB", "META"): SymbolChangeOutcome(CHANGE_APPLIED, 7)})
+    fmp = _FakeFMP(
+        [
+            {
+                "date": "2026-06-09",
+                "oldSymbol": "FB",
+                "newSymbol": "META",
+                "companyName": "Meta",
+            }
+        ]
+    )
+
+    load_symbol_changes(db, fmp)
+
+    assert "old_company_name" not in db.audit[0]["detail"]
+
+
 def test_untracked_renames_are_counted_but_not_recorded(patched):
     # The feed is global. Recording every rename fafnir does not track would build
     # an audit table of other people's tickers.

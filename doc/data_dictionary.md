@@ -87,7 +87,7 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
 | `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. |
 | `company_name` | TEXT | As reported with the rename. |
 | `status` | TEXT CHECK | `applied` / `conflict` / `ignored` / `dismissed` — see below. |
-| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. |
+| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. An applied rename records `old_company_name`, the security's name before the rename overwrote it: the security-master load declines a screener entry for the old ticker under that name (or the security's current name, or `company_name` above) as an echo instead of minting a copy of the company. |
 | `source` | TEXT | |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | |
 

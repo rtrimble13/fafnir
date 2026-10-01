@@ -12,7 +12,9 @@ identifiers, at one request per symbol.
 The vendor keeps listing names for months after they stop trading, and the upsert
 cannot see a delisted row (its arbiter is the partial index over
 ``delisted_date IS NULL``). :func:`is_retired_listing` is what stops those entries
-being minted as new securities night after night.
+being minted as new securities night after night. The same holds for a ticker a
+rename moved a security away from: the vendor keeps listing the old ticker too,
+and it is weighed against the renamed security's names the same way.
 
 Delisted/inactive securities are never deleted; a reconciliation step
 (``fafnir ingest delisted``) flips ``is_actively_trading``/``delisted_date``.
@@ -182,7 +184,12 @@ def check_company_name_drift(
 def is_retired_listing(
     incoming_name: Optional[str], retired: list[dict]
 ) -> Optional[dict]:
-    """The delisted row this vendor entry is a stale echo of, or None.
+    """The retired row this vendor entry is a stale echo of, or None.
+
+    ``retired`` holds the delisted rows for the entry's ticker and, for a ticker a
+    rename moved a security away from, one row per name of that renamed security
+    (:func:`repo.renamed_away_securities`). Both are names the warehouse has
+    already retired from the ticker.
 
     FMP keeps serving a name on the screener for months after it stops trading,
     and :func:`repo.upsert_security` cannot see that it is already held: its
@@ -261,10 +268,11 @@ class SecurityLoadResult(NamedTuple):
     tonight" is the difference between a load you can ignore and one you can audit.
 
     ``skipped_retired`` is the same argument for the entries this load declined:
-    names the vendor still lists that this warehouse has already retired. A steady
-    handful is normal -- the vendor lags a delisting by weeks. A number that climbs
-    every night means the delisting sweep and the screener disagree about the
-    universe, which is worth seeing rather than inferring from a row count.
+    names the vendor still lists that this warehouse has already retired, by a
+    delisting or by a rename. A steady handful is normal -- the vendor lags both by
+    weeks. A number that climbs every night means the delisting sweep and the
+    screener disagree about the universe, which is worth seeing rather than
+    inferring from a row count.
 
     ``skipped_test_issues`` are the exchanges' own test securities, which are not
     listings at all (:func:`is_exchange_test_issue`).
@@ -442,6 +450,14 @@ def load_securities(
         # refresh?"; only this answers "is this arrival real?" -- see
         # :func:`is_retired_listing` for why the upsert cannot answer it itself.
         retired = repo.delisted_securities(db)
+        # A ticker is retired by a rename as surely as by a delisting: the security
+        # moved to its new ticker and stays listed, so the old one is in neither
+        # map above, and the vendor's lingering entry for it would otherwise be
+        # minted as a copy of the renamed company (see
+        # :func:`repo.renamed_away_securities`). Same strict name test, so a
+        # different issuer taking the freed ticker still lists.
+        for symbol, renames in repo.renamed_away_securities(db).items():
+            retired.setdefault(symbol, []).extend(renames)
         new_symbols: list[str] = []
         skipped_retired: list[str] = []
         skipped_test_issues: list[str] = []

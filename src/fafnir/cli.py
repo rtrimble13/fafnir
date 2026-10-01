@@ -990,6 +990,14 @@ def security_merge_rename(
                 f"{exc} -- the rows changed since the comparison above. Re-run to "
                 "see the current one."
             ) from exc
+        # The name the vendor will keep serving the old ticker under, kept on the
+        # audit row as apply_symbol_change does: the next security-master load
+        # overwrites it on the survivor, and repo.renamed_away_securities needs it
+        # to decline that echo instead of minting a copy of the company.
+        old_company_name = database.fetchval(
+            "SELECT company_name FROM core.security WHERE security_id = %s",
+            (survivor_id,),
+        )
         # Only now does the ticker move: the merge is about identity, the retarget
         # is about the rename, and they carry different dates.
         repo.retarget_symbol(
@@ -999,6 +1007,14 @@ def security_merge_rename(
             new_symbol=new_symbol,
             change_date=effective,
         )
+        detail = {
+            "old_symbol": old_symbol,
+            "new_symbol": new_symbol,
+            "merged_security_id": victim_id,
+            "merged_by": resolved_by,
+        }
+        if old_company_name:
+            detail["old_company_name"] = old_company_name
         repo.record_symbol_change(
             database,
             old_symbol=old_symbol,
@@ -1006,12 +1022,7 @@ def security_merge_rename(
             change_date=effective,
             status=repo.CHANGE_APPLIED,
             security_id=survivor_id,
-            detail={
-                "old_symbol": old_symbol,
-                "new_symbol": new_symbol,
-                "merged_security_id": victim_id,
-                "merged_by": resolved_by,
-            },
+            detail=detail,
         )
         # The survivor's corporate actions just changed, so its factors are stale by
         # construction. Recomputing here rather than telling the operator to is the
