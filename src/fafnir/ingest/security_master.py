@@ -188,8 +188,9 @@ def is_retired_listing(
 
     ``retired`` holds the delisted rows for the entry's ticker and, for a ticker a
     rename moved a security away from, one row per name of that renamed security
-    (:func:`repo.renamed_away_securities`). Both are names the warehouse has
-    already retired from the ticker.
+    (:func:`repo.renamed_away_securities`), including any name a merge of an
+    earlier re-mint recorded. Both are names the warehouse has already retired
+    from the ticker.
 
     FMP keeps serving a name on the screener for months after it stops trading,
     and :func:`repo.upsert_security` cannot see that it is already held: its
@@ -460,6 +461,7 @@ def load_securities(
             retired.setdefault(symbol, []).extend(renames)
         new_symbols: list[str] = []
         skipped_retired: list[str] = []
+        skipped_labels: list[str] = []
         skipped_test_issues: list[str] = []
         # Memoised for the run. get_or_create_* is two round-trips (an
         # ON CONFLICT DO NOTHING insert, then a select), and the screener carries
@@ -495,10 +497,20 @@ def load_securities(
             # already retired, still being served by the vendor, is not a listing.
             # Inserting it mints a duplicate identity that captures the ticker's
             # xref period and hides the row holding the price history.
-            if previous is None and is_retired_listing(
-                company_name, retired.get(symbol, [])
-            ):
+            echo = (
+                is_retired_listing(company_name, retired.get(symbol, []))
+                if previous is None
+                else None
+            )
+            if echo is not None:
                 skipped_retired.append(symbol)
+                # Labelled for the log, so a night's rename echoes can be told
+                # from its delisting echoes without a query.
+                skipped_labels.append(
+                    f"{symbol} (renamed {echo['renamed_to']})"
+                    if "renamed_to" in echo
+                    else symbol
+                )
                 continue
             # The us-equity-etf filter lives in _us_entries now -- it needs the
             # screener's fields, which the bulk lists do not carry.
@@ -583,7 +595,7 @@ def load_securities(
                     else f"{len(skipped_retired)} vendor entries were"
                 ),
                 "an already-retired listing" if one else "already-retired listings",
-                ", ".join(skipped_retired[:20]),
+                ", ".join(skipped_labels[:20]),
                 "..." if len(skipped_retired) > 20 else "",
             )
         if len(new_symbols) >= LARGE_NEW_LISTING_BATCH:

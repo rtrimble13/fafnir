@@ -858,6 +858,13 @@ def _echo_merge_plan(plan) -> None:
         f"({plan.colliding_actions} already held), and delete security "
         f"{plan.victim_id}."
     )
+    if plan.echo_of and plan.victim_name:
+        renames = ", ".join(f"{old} -> {new}" for old, new in plan.echo_of)
+        click.echo(
+            f"Would record {plan.victim_name!r} on the rename {renames}, so the "
+            f"security-master load stops minting the vendor's lingering "
+            f"{plan.victim_symbol} entry."
+        )
     if plan.volume_only_disagreements:
         # Reported, never blocking: a restated volume across a rename is common and
         # costs no price accuracy. Silence here would be worse than a line of noise.
@@ -1285,6 +1292,10 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
     when it matters, on the pair where the newer row has been fed by the daily load
     and the older one holds the history.
 
+    When the victim holds a ticker the survivor was renamed away from, the merge
+    also records the victim's name on that rename, so the next security-master load
+    declines the vendor's lingering entry instead of minting it again.
+
     Refuses on a populated identity mismatch (CUSIP/ISIN/CIK) or disagreeing OHLC.
     Run --dry-run first: the preview is the same comparison the guard reads.
     """
@@ -1418,6 +1429,12 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         f"{report.flags_moved} flags ({report.flags_dropped} duplicated)."
     )
     click.echo(f"Security {victim_id} is gone. Adjustment factors recomputed.")
+    if report.plan.echo_of and report.plan.victim_name:
+        click.echo(
+            f"Recorded {report.plan.victim_name!r} as a name the vendor still lists "
+            f"{report.plan.victim_symbol} under; the next security-master load "
+            "declines it."
+        )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")

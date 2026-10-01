@@ -1185,6 +1185,35 @@ def test_a_different_issuer_taking_a_renamed_away_ticker_still_lists(db):
     assert new_sid is not None and new_sid != old_sid
 
 
+def test_a_merged_echo_under_a_variant_name_is_declined_by_the_next_load(db, caplog):
+    """A vendor spelling no stored name matches mints once, and only once.
+
+    MAPP in production came back as "Mattr Corp. (MAPP)", which matches the former,
+    current and feed names under no normalisation. The operator's merge of that row
+    records the spelling on the rename, and the same entry is declined the next
+    night instead of being minted again.
+    """
+    _load_rows(db, [_row("FB", "Facebook, Inc.")])
+    sid = repo.resolve_security_id(db, "FB")
+    _give_history(db, sid)
+    _sweep(db, "FB", "META", "Meta Platforms, Inc.")
+    tonight = [_row("META", "Meta Platforms, Inc."), _row("FB", "Facebook Inc (FB)")]
+
+    assert _load_rows(db, tonight).new_symbols == ["FB"]
+    echo = repo.active_security_for_symbol(db, "FB")
+    assert echo is not None and echo != sid
+    repo.merge_security(db, victim_id=echo, survivor_id=sid)
+
+    with caplog.at_level("INFO", logger=security_master.logger.name):
+        result = _load_rows(db, tonight)
+
+    assert result.new_symbols == []
+    assert result.skipped_retired == ["FB"]
+    assert db.fetchval("SELECT count(*) FROM core.security") == 1
+    # The log line says which retirement it was, not just the ticker.
+    assert "FB (renamed META)" in caplog.text
+
+
 def test_renamed_away_securities_skips_a_ticker_the_security_holds_again(db):
     """A rename the security has reversed leaves its ticker listed, not retired.
 

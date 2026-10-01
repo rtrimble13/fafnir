@@ -585,8 +585,10 @@ SELECT security_id, primary_symbol, company_name, delisted_date, first_seen_at,
   too, by `repo.renamed_away_securities`, which weighs the echo against the
   renamed security's former name (`core.symbol_change.detail.old_company_name`),
   its current name and the rename feed's name. A rename applied before that was
-  recorded has no former name on file, so an echo under the old name still
-  re-mints.
+  recorded has no former name on file, and a vendor spelling variant ("Mattr
+  Corp. (MAPP)") matches none of them, so those echoes still re-mint -- until a
+  `security merge` folds one back in, which records its name on the rename
+  (`detail.echo_names`) and stops the next one.
 
 - **Names differ → genuine ticker reuse.** A new issuer took a dead ticker, and
   two rows is *correct* (0009). Nothing to repair. Say so and leave it open, or
@@ -600,13 +602,14 @@ that decide whether the merge is right:
 
 - **Keep the oldest row.** It holds the ticker history back to 1900 and the
   identifiers; the re-minted row holds neither.
-- **Check every victim's company name against the rows you keep.**
-  `is_retired_listing` matches echoes against **delisted rows by normalised name**,
-  and against a *renamed* security's names only where the rename recorded them.
-  Before merging a re-mint into a live renamed security, check that the victim's
-  name equals (normalised) the rename's `detail.old_company_name`, its
-  `company_name`, or the survivor's current name. If none does, the next load
-  re-mints it -- keep one retired row per ticker instead.
+- **Read the `Would record ...` line before merging into a live renamed
+  security.** When the victim holds a ticker the survivor was renamed away from,
+  the dry run says the merge will record the victim's name on that rename, and the
+  next load then declines the vendor's entry. No such line, and the tickers
+  differ, means no applied rename links them: `is_retired_listing` would only see
+  **delisted rows by normalised name** for the victim's ticker, so unless one
+  remains under the victim's name, the next load re-mints it. Keep one retired row
+  per ticker in that case.
 
 `security dedupe` cannot fold a ticker whose rows name two different companies,
 which rules it out for most real cases; reach for `merge` by id instead.

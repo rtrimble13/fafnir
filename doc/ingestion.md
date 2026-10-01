@@ -391,6 +391,18 @@ dismissed and ignored rows are left exactly as they are. The count is reported a
 A rename for a ticker fafnir does not track is counted and dropped, not recorded:
 the feed is global across every venue, and the audit table is not a copy of it.
 
+The vendor keeps listing the *old* ticker on the screener for weeks after a rename,
+and nothing in `core.security` holds it any more: the security moved, and nothing
+was delisted. So an applied rename also retires its old ticker for the
+security-master load. `repo.renamed_away_securities` offers every name the echo is
+known to carry: the security's name before the rename (`detail.old_company_name`,
+recorded by the sweep and by `merge-rename`), any name a `security merge` recorded
+from a re-minted echo (`detail.echo_names`), the security's current name and the
+feed's. `is_retired_listing` weighs the screener entry against them with the same
+strict normalised-name test it uses for delisted rows. A matching entry is skipped
+and logged as `<OLD> (renamed <NEW>)`. A different issuer taking the freed ticker
+still lists.
+
 If the security master ran before the rename was known and minted the new ticker as
 its own row, the sweep folds that duplicate back in — but only when it is still
 empty (no bars, no actions, no factors). That fold is the one place fafnir deletes
