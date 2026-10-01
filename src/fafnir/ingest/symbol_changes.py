@@ -220,6 +220,11 @@ def load_symbol_changes(
                 continue
 
             detail = {"old_symbol": old, "new_symbol": new}
+            if outcome.old_company_name:
+                # The name the vendor will keep serving the old ticker under. Kept
+                # here because the rename has just overwritten it on the security,
+                # and the security-master load needs it to decline that echo.
+                detail["old_company_name"] = outcome.old_company_name
             if outcome.folded_security_id is not None:
                 counts["folded"] += 1
                 detail["folded_security_id"] = outcome.folded_security_id

@@ -407,11 +407,17 @@ class SymbolChangeOutcome(NamedTuple):
     ``folded_security_id`` is set when a duplicate security minted under the new
     ticker (by a security-master load that ran before the rename was known) was
     absorbed into the surviving one.
+
+    ``old_company_name`` is the security's name as it stood before this rename
+    overwrote it. It is the only record of the name the vendor keeps serving the
+    *old* ticker under, which is what lets a later security-master load recognise
+    that entry as an echo rather than a listing (:func:`renamed_away_securities`).
     """
 
     status: str
     security_id: Optional[int]
     folded_security_id: Optional[int] = None
+    old_company_name: Optional[str] = None
 
 
 def active_security_for_symbol(
@@ -792,6 +798,11 @@ class MergePlan(NamedTuple):
     victim_actions: int
     colliding_actions: int
     victim_flags: int
+    victim_name: Optional[str] = None
+    # The applied renames, as (old, new), that moved the survivor off the ticker the
+    # victim holds: the victim is the vendor's lingering entry for that old ticker,
+    # re-minted. The merge records its name on each (:func:`record_rename_echo`).
+    echo_of: tuple[tuple[str, str], ...] = ()
 
     @property
     def blockers(self) -> list[str]:
@@ -825,7 +836,7 @@ def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> Mer
         int(r["security_id"]): r
         for r in db.fetchall(
             """
-            SELECT security_id, primary_symbol, cusip, isin, cik
+            SELECT security_id, primary_symbol, company_name, cusip, isin, cik
               FROM core.security WHERE security_id = ANY(%s)
             """,
             ([survivor_id, victim_id],),
@@ -835,6 +846,22 @@ def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> Mer
         if sid not in rows:
             raise ValueError(f"no such security: {sid}")
     survivor, victim = rows[survivor_id], rows[victim_id]
+
+    # A victim on a ticker the survivor was renamed away from is a rename echo that
+    # got minted. Found here rather than in the merge so --dry-run shows it.
+    echo_of: tuple[tuple[str, str], ...] = ()
+    if victim["primary_symbol"] != survivor["primary_symbol"]:
+        echo_of = tuple(
+            (r["old_symbol"], r["new_symbol"])
+            for r in db.fetchall(
+                """
+                SELECT old_symbol, new_symbol FROM core.symbol_change
+                 WHERE security_id = %s AND old_symbol = %s AND status = %s
+                 ORDER BY change_date, symbol_change_id
+                """,
+                (survivor_id, victim["primary_symbol"], CHANGE_APPLIED),
+            )
+        )
 
     # A NULL on either side is missing data, not evidence of difference: FMP leaves
     # cik empty on most ETFs, and refusing on that would block the very merges this
@@ -917,6 +944,8 @@ def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> Mer
         victim_actions=int(counts["victim_actions"]),
         colliding_actions=int(counts["colliding_actions"]),
         victim_flags=int(counts["victim_flags"]),
+        victim_name=victim["company_name"],
+        echo_of=echo_of,
     )
 
 
@@ -1092,6 +1121,16 @@ def merge_security(
     # Attributes only; the next security-master load rewrites the survivor's.
     db.execute("DELETE FROM core.company_profile WHERE security_id = %s", (victim_id,))
     db.execute("DELETE FROM core.security WHERE security_id = %s", (victim_id,))
+    # Deleting a re-minted rename echo also deletes the only record of the name the
+    # vendor served it under, and the vendor keeps serving it: without this, the next
+    # security-master load mints the same row again.
+    if plan.echo_of and plan.victim_name:
+        record_rename_echo(
+            db,
+            security_id=survivor_id,
+            old_symbol=plan.victim_symbol,
+            company_name=plan.victim_name,
+        )
 
     return MergeReport(
         plan=plan,
@@ -1210,6 +1249,13 @@ def apply_symbol_change(
             return SymbolChangeOutcome(CHANGE_CONFLICT, security_id)
         folded = holder
 
+    # Read before retarget_symbol overwrites it: the vendor goes on serving the old
+    # ticker under this name for weeks, and once the rename lands nothing else in
+    # the warehouse remembers it.
+    old_company_name = db.fetchval(
+        "SELECT company_name FROM core.security WHERE security_id = %s",
+        (security_id,),
+    )
     retarget_symbol(
         db,
         security_id=security_id,
@@ -1219,7 +1265,7 @@ def apply_symbol_change(
         company_name=company_name,
         source=source,
     )
-    return SymbolChangeOutcome(CHANGE_APPLIED, security_id, folded)
+    return SymbolChangeOutcome(CHANGE_APPLIED, security_id, folded, old_company_name)
 
 
 def symbol_change_status(
@@ -1451,6 +1497,96 @@ def delisted_securities(db: Database, source: str = "fmp") -> dict[str, list[dic
             }
         )
     return out
+
+
+def renamed_away_securities(db: Database, source: str = "fmp") -> dict[str, list[dict]]:
+    """Every applied rename, grouped by the ticker the security was renamed AWAY from.
+
+    The other way a ticker stops naming a listed security. A rename closes the old
+    ticker's xref period on a security that stays listed under the new one, so the
+    old ticker is in neither :func:`listed_securities` (no listed row carries it)
+    nor :func:`delisted_securities` (the row that carried it is not delisted). The
+    vendor nonetheless keeps serving the old ticker on the screener for weeks, and
+    without this every such entry mints a second security_id -- a copy of the
+    renamed company that the price step then backfills in full. In production,
+    thirty-one were minted this way between 2026-08-29 and 2026-10-01, and nineteen
+    of them took a vendor copy of the renamed company's price history.
+
+    Shaped like :func:`delisted_securities` so the security-master load can weigh
+    an incoming name against both with the same strict test. Each rename
+    contributes one entry per name the echo may carry: the name the security had
+    before the rename (recorded in ``detail.old_company_name`` by
+    :func:`apply_symbol_change`; absent on renames applied before it was), any
+    name an operator's merge of a re-minted echo recorded in ``detail.echo_names``
+    (:func:`record_rename_echo`), its name now, and the name the rename feed
+    reported. The vendor is inconsistent about which of these it leaves on the
+    stale entry, and every one of them names the same company, so matching any is
+    an echo.
+
+    A rename the security has since reversed (it holds the old ticker again) is
+    left out: that ticker is listed, and the caller never asks about it.
+    """
+    out: dict[str, list[dict]] = {}
+    for row in db.fetchall(
+        """
+        SELECT c.old_symbol, c.new_symbol, c.change_date, s.security_id,
+               s.company_name, c.company_name AS feed_name,
+               c.detail->>'old_company_name' AS old_company_name,
+               c.detail->'echo_names' AS echo_names
+          FROM core.symbol_change c
+          JOIN core.security s ON s.security_id = c.security_id
+         WHERE c.status = 'applied' AND c.source = %s
+           AND s.primary_symbol <> c.old_symbol
+         ORDER BY c.change_date, c.symbol_change_id
+        """,
+        (source,),
+    ):
+        echoes = row["echo_names"] if isinstance(row["echo_names"], list) else []
+        names = (
+            row["old_company_name"],
+            *echoes,
+            row["company_name"],
+            row["feed_name"],
+        )
+        for name in dict.fromkeys(n for n in names if n):
+            out.setdefault(row["old_symbol"], []).append(
+                {
+                    "security_id": row["security_id"],
+                    "company_name": name,
+                    "renamed_to": row["new_symbol"],
+                    "change_date": row["change_date"],
+                }
+            )
+    return out
+
+
+def record_rename_echo(
+    db: Database, *, security_id: int, old_symbol: str, company_name: str
+) -> int:
+    """Remember a name the vendor served a renamed-away ticker under. Returns rows.
+
+    Appends ``company_name`` to ``detail.echo_names`` on every applied rename that
+    moved ``security_id`` off ``old_symbol``, unless it is already there. Called by
+    :func:`merge_security` when the row it deletes is a re-minted echo, because
+    that row's name is exactly the vendor string the load failed to match: a
+    spelling variant ("Mattr Corp. (MAPP)"), or the pre-rename name of a rename
+    applied before ``old_company_name`` was recorded. Once it is on the rename,
+    :func:`renamed_away_securities` offers it and the next load declines the entry
+    instead of minting it again.
+    """
+    return db.execute(
+        """
+        UPDATE core.symbol_change
+           SET detail = jsonb_set(
+                   COALESCE(detail, '{}'::jsonb), '{echo_names}',
+                   COALESCE(detail->'echo_names', '[]'::jsonb)
+                       || jsonb_build_array(%s::text)),
+               updated_at = now()
+         WHERE security_id = %s AND old_symbol = %s AND status = %s
+           AND NOT COALESCE(detail->'echo_names', '[]'::jsonb) ? %s
+        """,
+        (company_name, security_id, old_symbol, CHANGE_APPLIED, company_name),
+    )
 
 
 def security_asset_type(db: Database, security_id: int) -> Optional[str]:

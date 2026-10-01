@@ -337,6 +337,23 @@ def test_merge_rename_moves_the_ticker_and_closes_the_flag(db, duplicated):
         db.fetchval("SELECT status FROM core.symbol_change WHERE old_symbol = 'GREE'")
         == repo.CHANGE_APPLIED
     )
+    # The survivor's name as the old ticker knew it, for the security-master load
+    # to recognise the vendor's lingering GREE entry by (renamed_away_securities).
+    assert (
+        db.fetchval(
+            "SELECT detail->>'old_company_name' FROM core.symbol_change "
+            "WHERE old_symbol = 'GREE'"
+        )
+        == "GREE Inc"
+    )
+    # The victim held the NEW ticker, so it was no echo of the old one.
+    assert (
+        db.fetchval(
+            "SELECT detail->'echo_names' FROM core.symbol_change "
+            "WHERE old_symbol = 'GREE'"
+        )
+        is None
+    )
     open_flags = repo.list_dq_flags(
         db, repo.DqFilter(checks=("symbol_change_conflict",)), limit=10
     )
@@ -827,6 +844,82 @@ def test_merge_folds_a_duplicate_that_spans_two_tickers(db):
     assert _sec_ids(db, "OLDT") == set()
     assert _sec_ids(db, "NEWT") == {survivor}
     assert len(_bar_dates(db, survivor)) == 6
+
+
+def _applied_rename(db, old, new, sid):
+    repo.record_symbol_change(
+        db,
+        old_symbol=old,
+        new_symbol=new,
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_APPLIED,
+        security_id=sid,
+        detail={"old_symbol": old, "new_symbol": new},
+    )
+
+
+def _echo_names(db, old):
+    return db.fetchval(
+        "SELECT detail->'echo_names' FROM core.symbol_change WHERE old_symbol = %s",
+        (old,),
+    )
+
+
+def test_merging_a_rename_echo_records_its_name_on_the_rename(db):
+    """MAPP in production: renamed to MATR, re-minted on MAPP as "Mattr Corp. (MAPP)".
+
+    No name the rename knew matches that spelling, so merging the re-mint away left
+    nothing to stop the next load minting it again. The victim's own name is the
+    string the vendor is serving, so the merge keeps it on the rename.
+    """
+    survivor = _mk_security(db, "MATR", name="Mattr Corp.")
+    _bars(db, survivor, 6)
+    _applied_rename(db, "MAPP", "MATR", survivor)
+    victim = _mint_duplicate(db, "MAPP", name="Mattr Corp. (MAPP)")
+    _bars(db, victim, 4)
+
+    preview = _run(db, cli.security_merge, [str(victim), str(survivor), "--dry-run"])
+
+    assert preview.exit_code == 0, _text(preview)
+    assert "Would record 'Mattr Corp. (MAPP)' on the rename MAPP -> MATR" in _text(
+        preview
+    )
+    assert _echo_names(db, "MAPP") is None
+
+    result = _run(db, cli.security_merge, [str(victim), str(survivor), "--yes"])
+
+    assert result.exit_code == 0, _text(result)
+    assert "Recorded 'Mattr Corp. (MAPP)'" in _text(result)
+    assert _echo_names(db, "MAPP") == ["Mattr Corp. (MAPP)"]
+    offered = {r["company_name"] for r in repo.renamed_away_securities(db)["MAPP"]}
+    assert "Mattr Corp. (MAPP)" in offered
+
+    # Another copy minted before the load learned the name is merged the same way,
+    # and the name is not recorded twice.
+    again = _mint_duplicate(db, "MAPP", name="Mattr Corp. (MAPP)")
+    repo.merge_security(db, victim_id=again, survivor_id=survivor)
+    assert _echo_names(db, "MAPP") == ["Mattr Corp. (MAPP)"]
+
+
+def test_a_merge_across_tickers_no_rename_links_records_nothing(db):
+    """One instrument under two tickers with no rename between them (FFR/DTRE).
+
+    The survivor's rename away from some other ticker is not this victim's, and
+    recording the victim's name there would retire the wrong ticker.
+    """
+    survivor = _mk_security(db, "DTRE")
+    _bars(db, survivor, 5)
+    _applied_rename(db, "OLDD", "DTRE", survivor)
+    victim = _mint_duplicate(db, "FFR")
+    _bars(db, victim, 5)
+
+    assert (
+        repo.compare_securities(db, survivor_id=survivor, victim_id=victim).echo_of
+        == ()
+    )
+    repo.merge_security(db, victim_id=victim, survivor_id=survivor)
+
+    assert _echo_names(db, "OLDD") is None
 
 
 def test_merge_refuses_a_row_against_itself(db):

@@ -858,6 +858,13 @@ def _echo_merge_plan(plan) -> None:
         f"({plan.colliding_actions} already held), and delete security "
         f"{plan.victim_id}."
     )
+    if plan.echo_of and plan.victim_name:
+        renames = ", ".join(f"{old} -> {new}" for old, new in plan.echo_of)
+        click.echo(
+            f"Would record {plan.victim_name!r} on the rename {renames}, so the "
+            f"security-master load stops minting the vendor's lingering "
+            f"{plan.victim_symbol} entry."
+        )
     if plan.volume_only_disagreements:
         # Reported, never blocking: a restated volume across a rename is common and
         # costs no price accuracy. Silence here would be worse than a line of noise.
@@ -990,6 +997,14 @@ def security_merge_rename(
                 f"{exc} -- the rows changed since the comparison above. Re-run to "
                 "see the current one."
             ) from exc
+        # The name the vendor will keep serving the old ticker under, kept on the
+        # audit row as apply_symbol_change does: the next security-master load
+        # overwrites it on the survivor, and repo.renamed_away_securities needs it
+        # to decline that echo instead of minting a copy of the company.
+        old_company_name = database.fetchval(
+            "SELECT company_name FROM core.security WHERE security_id = %s",
+            (survivor_id,),
+        )
         # Only now does the ticker move: the merge is about identity, the retarget
         # is about the rename, and they carry different dates.
         repo.retarget_symbol(
@@ -999,6 +1014,14 @@ def security_merge_rename(
             new_symbol=new_symbol,
             change_date=effective,
         )
+        detail = {
+            "old_symbol": old_symbol,
+            "new_symbol": new_symbol,
+            "merged_security_id": victim_id,
+            "merged_by": resolved_by,
+        }
+        if old_company_name:
+            detail["old_company_name"] = old_company_name
         repo.record_symbol_change(
             database,
             old_symbol=old_symbol,
@@ -1006,12 +1029,7 @@ def security_merge_rename(
             change_date=effective,
             status=repo.CHANGE_APPLIED,
             security_id=survivor_id,
-            detail={
-                "old_symbol": old_symbol,
-                "new_symbol": new_symbol,
-                "merged_security_id": victim_id,
-                "merged_by": resolved_by,
-            },
+            detail=detail,
         )
         # The survivor's corporate actions just changed, so its factors are stale by
         # construction. Recomputing here rather than telling the operator to is the
@@ -1274,6 +1292,10 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
     when it matters, on the pair where the newer row has been fed by the daily load
     and the older one holds the history.
 
+    When the victim holds a ticker the survivor was renamed away from, the merge
+    also records the victim's name on that rename, so the next security-master load
+    declines the vendor's lingering entry instead of minting it again.
+
     Refuses on a populated identity mismatch (CUSIP/ISIN/CIK) or disagreeing OHLC.
     Run --dry-run first: the preview is the same comparison the guard reads.
     """
@@ -1407,6 +1429,12 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         f"{report.flags_moved} flags ({report.flags_dropped} duplicated)."
     )
     click.echo(f"Security {victim_id} is gone. Adjustment factors recomputed.")
+    if report.plan.echo_of and report.plan.victim_name:
+        click.echo(
+            f"Recorded {report.plan.victim_name!r} as a name the vendor still lists "
+            f"{report.plan.victim_symbol} under; the next security-master load "
+            "declines it."
+        )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
