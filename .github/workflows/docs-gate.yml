@@ -1,0 +1,39 @@
+name: docs-gate
+
+# Documentation moves with the code, in the same PR, or it does not move at all:
+# a follow-up "update the docs" PR is the one nobody opens. This job is the
+# enforcement (SA-0101).
+#
+#   1. A PR that changes src/, sql/, scripts/ or etc/ must also touch doc/,
+#      README.md, .claude/skills/, etc/fafnirrc or etc/crontab.example -- unless
+#      it carries the `no-docs-needed` label. The label types below re-run the
+#      check when the label is added or removed, so no empty push is needed.
+#   2. Every relative link and #anchor in the docs resolves.
+#
+# Both scripts are stdlib-only and read the event themselves, so nothing from the
+# PR (title, labels, branch name) is interpolated into a shell command here.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The diff is base...head, which needs the merge base: full history.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Behavioural changes bring their docs
+        run: python3 scripts/check_docs_touched.py
+      - name: Documentation links resolve
+        # Report broken links even when the step above failed: both are worth
+        # fixing in the same push.
+        if: success() || failure()
+        run: python3 scripts/check_doc_links.py

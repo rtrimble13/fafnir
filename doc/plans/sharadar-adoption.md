@@ -3,6 +3,11 @@
 - Status: **in progress** — updated at every sprint close-out (`SA-xx99` issues).
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Milestones: S01–S17 · Assessment: [sharadar-coa-assessment.md](sharadar-coa-assessment.md)
 - Status legend: ⬜ planned · 🔄 in progress · ✅ done (PR #) · ⏭ carried over · ✖ dropped (reason)
+- How a row changes: every row starts ⬜. The PR that starts an issue sets it 🔄, and the PR that
+  closes it sets it ✅ and fills the PR column, both in the same PR as the change (`docs-gate`).
+  At a sprint close-out, an unfinished row becomes ⏭ and moves to the next sprint's table with a
+  note in the tracking issue. A row dropped from scope becomes ✖ with the reason in the title
+  cell and a decision-log entry. Rows are never deleted.
 
 ## Plan overview
 
@@ -147,7 +152,7 @@ v1.1.0 at S07 (survivorship backfill, after the screener-default decision and DQ
 
 | Key | Issue | Title | Owner | Size | State | PR |
 |---|---|---|---|---|---|---|
-| `SA-0101` | [#42](https://github.com/rtrimble13/fafnir/issues/42) | Stand up the documentation machinery: living plan, PR template, docs-gate CI | Claude Code | M | ⬜ |  |
+| `SA-0101` | [#42](https://github.com/rtrimble13/fafnir/issues/42) | Stand up the documentation machinery: living plan, PR template, docs-gate CI | Claude Code | M | ✅ | [#134](https://github.com/rtrimble13/fafnir/pull/134) |
 | `SA-0102` | [#43](https://github.com/rtrimble13/fafnir/issues/43) | Send the licence questions to FMP and Sharadar; confirm personal-licence eligibility | Operator | S | ⬜ |  |
 | `SA-0103` | [#44](https://github.com/rtrimble13/fafnir/issues/44) | ADR 0012 — multi-vendor provenance, fill-only writes and per-vendor separability | Claude Code | M | ⬜ |  |
 | `SA-0104` | [#45](https://github.com/rtrimble13/fafnir/issues/45) | Scope every FMP loader, guard and ticker check to FMP-fed securities | Claude Code | M | ⬜ |  |
@@ -337,4 +342,12 @@ v1.1.0 at S07 (survivorship backfill, after the screener-default decision and DQ
 
 ## [built] notes
 
-_None yet — add one wherever the implementation departs from this plan, as `doc/plans/db-operations-agent.md` does._
+Add one wherever the implementation departs from this plan, as `doc/plans/db-operations-agent.md` does.
+
+- **[built] SA-0101.** (1) `doc/index.md` marks only this plan *in progress*; the assessment and
+  the two source documents are marked *reference*, since nothing will change them. (2) The docs
+  gate counts `etc/fafnirrc` and `etc/crontab.example` as documentation even though they sit under
+  `etc/`: a PR that edits only one of them passes. (3) `--no-renames` makes the gate see a file moved
+  out of `src/` under its old path, so a move counts as a change to `src/`. (4) The link check also
+  resolves `#anchor`s into Markdown files outside the scanned set, and treats a leading `/` as the
+  repository root, as GitHub does.

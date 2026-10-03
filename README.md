@@ -137,6 +137,7 @@ than guessing. See **[doc/duk.md](doc/duk.md)**.
 | [agent.md](doc/agent.md) | Run an operations agent on the host: DQ triage, automations, data questions |
 | [extending.md](doc/extending.md) | Add a source (FRED/BLS/BEA), a table, or an MCP tool |
 | [adr/](doc/adr/) | Architecture decision records |
+| [plans/sharadar-adoption.md](doc/plans/sharadar-adoption.md) | Living plan for adopting Sharadar (COA 2-M): sprints, status by issue, decision log |
 
 ## Development
 
