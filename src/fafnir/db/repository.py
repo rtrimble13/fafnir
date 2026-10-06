@@ -1143,6 +1143,72 @@ def merge_security(
     )
 
 
+#: Everything keyed to a security_id, in the order a purge clears it. The real FKs
+#: on core.security are all NO ACTION, so every child goes before the parent; the
+#: ops tables carry the id without an FK and would otherwise be left pointing at
+#: nothing. core.symbol_change is detached rather than deleted -- see
+#: :func:`purge_securities`.
+SECURITY_FOOTPRINT_TABLES = (
+    "core.daily_price",
+    "core.adjustment_factor",
+    "core.corporate_action",
+    "core.company_profile",
+    "core.symbol_xref",
+    "core.symbol_change",
+    "ops.load_watermark",
+    "ops.operator_override",
+    "ops.data_quality_flag",
+    "core.security",
+)
+
+
+def security_footprint(db: Database, security_ids: list[int]) -> dict[str, int]:
+    """Rows each table holds for these securities -- what a purge would touch."""
+    ids = list(security_ids)
+    return {
+        table: int(
+            db.fetchval(
+                f"SELECT count(*) FROM {table} WHERE security_id = ANY(%s)", (ids,)
+            )
+            or 0
+        )
+        for table in SECURITY_FOOTPRINT_TABLES
+    }
+
+
+def purge_securities(db: Database, security_ids: list[int]) -> dict[str, int]:
+    """Delete these securities and every row keyed to them. Returns rows per table.
+
+    This is the one place fafnir deletes a security that holds history. It exists
+    for a scope decision (ADR 0012) -- instruments the warehouse no longer carries --
+    and NOT for a security that delisted: survivorship-free history is the point of
+    this warehouse, and a delisting is a fact about the security, not a reason to
+    forget it. The caller owns the transaction, so a failure part-way leaves
+    nothing half-removed.
+
+    ``core.symbol_change`` rows are detached (``security_id`` set NULL), not
+    deleted. The rename sweep reads that table to know a change was already
+    recorded; deleting the row would let the vendor's feed re-offer the rename
+    against a ticker nothing holds any more, every night.
+    """
+    ids = list(security_ids)
+    if not ids:
+        return {table: 0 for table in SECURITY_FOOTPRINT_TABLES}
+    removed: dict[str, int] = {}
+    for table in SECURITY_FOOTPRINT_TABLES:
+        if table == "core.symbol_change":
+            removed[table] = db.execute(
+                "UPDATE core.symbol_change SET security_id = NULL"
+                " WHERE security_id = ANY(%s)",
+                (ids,),
+            )
+        else:
+            removed[table] = db.execute(
+                f"DELETE FROM {table} WHERE security_id = ANY(%s)", (ids,)
+            )
+    return removed
+
+
 def retarget_symbol(
     db: Database,
     *,

@@ -35,6 +35,11 @@ bea_key = ""
 # Target universe for the security master.
 universe = "us-equity-etf"
 
+# Instrument kinds kept out of the universe (ADR 0012): never minted by
+# `fafnir ingest securities`, removed with `fafnir security descope`. Default is all
+# three; [] admits them again. Keep one ticker anyway with `fafnir track add`.
+# exclude_instruments = ["warrant", "right", "unit"]
+
 # Proactive FMP throttle (Professional plan ~300 req/min; stay just under).
 request_rate_per_min = 280
 

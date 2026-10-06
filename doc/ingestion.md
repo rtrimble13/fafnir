@@ -410,6 +410,27 @@ a security; retention exists so history is never lost, and a stub has none. A
 duplicate that *has* accumulated history is a `conflict` instead: merging two price
 histories is not a decision a loader should make silently.
 
+### Instruments out of scope: warrants, rights and units (ADR 0012)
+
+`ingest securities` does not mint warrants, rights or units. It classifies each
+screener entry by ticker with `security_master.instrument_kind`:
+
+- Nasdaq's reserved fifth letters W, R and U decide on their own.
+- So do the NYSE `-WT` / `-WS` / `-RT` / `-UN` suffixes.
+- A three-letter base plus W/R/U, or a fifth-letter Z, counts only when the
+  vendor's name names the same kind.
+
+A matching entry is skipped before anything is written, and the run reports it:
+`Skipped 12 out-of-scope instruments (warrant/right/unit)`. A few a night is normal
+SPAC issuance.
+
+- `[general] exclude_instruments` chooses the kinds. All three are excluded by
+  default; `[]` admits everything.
+- To keep a single ticker, declare it with `fafnir track add`. Granite REIT's
+  stapled units (`GRP-UN`) are the known case.
+- Rows minted before the filter existed are not refreshed. Remove them with
+  `fafnir security descope` (see [operations.md](operations.md#descoping-an-instrument-kind)).
+
 ## Order of operations (daily)
 
 ```

@@ -182,3 +182,13 @@ the bad one).
 
 > **Wrong answer:** an outlier on the newest bar read as a market move, or deleted
 > as a bad bar, on its first night. Recheck it after the next load.
+
+## 18. Warrants, rights and units are not in the universe (ADR 0012)
+
+From the release that carries ADR 0012, `ingest securities` skips them, and
+`fafnir security descope` has removed the ones minted before it. SPAC class A shares
+are still held. A warrant, right or unit that *is* present was declared on purpose
+(`fafnir track list`), as Granite REIT's `GRP-UN` is.
+
+> **Wrong answer:** "fafnir has no data for ABCDW" read as a load failure, or a
+> SPAC's unit or warrant history expected next to its class A shares.

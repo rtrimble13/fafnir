@@ -269,7 +269,12 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
     universe = universe or cfg.universe
     with Database(cfg.dsn) as database:
         result = security_master.load_securities(
-            database, fmp, universe=universe, include_etfs=not no_etfs, limit=limit
+            database,
+            fmp,
+            universe=universe,
+            include_etfs=not no_etfs,
+            limit=limit,
+            excluded_kinds=cfg.excluded_instruments,
         )
         if enrich:
             syms = [
@@ -289,6 +294,12 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
         f"Loaded {result.total} securities ({len(result.new_symbols)} new). "
         f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}"
     )
+    if result.skipped_out_of_scope:
+        click.echo(
+            f"Skipped {len(result.skipped_out_of_scope)} out-of-scope instruments "
+            f"({'/'.join(cfg.excluded_instruments)}); "
+            "see [general] exclude_instruments."
+        )
     if result.new_symbols:
         shown = ", ".join(result.new_symbols[:25])
         more = (
@@ -1437,6 +1448,149 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+# The instrument kinds `security descope --kind` accepts. A literal, because click
+# needs it when this module is imported and security_master is imported lazily; a
+# unit test holds it equal to security_master.INSTRUMENT_KINDS.
+_DESCOPE_KINDS = ("warrant", "right", "unit")
+
+
+@security.command("descope")
+@click.option(
+    "--kind",
+    "kinds",
+    multiple=True,
+    type=click.Choice(_DESCOPE_KINDS),
+    help="Only this kind; repeatable  [default: [general] exclude_instruments]",
+)
+@click.option(
+    "--note", "-m", help="Why. Kept on the ops.ingestion_run row that audits the run."
+)
+@click.option("--by", "removed_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="List what would be removed; change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
+    """Delete every security of an excluded instrument kind, with all its rows.
+
+    \b
+      fafnir security descope --dry-run
+      fafnir security descope -m "ADR 0012: no warrants, rights or units" --yes
+
+    For a scope decision (ADR 0012), never for a delisting: a security that stopped
+    trading keeps its history. Deploy the release that stops `ingest securities`
+    minting these first, or the next nightly load mints them straight back.
+
+    Candidates are classified by their ticker (and, for two ambiguous shapes, their
+    name); see `security_master.instrument_kind`. A symbol in the declared universe
+    (`fafnir track add`) is kept -- that is how one is exempted.
+
+    IRREVERSIBLE. Bars, corporate actions, factors, profiles, ticker periods,
+    watermarks, operator overrides and DQ flags go with each security, in one
+    transaction. Take a backup first. The audit trail is a single ops.ingestion_run
+    row (source 'operator', endpoint 'security-descope') naming every symbol removed.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import security_master
+    from fafnir.ingest.runlog import RunLog
+
+    cfg = ctx.obj["config"]
+    wanted = tuple(kinds) or cfg.excluded_instruments
+    if not wanted:
+        raise click.ClickException(
+            "No instrument kind is excluded ([general] exclude_instruments is empty) "
+            "and no --kind was given, so there is nothing to descope."
+        )
+    if removed_by is None:
+        removed_by = _os_user()
+
+    with Database(cfg.dsn) as database:
+        declared = {r["symbol"] for r in repo.list_tracked_symbols(database)}
+        candidates: list[dict] = []
+        kept: list[str] = []
+        securities = database.fetchall(
+            "SELECT security_id, primary_symbol, company_name, is_etf, is_fund,"
+            " is_actively_trading FROM core.security"
+            " ORDER BY primary_symbol, security_id"
+        )
+        for row in securities:
+            kind = security_master.out_of_scope_kind(
+                row["primary_symbol"],
+                row["company_name"],
+                is_etf=bool(row["is_etf"]),
+                is_fund=bool(row["is_fund"]),
+                excluded=wanted,
+            )
+            if kind is None:
+                continue
+            if row["primary_symbol"] in declared:
+                kept.append(row["primary_symbol"])
+                continue
+            candidates.append({**row, "kind": kind})
+
+        if kept:
+            click.echo(f"Kept, declared in ref.tracked_symbol: {', '.join(kept)}")
+        if not candidates:
+            click.echo(f"No {'/'.join(wanted)} securities to descope.")
+            return
+
+        ids = [int(c["security_id"]) for c in candidates]
+        footprint = repo.security_footprint(database, ids)
+        for c in candidates:
+            click.echo(
+                f"{c['security_id']:>8}  {c['primary_symbol']:<9} {c['kind']:<8} "
+                f"{'active' if c['is_actively_trading'] else 'inactive':<8} "
+                f"{c['company_name'] or ''}"
+            )
+        for kind in wanted:
+            of_kind = [c for c in candidates if c["kind"] == kind]
+            active = sum(1 for c in of_kind if c["is_actively_trading"])
+            click.echo(f"{kind:<8} {len(of_kind):>6} securities ({active} active)")
+        for table, count in footprint.items():
+            verb = "detach" if table == "core.symbol_change" else "delete"
+            click.echo(f"  {verb} {count:>9} rows  {table}")
+
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Delete these {len(ids)} securities and every row keyed to them? "
+                "This cannot be undone.",
+                abort=True,
+            )
+        # The RunLog row commits first (it is the record that the run happened, even
+        # if the purge then fails), and its exit commits the purge with the outcome.
+        # Nothing is printed between the deletes and that commit: a closed pipe there
+        # would roll the purge back after the screen said it was done.
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-descope",
+            params={
+                "kinds": list(wanted),
+                "note": note,
+                "by": removed_by,
+                "securities": len(ids),
+                "symbols": [c["primary_symbol"] for c in candidates],
+                "security_ids": ids,
+            },
+        ) as run:
+            removed = repo.purge_securities(database, ids)
+            run.symbols_requested = len(ids)
+            run_id = run.run_id
+
+    for table, count in removed.items():
+        verb = "detached" if table == "core.symbol_change" else "deleted"
+        click.echo(f"  {verb} {count:>9} rows  {table}")
+    click.echo(
+        f"Descoped {len(ids)} securit{'y' if len(ids) == 1 else 'ies'} as {removed_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 

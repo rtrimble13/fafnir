@@ -613,6 +613,32 @@ the compared window is not by itself a reason for the two to disagree.
   is on something between releases, which is worth knowing before you conclude a
   defect is unfixed.
 
+### Descoping an instrument kind
+
+[ADR 0012](adr/0012-warrants-rights-units-out-of-scope.md) takes warrants, rights
+and units out of scope. Deploying the release stops new ones being minted.
+Removing the ones already held is a one-time operator step, and it is
+**irreversible**:
+
+```bash
+F="sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir"
+scripts/backup_dump.sh                                # 1. a restorable copy first
+$F track add GRP-UN --asset-type equity --exchange NYSE \
+   --note "Granite REIT stapled units: the REIT's only US listing (ADR 0012)"
+$F security descope --dry-run > descope-dry-run.txt   # 2. read every line
+$F security descope -m "ADR 0012" --yes > descope.txt # 3. one transaction
+$F db refresh-marts                                   # 4. drop them from the marts
+```
+
+- **What goes with each security:** bars, corporate actions, factors, profiles,
+  ticker periods, watermarks, operator overrides and DQ flags. Rename records are
+  kept, with `security_id` set to NULL.
+- **The audit record** is the `ops.ingestion_run` row with source `operator` and
+  endpoint `security-descope`. It names every symbol and id removed.
+- **Order matters.** Run this only after the release that stops the minting is
+  deployed. Before that, the next nightly load mints the removed securities back,
+  with full history.
+
 ## Recovery
 
 - **Interrupted backfill** — just re-run `scripts/initial_backfill.sh`; watermarks
