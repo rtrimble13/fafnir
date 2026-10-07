@@ -32,6 +32,7 @@ import click
 from fafnir import __version__
 from fafnir.config import get_config
 from fafnir.db.connection import Database, DatabaseConnectionError
+from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
 from fafnir.logging_config import LogDirectoryError, setup_logging
 
 
@@ -53,6 +54,17 @@ def _os_user() -> str:
         return getpass.getuser()
     except (OSError, KeyError):
         return "unknown"
+
+
+def _excluded_instruments(cfg) -> tuple[str, ...]:
+    """``[general] exclude_instruments``, with a misspelt kind as one line, not a
+    traceback. The setting is read by the nightly load, so its error is the first
+    thing an operator sees in the journal after a typo.
+    """
+    try:
+        return tuple(cfg.excluded_instruments)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _split_symbols(value: Optional[str]) -> list[str]:
@@ -267,9 +279,15 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
     universe = universe or cfg.universe
+    excluded = _excluded_instruments(cfg)
     with Database(cfg.dsn) as database:
         result = security_master.load_securities(
-            database, fmp, universe=universe, include_etfs=not no_etfs, limit=limit
+            database,
+            fmp,
+            universe=universe,
+            include_etfs=not no_etfs,
+            limit=limit,
+            excluded_kinds=excluded,
         )
         if enrich:
             syms = [
@@ -289,6 +307,11 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
         f"Loaded {result.total} securities ({len(result.new_symbols)} new). "
         f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}"
     )
+    if result.skipped_out_of_scope:
+        click.echo(
+            f"Skipped {len(result.skipped_out_of_scope)} out-of-scope instruments "
+            f"({'/'.join(excluded)}); see [general] exclude_instruments."
+        )
     if result.new_symbols:
         shown = ", ".join(result.new_symbols[:25])
         more = (
@@ -925,8 +948,10 @@ def security_merge_rename(
     is absorbed and deleted.
 
     Refuses unless the vendor's own identifiers agree (CUSIP/ISIN/CIK, where both
-    sides have them) and the overlapping sessions agree on OHLC. Run it with
-    --dry-run first: the preview is the same comparison the guard runs.
+    sides have them) and the overlapping sessions agree on OHLC, and refuses a
+    rename that would change what the instrument is (a share onto its unit's or
+    warrant's ticker, ADR 0012). Run it with --dry-run first: the preview is the
+    same comparison the guard runs.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
@@ -967,11 +992,22 @@ def security_merge_rename(
         )
         click.echo(f"{old_symbol} -> {new_symbol}, effective {effective}")
         _echo_merge_plan(plan)
+        # Not in the plan's blockers: merge_security re-checks those for any merge,
+        # and this one is about the rename, which only this command carries out.
+        refusal = repo.rename_instrument_refusal(
+            database,
+            security_id=survivor_id,
+            old_symbol=old_symbol,
+            new_symbol=new_symbol,
+            new_name=plan.victim_name,
+        )
+        if refusal:
+            click.echo(f"BLOCKER: {refusal}", err=True)
 
         if dry_run:
             click.echo("Dry run: nothing changed.")
             return
-        if plan.blockers and not force:
+        if (plan.blockers or refusal) and not force:
             raise click.ClickException(
                 "Refusing to merge -- see the blockers above. If you have read them "
                 "and this is still one instrument, re-run with --force."
@@ -1437,6 +1473,183 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+def _descope_verb(table: str, *, done: bool = False) -> str:
+    """What a descope does to one footprint entry: an unresolved rename is
+    dismissed, a rename record detached, every other row deleted.
+    """
+    from fafnir.db import repository as repo
+
+    if table == repo.UNRESOLVED_RENAMES:
+        return "dismissed" if done else "dismiss"
+    if table == "core.symbol_change":
+        return "detached" if done else "detach"
+    return "deleted" if done else "delete"
+
+
+@security.command("descope")
+@click.option(
+    "--kind",
+    "kinds",
+    multiple=True,
+    type=click.Choice(INSTRUMENT_KINDS),
+    help="Only this kind; repeatable. It must be one [general] exclude_instruments "
+    "excludes  [default: every kind it excludes]",
+)
+@click.option(
+    "--note",
+    "-m",
+    help="Why. Kept on the ops.ingestion_run row that audits the run, and on any "
+    "rename it dismisses.",
+)
+@click.option("--by", "removed_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="List what would be removed; change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
+    """Delete every security of an excluded instrument kind, with all its rows.
+
+    \b
+      fafnir security descope --dry-run
+      fafnir security descope -m "ADR 0012: no warrants, rights or units" --yes
+
+    For a scope decision (ADR 0012), never for a delisting: a security that stopped
+    trading keeps its history. Deploy the release that stops `ingest securities`
+    minting these first, or the next nightly load mints them straight back. For
+    the same reason a --kind that [general] exclude_instruments does not exclude is
+    refused.
+
+    Candidates are classified by their ticker (and, for two ambiguous shapes, their
+    name); see `fafnir.instruments.instrument_kind`. A symbol in the declared
+    universe (`fafnir track add`) is kept -- that is how one is exempted.
+
+    IRREVERSIBLE. Bars, corporate actions, factors, profiles, ticker periods,
+    watermarks, operator overrides and DQ flags go with each security, in one
+    transaction. Rename records are kept, detached; a rename still in conflict that
+    names one of them is dismissed, because removing either side changes what the
+    nightly sweep would do with it. Take a backup first. The audit trail is a single
+    ops.ingestion_run row (source 'operator', endpoint 'security-descope') naming
+    every symbol removed.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest.runlog import RunLog
+
+    cfg = ctx.obj["config"]
+    excluded = _excluded_instruments(cfg)
+    wanted = tuple(kinds) or excluded
+    if not wanted:
+        raise click.ClickException(
+            "No instrument kind is excluded ([general] exclude_instruments is empty) "
+            "and no --kind was given, so there is nothing to descope."
+        )
+    admitted = [k for k in wanted if k not in excluded]
+    if admitted:
+        raise click.ClickException(
+            f"[general] exclude_instruments does not exclude {'/'.join(admitted)}, so "
+            "`ingest securities` still mints them: the next nightly load would mint "
+            "every one back under a new id and pull its full price history. Exclude "
+            "the kind first."
+        )
+    if removed_by is None:
+        removed_by = _os_user()
+
+    with Database(cfg.dsn) as database:
+        declared = {r["symbol"] for r in repo.list_tracked_symbols(database)}
+        candidates: list[dict] = []
+        kept: list[str] = []
+        securities = database.fetchall(
+            "SELECT security_id, primary_symbol, company_name, is_etf, is_fund,"
+            " is_actively_trading FROM core.security"
+            " ORDER BY primary_symbol, security_id"
+        )
+        for row in securities:
+            kind = out_of_scope_kind(
+                row["primary_symbol"],
+                row["company_name"],
+                is_etf=bool(row["is_etf"]),
+                is_fund=bool(row["is_fund"]),
+                excluded=wanted,
+            )
+            if kind is None:
+                continue
+            if row["primary_symbol"] in declared:
+                kept.append(row["primary_symbol"])
+                continue
+            candidates.append({**row, "kind": kind})
+
+        if kept:
+            click.echo(f"Kept, declared in ref.tracked_symbol: {', '.join(kept)}")
+        if not candidates:
+            click.echo(f"No {'/'.join(wanted)} securities to descope.")
+            return
+
+        ids = [int(c["security_id"]) for c in candidates]
+        footprint = repo.security_footprint(database, ids)
+        renames = repo.unresolved_renames(database, ids)
+        for c in candidates:
+            click.echo(
+                f"{c['security_id']:>8}  {c['primary_symbol']:<9} {c['kind']:<8} "
+                f"{'active' if c['is_actively_trading'] else 'inactive':<8} "
+                f"{c['company_name'] or ''}"
+            )
+        for r in renames:
+            click.echo(
+                f"Unresolved rename, dismissed with them: {r['old_symbol']} -> "
+                f"{r['new_symbol']} ({r['change_date']})"
+            )
+        for kind in wanted:
+            of_kind = [c for c in candidates if c["kind"] == kind]
+            active = sum(1 for c in of_kind if c["is_actively_trading"])
+            click.echo(f"{kind:<8} {len(of_kind):>6} securities ({active} active)")
+        for table, count in footprint.items():
+            click.echo(f"  {_descope_verb(table):<9} {count:>9} rows  {table}")
+
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Delete these {len(ids)} securities and every row keyed to them? "
+                "This cannot be undone.",
+                abort=True,
+            )
+        # The RunLog row commits first (it is the record that the run happened, even
+        # if the purge then fails), and its exit commits the purge with the outcome.
+        # Nothing is printed between the deletes and that commit: a closed pipe there
+        # would roll the purge back after the screen said it was done.
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-descope",
+            params={
+                "kinds": list(wanted),
+                "note": note,
+                "by": removed_by,
+                "securities": len(ids),
+                "symbols": [c["primary_symbol"] for c in candidates],
+                "security_ids": ids,
+                "renames_dismissed": [
+                    f"{r['old_symbol']}->{r['new_symbol']}@{r['change_date']}"
+                    for r in renames
+                ],
+            },
+        ) as run:
+            removed = repo.purge_securities(
+                database, ids, removed_by=removed_by, note=note
+            )
+            run.symbols_requested = len(ids)
+            run_id = run.run_id
+
+    for table, count in removed.items():
+        click.echo(f"  {_descope_verb(table, done=True):<9} {count:>9} rows  {table}")
+    click.echo(
+        f"Descoped {len(ids)} securit{'y' if len(ids) == 1 else 'ies'} as {removed_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 

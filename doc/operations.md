@@ -613,6 +613,43 @@ the compared window is not by itself a reason for the two to disagree.
   is on something between releases, which is worth knowing before you conclude a
   defect is unfixed.
 
+### Descoping an instrument kind
+
+[ADR 0012](adr/0012-warrants-rights-units-out-of-scope.md) takes warrants, rights
+and units out of scope. Deploying the release stops new ones being minted.
+Removing the ones already held is a one-time operator step, and it is
+**irreversible**:
+
+```bash
+F="sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir"
+scripts/backup_dump.sh                                # 1. a restorable copy first
+$F track add GRP-UN --asset-type equity --exchange NYSE \
+   --note "Granite REIT stapled units: the REIT's only US listing (ADR 0012)"
+$F security descope --dry-run > descope-dry-run.txt   # 2. read every line
+$F security descope -m "ADR 0012" --yes > descope.txt # 3. one transaction
+$F db refresh-marts                                   # 4. drop them from the marts
+```
+
+- **What goes with each security:** bars, corporate actions, factors, profiles,
+  ticker periods, watermarks, operator overrides and DQ flags. Rename records are
+  kept, with `security_id` set to NULL.
+- **Renames still in conflict that name one of them are dismissed**, and their
+  `symbol_change_conflict` flags resolved. The dry run lists each one (`Unresolved
+  rename, dismissed with them: …`). Left open, they could never resolve, or, with
+  their blocker gone, would be left to the sweep to decide alone.
+- **The audit record** is the `ops.ingestion_run` row with source `operator` and
+  endpoint `security-descope`. It names every symbol and id removed, and every
+  rename dismissed.
+- **Order matters.** Run this only after the release that stops the minting is
+  deployed. Before that, the next nightly load mints the removed securities back,
+  with full history. For the same reason, a `--kind` that
+  `[general] exclude_instruments` does not exclude is refused.
+- **Not while the nightly job runs.** It still loads prices for these securities
+  until they are gone, and its inserts collide with the deletes. Either the
+  descope fails and rolls back whole, or the night's whole `ingest prices` run
+  aborts on the first bar for a security the descope removed. Check
+  `systemctl list-timers 'fafnir-*'` and run it in the day.
+
 ## Recovery
 
 - **Interrupted backfill** — just re-run `scripts/initial_backfill.sh`; watermarks

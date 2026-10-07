@@ -1310,3 +1310,163 @@ def test_a_load_without_a_classification_does_not_erase_the_stored_one(db):
         before["sector_id"],
         before["industry_id"],
     )
+
+
+# ---------------------------------------------------------------------------
+# A rename never changes what an instrument is (ADR 0012)
+# ---------------------------------------------------------------------------
+
+
+def _shuffle(old, new, name="Abcd Acquisition Corp."):
+    return _RenameFMP(
+        [
+            {
+                "date": "2024-06-10",
+                "oldSymbol": old,
+                "newSymbol": new,
+                "companyName": name,
+            }
+        ]
+    )
+
+
+def _ticker(db, sid):
+    return db.fetchval(
+        "SELECT primary_symbol FROM core.security WHERE security_id = %s", (sid,)
+    )
+
+
+def test_the_sweep_refuses_to_rename_a_share_onto_its_units_ticker(db):
+    """The vendor's pre-launch shuffle with the unit never minted (ADR 0012): no
+    holder blocks it, so only the instrument guard stands between the class A share
+    and a ticker the security-master load never refreshes."""
+    from fafnir.ingest.symbol_changes import load_symbol_changes
+
+    share = _mk_security(db, "ABCD", name="Abcd Acquisition Corp.")
+    _give_history(db, share)
+
+    counts = load_symbol_changes(db, _shuffle("ABCD", "ABCDU"))
+
+    assert counts["conflict"] == 1 and counts["applied"] == 0
+    assert _ticker(db, share) == "ABCD"
+    assert [x["symbol"] for x in _xref(db, share)] == ["ABCD"]
+    row = db.fetchone(
+        "SELECT status, security_id, detail FROM core.symbol_change"
+        " WHERE old_symbol = 'ABCD' AND new_symbol = 'ABCDU'"
+    )
+    assert row["status"] == repo.CHANGE_CONFLICT
+    assert row["security_id"] == share
+    assert "does not change what an instrument is" in row["detail"]["reason"]
+    flag = db.fetchone(
+        "SELECT security_id, detail FROM ops.data_quality_flag"
+        " WHERE check_name = 'symbol_change_conflict' AND resolved_at IS NULL"
+    )
+    assert flag["security_id"] == share
+    assert flag["detail"]["reason"] == row["detail"]["reason"]
+
+    # Retried every night, refused every night, flagged once.
+    again = load_symbol_changes(db, _shuffle("ABCD", "ABCDU"))
+    assert again["conflict"] == 1
+    assert _ticker(db, share) == "ABCD"
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag"
+            " WHERE check_name = 'symbol_change_conflict'"
+        )
+        == 1
+    )
+
+
+def test_an_empty_unit_is_not_folded_into_the_share(db):
+    """Before ADR 0012 a freshly minted, still empty unit was folded away and the
+    shuffle applied. The guard runs before the fold."""
+    share = _mk_security(db, "ABCD", name="Abcd Acquisition Corp.")
+    _give_history(db, share)
+    unit = _mk_security(db, "ABCDU", name="Abcd Acquisition Corp. Units")
+
+    outcome = repo.apply_symbol_change(
+        db,
+        old_symbol="ABCD",
+        new_symbol="ABCDU",
+        change_date=CHANGE_DATE,
+        company_name="Abcd Acquisition Corp.",
+    )
+
+    assert outcome.status == repo.CHANGE_CONFLICT
+    assert outcome.folded_security_id is None
+    assert _ticker(db, share) == "ABCD"
+    assert _ticker(db, unit) == "ABCDU"
+
+
+@pytest.mark.parametrize(
+    "old, new, name",
+    [
+        ("ABCDW", "ABCD", "Abcd Acquisition Corp."),  # warrant onto its share
+        ("ABCDU", "ABCDW", "Abcd Acquisition Corp."),  # unit onto its warrant
+        ("AAC", "AAC-WT", "Ares Acquisition Corporation"),  # NYSE suffix
+        ("ZKP", "ZKPU", "Lafayette Digital Acquisition Corp. I"),  # 3-letter base
+    ],
+)
+def test_the_sweep_refuses_every_shape_of_the_shuffle(db, old, new, name):
+    held = _mk_security(db, old, name=name)
+    _give_history(db, held)
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol=old, new_symbol=new, change_date=CHANGE_DATE, company_name=name
+    )
+
+    assert outcome.status == repo.CHANGE_CONFLICT and outcome.reason
+    assert _ticker(db, held) == old
+
+
+def test_a_shuffle_from_a_ticker_never_minted_is_not_claimed_as_applied(db):
+    """ABCDU -> ABCD with only the share held. The end state "ABCD is ours" holds,
+    but it is not this rename's: recording it as applied would list ABCDU as a
+    ticker the share was renamed away from."""
+    share = _mk_security(db, "ABCD", name="Abcd Acquisition Corp.")
+
+    outcome = repo.apply_symbol_change(
+        db,
+        old_symbol="ABCDU",
+        new_symbol="ABCD",
+        change_date=CHANGE_DATE,
+        company_name="Abcd Acquisition Corp.",
+    )
+
+    assert outcome.status == repo.CHANGE_UNKNOWN
+    assert _ticker(db, share) == "ABCD"
+    assert "ABCDU" not in repo.renamed_away_securities(db)
+
+
+@pytest.mark.parametrize(
+    "old, new, name",
+    [
+        # A de-SPAC: the warrants follow the share to the merged company's ticker.
+        ("ABCDW", "NEWCW", "NewCo Holdings, Inc. Warrants"),
+        ("AAC-WT", "NEWC-WT", "NewCo Holdings, Inc."),
+        # Ordinary renames, including onto a ticker that happens to end in W.
+        ("FB", "META", "Meta Platforms, Inc."),
+        ("CHRX", "CHRW", "C.H. Robinson Worldwide, Inc."),
+    ],
+)
+def test_renames_that_keep_the_instrument_still_apply(db, old, new, name):
+    held = _mk_security(db, old, name=name)
+    _give_history(db, held)
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol=old, new_symbol=new, change_date=CHANGE_DATE, company_name=name
+    )
+
+    assert outcome.status == repo.CHANGE_APPLIED and outcome.reason is None
+    assert _ticker(db, held) == new
+
+
+def test_an_etf_is_never_refused(db):
+    sid = _mk_security(db, "ABC", name="Abc Covered Call ETF")
+    db.execute("UPDATE core.security SET is_etf = TRUE WHERE security_id = %s", (sid,))
+
+    outcome = repo.apply_symbol_change(
+        db, old_symbol="ABC", new_symbol="ABCW", change_date=CHANGE_DATE
+    )
+
+    assert outcome.status == repo.CHANGE_APPLIED

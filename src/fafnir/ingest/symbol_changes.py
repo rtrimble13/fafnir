@@ -220,6 +220,8 @@ def load_symbol_changes(
                 continue
 
             detail = {"old_symbol": old, "new_symbol": new}
+            if outcome.reason:
+                detail["reason"] = outcome.reason
             if outcome.old_company_name:
                 # The name the vendor will keep serving the old ticker under. Kept
                 # here because the rename has just overwritten it on the security,
@@ -247,8 +249,10 @@ def load_symbol_changes(
             )
 
             if outcome.status == repo.CHANGE_CONFLICT:
-                # Two live securities claiming one ticker, both with history. A
-                # human decides; the flag is how they find out.
+                # Two live securities claiming one ticker, both with history, or a
+                # rename that would turn the security into a different instrument
+                # (outcome.reason says which). A human decides; the flag is how
+                # they find out.
                 #
                 # Once per conflict, not once per retry: conflicts are retried on
                 # every sweep by design, so a plain insert would add an unresolved
@@ -266,18 +270,19 @@ def load_symbol_changes(
                     table_name="core.security",
                     record_key={"old_symbol": old, "new_symbol": new},
                     detail={
-                        "reason": "new ticker already belongs to another listed "
+                        "reason": outcome.reason
+                        or "new ticker already belongs to another listed "
                         "security that carries price history",
                         "change_date": str(when),
                     },
                     ingestion_run_id=run.run_id,
                 ):
                     logger.warning(
-                        "symbol change %s -> %s on %s conflicts with an existing "
-                        "security; left unapplied for review",
+                        "symbol change %s -> %s on %s %s; left unapplied for review",
                         old,
                         new,
                         when,
+                        outcome.reason or "conflicts with an existing security",
                     )
             elif outcome.status == repo.CHANGE_APPLIED:
                 logger.info(

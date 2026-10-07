@@ -14,7 +14,8 @@ Config sections
 ``[api]``
     fmp_key, fred_key, bls_key, bea_key
 ``[general]``
-    log_level, log_dir, universe, request_rate_per_min, overlap_days
+    log_level, log_dir, universe, request_rate_per_min, overlap_days,
+    exclude_instruments
 
 Environment overrides
 ---------------------
@@ -28,6 +29,8 @@ import os
 import tomllib
 from pathlib import Path
 from typing import Any, Optional
+
+from fafnir.instruments import INSTRUMENT_KINDS
 
 DEFAULT_CONFIG_PATH = "~/.fafnirrc"
 
@@ -205,6 +208,27 @@ class FafnirConfig:
         roughly 1.3% of a full nightly refresh.
         """
         return max(0, int(self._get("general", "actions_reconcile_buckets", 30)))
+
+    @property
+    def excluded_instruments(self) -> tuple[str, ...]:
+        """Instrument kinds kept out of the universe (ADR 0012).
+
+        ``[general] exclude_instruments`` -- any of ``warrant``, ``right``, ``unit``;
+        all three by default, ``[]`` to admit everything again. An unknown kind is
+        an error rather than ignored: a misspelt ``"warants"`` would otherwise
+        quietly put every warrant back into scope.
+        """
+        raw = self._get("general", "exclude_instruments", list(INSTRUMENT_KINDS))
+        if isinstance(raw, str):
+            raw = [raw]
+        kinds = tuple(dict.fromkeys(str(k).strip().lower() for k in raw))
+        unknown = [k for k in kinds if k not in INSTRUMENT_KINDS]
+        if unknown:
+            raise ValueError(
+                f"[general] exclude_instruments: unknown kind(s) {unknown}; "
+                f"expected any of {list(INSTRUMENT_KINDS)}"
+            )
+        return kinds
 
     @property
     def calendar_start_year(self) -> int:

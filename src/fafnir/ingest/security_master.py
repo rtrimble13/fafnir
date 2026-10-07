@@ -43,6 +43,7 @@ from typing import Iterable, NamedTuple, Optional
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
+from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
 from fafnir.logging_config import get_logger
 from fafnir.sources.fmp import FMPClient, SourceError
 
@@ -277,12 +278,18 @@ class SecurityLoadResult(NamedTuple):
 
     ``skipped_test_issues`` are the exchanges' own test securities, which are not
     listings at all (:func:`is_exchange_test_issue`).
+
+    ``skipped_out_of_scope`` are warrants, rights and units the vendor lists and
+    this warehouse does not carry (:func:`out_of_scope_kind`, ADR 0012). A few new
+    ones a night is SPAC issuance; the count is reported so the filter is visible
+    rather than inferred from a universe that silently got smaller.
     """
 
     total: int
     new_symbols: list[str]
     skipped_retired: list[str]
     skipped_test_issues: list[str]
+    skipped_out_of_scope: list[str]
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:
@@ -405,12 +412,19 @@ def load_securities(
     universe: str = "us-equity-etf",
     include_etfs: bool = True,
     limit: Optional[int] = None,
+    excluded_kinds: Iterable[str] = INSTRUMENT_KINDS,
 ) -> SecurityLoadResult:
     """Load the security master from FMP bulk lists.
 
     Returns the number upserted and the tickers that were not in the master
     before this run -- new listings entering scope.
+
+    ``excluded_kinds`` are instrument kinds never written (``[general]
+    exclude_instruments``; empty admits everything). A symbol in the declared
+    universe (``ref.tracked_symbol``) is exempt: declaring it is how an operator
+    keeps one, such as a REIT whose stapled units are its only US listing.
     """
+    excluded = tuple(excluded_kinds)
     with RunLog(
         db,
         source="fmp",
@@ -463,6 +477,11 @@ def load_securities(
         skipped_retired: list[str] = []
         skipped_labels: list[str] = []
         skipped_test_issues: list[str] = []
+        skipped_out_of_scope: list[str] = []
+        # Read once: a handful of declarations against ~21k entries.
+        declared = (
+            {r["symbol"] for r in repo.list_tracked_symbols(db)} if excluded else set()
+        )
         # Memoised for the run. get_or_create_* is two round-trips (an
         # ON CONFLICT DO NOTHING insert, then a select), and the screener carries
         # a classification on every one of ~21k entries drawn from a taxonomy of
@@ -491,6 +510,19 @@ def load_securities(
                 # Not a listing at all: nothing written, nothing flagged. A row
                 # already minted for one stays until an operator removes it.
                 skipped_test_issues.append(symbol)
+                continue
+            # Before anything is written, like the test issues: an excluded
+            # instrument is not refreshed either, so a row minted before the
+            # filter existed simply stops changing until `security descope`
+            # removes it.
+            if symbol not in declared and out_of_scope_kind(
+                symbol,
+                company_name,
+                is_etf=is_etf,
+                is_fund=bool(entry.get("isFund", False)),
+                excluded=excluded,
+            ):
+                skipped_out_of_scope.append(symbol)
                 continue
             previous = listed.get(symbol)
             # Before anything is written or flagged: a name this warehouse has
@@ -613,8 +645,20 @@ def load_securities(
                 len(skipped_test_issues),
                 ", ".join(skipped_test_issues[:20]),
             )
+        if skipped_out_of_scope:
+            logger.info(
+                "%d out-of-scope instrument(s) skipped (%s): %s%s",
+                len(skipped_out_of_scope),
+                "/".join(excluded),
+                ", ".join(skipped_out_of_scope[:20]),
+                "..." if len(skipped_out_of_scope) > 20 else "",
+            )
         return SecurityLoadResult(
-            count, new_symbols, skipped_retired, skipped_test_issues
+            count,
+            new_symbols,
+            skipped_retired,
+            skipped_test_issues,
+            skipped_out_of_scope,
         )
 
 

@@ -388,6 +388,40 @@ def test_merge_rename_refuses_a_mismatched_pair(db):
     assert len(_bar_dates(db, victim)) == 5
 
 
+def test_merge_rename_refuses_to_turn_a_share_into_its_unit(db):
+    """The vendor's ABCD -> ABCDU shuffle, with nothing else to catch it: a SPAC's
+    unit trades at its share's price, and FMP serves both under one name."""
+    share = _mk_security(db, "ABCD", name="Abcd Acquisition Corp.")
+    unit = _mk_security(db, "ABCDU", name="Abcd Acquisition Corp.")
+    _bars(db, share, 5, close=10.0)
+    _bars(db, unit, 5, close=10.0)
+    repo.record_symbol_change(
+        db,
+        old_symbol="ABCD",
+        new_symbol="ABCDU",
+        change_date=CHANGE_DATE,
+        status=repo.CHANGE_CONFLICT,
+        security_id=share,
+    )
+
+    preview = _run(db, cli.security_merge_rename, ["ABCD", "ABCDU", "--dry-run"])
+    assert "BLOCKER: ABCD is not a warrant, right or unit and ABCDU is a unit" in (
+        _text(preview)
+    )
+    result = _run(db, cli.security_merge_rename, ["ABCD", "ABCDU", "--yes"])
+
+    assert result.exit_code != 0
+    assert "Refusing to merge" in _text(result)
+    assert len(_bar_dates(db, unit)) == 5
+    assert (
+        db.fetchval(
+            "SELECT primary_symbol FROM core.security WHERE security_id = %s",
+            (share,),
+        )
+        == "ABCD"
+    )
+
+
 def test_merge_rename_sends_a_free_ticker_back_to_the_sweep(db):
     """No duplicate means no conflict; inventing a merge with one side helps nobody."""
     _mk_security(db, "GREE")

@@ -147,7 +147,9 @@ answered with its own ~5-year window. Always pass an explicit `--from` when
 re-backfilling a truncated history, whichever version is deployed.
 
 **Propose, never run** — `scripts/reset_data.sh`, `fafnir db rollback`,
-`fafnir db migrate`, edits to `~/.fafnirrc`, timer and unit changes,
+`fafnir db migrate`, `fafnir security descope` (ADR 0012: irreversible, and its dry
+run too, since the settings deny the command by prefix), edits to `~/.fafnirrc`,
+timer and unit changes,
 `systemctl restart/stop`, anything touching `/etc`.
 
 **Never** — edit the deployed checkout at `/opt/fafnir` (rule 7: it is deployed,
