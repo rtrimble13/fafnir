@@ -43,8 +43,10 @@ These are not style guidance. Each one is a way this system gets damaged.
    that is real and permanent while **keeping** the record — which a resolve does
    not. Under an operator's explicit direction to clear a check, accept is the
    disposition to reach for; see `references/sweep-policy.md`.
-6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` are
-   operator commands.** Propose; never run.
+6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` and
+   `fafnir security descope` are operator commands.** Propose; never run. A
+   descope deletes every security of a kind with all its history (ADR 0012), and
+   only a backup brings it back.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
    checkout the venv installs from. Editing it to fix tonight's problem is
    invisible to the repo, destroyed by the next `git pull`, and leaves the

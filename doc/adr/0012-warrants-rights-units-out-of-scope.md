@@ -4,7 +4,8 @@
 - Date: 2026-10-06
 - Implemented by: `src/fafnir/ingest/security_master.py` (`instrument_kind`,
   `out_of_scope_kind`, `load_securities`), `src/fafnir/db/repository.py`
-  (`security_footprint`, `purge_securities`), `fafnir security descope`,
+  (`security_footprint`, `unresolved_renames`, `purge_securities`),
+  `fafnir security descope`,
   `[general] exclude_instruments`
 - Related: [ADR 0005](0005-automatic-universe-maintenance.md) (the screener defines
   the universe), [ADR 0006](0006-curated-fund-universe.md) (the declared universe)
@@ -53,9 +54,12 @@ time, and none of it improves data anyone uses.
    names that are in scope.
 2. **Stop minting them.** `fafnir ingest securities` skips an excluded entry before
    anything is written, like an exchange test issue, and reports the count.
-3. **Remove what is held** with `fafnir security descope`. It previews by default
-   with `--dry-run`, deletes every row keyed to each security in one transaction,
-   and leaves an `ops.ingestion_run` row naming every symbol removed.
+3. **Remove what is held** with `fafnir security descope`. `--dry-run` lists every
+   candidate and the rows each table holds for them. The real run asks for
+   confirmation (unless `--yes`), deletes every row keyed to each security in one
+   transaction, and leaves an `ops.ingestion_run` row naming every symbol removed.
+   It refuses a `--kind` that `[general] exclude_instruments` does not exclude,
+   because the next nightly load would mint those straight back.
 4. **Exceptions are declared, not coded.** A symbol in `ref.tracked_symbol`
    (`fafnir track add`) is exempt from both steps. The known case is `GRP-UN`:
    Granite REIT's stapled units are its only US listing.
@@ -77,6 +81,14 @@ time, and none of it improves data anyone uses.
 - **Rename records survive, detached.** `core.symbol_change` rows that point at a
   removed security have `security_id` set to NULL instead of being deleted, so the
   rename sweep does not re-offer them every night.
+- **Renames still in conflict are dismissed.** The sweep retries a `conflict`
+  every night, and removing either side changes its answer. With the old ticker
+  gone it can never resolve. With the target's holder gone, nothing blocks it any
+  more: the vendor's pre-launch shuffle (`ABCD -> ABCDU`) would rename a SPAC's
+  class A share onto its unit's ticker, where the security-master load never
+  refreshes it and the next descope deletes it. So the descope dismisses every
+  conflict that names a removed security, and resolves its flag, in the same
+  transaction.
 - **Landing payloads are kept.** `landing.fmp_raw` is the vendor archive and is not
   keyed to a security.
 - **This does not delist anything.** Survivorship-free history remains the rule.

@@ -84,7 +84,7 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
 | `symbol_change_id` | BIGINT IDENTITY PK | |
 | `old_symbol` / `new_symbol` | TEXT NOT NULL | `CHECK (old_symbol <> new_symbol)`. |
 | `change_date` | DATE NOT NULL | Effective date; the xref period boundary. |
-| `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. |
+| `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. Also NULL once `fafnir security descope` has removed that security (ADR 0012): the row is kept, detached, so the sweep still knows the rename was recorded. |
 | `company_name` | TEXT | As reported with the rename. |
 | `status` | TEXT CHECK | `applied` / `conflict` / `ignored` / `dismissed` — see below. |
 | `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. An applied rename records `old_company_name`, the security's name before the rename overwrote it: the security-master load declines a screener entry for the old ticker under that name (or the security's current name, or `company_name` above) as an echo instead of minting a copy of the company. `echo_names` lists further names it declines on that ticker: each one recorded by `security merge` from a re-minted echo it folded back in. |
@@ -102,6 +102,9 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
   `fafnir security dismiss-rename`, never by a loader, and the reasoning is kept in
   `detail`. It is **not** the way to close a rename that is real but blocked —
   that one is merged with `fafnir security merge-rename` and reaches `applied`.
+  `fafnir security descope` also sets it, on a `conflict` naming a security it
+  removes: the removal would otherwise leave the rename unresolvable, or let the
+  sweep carry it onto the security that remains.
 
 Renames of tickers fafnir does not track are counted but not stored — the feed is
 global across every venue.

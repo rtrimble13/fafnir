@@ -55,6 +55,17 @@ def _os_user() -> str:
         return "unknown"
 
 
+def _excluded_instruments(cfg) -> tuple[str, ...]:
+    """``[general] exclude_instruments``, with a misspelt kind as one line, not a
+    traceback. The setting is read by the nightly load, so its error is the first
+    thing an operator sees in the journal after a typo.
+    """
+    try:
+        return tuple(cfg.excluded_instruments)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _split_symbols(value: Optional[str]) -> list[str]:
     if not value:
         return []
@@ -267,6 +278,7 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
     universe = universe or cfg.universe
+    excluded = _excluded_instruments(cfg)
     with Database(cfg.dsn) as database:
         result = security_master.load_securities(
             database,
@@ -274,7 +286,7 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
             universe=universe,
             include_etfs=not no_etfs,
             limit=limit,
-            excluded_kinds=cfg.excluded_instruments,
+            excluded_kinds=excluded,
         )
         if enrich:
             syms = [
@@ -297,8 +309,7 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
     if result.skipped_out_of_scope:
         click.echo(
             f"Skipped {len(result.skipped_out_of_scope)} out-of-scope instruments "
-            f"({'/'.join(cfg.excluded_instruments)}); "
-            "see [general] exclude_instruments."
+            f"({'/'.join(excluded)}); see [general] exclude_instruments."
         )
     if result.new_symbols:
         shown = ", ".join(result.new_symbols[:25])
@@ -1457,16 +1468,33 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
 _DESCOPE_KINDS = ("warrant", "right", "unit")
 
 
+def _descope_verb(table: str, *, done: bool = False) -> str:
+    """What a descope does to one footprint entry: an unresolved rename is
+    dismissed, a rename record detached, every other row deleted.
+    """
+    from fafnir.db import repository as repo
+
+    if table == repo.UNRESOLVED_RENAMES:
+        return "dismissed" if done else "dismiss"
+    if table == "core.symbol_change":
+        return "detached" if done else "detach"
+    return "deleted" if done else "delete"
+
+
 @security.command("descope")
 @click.option(
     "--kind",
     "kinds",
     multiple=True,
     type=click.Choice(_DESCOPE_KINDS),
-    help="Only this kind; repeatable  [default: [general] exclude_instruments]",
+    help="Only this kind; repeatable. It must be one [general] exclude_instruments "
+    "excludes  [default: every kind it excludes]",
 )
 @click.option(
-    "--note", "-m", help="Why. Kept on the ops.ingestion_run row that audits the run."
+    "--note",
+    "-m",
+    help="Why. Kept on the ops.ingestion_run row that audits the run, and on any "
+    "rename it dismisses.",
 )
 @click.option("--by", "removed_by", help="Who  [default: the OS user]")
 @click.option(
@@ -1483,7 +1511,9 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
 
     For a scope decision (ADR 0012), never for a delisting: a security that stopped
     trading keeps its history. Deploy the release that stops `ingest securities`
-    minting these first, or the next nightly load mints them straight back.
+    minting these first, or the next nightly load mints them straight back. For
+    the same reason a --kind that [general] exclude_instruments does not exclude is
+    refused.
 
     Candidates are classified by their ticker (and, for two ambiguous shapes, their
     name); see `security_master.instrument_kind`. A symbol in the declared universe
@@ -1491,19 +1521,31 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
 
     IRREVERSIBLE. Bars, corporate actions, factors, profiles, ticker periods,
     watermarks, operator overrides and DQ flags go with each security, in one
-    transaction. Take a backup first. The audit trail is a single ops.ingestion_run
-    row (source 'operator', endpoint 'security-descope') naming every symbol removed.
+    transaction. Rename records are kept, detached; a rename still in conflict that
+    names one of them is dismissed, because removing either side changes what the
+    nightly sweep would do with it. Take a backup first. The audit trail is a single
+    ops.ingestion_run row (source 'operator', endpoint 'security-descope') naming
+    every symbol removed.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import security_master
     from fafnir.ingest.runlog import RunLog
 
     cfg = ctx.obj["config"]
-    wanted = tuple(kinds) or cfg.excluded_instruments
+    excluded = _excluded_instruments(cfg)
+    wanted = tuple(kinds) or excluded
     if not wanted:
         raise click.ClickException(
             "No instrument kind is excluded ([general] exclude_instruments is empty) "
             "and no --kind was given, so there is nothing to descope."
+        )
+    admitted = [k for k in wanted if k not in excluded]
+    if admitted:
+        raise click.ClickException(
+            f"[general] exclude_instruments does not exclude {'/'.join(admitted)}, so "
+            "`ingest securities` still mints them: the next nightly load would mint "
+            "every one back under a new id and pull its full price history. Exclude "
+            "the kind first."
         )
     if removed_by is None:
         removed_by = _os_user()
@@ -1540,19 +1582,24 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
 
         ids = [int(c["security_id"]) for c in candidates]
         footprint = repo.security_footprint(database, ids)
+        renames = repo.unresolved_renames(database, ids)
         for c in candidates:
             click.echo(
                 f"{c['security_id']:>8}  {c['primary_symbol']:<9} {c['kind']:<8} "
                 f"{'active' if c['is_actively_trading'] else 'inactive':<8} "
                 f"{c['company_name'] or ''}"
             )
+        for r in renames:
+            click.echo(
+                f"Unresolved rename, dismissed with them: {r['old_symbol']} -> "
+                f"{r['new_symbol']} ({r['change_date']})"
+            )
         for kind in wanted:
             of_kind = [c for c in candidates if c["kind"] == kind]
             active = sum(1 for c in of_kind if c["is_actively_trading"])
             click.echo(f"{kind:<8} {len(of_kind):>6} securities ({active} active)")
         for table, count in footprint.items():
-            verb = "detach" if table == "core.symbol_change" else "delete"
-            click.echo(f"  {verb} {count:>9} rows  {table}")
+            click.echo(f"  {_descope_verb(table):<9} {count:>9} rows  {table}")
 
         if dry_run:
             click.echo("Dry run: nothing changed.")
@@ -1578,15 +1625,20 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
                 "securities": len(ids),
                 "symbols": [c["primary_symbol"] for c in candidates],
                 "security_ids": ids,
+                "renames_dismissed": [
+                    f"{r['old_symbol']}->{r['new_symbol']}@{r['change_date']}"
+                    for r in renames
+                ],
             },
         ) as run:
-            removed = repo.purge_securities(database, ids)
+            removed = repo.purge_securities(
+                database, ids, removed_by=removed_by, note=note
+            )
             run.symbols_requested = len(ids)
             run_id = run.run_id
 
     for table, count in removed.items():
-        verb = "detached" if table == "core.symbol_change" else "deleted"
-        click.echo(f"  {verb} {count:>9} rows  {table}")
+        click.echo(f"  {_descope_verb(table, done=True):<9} {count:>9} rows  {table}")
     click.echo(
         f"Descoped {len(ids)} securit{'y' if len(ids) == 1 else 'ies'} as {removed_by} "
         f"(ops.ingestion_run {run_id})."

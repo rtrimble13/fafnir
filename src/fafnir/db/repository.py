@@ -1162,21 +1162,65 @@ SECURITY_FOOTPRINT_TABLES = (
 )
 
 
+#: The key :func:`security_footprint` and :func:`purge_securities` count the
+#: unresolved renames under. Not a table of its own: those rows stay in
+#: core.symbol_change, closed as ``dismissed`` -- see :func:`purge_securities`.
+UNRESOLVED_RENAMES = "core.symbol_change (unresolved renames)"
+
+
+def unresolved_renames(db: Database, security_ids: list[int]) -> list[dict]:
+    """The ``conflict`` renames that name one of these securities, on either side.
+
+    A conflict row carries the id of the security being renamed, and names the
+    listed security already holding the target ticker only by that ticker, so both
+    are matched -- the ticker the way :func:`active_security_for_symbol` finds the
+    holder that blocks the rename. These are the renames a purge has to close: see
+    :func:`purge_securities`.
+    """
+    ids = list(security_ids)
+    return db.fetchall(
+        """
+        WITH held AS (
+            SELECT s.primary_symbol AS symbol FROM core.security s
+             WHERE s.security_id = ANY(%s) AND s.delisted_date IS NULL
+            UNION
+            SELECT x.symbol FROM core.symbol_xref x
+              JOIN core.security s ON s.security_id = x.security_id
+             WHERE x.security_id = ANY(%s) AND x.valid_to IS NULL
+               AND s.delisted_date IS NULL
+        )
+        SELECT c.old_symbol, c.new_symbol, c.change_date, c.security_id, c.source
+          FROM core.symbol_change c
+         WHERE c.status = %s
+           AND (c.security_id = ANY(%s)
+                OR c.new_symbol IN (SELECT symbol FROM held))
+         ORDER BY c.change_date, c.old_symbol, c.new_symbol
+        """,
+        (ids, ids, CHANGE_CONFLICT, ids),
+    )
+
+
 def security_footprint(db: Database, security_ids: list[int]) -> dict[str, int]:
     """Rows each table holds for these securities -- what a purge would touch."""
     ids = list(security_ids)
-    return {
-        table: int(
+    footprint = {UNRESOLVED_RENAMES: len(unresolved_renames(db, ids))}
+    for table in SECURITY_FOOTPRINT_TABLES:
+        footprint[table] = int(
             db.fetchval(
                 f"SELECT count(*) FROM {table} WHERE security_id = ANY(%s)", (ids,)
             )
             or 0
         )
-        for table in SECURITY_FOOTPRINT_TABLES
-    }
+    return footprint
 
 
-def purge_securities(db: Database, security_ids: list[int]) -> dict[str, int]:
+def purge_securities(
+    db: Database,
+    security_ids: list[int],
+    *,
+    removed_by: str,
+    note: Optional[str] = None,
+) -> dict[str, int]:
     """Delete these securities and every row keyed to them. Returns rows per table.
 
     This is the one place fafnir deletes a security that holds history. It exists
@@ -1190,11 +1234,51 @@ def purge_securities(db: Database, security_ids: list[int]) -> dict[str, int]:
     deleted. The rename sweep reads that table to know a change was already
     recorded; deleting the row would let the vendor's feed re-offer the rename
     against a ticker nothing holds any more, every night.
+
+    Detaching is only safe for a rename that is already terminal. A ``conflict`` is
+    retried every night, and the purge changes its answer. With the old ticker
+    gone, a conflict whose two sides were both removed can never resolve, and stays
+    in the review queue for good. Worse, when only the target's holder was removed,
+    nothing blocks the rename any more, and the sweep carries it onto the remaining
+    security. That is the vendor's pre-launch ticker shuffle (``ABCD -> ABCDU``)
+    renaming a SPAC's class A share onto its unit's ticker, which the
+    security-master load then never refreshes and the next descope deletes. So
+    every :func:`unresolved_renames` row is dismissed first, as ``removed_by``, and
+    its ``symbol_change_conflict`` flag resolved.
     """
     ids = list(security_ids)
     if not ids:
-        return {table: 0 for table in SECURITY_FOOTPRINT_TABLES}
-    removed: dict[str, int] = {}
+        return {UNRESOLVED_RENAMES: 0, **{t: 0 for t in SECURITY_FOOTPRINT_TABLES}}
+    reason = "security descope: one side of this rename is out of scope (ADR 0012)"
+    if note:
+        reason = f"{reason}. {note}"
+    renames = unresolved_renames(db, ids)
+    for rename in renames:
+        dismiss_symbol_change(
+            db,
+            old_symbol=rename["old_symbol"],
+            new_symbol=rename["new_symbol"],
+            change_date=rename["change_date"],
+            note=reason,
+            dismissed_by=removed_by,
+            source=rename["source"],
+        )
+        flag_ids = open_dq_flag_ids_for_record(
+            db,
+            check_name="symbol_change_conflict",
+            record_key={
+                "old_symbol": rename["old_symbol"],
+                "new_symbol": rename["new_symbol"],
+            },
+        )
+        if flag_ids:
+            resolve_dq_flags(
+                db,
+                DqFilter(flag_ids=tuple(flag_ids)),
+                note=reason,
+                resolved_by=removed_by,
+            )
+    removed: dict[str, int] = {UNRESOLVED_RENAMES: len(renames)}
     for table in SECURITY_FOOTPRINT_TABLES:
         if table == "core.symbol_change":
             removed[table] = db.execute(

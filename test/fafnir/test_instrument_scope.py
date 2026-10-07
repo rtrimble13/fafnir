@@ -8,6 +8,7 @@ either leaking back into scope or, worse, a real company falling out of it.
 
 from __future__ import annotations
 
+import click
 import pytest
 
 from fafnir import cli
@@ -117,3 +118,6 @@ def test_a_misspelt_kind_is_an_error_not_a_silent_readmission(tmp_path):
     cfg = _config(tmp_path, '[general]\nexclude_instruments = ["warants"]\n')
     with pytest.raises(ValueError, match="warants"):
         cfg.excluded_instruments
+    # The commands that read it say so in one line rather than a traceback.
+    with pytest.raises(click.ClickException, match="warants"):
+        cli._excluded_instruments(cfg)

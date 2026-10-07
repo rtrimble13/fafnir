@@ -405,8 +405,10 @@ still lists.
 
 If the security master ran before the rename was known and minted the new ticker as
 its own row, the sweep folds that duplicate back in — but only when it is still
-empty (no bars, no actions, no factors). That fold is the one place fafnir deletes
-a security; retention exists so history is never lost, and a stub has none. A
+empty (no bars, no actions, no factors). That fold is the one place a loader deletes
+a security; retention exists so history is never lost, and a stub has none. (An
+operator can too: `security merge` folds a duplicate by hand, and `security
+descope` removes an instrument kind taken out of scope.) A
 duplicate that *has* accumulated history is a `conflict` instead: merging two price
 histories is not a decision a loader should make silently.
 

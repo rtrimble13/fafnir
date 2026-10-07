@@ -185,10 +185,14 @@ the bad one).
 
 ## 18. Warrants, rights and units are not in the universe (ADR 0012)
 
-From the release that carries ADR 0012, `ingest securities` skips them, and
-`fafnir security descope` has removed the ones minted before it. SPAC class A shares
-are still held. A warrant, right or unit that *is* present was declared on purpose
-(`fafnir track list`), as Granite REIT's `GRP-UN` is.
+From the release that carries ADR 0012, `ingest securities` skips them. The ones
+minted before it stay until an operator runs `fafnir security descope`, once. Until
+then the load no longer refreshes them, though their prices still load. Whether it
+has run is an `ops.ingestion_run` row with endpoint `security-descope`. After it, a
+warrant, right or unit that *is* present was declared on purpose
+(`fafnir track list`), as Granite REIT's `GRP-UN` is. SPAC class A shares are still
+held either way.
 
 > **Wrong answer:** "fafnir has no data for ABCDW" read as a load failure, or a
-> SPAC's unit or warrant history expected next to its class A shares.
+> SPAC's unit or warrant history expected next to its class A shares. Equally, a
+> warrant still held before the descope has run is not a filter failure.

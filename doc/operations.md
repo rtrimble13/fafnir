@@ -633,11 +633,22 @@ $F db refresh-marts                                   # 4. drop them from the ma
 - **What goes with each security:** bars, corporate actions, factors, profiles,
   ticker periods, watermarks, operator overrides and DQ flags. Rename records are
   kept, with `security_id` set to NULL.
+- **Renames still in conflict that name one of them are dismissed**, and their
+  `symbol_change_conflict` flags resolved. The dry run lists each one (`Unresolved
+  rename, dismissed with them: …`). Left open, they could never resolve, or the
+  next sweep would carry the rename onto the security that remains.
 - **The audit record** is the `ops.ingestion_run` row with source `operator` and
-  endpoint `security-descope`. It names every symbol and id removed.
+  endpoint `security-descope`. It names every symbol and id removed, and every
+  rename dismissed.
 - **Order matters.** Run this only after the release that stops the minting is
   deployed. Before that, the next nightly load mints the removed securities back,
-  with full history.
+  with full history. For the same reason, a `--kind` that
+  `[general] exclude_instruments` does not exclude is refused.
+- **Not while the nightly job runs.** It still loads prices for these securities
+  until they are gone, and its inserts collide with the deletes. Either the
+  descope fails and rolls back whole, or the night's whole `ingest prices` run
+  aborts on the first bar for a security the descope removed. Check
+  `systemctl list-timers 'fafnir-*'` and run it in the day.
 
 ## Recovery
 

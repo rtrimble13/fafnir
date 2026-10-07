@@ -17,6 +17,7 @@ from click.testing import CliRunner
 from fafnir import cli
 from fafnir.db import repository as repo
 from fafnir.ingest import security_master
+from fafnir.ingest.symbol_changes import load_symbol_changes
 
 pytestmark = pytest.mark.integration
 
@@ -40,6 +41,18 @@ class _ScreenerFMP:
 
 def _row(symbol, name):
     return {"symbol": symbol, "exchangeShortName": "NASDAQ", "name": name}
+
+
+class _RenameFeed:
+    """Symbol-change feed stub."""
+
+    bytes_downloaded = 0
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def symbol_changes(self, *, max_pages=5):
+        return self.rows
 
 
 def _held(db, symbol):
@@ -144,8 +157,7 @@ def _mint(db, symbol, name="Abcd Acquisition Corp."):
     return sid
 
 
-def _give_everything(db, sid, symbol):
-    """One row in every table that keys to a security."""
+def _bar(db, sid):
     repo.upsert_daily_prices(
         db,
         [
@@ -160,6 +172,11 @@ def _give_everything(db, sid, symbol):
             }
         ],
     )
+
+
+def _give_everything(db, sid, symbol):
+    """One row in every table that keys to a security, and a rename in conflict."""
+    _bar(db, sid)
     repo.upsert_corporate_action(
         db,
         security_id=sid,
@@ -185,6 +202,14 @@ def _give_everything(db, sid, symbol):
         new_symbol=symbol,
         change_date=DAY,
         status="applied",
+        security_id=sid,
+    )
+    repo.record_symbol_change(
+        db,
+        old_symbol=symbol,
+        new_symbol=symbol + "Q",
+        change_date=DAY,
+        status="conflict",
         security_id=sid,
     )
     repo.set_watermark(db, "fmp", "test-endpoint", DAY, security_id=sid)
@@ -216,7 +241,7 @@ def test_purge_removes_every_row_and_detaches_the_rename_trail(db):
     _give_everything(db, sid, "ABCDW")
     assert all(n >= 1 for n in _rows_for(db, sid).values())
 
-    removed = repo.purge_securities(db, [sid])
+    removed = repo.purge_securities(db, [sid], removed_by="tester")
 
     assert all(n >= 1 for n in removed.values())
     assert all(n == 0 for n in _rows_for(db, sid).values())
@@ -228,6 +253,14 @@ def test_purge_removes_every_row_and_detaches_the_rename_trail(db):
         )
         == 1
     )
+    # The conflict is closed rather than left for the sweep to retry for ever.
+    dismissed = db.fetchone(
+        "SELECT status, security_id, detail FROM core.symbol_change"
+        " WHERE old_symbol = 'ABCDW' AND new_symbol = 'ABCDWQ'"
+    )
+    assert dismissed["status"] == repo.CHANGE_DISMISSED
+    assert dismissed["security_id"] is None
+    assert dismissed["detail"]["dismissed_by"] == "tester"
 
 
 def test_purge_leaves_every_other_security_alone(db):
@@ -237,9 +270,15 @@ def test_purge_leaves_every_other_security_alone(db):
     _give_everything(db, keeper, "ABCD")
     before = _rows_for(db, keeper)
 
-    repo.purge_securities(db, [victim])
+    repo.purge_securities(db, [victim], removed_by="tester")
 
     assert _rows_for(db, keeper) == before
+    assert (
+        repo.symbol_change_status(
+            db, old_symbol="ABCD", new_symbol="ABCDQ", change_date=DAY
+        )
+        == repo.CHANGE_CONFLICT
+    )
 
 
 def test_descope_dry_run_lists_and_changes_nothing(db):
@@ -295,3 +334,70 @@ def test_descope_with_nothing_excluded_refuses(db):
     result = _descope(db, "--dry-run", excluded=())
     assert result.exit_code != 0
     assert "nothing to descope" in result.output
+
+
+def test_descope_refuses_a_kind_the_load_still_mints(db):
+    """Removing units the nightly load still admits would only re-mint them, under
+    new ids and with their full price history."""
+    _mint(db, "ABCDU", "Abcd Acquisition Corp. Units")
+
+    result = _descope(db, "--kind", "unit", "--yes", excluded=("warrant",))
+
+    assert result.exit_code != 0
+    assert "does not exclude unit" in result.output
+    assert _held(db, "ABCDU") == 1
+
+
+def test_descope_does_not_unblock_a_rename_onto_a_removed_ticker(db):
+    """The vendor's pre-launch shuffle, ABCD -> ABCDU, conflicts while the unit is
+    held. Removing the unit must not let the next sweep carry the rename onto the
+    class A share: renamed to ABCDU, the security-master load would never refresh
+    it again, and the next descope would delete it as a unit."""
+    share = _mint(db, "ABCD")
+    unit = _mint(db, "ABCDU", "Abcd Acquisition Corp. Units")
+    _bar(db, share)
+    _bar(db, unit)
+    feed = _RenameFeed(
+        [
+            {
+                "date": str(DAY),
+                "oldSymbol": "ABCD",
+                "newSymbol": "ABCDU",
+                "companyName": "Abcd Acquisition Corp.",
+            }
+        ]
+    )
+    load_symbol_changes(db, feed)
+    assert (
+        repo.symbol_change_status(
+            db, old_symbol="ABCD", new_symbol="ABCDU", change_date=DAY
+        )
+        == repo.CHANGE_CONFLICT
+    )
+
+    dry = _descope(db, "--dry-run")
+    assert "Unresolved rename, dismissed with them: ABCD -> ABCDU" in dry.output
+    result = _descope(db, "--yes", "-m", "ADR 0012", "--by", "tester")
+    assert result.exit_code == 0, result.output
+
+    assert (
+        repo.symbol_change_status(
+            db, old_symbol="ABCD", new_symbol="ABCDU", change_date=DAY
+        )
+        == repo.CHANGE_DISMISSED
+    )
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.data_quality_flag"
+            " WHERE check_name = 'symbol_change_conflict' AND resolved_at IS NULL"
+        )
+        == 0
+    )
+    load_symbol_changes(db, feed)
+    assert (
+        db.fetchval(
+            "SELECT primary_symbol FROM core.security WHERE security_id = %s",
+            (share,),
+        )
+        == "ABCD"
+    )
