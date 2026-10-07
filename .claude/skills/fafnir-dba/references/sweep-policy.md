@@ -31,6 +31,16 @@ The **Never** tier is also `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, an
 moment you decide. `test_never_auto_matches_the_skill` asserts the two lists
 agree — if you are editing one, edit both.
 
+**Warrants, rights and units awaiting the descope** (ADR 0012). Until an
+`ops.ingestion_run` row with endpoint `security-descope` exists, every flag on one
+of these sits on a row the descope will delete, flags and all. Leave their `stale`,
+`gap`, `sparse_coverage` and `outlier` flags open rather than re-fetching,
+rechecking or accepting them, and say so in the report.
+
+Classify with `fafnir.instruments.instrument_kind`, not by eye: most SPAC warrants
+carry the sponsor's plain name. The descope itself is an operator command, so
+propose it; never run it.
+
 ---
 
 ## Preconditions for the judgement tier

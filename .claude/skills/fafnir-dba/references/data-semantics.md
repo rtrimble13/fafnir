@@ -203,3 +203,41 @@ instead.
 > **Wrong answer:** "fafnir has no data for ABCDW" read as a load failure, or a
 > SPAC's unit or warrant history expected next to its class A shares. Equally, a
 > warrant still held before the descope has run is not a filter failure.
+
+## 19. A dividend can be stored twice across a ticker change
+
+After a rename, FMP files a distribution again under the new ticker. When a split
+takes effect on the record date, it also restates the amount on the new share
+basis and dates it at the ticker change.
+
+OPNW (VerifyMe → OpenWorld, 2026-09/10) carried two rows with the same record and
+payment dates: $0.15 ex 09-29 under VRME, and $1.50 "ex 10-01" under OPNW. That was
+one dividend counted twice, and it put the adjusted prices about 17% low.
+
+When a split and a dividend share an ex-date, the stored dividend must be in
+**pre-split** terms. The factor is valued against the prior raw close, which is the
+pre-split close. The post-split amount there gives a negative factor
+(`dividend_exceeds_price`), and it is skipped.
+
+> **Wrong answer:** two dividends with the same record and payment dates read as two
+> distributions, or the post-split amount "corrected" onto the split's ex-date.
+
+## 20. A venue transfer can arrive as a delisting
+
+FMP's delisted feed has reported a move between exchanges as a delisting. ET, SUN,
+SUNC and USAC moved from the NYSE to the Texas Stock Exchange after the 2026-10-02
+close and kept their tickers. The nightly sweep stamped them delisted 2026-10-05,
+and they stopped receiving bars.
+
+Nothing puts them back on its own:
+
+- TXSE is not among the venues the security-master load reads, so the load does not
+  re-admit them.
+- `mark_delisted` is one-way, and no command undoes it.
+
+Before reporting a large, liquid name as delisted, check for a venue transfer in
+company investor relations or exchange notices. A wrongly stamped delisting is an
+escalation, because the fix is code (the venue list, an un-delist path) plus an
+operator decision.
+
+> **Wrong answer:** "ET was delisted on 2026-10-05". It changed venue.
