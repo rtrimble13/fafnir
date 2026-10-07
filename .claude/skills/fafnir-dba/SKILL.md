@@ -301,9 +301,10 @@ the full sort order, with the queries.
   sequence values. The real run's override or action id is therefore not the next
   number after the last one; read ids from the output, never predict them.
 - **`mart.v_security_price_coverage` is a live view.** It is right for a handful of
-  securities, but joined to hundreds it exceeds `sql_read`'s timeout. Count bars from
-  `core.daily_price` with `security_id = ANY(ARRAY(SELECT …))` and a `trade_date`
-  bound instead: 493 securities and 77,804 bars came back at once that way.
+  securities, but joined to hundreds it exceeds the read role's `statement_timeout`.
+  Count bars from `core.daily_price` with `security_id = ANY(ARRAY(SELECT …))` and a
+  `trade_date` bound instead: 493 securities and 77,804 bars came back at once that
+  way.
 - **A step whose dry run exists only after the previous step ran.** Examples: a
   split re-added once a revoke has run, or a merge re-checked once its noise bars
   are deleted. State the expected dry-run output in the plan, before the first step

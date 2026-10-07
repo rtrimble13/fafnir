@@ -216,8 +216,10 @@ one dividend counted twice, and it put the adjusted prices about 17% low.
 
 When a split and a dividend share an ex-date, the stored dividend must be in
 **pre-split** terms. The factor is valued against the prior raw close, which is the
-pre-split close. The post-split amount there gives a negative factor
-(`dividend_exceeds_price`), and it is skipped.
+pre-split close. A post-split amount there is wrong either way. After a large
+enough reverse split, like OPNW's 1-for-10, it exceeds that close: the factor goes
+negative (`dividend_exceeds_price`) and the dividend is skipped. After a forward
+split it is silently too small, and nothing flags it.
 
 > **Wrong answer:** two dividends with the same record and payment dates read as two
 > distributions, or the post-split amount "corrected" onto the split's ex-date.

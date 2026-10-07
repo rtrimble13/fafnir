@@ -635,6 +635,13 @@ $F db refresh-marts                                   # 4. drop them from the ma
   ticker makes `ingest tracked` mint it again as a new security. Both show at the
   top of the dry run (`Kept, declared …` / `Kept, --keep …`). A `--keep` that names
   nothing the run would remove stops the run before anything changes.
+- **If `GRP-UN` was declared** under the earlier version of this runbook, undo that
+  before the descope: `$F track rm GRP-UN`. If `ingest tracked` has run since, check
+  `SELECT security_id, delisted_date FROM core.security WHERE primary_symbol =
+  'GRP-UN'`. A second, listed row is the duplicate it minted. Fold it into the
+  delisted original with `$F security merge <duplicate_id> <original_id>
+  --dry-run`, then without `--dry-run`, before the descope. `--keep GRP-UN` keeps
+  every row under the ticker, the duplicate included.
 - **What goes with each security:** bars, corporate actions, factors, profiles,
   ticker periods, watermarks, operator overrides and DQ flags. Rename records are
   kept, with `security_id` set to NULL.

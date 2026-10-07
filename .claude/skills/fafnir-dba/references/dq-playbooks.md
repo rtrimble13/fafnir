@@ -641,8 +641,8 @@ Three shapes need more than the merge itself:
 - **A SPAC merger the feed never sent as a ticker change** (COLA → SAIQ,
   2026-10-06). The old ticker is delisted, so `merge-rename` refuses ("not a listed
   security") and nothing retargets a delisted row. Merge the **old row into the live
-  new one** (`security merge <old> <new>`). Keeping the old row instead just gets the
-  new ticker minted again.
+  new one** (`security merge <old_id> <new_id>`; it takes security ids, victim
+  first). Keeping the old row instead just gets the new ticker minted again.
   - The old row's ticker period and identifiers (the SPAC's CUSIP, ISIN and CIK)
     are deleted with it.
   - `--note` is stored only on the duplicate-identity flags the merge closes, and a
