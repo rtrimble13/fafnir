@@ -32,7 +32,7 @@ import click
 from fafnir import __version__
 from fafnir.config import get_config
 from fafnir.db.connection import Database, DatabaseConnectionError
-from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
+from fafnir.instruments import INSTRUMENT_KINDS, select_descope_candidates
 from fafnir.logging_config import LogDirectoryError, setup_logging
 
 
@@ -1504,13 +1504,23 @@ def _descope_verb(table: str, *, done: bool = False) -> str:
     help="Why. Kept on the ops.ingestion_run row that audits the run, and on any "
     "rename it dismisses.",
 )
+@click.option(
+    "--keep",
+    "keep_symbols",
+    multiple=True,
+    metavar="SYMBOL",
+    help="Keep this security although its kind is excluded; repeatable. For one "
+    "that no longer lists -- a listed one is declared with `track add` instead. "
+    "A SYMBOL matching nothing this run would remove is refused, so a typo cannot "
+    "delete the security it meant to keep.",
+)
 @click.option("--by", "removed_by", help="Who  [default: the OS user]")
 @click.option(
     "--dry-run", is_flag=True, help="List what would be removed; change nothing."
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
 @click.pass_context
-def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
+def security_descope(ctx, kinds, note, keep_symbols, removed_by, dry_run, yes):
     """Delete every security of an excluded instrument kind, with all its rows.
 
     \b
@@ -1524,8 +1534,16 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
     refused.
 
     Candidates are classified by their ticker (and, for two ambiguous shapes, their
-    name); see `fafnir.instruments.instrument_kind`. A symbol in the declared
-    universe (`fafnir track add`) is kept -- that is how one is exempted.
+    name); see `fafnir.instruments.instrument_kind`. There are two ways to keep one:
+
+    \b
+      * a symbol in the declared universe (`fafnir track add`), for a ticker that
+        still lists -- every future descope skips it too;
+      * --keep SYMBOL, for this run, for one that no longer lists. Declaring a
+        delisted ticker makes `ingest tracked` mint it again as a new security.
+
+    Every --keep must name a security this run would otherwise remove; one that
+    names nothing is refused before anything is read out or changed.
 
     IRREVERSIBLE. Bars, corporate actions, factors, profiles, ticker periods,
     watermarks, operator overrides and DQ flags go with each security, in one
@@ -1559,30 +1577,42 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
 
     with Database(cfg.dsn) as database:
         declared = {r["symbol"] for r in repo.list_tracked_symbols(database)}
-        candidates: list[dict] = []
-        kept: list[str] = []
         securities = database.fetchall(
             "SELECT security_id, primary_symbol, company_name, is_etf, is_fund,"
-            " is_actively_trading FROM core.security"
+            " is_actively_trading, delisted_date FROM core.security"
             " ORDER BY primary_symbol, security_id"
         )
-        for row in securities:
-            kind = out_of_scope_kind(
-                row["primary_symbol"],
-                row["company_name"],
-                is_etf=bool(row["is_etf"]),
-                is_fund=bool(row["is_fund"]),
-                excluded=wanted,
+        selection = select_descope_candidates(
+            securities, excluded=wanted, declared=declared, keep=keep_symbols
+        )
+        if selection.unmatched_keeps:
+            raise click.ClickException(
+                f"--keep {', '.join(selection.unmatched_keeps)} matches no "
+                f"{'/'.join(wanted)} security this run would remove. Nothing was "
+                "changed. Check the ticker: a misspelt --keep would have deleted the "
+                "security it was meant to keep."
             )
-            if kind is None:
-                continue
-            if row["primary_symbol"] in declared:
-                kept.append(row["primary_symbol"])
-                continue
-            candidates.append({**row, "kind": kind})
+        candidates = selection.candidates
 
-        if kept:
-            click.echo(f"Kept, declared in ref.tracked_symbol: {', '.join(kept)}")
+        if selection.kept_declared:
+            click.echo(
+                "Kept, declared in ref.tracked_symbol: "
+                + ", ".join(k["primary_symbol"] for k in selection.kept_declared)
+            )
+        if selection.kept_by_request:
+            click.echo(
+                "Kept, --keep: "
+                + ", ".join(
+                    f"{k['primary_symbol']} ({k['security_id']}, "
+                    + (
+                        f"delisted {k['delisted_date']}"
+                        if k["delisted_date"]
+                        else "listed"
+                    )
+                    + ")"
+                    for k in selection.kept_by_request
+                )
+            )
         if not candidates:
             click.echo(f"No {'/'.join(wanted)} securities to descope.")
             return
@@ -1632,6 +1662,10 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
                 "securities": len(ids),
                 "symbols": [c["primary_symbol"] for c in candidates],
                 "security_ids": ids,
+                "kept_declared": [k["primary_symbol"] for k in selection.kept_declared],
+                "kept_by_option": [
+                    k["primary_symbol"] for k in selection.kept_by_request
+                ],
                 "renames_dismissed": [
                     f"{r['old_symbol']}->{r['new_symbol']}@{r['change_date']}"
                     for r in renames

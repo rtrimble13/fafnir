@@ -623,13 +623,25 @@ Removing the ones already held is a one-time operator step, and it is
 ```bash
 F="sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir"
 scripts/backup_dump.sh                                # 1. a restorable copy first
-$F track add GRP-UN --asset-type equity --exchange NYSE \
-   --note "Granite REIT stapled units: the REIT's only US listing (ADR 0012)"
-$F security descope --dry-run > descope-dry-run.txt   # 2. read every line
-$F security descope -m "ADR 0012" --yes > descope.txt # 3. one transaction
+K="--keep GRP-UN"   # Granite REIT's units: delisted from NYSE 2025-12-31, history kept
+$F security descope $K --dry-run > descope-dry-run.txt    # 2. read every line
+$F security descope $K -m "ADR 0012" --yes > descope.txt  # 3. one transaction
 $F db refresh-marts                                   # 4. drop them from the marts
 ```
 
+- **Keeping one.** A ticker that still lists is declared once with
+  `fafnir track add`, and every descope skips it. A security that no longer lists
+  is named with `--keep SYMBOL` on each run instead, because declaring a delisted
+  ticker makes `ingest tracked` mint it again as a new security. Both show at the
+  top of the dry run (`Kept, declared …` / `Kept, --keep …`). A `--keep` that names
+  nothing the run would remove stops the run before anything changes.
+- **If `GRP-UN` was declared** under the earlier version of this runbook, undo that
+  before the descope: `$F track rm GRP-UN`. If `ingest tracked` has run since, check
+  `SELECT security_id, delisted_date FROM core.security WHERE primary_symbol =
+  'GRP-UN'`. A second, listed row is the duplicate it minted. Fold it into the
+  delisted original with `$F security merge <duplicate_id> <original_id>
+  --dry-run`, then without `--dry-run`, before the descope. `--keep GRP-UN` keeps
+  every row under the ticker, the duplicate included.
 - **What goes with each security:** bars, corporate actions, factors, profiles,
   ticker periods, watermarks, operator overrides and DQ flags. Rename records are
   kept, with `security_id` set to NULL.
@@ -638,8 +650,8 @@ $F db refresh-marts                                   # 4. drop them from the ma
   rename, dismissed with them: …`). Left open, they could never resolve, or, with
   their blocker gone, would be left to the sweep to decide alone.
 - **The audit record** is the `ops.ingestion_run` row with source `operator` and
-  endpoint `security-descope`. It names every symbol and id removed, and every
-  rename dismissed.
+  endpoint `security-descope`. It names every symbol and id removed, every rename
+  dismissed, and what was kept (`kept_declared`, `kept_by_option`).
 - **Order matters.** Run this only after the release that stops the minting is
   deployed. Before that, the next nightly load mints the removed securities back,
   with full history. For the same reason, a `--kind` that

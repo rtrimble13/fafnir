@@ -113,6 +113,26 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
 - **`journalctl` needs the `adm` or `systemd-journal` group**, which `claude` is
   not in. Use `ops.ingestion_run` for what ran and how it ended.
 
+### Resuming a plan an earlier session made
+
+Notes and memory record what was *planned* or *approved*; only the warehouse records
+what *ran*. A session can end between a real run and the note that would have
+recorded it. On 2026-10-06 the notes said "dry runs only, awaiting a yes" while
+most of the approved batches had already run, minutes after the notes were written.
+Before acting on an earlier plan:
+
+- Read that session's run output if it exists: real-run files sit next to its dry
+  runs.
+- Ask the warehouse what changed since the plan was written: `max(resolved_at)` on
+  `ops.data_quality_flag`; `max(override_id)`, `max(created_at)` and
+  `max(revoked_at)` on `ops.operator_override`; every `ops.ingestion_run` since.
+- Check each planned effect before proposing it again: the action row, the flag's
+  state, the bars a re-fetch was meant to land.
+
+Most commands refuse a literal repeat. The real damage is a plan built on a stale
+picture: a recheck prediction computed before a re-fetch, or a split "restored" by
+a revoke that in fact left the security with none.
+
 ## Which tool for what
 
 | Need | Use |
@@ -276,6 +296,20 @@ the full sort order, with the queries.
 - **A `prices delete` dry run prints every bar.** Count the `requested` rows in the
   output file against the dates you passed; a date with no stored bar is skipped
   with only a one-line `No stored bar on …` notice.
+- **A dry run that rolls back still uses up ids.** `prices delete` and
+  `actions add|delete` dry runs make the change and roll it back, which consumes
+  sequence values. The real run's override or action id is therefore not the next
+  number after the last one; read ids from the output, never predict them.
+- **`mart.v_security_price_coverage` is a live view.** It is right for a handful of
+  securities, but joined to hundreds it exceeds the read role's `statement_timeout`.
+  Count bars from `core.daily_price` with `security_id = ANY(ARRAY(SELECT …))` and a
+  `trade_date` bound instead: 493 securities and 77,804 bars came back at once that
+  way.
+- **A step whose dry run exists only after the previous step ran.** Examples: a
+  split re-added once a revoke has run, or a merge re-checked once its noise bars
+  are deleted. State the expected dry-run output in the plan, before the first step
+  runs. Then run each dry run between steps and stop on any mismatch rather than
+  reasoning past it.
 
 ## Reference
 
