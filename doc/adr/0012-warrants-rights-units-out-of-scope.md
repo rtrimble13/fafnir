@@ -1,6 +1,6 @@
 # ADR 0012: Warrants, rights and units are out of scope
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-06
 - Implemented by: `src/fafnir/ingest/security_master.py` (`instrument_kind`,
   `out_of_scope_kind`, `load_securities`), `src/fafnir/db/repository.py`
