@@ -15,6 +15,7 @@ from typing import Any, Iterable, NamedTuple, Optional, Sequence
 import psycopg
 
 from fafnir.db.connection import Database
+from fafnir.instruments import rename_changes_instrument
 
 # ---------------------------------------------------------------------------
 # Reference dimensions
@@ -412,12 +413,17 @@ class SymbolChangeOutcome(NamedTuple):
     overwrote it. It is the only record of the name the vendor keeps serving the
     *old* ticker under, which is what lets a later security-master load recognise
     that entry as an echo rather than a listing (:func:`renamed_away_securities`).
+
+    ``reason`` says why a ``conflict`` was refused when it is not the usual one (the
+    new ticker held by another listed security with history): a rename that would
+    change what the instrument is (:func:`rename_instrument_refusal`).
     """
 
     status: str
     security_id: Optional[int]
     folded_security_id: Optional[int] = None
     old_company_name: Optional[str] = None
+    reason: Optional[str] = None
 
 
 def active_security_for_symbol(
@@ -1238,13 +1244,13 @@ def purge_securities(
     Detaching is only safe for a rename that is already terminal. A ``conflict`` is
     retried every night, and the purge changes its answer. With the old ticker
     gone, a conflict whose two sides were both removed can never resolve, and stays
-    in the review queue for good. Worse, when only the target's holder was removed,
-    nothing blocks the rename any more, and the sweep carries it onto the remaining
-    security. That is the vendor's pre-launch ticker shuffle (``ABCD -> ABCDU``)
-    renaming a SPAC's class A share onto its unit's ticker, which the
-    security-master load then never refreshes and the next descope deletes. So
-    every :func:`unresolved_renames` row is dismissed first, as ``removed_by``, and
-    its ``symbol_change_conflict`` flag resolved.
+    in the review queue for good. When only the target's holder was removed, the
+    holder that blocked the rename is gone: the sweep's instrument guard
+    (:func:`rename_instrument_refusal`) still refuses the vendor's pre-launch
+    shuffle (``ABCD -> ABCDU``), but a removal is no reason to carry any rename an
+    operator had not decided on. So every :func:`unresolved_renames` row is
+    dismissed first, as ``removed_by``, and its ``symbol_change_conflict`` flag
+    resolved.
     """
     ids = list(security_ids)
     if not ids:
@@ -1338,6 +1344,40 @@ def retarget_symbol(
     )
 
 
+def rename_instrument_refusal(
+    db: Database,
+    *,
+    security_id: int,
+    old_symbol: str,
+    new_symbol: str,
+    new_name: Optional[str] = None,
+) -> Optional[str]:
+    """Why renaming this security from OLD to NEW would change what it is, or None.
+
+    :func:`fafnir.instruments.rename_changes_instrument`, with the old ticker
+    classified under the name the security is held under and ``new_name`` (the
+    rename feed's, or the other row's) for the new one. Funds and ETFs are never
+    refused. Shared by the nightly sweep (:func:`apply_symbol_change`) and
+    `fafnir security merge-rename`, the two paths that move a held security to a
+    new ticker.
+    """
+    row = db.fetchone(
+        "SELECT company_name, is_etf, is_fund FROM core.security"
+        " WHERE security_id = %s",
+        (security_id,),
+    )
+    if row is None:
+        return None
+    return rename_changes_instrument(
+        old_symbol,
+        new_symbol,
+        old_name=row["company_name"],
+        new_name=new_name or row["company_name"],
+        is_etf=bool(row["is_etf"]),
+        is_fund=bool(row["is_fund"]),
+    )
+
+
 def apply_symbol_change(
     db: Database,
     *,
@@ -1360,11 +1400,16 @@ def apply_symbol_change(
       * ``applied``  -- the rename is now reflected in core.security and the xref.
       * ``conflict`` -- the new ticker already belongs to a different *listed*
         security that carries history. Merging two price histories is not a
-        decision a loader should make silently, so nothing is changed.
+        decision a loader should make silently, so nothing is changed. Also the
+        outcome, with a ``reason``, for a rename that would change what the
+        instrument is (:func:`rename_instrument_refusal`): checked before anything
+        else, so no fold, no free ticker and no later sweep ever carries it.
       * ``ignored``  -- the old ticker belongs to a delisted issuer. That is ticker
         reuse, not a rename, and 0009 already handles it by minting a new id.
       * ``unknown``  -- the old ticker is not in the security master at all, and
-        neither is the new one. Retryable: the security master may catch up.
+        neither is the new one. Retryable: the security master may catch up. Also
+        the outcome when only the new ticker is ours but the rename would change
+        the instrument: that end state is not this rename's, so it is not claimed.
     """
     old_symbol = (old_symbol or "").strip().upper()
     new_symbol = (new_symbol or "").strip().upper()
@@ -1387,10 +1432,28 @@ def apply_symbol_change(
         # is what lets a conflict leave the review queue: a non-terminal audit row
         # can only be closed by a later sweep reaching a terminal outcome.
         already = active_security_for_symbol(db, new_symbol, source)
-        if already is not None:
+        if already is not None and not rename_changes_instrument(
+            old_symbol, new_symbol, old_name=company_name
+        ):
             return SymbolChangeOutcome(CHANGE_APPLIED, already)
-        # Neither ticker is ours. Retryable: the security master may catch up.
+        # Neither ticker is ours, or only the new one is and it names a different
+        # instrument (the vendor's ABCDU -> ABCD for a unit never minted): recording
+        # that as applied would hand the unit's ticker to the share as a renamed-away
+        # name. Retryable: the security master may catch up.
         return SymbolChangeOutcome(CHANGE_UNKNOWN, None)
+
+    # Before the fold and before the free-ticker path: the shuffle this refuses
+    # (ABCD -> ABCDU) is usually unblocked, either because ADR 0012 never mints the
+    # unit or because the unit is still empty and would be folded away.
+    refusal = rename_instrument_refusal(
+        db,
+        security_id=security_id,
+        old_symbol=old_symbol,
+        new_symbol=new_symbol,
+        new_name=company_name,
+    )
+    if refusal:
+        return SymbolChangeOutcome(CHANGE_CONFLICT, security_id, reason=refusal)
 
     folded: Optional[int] = None
     holder = active_security_for_symbol(db, new_symbol, source)

@@ -13,10 +13,11 @@ import pytest
 
 from fafnir import cli
 from fafnir.config import FafnirConfig
-from fafnir.ingest.security_master import (
+from fafnir.instruments import (
     INSTRUMENT_KINDS,
     instrument_kind,
     out_of_scope_kind,
+    rename_changes_instrument,
 )
 
 
@@ -91,10 +92,6 @@ def test_out_of_scope_honours_the_excluded_kinds():
     assert out_of_scope_kind("AAPL", "Apple Inc.") is None
 
 
-def test_the_cli_offers_exactly_the_kinds_the_rule_knows():
-    assert tuple(cli._DESCOPE_KINDS) == INSTRUMENT_KINDS
-
-
 def _config(tmp_path, body: str) -> FafnirConfig:
     path = tmp_path / "fafnirrc"
     path.write_text(body)
@@ -121,3 +118,63 @@ def test_a_misspelt_kind_is_an_error_not_a_silent_readmission(tmp_path):
     # The commands that read it say so in one line rather than a traceback.
     with pytest.raises(click.ClickException, match="warants"):
         cli._excluded_instruments(cfg)
+
+
+# ---------------------------------------------------------------------------
+# A rename never changes what an instrument is. These are the shapes of the
+# vendor's ticker shuffles, not production pairs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "old, new, name",
+    [
+        ("ABCD", "ABCDU", "Abcd Acquisition Corp."),  # share onto its unit
+        ("ABCDU", "ABCD", "Abcd Acquisition Corp."),  # and back
+        ("ABCD", "ABCDW", None),
+        ("ABCD", "ABCDR", None),
+        ("ABCDU", "ABCDW", None),  # unit onto its warrant
+        ("AAC", "AAC-WT", "Ares Acquisition Corporation"),
+        ("BIII-UN", "BIII", "Black Spade Acquisition III Co"),
+        # A three-letter base: ZKPU alone needs its name, the shape does not.
+        ("ZKP", "ZKPU", "Lafayette Digital Acquisition Corp. I"),
+        ("ODVW", "ODVWZ", "Osisko Development Corp."),
+    ],
+)
+def test_a_shuffle_within_one_issue_is_refused(old, new, name):
+    assert rename_changes_instrument(old, new, old_name=name)
+
+
+@pytest.mark.parametrize(
+    "old, new, old_name, new_name",
+    [
+        ("FB", "META", "Facebook, Inc.", "Meta Platforms, Inc."),
+        # A de-SPAC: warrants follow the share to the merged company's ticker.
+        ("ABCDW", "NEWCW", "Abcd Acquisition Corp.", "NewCo Holdings, Inc."),
+        ("AAC-WT", "NEWC-WT", "Ares Acquisition Corporation", "NewCo Holdings"),
+        ("ZKPW", "NEWCW", "Lafayette Digital Acquisition Corp. I Warrant", None),
+        # Four-letter tickers ending in W/R/U that are ordinary shares.
+        ("CHRX", "CHRW", "C.H. Robinson Worldwide, Inc.", None),
+        ("SNOW", "SNWF", "Snowflake Inc.", None),
+        ("ABCD", "ABCD", "Abcd Acquisition Corp.", None),
+        ("", "ABCDU", None, None),
+    ],
+)
+def test_renames_that_keep_the_instrument_are_allowed(old, new, old_name, new_name):
+    assert (
+        rename_changes_instrument(old, new, old_name=old_name, new_name=new_name)
+        is None
+    )
+
+
+def test_the_reason_names_both_sides():
+    reason = rename_changes_instrument("ABCD", "ABCDU")
+    assert reason.startswith("ABCD is not a warrant, right or unit and ABCDU is a unit")
+    assert "ZKPU is ZKP plus the designator letter U" in rename_changes_instrument(
+        "ZKP", "ZKPU"
+    )
+
+
+def test_funds_and_etfs_are_never_refused():
+    assert rename_changes_instrument("ABCD", "ABCDU", is_etf=True) is None
+    assert rename_changes_instrument("ABC", "ABCW", is_fund=True) is None

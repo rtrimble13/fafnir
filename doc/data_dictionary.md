@@ -87,14 +87,18 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
 | `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. Also NULL once `fafnir security descope` has removed that security (ADR 0012): the row is kept, detached, so the sweep still knows the rename was recorded. |
 | `company_name` | TEXT | As reported with the rename. |
 | `status` | TEXT CHECK | `applied` / `conflict` / `ignored` / `dismissed` — see below. |
-| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. An applied rename records `old_company_name`, the security's name before the rename overwrote it: the security-master load declines a screener entry for the old ticker under that name (or the security's current name, or `company_name` above) as an echo instead of minting a copy of the company. `echo_names` lists further names it declines on that ticker: each one recorded by `security merge` from a re-minted echo it folded back in. |
+| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. A `conflict` refused because it would change the instrument carries that as `reason`. An applied rename records `old_company_name`, the security's name before the rename overwrote it: the security-master load declines a screener entry for the old ticker under that name (or the security's current name, or `company_name` above) as an echo instead of minting a copy of the company. `echo_names` lists further names it declines on that ticker: each one recorded by `security merge` from a re-minted echo it folded back in. |
 | `source` | TEXT | |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | |
 
 - `applied` — carried onto an existing `security_id` (terminal; never downgraded).
 - `conflict` — the new ticker already belongs to another **listed** security that
   carries history. Nothing was changed; retried on every sweep and raised as a
-  `symbol_change_conflict` DQ flag.
+  `symbol_change_conflict` DQ flag. Also the status, with `detail.reason`, of a
+  rename that would change what the instrument is: a share onto its own warrant,
+  right or unit ticker, or back (`ABCD -> ABCDU`, the vendor's pre-launch shuffle;
+  ADR 0012, `fafnir.instruments.rename_changes_instrument`). Such a rename is never
+  carried, so it waits for `fafnir security dismiss-rename`.
 - `ignored` — the old ticker belongs to a delisted issuer, so this is ticker
   *reuse*, not a rename.
 - `dismissed` (0018) — an operator judged the reported rename not to be a rename

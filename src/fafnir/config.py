@@ -30,6 +30,8 @@ import tomllib
 from pathlib import Path
 from typing import Any, Optional
 
+from fafnir.instruments import INSTRUMENT_KINDS
+
 DEFAULT_CONFIG_PATH = "~/.fafnirrc"
 
 #: Named once so the connection error surface can describe precedence without
@@ -216,8 +218,6 @@ class FafnirConfig:
         an error rather than ignored: a misspelt ``"warants"`` would otherwise
         quietly put every warrant back into scope.
         """
-        from fafnir.ingest.security_master import INSTRUMENT_KINDS
-
         raw = self._get("general", "exclude_instruments", list(INSTRUMENT_KINDS))
         if isinstance(raw, str):
             raw = [raw]

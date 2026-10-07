@@ -18,6 +18,7 @@ from fafnir import cli
 from fafnir.db import repository as repo
 from fafnir.ingest import security_master
 from fafnir.ingest.symbol_changes import load_symbol_changes
+from fafnir.instruments import INSTRUMENT_KINDS
 
 pytestmark = pytest.mark.integration
 
@@ -62,12 +63,12 @@ def _held(db, symbol):
 
 
 class _Cfg:
-    def __init__(self, dsn, excluded=security_master.INSTRUMENT_KINDS):
+    def __init__(self, dsn, excluded=INSTRUMENT_KINDS):
         self.dsn = dsn
         self.excluded_instruments = tuple(excluded)
 
 
-def _descope(db, *args, excluded=security_master.INSTRUMENT_KINDS):
+def _descope(db, *args, excluded=INSTRUMENT_KINDS):
     # Invoked directly, not through cli.main, whose callback would rebuild the
     # config from ~/.fafnirrc and aim this at the machine's own warehouse.
     return CliRunner().invoke(

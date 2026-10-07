@@ -415,7 +415,7 @@ histories is not a decision a loader should make silently.
 ### Instruments out of scope: warrants, rights and units (ADR 0012)
 
 `ingest securities` does not mint warrants, rights or units. It classifies each
-screener entry by ticker with `security_master.instrument_kind`:
+screener entry by ticker with `fafnir.instruments.instrument_kind`:
 
 - Nasdaq's reserved fifth letters W, R and U decide on their own.
 - So do the NYSE `-WT` / `-WS` / `-RT` / `-UN` suffixes.
@@ -432,6 +432,21 @@ SPAC issuance.
   stapled units (`GRP-UN`) are the known case.
 - Rows minted before the filter existed are not refreshed. Remove them with
   `fafnir security descope` (see [operations.md](operations.md#descoping-an-instrument-kind)).
+
+**A rename never changes the instrument.** The vendor's rename feed shuffles one
+SPAC's tickers among themselves before launch (`ABCD -> ABCDU`, and back). With the
+unit never minted, nothing holds the target ticker, and the sweep would move the
+class A share onto it. From there the screener load would skip it as out of scope,
+the price step would feed it the unit's bars, and the next descope would delete it.
+So `apply_symbol_change` refuses, before the fold and before the free-ticker path,
+any rename `fafnir.instruments.rename_changes_instrument` objects to. That covers
+a rename between kinds (`ABCD -> ABCDU`, `AAC -> AAC-WT`, `ABCDU -> ABCDW`), and one
+ticker being the other plus a designator letter (`ZKP -> ZKPU`). The row is
+recorded as a `conflict` with `detail.reason`, flagged once, and retried and
+refused nightly until `fafnir security dismiss-rename` closes it.
+`security merge-rename` refuses the same renames unless forced. A de-SPAC rename
+keeps the kind (`ABCDW -> NEWCW`) and applies as before; funds and ETFs are never
+refused.
 
 ## Order of operations (daily)
 

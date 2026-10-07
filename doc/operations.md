@@ -635,8 +635,8 @@ $F db refresh-marts                                   # 4. drop them from the ma
   kept, with `security_id` set to NULL.
 - **Renames still in conflict that name one of them are dismissed**, and their
   `symbol_change_conflict` flags resolved. The dry run lists each one (`Unresolved
-  rename, dismissed with them: …`). Left open, they could never resolve, or the
-  next sweep would carry the rename onto the security that remains.
+  rename, dismissed with them: …`). Left open, they could never resolve, or, with
+  their blocker gone, would be left to the sweep to decide alone.
 - **The audit record** is the `ops.ingestion_run` row with source `operator` and
   endpoint `security-descope`. It names every symbol and id removed, and every
   rename dismissed.

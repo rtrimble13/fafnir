@@ -32,6 +32,7 @@ import click
 from fafnir import __version__
 from fafnir.config import get_config
 from fafnir.db.connection import Database, DatabaseConnectionError
+from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
 from fafnir.logging_config import LogDirectoryError, setup_logging
 
 
@@ -947,8 +948,10 @@ def security_merge_rename(
     is absorbed and deleted.
 
     Refuses unless the vendor's own identifiers agree (CUSIP/ISIN/CIK, where both
-    sides have them) and the overlapping sessions agree on OHLC. Run it with
-    --dry-run first: the preview is the same comparison the guard runs.
+    sides have them) and the overlapping sessions agree on OHLC, and refuses a
+    rename that would change what the instrument is (a share onto its unit's or
+    warrant's ticker, ADR 0012). Run it with --dry-run first: the preview is the
+    same comparison the guard runs.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
@@ -989,11 +992,22 @@ def security_merge_rename(
         )
         click.echo(f"{old_symbol} -> {new_symbol}, effective {effective}")
         _echo_merge_plan(plan)
+        # Not in the plan's blockers: merge_security re-checks those for any merge,
+        # and this one is about the rename, which only this command carries out.
+        refusal = repo.rename_instrument_refusal(
+            database,
+            security_id=survivor_id,
+            old_symbol=old_symbol,
+            new_symbol=new_symbol,
+            new_name=plan.victim_name,
+        )
+        if refusal:
+            click.echo(f"BLOCKER: {refusal}", err=True)
 
         if dry_run:
             click.echo("Dry run: nothing changed.")
             return
-        if plan.blockers and not force:
+        if (plan.blockers or refusal) and not force:
             raise click.ClickException(
                 "Refusing to merge -- see the blockers above. If you have read them "
                 "and this is still one instrument, re-run with --force."
@@ -1462,12 +1476,6 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
-# The instrument kinds `security descope --kind` accepts. A literal, because click
-# needs it when this module is imported and security_master is imported lazily; a
-# unit test holds it equal to security_master.INSTRUMENT_KINDS.
-_DESCOPE_KINDS = ("warrant", "right", "unit")
-
-
 def _descope_verb(table: str, *, done: bool = False) -> str:
     """What a descope does to one footprint entry: an unresolved rename is
     dismissed, a rename record detached, every other row deleted.
@@ -1486,7 +1494,7 @@ def _descope_verb(table: str, *, done: bool = False) -> str:
     "--kind",
     "kinds",
     multiple=True,
-    type=click.Choice(_DESCOPE_KINDS),
+    type=click.Choice(INSTRUMENT_KINDS),
     help="Only this kind; repeatable. It must be one [general] exclude_instruments "
     "excludes  [default: every kind it excludes]",
 )
@@ -1516,8 +1524,8 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
     refused.
 
     Candidates are classified by their ticker (and, for two ambiguous shapes, their
-    name); see `security_master.instrument_kind`. A symbol in the declared universe
-    (`fafnir track add`) is kept -- that is how one is exempted.
+    name); see `fafnir.instruments.instrument_kind`. A symbol in the declared
+    universe (`fafnir track add`) is kept -- that is how one is exempted.
 
     IRREVERSIBLE. Bars, corporate actions, factors, profiles, ticker periods,
     watermarks, operator overrides and DQ flags go with each security, in one
@@ -1528,7 +1536,6 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
     every symbol removed.
     """
     from fafnir.db import repository as repo
-    from fafnir.ingest import security_master
     from fafnir.ingest.runlog import RunLog
 
     cfg = ctx.obj["config"]
@@ -1560,7 +1567,7 @@ def security_descope(ctx, kinds, note, removed_by, dry_run, yes):
             " ORDER BY primary_symbol, security_id"
         )
         for row in securities:
-            kind = security_master.out_of_scope_kind(
+            kind = out_of_scope_kind(
                 row["primary_symbol"],
                 row["company_name"],
                 is_etf=bool(row["is_etf"]),

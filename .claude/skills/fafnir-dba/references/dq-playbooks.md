@@ -653,11 +653,23 @@ conflict and re-flags it, so a resolve changes nothing. The terminal state lives
 in `core.symbol_change` (0018), and two commands write it — both of which close
 the flag for you.
 
+**Read `detail.reason` first.** Two different refusals raise this flag:
+
+- **"... a rename does not change what an instrument is"** or **"... plus the
+  designator letter ..."**: the sweep's instrument guard (ADR 0012) refused a
+  rename that would move a share onto its own warrant, right or unit ticker, or
+  back (`ABCD -> ABCDU`, `ZKP -> ZKPU`). That is the vendor shuffling one SPAC's
+  tickers, never a rename. It cannot clear itself, and `merge-rename` refuses it
+  too. Close it with `fafnir security dismiss-rename <OLD> <NEW> -m "<why>"`.
+- **"new ticker already belongs to another listed security ..."**: two live
+  claims on one ticker. Diagnose below.
+
 **Diagnose** — the two cases look identical in `fafnir status` and need opposite
 treatment:
 
 ```sql
-SELECT f.record_key->>'old_symbol' AS old_sym, f.record_key->>'new_symbol' AS new_sym,
+SELECT f.detail->>'reason' AS reason,
+       f.record_key->>'old_symbol' AS old_sym, f.record_key->>'new_symbol' AS new_sym,
        o.cusip AS old_cusip, n.cusip AS new_cusip, o.cik AS old_cik, n.cik AS new_cik,
        (SELECT max(trade_date) FROM core.daily_price WHERE security_id = o.security_id)
          AS old_last_bar

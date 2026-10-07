@@ -2,10 +2,12 @@
 
 - Status: Accepted
 - Date: 2026-10-06
-- Implemented by: `src/fafnir/ingest/security_master.py` (`instrument_kind`,
-  `out_of_scope_kind`, `load_securities`), `src/fafnir/db/repository.py`
-  (`security_footprint`, `unresolved_renames`, `purge_securities`),
-  `fafnir security descope`,
+- Implemented by: `src/fafnir/instruments.py` (`instrument_kind`,
+  `out_of_scope_kind`, `rename_changes_instrument`),
+  `src/fafnir/ingest/security_master.py` (`load_securities`),
+  `src/fafnir/db/repository.py` (`security_footprint`, `unresolved_renames`,
+  `purge_securities`, `rename_instrument_refusal`, `apply_symbol_change`),
+  `fafnir security descope`, `fafnir security merge-rename`,
   `[general] exclude_instruments`
 - Related: [ADR 0005](0005-automatic-universe-maintenance.md) (the screener defines
   the universe), [ADR 0006](0006-curated-fund-universe.md) (the declared universe)
@@ -66,6 +68,14 @@ time, and none of it improves data anyone uses.
 5. **Configurable.** `[general] exclude_instruments` defaults to all three kinds;
    `[]` restores the old behaviour. An unknown kind is a hard error, because a typo
    would otherwise silently re-admit a kind.
+6. **A rename never changes the instrument.** The rename sweep and `security
+   merge-rename` refuse a rename between kinds (`ABCD -> ABCDU`), or where one
+   ticker is the other plus a designator letter (`ZKP -> ZKPU`). The vendor's
+   feed reports both while it shuffles a SPAC's tickers before launch. Until now
+   the unit holding the target ticker blocked them, or was folded away while
+   empty. Once units are never minted, nothing would. The refusal is recorded as
+   a `conflict` with its reason, for `security dismiss-rename`. This rule holds
+   whatever `exclude_instruments` says.
 
 ## Consequences
 
@@ -83,12 +93,11 @@ time, and none of it improves data anyone uses.
   rename sweep does not re-offer them every night.
 - **Renames still in conflict are dismissed.** The sweep retries a `conflict`
   every night, and removing either side changes its answer. With the old ticker
-  gone it can never resolve. With the target's holder gone, nothing blocks it any
-  more: the vendor's pre-launch shuffle (`ABCD -> ABCDU`) would rename a SPAC's
-  class A share onto its unit's ticker, where the security-master load never
-  refreshes it and the next descope deletes it. So the descope dismisses every
-  conflict that names a removed security, and resolves its flag, in the same
-  transaction.
+  gone it can never resolve. With the target's holder gone, the holder that
+  blocked it is gone too: decision 6 still refuses the shuffle, but a removal is
+  no reason to carry any rename an operator had not decided on. So the descope
+  dismisses every conflict that names a removed security, and resolves its flag,
+  in the same transaction.
 - **Landing payloads are kept.** `landing.fmp_raw` is the vendor archive and is not
   keyed to a security.
 - **This does not delist anything.** Survivorship-free history remains the rule.

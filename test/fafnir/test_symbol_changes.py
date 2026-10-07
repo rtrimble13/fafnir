@@ -52,6 +52,8 @@ class _FakeDB:
         self.applied: list[tuple[str, str, date]] = []
         self.audit: list[dict] = []
         self.flags: list[str] = []
+        # The detail each written flag carried, in the same order.
+        self.flag_details: list[dict] = []
         # (check_name, record_key) already open, so the dedupe guard can be faked.
         self.open_flags: set[tuple] = set()
         # (check_name, record_key) -> open flag ids, for the lookups that close one.
@@ -104,6 +106,7 @@ def patched(monkeypatch):
             return False
         db.open_flags.add(key)
         db.flags.append(check_name)
+        db.flag_details.append(kw.get("detail") or {})
         return True
 
     def open_ids(db, *, check_name, record_key):
@@ -443,3 +446,39 @@ def test_symbol_change_paging_stops_when_the_server_ignores_page(monkeypatch):
 
     assert len(calls) == 2  # first page, then one repeat that ends it
     assert len(rows) == len(page)
+
+
+def test_a_rename_refused_for_its_instrument_says_so_on_the_flag(patched):
+    """The two conflicts read differently in the queue: a held target is a merge
+    question, a shuffle within one SPAC is a dismissal."""
+    reason = (
+        "ABCD is not a warrant, right or unit and ABCDU is a unit; "
+        "a rename does not change what an instrument is"
+    )
+    db = _FakeDB(
+        outcomes={
+            ("ABCD", "ABCDU"): SymbolChangeOutcome(CHANGE_CONFLICT, 7, reason=reason),
+            ("FB", "META"): SymbolChangeOutcome(CHANGE_CONFLICT, 8),
+        }
+    )
+    fmp = _FakeFMP(
+        [
+            {"date": "2026-08-04", "oldSymbol": "ABCD", "newSymbol": "ABCDU"},
+            {"date": "2026-06-09", "oldSymbol": "FB", "newSymbol": "META"},
+        ]
+    )
+
+    counts = load_symbol_changes(db, fmp)
+
+    assert counts["conflict"] == 2
+    by_pair = {(a["old_symbol"], a["new_symbol"]): a for a in db.audit}
+    assert by_pair[("ABCD", "ABCDU")]["detail"]["reason"] == reason
+    assert "reason" not in by_pair[("FB", "META")]["detail"]
+    reasons = sorted(d["reason"] for d in db.flag_details)
+    assert reasons == sorted(
+        [
+            reason,
+            "new ticker already belongs to another listed security that carries "
+            "price history",
+        ]
+    )
