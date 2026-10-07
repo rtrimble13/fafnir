@@ -360,7 +360,7 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 
 ### `ops.data_quality_flag` — quarantine/anomaly queue. **Grain:** `dq_flag_id`.
 `ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),
-`check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/...), `severity`
+`check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/`dorq_*`/...), `severity`
 (`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`,
 `resolved_by`, `resolution_note`.
 
@@ -406,6 +406,12 @@ into an exception that aborts whatever load raised it. 0016 also collapsed the
 duplicates a running warehouse had already accumulated, keeping the earliest row of
 each condition so `detected_at` still says when the problem was first seen.
 
+`dorq_*` flags are dorq's (doc/dorq.md): `detail` is dorq's whole report, with
+`p_error`, the hypotheses and evidence, the suggested repair and `dorq.version` /
+`dorq.config_hash`. The cross-sectional ones (`dorq_cohort_gap`, `dorq_cohort_move`)
+have a NULL `security_id`. They are written with the same open/accepted guards as
+the SQL checks, by a run recorded in `ops.ingestion_run` with `source = 'dorq'`.
+
 ### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
 `last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
 whole-endpoint (non per-symbol) mark.
@@ -415,6 +421,7 @@ whole-endpoint (non per-symbol) mark.
 | `historical-price-eod/non-split-adjusted` | the security | bars are loaded through this date |
 | `corporate-actions` | the security | its full action history has been pulled, as of this date |
 | `corporate-actions-calendar` | `0` | the market-wide calendars have been read through this date |
+| `dq-run`, `dq-shadow` (source `dorq`) | `0` | dorq has judged bars through this as-of date, into the queue or the shadow file; the next nightly run reports from five sessions before it |
 
 The `corporate-actions` row is a presence flag as much as a date: its *absence* is what
 puts a newly minted security on the full-history path, so it is stamped with the run

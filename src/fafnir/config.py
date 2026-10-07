@@ -16,11 +16,15 @@ Config sections
 ``[general]``
     log_level, log_dir, universe, request_rate_per_min, overlap_days,
     exclude_instruments
+``[dq]``
+    engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir,
+    dorq_lookback_sessions, dorq_threads -- see :mod:`fafnir.dq.dorq`
 
 Environment overrides
 ---------------------
 ``FAFNIR_DSN``, ``FAFNIR_DB_PASSWORD``/``PGPASSWORD``, ``FMP_API_KEY``,
-``FRED_API_KEY``, ``BLS_API_KEY``, ``BEA_API_KEY``, ``FAFNIR_LOG_DIR``.
+``FRED_API_KEY``, ``BLS_API_KEY``, ``BEA_API_KEY``, ``FAFNIR_LOG_DIR``,
+``FAFNIR_DORQ_PATH``.
 """
 
 from __future__ import annotations
@@ -245,6 +249,60 @@ class FafnirConfig:
     def horizon_extra_years(self) -> int:
         """How many years past the current year the rolling horizon stays ahead."""
         return int(self._get("general", "horizon_extra_years", 2))
+
+    # -- dq: the dorq engine (plan DR-0702; doc/dorq.md) -------------------
+    @property
+    def dq_engine(self) -> str:
+        """Which engine `fafnir dq run` uses by default: ``sql``, ``dorq`` or ``both``.
+
+        ``sql`` -- the checks in :mod:`fafnir.dq.checks`, and nothing else -- until
+        an operator opts in. dorq is a second binary, so a host that has not
+        installed it must keep working exactly as before.
+        """
+        value = str(self._get("dq", "engine", "sql")).strip().lower()
+        if value not in ("sql", "dorq", "both"):
+            raise ValueError(
+                f"[dq] engine: {value!r} is not one of 'sql', 'dorq' or 'both'"
+            )
+        return value
+
+    @property
+    def dorq_path(self) -> str:
+        """The dorq binary. ``FAFNIR_DORQ_PATH`` wins over the file."""
+        env = os.environ.get("FAFNIR_DORQ_PATH", "").strip()
+        if env:
+            return env
+        return str(self._get("dq", "dorq_path", "/opt/dorq/bin/dorq"))
+
+    @property
+    def dorq_config(self) -> str:
+        """dorq's own config file (``priors/fafnir.toml`` and the calibration it
+        includes). Empty runs dorq ``--isolated``: its defaults, and never a
+        ``dorq.toml`` that happens to sit in the working directory."""
+        return str(self._get("dq", "dorq_config", "") or "")
+
+    @property
+    def dorq_shadow(self) -> bool:
+        """Whether dorq's flags go to ``dorq_shadow_dir`` instead of the queue.
+
+        True by default: dorq writes to the queue only once the shadow period has
+        met the plan's cutover criteria and an operator turns this off (plan §7.4).
+        """
+        return bool(self._get("dq", "dorq_shadow", True))
+
+    @property
+    def dorq_shadow_dir(self) -> str:
+        return str(self._get("dq", "dorq_shadow_dir", "var/dorq-shadow"))
+
+    @property
+    def dorq_lookback_sessions(self) -> int:
+        """Sessions of history the nightly dorq run reads per security (plan §7.2)."""
+        return max(20, int(self._get("dq", "dorq_lookback_sessions", 260)))
+
+    @property
+    def dorq_threads(self) -> int:
+        """dorq worker threads; 0 is one per core. The output does not depend on it."""
+        return max(0, int(self._get("dq", "dorq_threads", 0)))
 
     def is_loaded(self) -> bool:
         return bool(self._data)

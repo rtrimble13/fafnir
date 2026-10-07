@@ -3480,19 +3480,189 @@ def dq():
     """Data-quality checks."""
 
 
+def _dq_engine(cfg, engine: Optional[str]) -> str:
+    """``--engine``, else ``[dq] engine``, with a bad config value as one line."""
+    if engine:
+        return engine
+    try:
+        return cfg.dq_engine
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @dq.command("run")
 @click.option("--exchange", default="NASDAQ", show_default=True)
 @click.option("--outlier-threshold", default=0.5, show_default=True, type=float)
+@click.option(
+    "--engine",
+    type=click.Choice(["sql", "dorq", "both"]),
+    help="Which checks run  [default: [dq] engine, else sql]",
+)
+@click.option(
+    "--shadow/--no-shadow",
+    default=None,
+    help="dorq's flags to var/dorq-shadow/ instead of the queue  "
+    "[default: [dq] dorq_shadow, else shadow]",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="dorq over every bar of every security, not the nightly lookback.",
+)
 @click.pass_context
-def dq_run(ctx, exchange, outlier_threshold):
-    """Run gap / outlier / freshness checks; write flags to ops.data_quality_flag."""
+def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full):
+    """Run the data-quality checks; write flags to ops.data_quality_flag.
+
+    \b
+      fafnir dq run                          # [dq] engine: sql by default
+      fafnir dq run --engine both            # SQL checks, and dorq in shadow
+      fafnir dq run --engine dorq --full     # dorq over the whole history
+
+    The SQL engine is the gap / outlier / freshness / identity / classification
+    checks. dorq (doc/dorq.md) judges every bar of the lookback for a data error
+    and writes `dorq_*` flags -- or, in shadow mode, the shadow file
+    `fafnir dq compare` reads, leaving the queue alone. Shadow is the default
+    until the cutover criteria are met (dorq plan §7.4, §8).
+    """
     from fafnir.dq import checks
+    from fafnir.dq import dorq as dorq_engine
+
+    cfg = ctx.obj["config"]
+    engine = _dq_engine(cfg, engine)
+    if shadow is None:
+        shadow = cfg.dorq_shadow
+    with Database(cfg.dsn) as database:
+        if engine in ("sql", "both"):
+            result = checks.run_all(
+                database, exchange_code=exchange, outlier_threshold=outlier_threshold
+            )
+            # Durable before dorq runs: a dorq failure must not cost the SQL flags.
+            database.commit()
+            click.echo(f"DQ flags written: {result}")
+        if engine in ("dorq", "both"):
+            settings = dorq_engine.settings_from(cfg)
+            try:
+                out = dorq_engine.run(
+                    database, settings, exchange, shadow=shadow, full=full
+                )
+            except dorq_engine.DorqError as exc:
+                raise click.ClickException(str(exc)) from exc
+            database.commit()
+            w = out.window
+            span = (
+                f"{w.bars_from or 'start'}..{w.as_of}"
+                + (f", reporting from {w.since}" if w.since else "")
+                if w.as_of
+                else "no bars"
+            )
+            detected = sum(out.detected.values())
+            if shadow:
+                click.echo(
+                    f"dorq {out.version} ({span}): {_plural(detected, 'violation')}"
+                    f" written to the shadow file {out.shadow_file}"
+                )
+            else:
+                click.echo(
+                    f"dorq {out.version} ({span}): {_plural(detected, 'violation')},"
+                    f" DQ flags written: {out.flagged}"
+                )
+
+
+@dq.command("compare")
+@click.argument("shadow_file", required=False, type=click.Path(dir_okay=False))
+@click.option(
+    "--labels",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Labels (`dq export-labels`) to measure precision against.",
+)
+@click.option(
+    "--slack",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Calendar days a report may sit from a flag or label and still match.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.pass_context
+def dq_compare(ctx, shadow_file, labels, slack, as_json):
+    """Compare a shadow night of dorq with the SQL checks and the labels.
+
+    \b
+      fafnir dq compare                       # the newest shadow file
+      fafnir dq compare var/dorq-shadow/2026-10-06.jsonl --labels labels.jsonl
+
+    Overlap: of the outlier / gap / stale flags keyed in the night's window, how
+    many dorq also reports, and how many of dorq's reports no SQL check made.
+    Precision, with --labels: the share of dorq's reports that were real data
+    errors, at warn and at error. Reads only.
+    """
+    from pathlib import Path
+
+    from fafnir.dq import compare as cmp
+
+    cfg = ctx.obj["config"]
+    path = (
+        Path(shadow_file)
+        if shadow_file
+        else cmp.latest_shadow_file(cfg.dorq_shadow_dir)
+    )
+    if path is None or not path.is_file():
+        raise click.ClickException(
+            f"No shadow file in {cfg.dorq_shadow_dir}. Run "
+            "`fafnir dq run --engine both` (shadow is the default) first."
+        )
+    try:
+        label_rows = cmp.read_labels(Path(labels)) if labels else None
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    with Database(cfg.dsn) as database:
+        result = cmp.compare(database, path, labels=label_rows, slack_days=slack)
+    if as_json:
+        _dq_json(result.as_dict())
+    else:
+        click.echo(cmp.format_comparison(result))
+
+
+@dq.command("export-labels")
+@click.option(
+    "--out",
+    "out_path",
+    required=True,
+    type=click.Path(dir_okay=False),
+    help="The labels, as JSON Lines (dorq's doc/labels.md).",
+)
+@click.option(
+    "--restore",
+    "restore_path",
+    type=click.Path(dir_okay=False),
+    help="Also write the repaired bars as they stood, for dorq --restore.",
+)
+@click.pass_context
+def dq_export_labels(ctx, out_path, restore_path):
+    """Write the warehouse's repairs and judged flags as labels for dorq.
+
+    \b
+      fafnir dq export-labels --out labels.jsonl --restore before.csv
+      dorq calibrate bars.csv --labels labels.jsonl --restore before.csv ...
+
+    A repair (ops.operator_override) is a confirmed data error, and the override
+    keeps the bar as it stood, so --restore puts the evidence back. An outlier or
+    dorq flag closed by judgement is a market fact. See fafnir.dq.labels for what
+    each becomes and what is left out. Reads only.
+    """
+    from pathlib import Path
+
+    from fafnir.dq import labels as lb
 
     with Database(ctx.obj["config"].dsn) as database:
-        result = checks.run_all(
-            database, exchange_code=exchange, outlier_threshold=outlier_threshold
+        export = lb.build(database)
+    lb.write(export, Path(out_path), Path(restore_path) if restore_path else None)
+    kinds = ", ".join(f"{k} {n}" for k, n in export.by_kind().items()) or "none"
+    click.echo(f"Wrote {_plural(len(export.labels), 'label')} to {out_path} ({kinds}).")
+    if restore_path:
+        click.echo(
+            f"Wrote {_plural(len(export.restore), 'bar')} as they stood to {restore_path}."
         )
-    click.echo(f"DQ flags written: {result}")
 
 
 # ---------------------------------------------------------------------------
@@ -4256,16 +4426,38 @@ def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
     `price_*` and the NEVER_AUTO_RESOLVE checks are excluded and cannot be named:
     a quarantine describes a bar that was never stored, so there is nothing to
     re-evaluate, and a measurement's value is the record itself.
+
+    `dorq_*` flags are rechecked by re-running dorq over the full history of the
+    securities that carry them (dorq is deterministic), closing each flag it no
+    longer emits. Without --check, they are included whenever any are open.
     """
     from fafnir.db import repository as repo
+    from fafnir.dq import dorq as dorq_engine
     from fafnir.dq import recheck as rc
 
     if resolved_by is None:
         resolved_by = _os_user()
+    named = list(checks)
+    sql_checks = [c for c in named if not c.startswith(dorq_engine.DORQ_PREFIX)]
+    dorq_checks = [c for c in named if c.startswith(dorq_engine.DORQ_PREFIX)]
+    cfg = ctx.obj["config"]
     try:
         results = None
-        with Database(ctx.obj["config"].dsn) as database:
-            results = rc.recheck(database, checks=list(checks) or None)
+        with Database(cfg.dsn) as database:
+            results = []
+            if sql_checks or not named:
+                results += rc.recheck(database, checks=sql_checks or None)
+            if dorq_checks or (not named and rc.open_dorq_checks(database)):
+                try:
+                    results += rc.recheck_dorq(
+                        database,
+                        dorq_engine.settings_from(cfg),
+                        checks=dorq_checks or None,
+                    )
+                except dorq_engine.DorqError as exc:
+                    if dorq_checks:
+                        raise click.ClickException(str(exc)) from exc
+                    click.echo(f"  dorq_*: skipped -- {exc}", err=True)
 
             total = sum(r.stale for r in results)
             width = max(len(r.check_name) for r in results)
@@ -4351,6 +4543,32 @@ def dq_reopen(ctx, flag_ids):
                 click.echo(f"  {flag_id}: {reason}.", err=True)
 
 
+def _dorq_status(cfg) -> Optional[str]:
+    """The `status` line for dorq, or None on a host that does not use it.
+
+    Shown when the engine includes dorq or a binary sits at the configured path:
+    a host running the SQL checks alone, with no dorq installed, should not be
+    told about a component it never asked for.
+    """
+    import os
+
+    from fafnir.dq import dorq as dorq_engine
+
+    try:
+        engine = cfg.dq_engine
+    except ValueError as exc:
+        return f"dorq       : {exc}"
+    settings = dorq_engine.settings_from(cfg)
+    if engine == "sql" and not os.path.exists(settings.path):
+        return None
+    mode = f"engine {engine}" + (", shadow" if cfg.dorq_shadow else "")
+    try:
+        version = dorq_engine.dorq_version(settings)
+    except dorq_engine.DorqError:
+        return f"dorq       : NOT FOUND at {settings.path} ({mode})"
+    return f"dorq       : {version} ({mode})"
+
+
 @main.command("status")
 @click.pass_context
 def status(ctx):
@@ -4388,6 +4606,9 @@ def status(ctx):
     if open_flags:
         dq_line += "  -- fafnir dq list"
     click.echo(dq_line)
+    dorq_line = _dorq_status(ctx.obj["config"])
+    if dorq_line:
+        click.echo(dorq_line)
     if pending_renames:
         click.echo(f"Renames    : {pending_renames} unapplied (need review)")
         for row in rename_sample:

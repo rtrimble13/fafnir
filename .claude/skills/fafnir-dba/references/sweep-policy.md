@@ -18,9 +18,9 @@ preconditions.
 
 | Tier | Checks | What a sweep may do |
 |---|---|---|
-| **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price`, `security_duplicate_identity` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
-| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
-| **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `tracked_symbol_unknown_to_source` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
+| **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price`, `security_duplicate_identity`, `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
+| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification`, and every other `dorq_*` check at `error` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
+| **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `tracked_symbol_unknown_to_source`, `dorq_*` at `warn` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
 
 `sparse_coverage` is not yet placed in a tier. Until it is, treat it as **report
 only**: nothing about it has been repaired, so closing one frees its slot and the
@@ -73,6 +73,17 @@ leave it open. "I could not check" is not "it is fine".
 - The disposition is **accept**, not resolve: the check skips only a split on the
   bar's exact date, so a resolved flag on a split between two bars is re-written.
   `references/outlier-classification.md` is the sort order for the rest.
+
+### `dorq_*` at `warn`
+- `detail.provisional` is false. A provisional report is about the newest bars and
+  is judged again tomorrow with more evidence; leave it.
+- The runner-up hypothesis in `detail.hypotheses` is a market explanation
+  (`market_move`, `tick_move`, `explained_split`), and the bars around the date,
+  read with `price_history`, show why: the move held, peers moved, or the tick grid
+  explains it.
+- The note names the hypothesis you agreed with. A resolved `dorq_*` flag becomes a
+  market-fact label at the next `dq export-labels`, so the note is training data.
+- Never batch across codes: one batch, one `code`.
 
 ### `stale`
 Only the two determinate branches:

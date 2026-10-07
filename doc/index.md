@@ -23,6 +23,9 @@ read through the `duk` CLI.
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,
   [working the DQ queue](operations.md#working-the-dq-queue), reconciliation,
   recovery, backups
+- [dorq](dorq.md) — the Bayesian data-quality engine: install, configure, the
+  shadow period, `dq compare`, `dq export-labels`, calibration
+  ([ADR 0013](adr/0013-dorq-dq-engine.md))
 - [duk CLI](duk.md) — reading the warehouse (db) vs the API (live)
 - [Operations Agent](agent.md) — running an agent on the host for DQ triage,
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation

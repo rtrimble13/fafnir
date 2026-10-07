@@ -356,3 +356,144 @@ def recheck(
         )
         out.append(RecheckResult(name, open_flags, ids, reason))
     return out
+
+
+# ---------------------------------------------------------------------------
+# dorq: rerun and negate (dorq plan §7.5, DR-0705)
+# ---------------------------------------------------------------------------
+#
+# A dorq flag has no SQL predicate to negate: it is the output of a model. But the
+# model is deterministic -- the same bars, context and settings give the same
+# output, byte for byte -- so the negation is to run it again. dorq is re-run over
+# the full history of every security with an open dorq flag, and a flag is closed
+# when that run no longer emits its (check_name, security_id, record_key).
+#
+# Two kinds are never closed this way. The NEVER_AUTO_RESOLVE dorq checks name a
+# repair that a resolve would skip (an era at the wrong scale, a split on file
+# that is wrong). The cross-sectional ones (a failed load across a cohort, a
+# family split) are judged across securities, and a re-run over the few with open
+# flags cannot reproduce the cohort they were found in.
+
+
+def dorq_recheck_excluded() -> frozenset[str]:
+    """The dorq checks rerun-and-negate must never close."""
+    from fafnir.dq.dorq import CROSS_SECTIONAL_CHECKS
+    from fafnir_mcp.tools import NEVER_AUTO_RESOLVE
+
+    return (
+        frozenset(c for c in NEVER_AUTO_RESOLVE if c.startswith("dorq_"))
+        | CROSS_SECTIONAL_CHECKS
+    )
+
+
+def open_dorq_checks(db: Database) -> list[str]:
+    """The dorq checks with open flags that rerun-and-negate may close."""
+    rows = db.fetchall(r"""
+        SELECT DISTINCT check_name FROM ops.data_quality_flag
+         WHERE check_name LIKE 'dorq\_%' AND resolved_at IS NULL
+         ORDER BY 1
+        """)
+    excluded = dorq_recheck_excluded()
+    return [r["check_name"] for r in rows if r["check_name"] not in excluded]
+
+
+def recheck_dorq(
+    db: Database,
+    settings,
+    *,
+    checks: Optional[Sequence[str]] = None,
+    exchange_code: str = "NASDAQ",
+) -> list[RecheckResult]:
+    """Re-run dorq over the securities with open dorq flags; list the flags it no
+    longer emits. Reads only, like :func:`recheck`.
+
+    ``settings`` is a :class:`fafnir.dq.dorq.DorqSettings`. Raises
+    :class:`fafnir.dq.dorq.DorqError` when dorq cannot run, and ``ValueError`` for
+    a check this may not close.
+    """
+    from fafnir.dq import dorq as dorq_engine
+
+    excluded = dorq_recheck_excluded()
+    wanted = list(checks) if checks else open_dorq_checks(db)
+    refused = [
+        c for c in wanted if c in excluded or not c.startswith(dorq_engine.DORQ_PREFIX)
+    ]
+    if refused:
+        raise ValueError(
+            f"not re-evaluable by re-running dorq: {', '.join(sorted(refused))}. "
+            "The NEVER_AUTO_RESOLVE dorq checks name a repair, and the cross-sectional "
+            "ones cannot be reproduced over a subset of securities."
+        )
+    if not wanted:
+        return []
+    flags = db.fetchall(
+        """
+        SELECT dq_flag_id, check_name, security_id, record_key,
+               detail->'dorq'->>'version' AS version
+          FROM ops.data_quality_flag
+         WHERE check_name = ANY(%s) AND resolved_at IS NULL
+           AND security_id IS NOT NULL
+         ORDER BY dq_flag_id
+        """,
+        (wanted,),
+    )
+    if not flags:
+        return [RecheckResult(name, 0, [], "") for name in sorted(wanted)]
+    securities = sorted({int(f["security_id"]) for f in flags})
+    run = dorq_engine.run_dorq(
+        db,
+        settings,
+        exchange_code,
+        dorq_engine.full_window(db, exchange_code),
+        security_ids=securities,
+    )
+    emitted = {
+        (
+            r["check_name"],
+            int(r["security_id"]),
+            dorq_engine.record_key_json(r["record_key"]),
+        )
+        for r in run.records
+        if r.get("security_id") is not None
+    }
+    out: list[RecheckResult] = []
+    for name in sorted(wanted):
+        mine = [f for f in flags if f["check_name"] == name]
+        stale = [
+            f
+            for f in mine
+            if (
+                name,
+                int(f["security_id"]),
+                dorq_engine.record_key_json(f["record_key"]),
+            )
+            not in emitted
+        ]
+        reason = (
+            f"re-running dorq {run.version} over the security's full history no longer "
+            "reports it"
+        )
+        older = sorted(
+            {
+                f["version"]
+                for f in stale
+                if f["version"] and f["version"] != run.version
+            }
+        )
+        if older:
+            reason += (
+                f"; written by dorq {', '.join(older)}, so a model change rather than a "
+                "repair may be what cleared it"
+            )
+        logger.info(
+            "recheck %s: %d of %d open flags no longer hold",
+            name,
+            len(stale),
+            len(mine),
+        )
+        out.append(
+            RecheckResult(
+                name, len(mine), [int(f["dq_flag_id"]) for f in stale], reason
+            )
+        )
+    return out

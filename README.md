@@ -77,6 +77,8 @@ fafnir ingest prices --symbols VFIAX             # no watermark yet -> full hist
 fafnir dq list                                   # open flags by check and severity
 fafnir dq list --detail --check gap --symbol AAPL
 fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
+fafnir dq run --engine both                      # + dorq, in shadow (doc/dorq.md)
+fafnir dq compare --labels labels.jsonl          # dorq vs the SQL checks and labels
 
 # 7. Read with duk (db mode)
 duk ph AAPL --adj -S db
