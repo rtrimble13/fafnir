@@ -402,3 +402,87 @@ def test_descope_does_not_unblock_a_rename_onto_a_removed_ticker(db):
         )
         == "ABCD"
     )
+
+
+# ---------------------------------------------------------------------------
+# --keep: one security of an excluded kind that cannot be declared
+# ---------------------------------------------------------------------------
+
+
+def _mint_delisted_reit_units(db):
+    """GRP-UN's shape: a REIT's stapled units that left the venue, history kept."""
+    sid = _mint(db, "EFGH-UN", "Efgh Real Estate Investment Trust")
+    _bar(db, sid)
+    repo.mark_delisted(db, security_id=sid, delisted_date=dt.date(2025, 12, 31))
+    return sid
+
+
+def test_keep_spares_a_delisted_security_with_its_history(db):
+    kept = _mint_delisted_reit_units(db)
+    gone = _mint(db, "ABCDU", "Abcd Acquisition Corp. Units")
+    _mint(db, "ABCD")
+
+    result = _descope(db, "--keep", "EFGH-UN", "-m", "ADR 0012", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert "Kept, --keep: EFGH-UN" in result.output
+    assert "delisted 2025-12-31" in result.output
+    assert db.fetchval(
+        "SELECT count(*) FROM core.security WHERE security_id = %s", (kept,)
+    )
+    assert db.fetchval(
+        "SELECT count(*) FROM core.daily_price WHERE security_id = %s", (kept,)
+    )
+    assert not db.fetchval(
+        "SELECT count(*) FROM core.security WHERE security_id = %s", (gone,)
+    )
+    run = db.fetchone(
+        "SELECT params FROM ops.ingestion_run"
+        " WHERE endpoint = 'security-descope' ORDER BY ingestion_run_id DESC LIMIT 1"
+    )
+    assert run["params"]["kept_by_option"] == ["EFGH-UN"]
+    assert "EFGH-UN" not in run["params"]["symbols"]
+
+
+def test_keep_shows_in_the_dry_run(db):
+    _mint_delisted_reit_units(db)
+    _mint(db, "ABCDU", "Abcd Acquisition Corp. Units")
+
+    result = _descope(db, "--keep", "efgh-un", "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert "Kept, --keep: EFGH-UN" in result.output
+    assert "Dry run: nothing changed." in result.output
+    assert _held(db, "EFGH-UN") == 1 and _held(db, "ABCDU") == 1
+
+
+@pytest.mark.parametrize("keep", ["EFGH-U", "ABCD", "ZZZZW"])
+def test_a_keep_that_matches_nothing_refuses_the_whole_run(db, keep):
+    """A typo must not turn into the deletion of the security it meant to keep."""
+    _mint_delisted_reit_units(db)
+    _mint(db, "ABCDU", "Abcd Acquisition Corp. Units")
+    _mint(db, "ABCD")
+
+    result = _descope(db, "--keep", keep, "--yes")
+
+    assert result.exit_code != 0
+    assert "matches no" in result.output and "Nothing was changed" in result.output
+    assert _held(db, "EFGH-UN") == 1 and _held(db, "ABCDU") == 1
+    assert not db.fetchval(
+        "SELECT count(*) FROM ops.ingestion_run WHERE endpoint = 'security-descope'"
+    )
+
+
+def test_keep_and_declaration_work_together(db):
+    _mint_delisted_reit_units(db)
+    _mint(db, "ABCDU", "Abcd Acquisition Corp. Units")
+    _mint(db, "IJKLU", "Ijkl Holdings Corporate Units")
+    repo.upsert_tracked_symbol(db, symbol="IJKLU", asset_type="equity")
+
+    result = _descope(db, "--keep", "EFGH-UN", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert "Kept, declared in ref.tracked_symbol: IJKLU" in result.output
+    assert "Kept, --keep: EFGH-UN" in result.output
+    assert _held(db, "ABCDU") == 0
+    assert _held(db, "EFGH-UN") == 1 and _held(db, "IJKLU") == 1

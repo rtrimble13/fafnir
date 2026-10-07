@@ -215,6 +215,12 @@ explanation. The queries and thresholds for each are in
 - **A near-miss split** — one jump of the split's ratio on a session 1–5 days off
   the ex-date, and the price holds — is a *misdated* split, not a market move.
   Correct the ex-date with `fafnir actions redate <id> --ex-date <d>`; do not accept.
+  **Before redating, compare the bar you are dating from across every run's
+  payload** in `landing.fmp_raw`, not only the latest. FMP restates a new ticker's
+  first bars on the post-split scale (×k the price, ÷k the volume), and a restated
+  bar looks exactly like an earlier ex-date. On 2026-10-04 OPNW was redated
+  09-29 → 09-25 off such a bar and had to be undone, though the as-traded 09-25 bar
+  was in the payloads of earlier runs.
   **Two** jumps of the split's size a few days apart are not a misdate: the pre-split
   history is mis-adjusted, and moving the date fixes neither.
 - **A split the feed never reported** — a clean ×k or ÷k jump (within 3%) that holds
@@ -274,6 +280,17 @@ the row back** — the next load, or an explicit `ingest prices`, does. A bar *e
 the operator's bars and writes the vendor's back exactly as they stood, because the
 edit replaced them rather than judging them worthless. Deletes need migration 0025
 on the host and bar edits need 0026 — check `schema_state` before planning with them.
+
+**Corporate actions behave the same way.** Revoking an `actions delete` override,
+or the pair of overrides `actions redate` leaves, lifts the suppression and removes
+the operator's row. It **does not bring the vendor's row back**. That happens only
+if a later actions load re-reads the date: the calendar sweep's overlap window is
+about a week, and the per-symbol rotation reaches each security once a month.
+
+After a revoke, read `core.corporate_action` for the security. If the vendor's event
+is missing and its date is confirmed, add it with `actions add`, as an operator
+row that no feed overwrites. On 2026-10-06, undoing OPNW's redate left it with no
+split at all.
 
 **Close with:** `repair-then-recheck` for a missing or misdated action, a duplicate,
 a re-fetchable or deleted bar (`dq recheck --check outlier` — a deleted bar, a
@@ -466,6 +483,14 @@ truncated before that deploy still need the re-backfill.)
 dividend. Fix the gap first, then `fafnir adjust --symbol <SYM>`, then
 `dq recheck`.
 
+**A security with no bars at all can never be closed by the recheck**, because its
+rule is "a prior raw close now exists". The usual case is a stray dividend on an
+empty echo row: the calendar sweep attaching a renamed company's distribution to
+the shell its old ticker left (GBF → AGGM, 2026-10-06). Delete the stray row with
+`actions delete <id>`; its override keeps it out. Then **resolve the flag by id**:
+with no dividend left, `adjust` has nothing to re-detect. Confirm first that the
+renamed company still holds its own copy of the distribution.
+
 ---
 
 ## `corporate_action_drift` — the calendar sweep disagreed with the per-symbol feed
@@ -610,6 +635,32 @@ that decide whether the merge is right:
   **delisted rows by normalised name** for the victim's ticker, so unless one
   remains under the victim's name, the next load re-mints it. Keep one retired row
   per ticker in that case.
+
+Three shapes need more than the merge itself:
+
+- **A SPAC merger the feed never sent as a ticker change** (COLA → SAIQ,
+  2026-10-06). The old ticker is delisted, so `merge-rename` refuses ("not a listed
+  security") and nothing retargets a delisted row. Merge the **old row into the live
+  new one** (`security merge <old_id> <new_id>`; it takes security ids, victim
+  first). Keeping the old row instead just gets the new ticker minted again.
+  - The old row's ticker period and identifiers (the SPAC's CUSIP, ISIN and CIK)
+    are deleted with it.
+  - `--note` is stored only on the duplicate-identity flags the merge closes, and a
+    two-ticker pair has none.
+  - So write the lineage and identifiers into a note that persists, such as the
+    overrides of the clearing step below.
+- **The OHLC guard tripped by vendor restatement**: one-cent or sub-cent
+  differences, with closes otherwise equal. Never `--force`. Instead:
+  1. Confirm the survivor holds every one of those dates.
+  2. Delete the disagreeing bars **on the victim** with `prices delete`.
+  3. Re-run the dry run until it shows 0 disagreeing, then merge.
+  4. `override revoke` the delete overrides the merge re-points onto the survivor.
+     There they sit over the survivor's own stored bars, and would only stop the
+     loader updating those sessions.
+- **Victim flags whose twin on the survivor is already closed** move across
+  **open**, because the merge drops a victim flag only against an *open* twin.
+  Resolve each one by id afterwards, citing the twin's id and how it was closed
+  (WKEY → WQEY, 2026-10-07: six copies of accepted outliers).
 
 `security dedupe` cannot fold a ticker whose rows name two different companies,
 which rules it out for most real cases; reach for `merge` by id instead.

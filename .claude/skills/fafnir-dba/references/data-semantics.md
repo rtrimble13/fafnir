@@ -189,10 +189,57 @@ From the release that carries ADR 0012, `ingest securities` skips them. The ones
 minted before it stay until an operator runs `fafnir security descope`, once. Until
 then the load no longer refreshes them, though their prices still load. Whether it
 has run is an `ops.ingestion_run` row with endpoint `security-descope`. After it, a
-warrant, right or unit that *is* present was declared on purpose
-(`fafnir track list`), as Granite REIT's `GRP-UN` is. SPAC class A shares are still
-held either way.
+warrant, right or unit that *is* present was kept on purpose. Either it was
+declared (`fafnir track list`), which is for tickers that still list, or it was
+named with `--keep` on that run (the audit row's `kept_by_option`), as Granite
+REIT's delisted `GRP-UN` was. SPAC class A shares are still held either way.
+
+**Never propose `track add` for a delisted ticker.** `ingest tracked` looks only for
+a *listed* security under a declared ticker. It finds none, and mints a new, active
+one that the price step backfills with a duplicate of the history. If FMP has no
+profile for the ticker, it raises `tracked_symbol_unknown_to_source` every night
+instead.
 
 > **Wrong answer:** "fafnir has no data for ABCDW" read as a load failure, or a
 > SPAC's unit or warrant history expected next to its class A shares. Equally, a
 > warrant still held before the descope has run is not a filter failure.
+
+## 19. A dividend can be stored twice across a ticker change
+
+After a rename, FMP files a distribution again under the new ticker. When a split
+takes effect on the record date, it also restates the amount on the new share
+basis and dates it at the ticker change.
+
+OPNW (VerifyMe → OpenWorld, 2026-09/10) carried two rows with the same record and
+payment dates: $0.15 ex 09-29 under VRME, and $1.50 "ex 10-01" under OPNW. That was
+one dividend counted twice, and it put the adjusted prices about 17% low.
+
+When a split and a dividend share an ex-date, the stored dividend must be in
+**pre-split** terms. The factor is valued against the prior raw close, which is the
+pre-split close. A post-split amount there is wrong either way. After a large
+enough reverse split, like OPNW's 1-for-10, it exceeds that close: the factor goes
+negative (`dividend_exceeds_price`) and the dividend is skipped. After a forward
+split it is silently too small, and nothing flags it.
+
+> **Wrong answer:** two dividends with the same record and payment dates read as two
+> distributions, or the post-split amount "corrected" onto the split's ex-date.
+
+## 20. A venue transfer can arrive as a delisting
+
+FMP's delisted feed has reported a move between exchanges as a delisting. ET, SUN,
+SUNC and USAC moved from the NYSE to the Texas Stock Exchange after the 2026-10-02
+close and kept their tickers. The nightly sweep stamped them delisted 2026-10-05,
+and they stopped receiving bars.
+
+Nothing puts them back on its own:
+
+- TXSE is not among the venues the security-master load reads, so the load does not
+  re-admit them.
+- `mark_delisted` is one-way, and no command undoes it.
+
+Before reporting a large, liquid name as delisted, check for a venue transfer in
+company investor relations or exchange notices. A wrongly stamped delisting is an
+escalation, because the fix is code (the venue list, an un-delist path) plus an
+operator decision.
+
+> **Wrong answer:** "ET was delisted on 2026-10-05". It changed venue.

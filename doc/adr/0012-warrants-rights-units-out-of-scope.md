@@ -62,9 +62,19 @@ time, and none of it improves data anyone uses.
    transaction, and leaves an `ops.ingestion_run` row naming every symbol removed.
    It refuses a `--kind` that `[general] exclude_instruments` does not exclude,
    because the next nightly load would mint those straight back.
-4. **Exceptions are declared, not coded.** A symbol in `ref.tracked_symbol`
-   (`fafnir track add`) is exempt from both steps. The known case is `GRP-UN`:
-   Granite REIT's stapled units are its only US listing.
+4. **Exceptions are named, not coded.** There are two ways, for two situations:
+   - **A ticker that still lists:** declare it in `ref.tracked_symbol`
+     (`fafnir track add`). It is then exempt from the load filter and from every
+     descope.
+   - **A security that no longer lists:** pass `--keep SYMBOL` to the descope run.
+     Declaring a delisted ticker is a trap. `ingest tracked` looks only for a
+     *listed* security under it, finds none, and mints a new, active one, which
+     the price step then backfills with a duplicate history.
+
+   The known case is `GRP-UN`. Granite REIT's stapled units left the NYSE on
+   2025-12-31 (TSX `GRT.UN` remains) and are kept with `--keep`. A `--keep` that
+   matches nothing the run would remove is refused, so a typo cannot delete the
+   security it meant to keep.
 5. **Configurable.** `[general] exclude_instruments` defaults to all three kinds;
    `[]` restores the old behaviour. An unknown kind is a hard error, because a typo
    would otherwise silently re-admit a kind.

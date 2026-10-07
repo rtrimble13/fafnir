@@ -428,8 +428,10 @@ SPAC issuance.
 
 - `[general] exclude_instruments` chooses the kinds. All three are excluded by
   default; `[]` admits everything.
-- To keep a single ticker, declare it with `fafnir track add`. Granite REIT's
-  stapled units (`GRP-UN`) are the known case.
+- To keep a single ticker that still lists, declare it with `fafnir track add`.
+  Never declare a delisted one: `ingest tracked` would mint it again as a new,
+  active security. A delisted security of an excluded kind is kept by naming it
+  with `security descope --keep`, as Granite REIT's `GRP-UN` is.
 - Rows minted before the filter existed are not refreshed. Remove them with
   `fafnir security descope` (see [operations.md](operations.md#descoping-an-instrument-kind)).
 
