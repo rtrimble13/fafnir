@@ -38,9 +38,15 @@ dorq_lookback_sessions = 260              # bars per security on a nightly run
 dorq_threads = 0           # 0: one per core; the output does not depend on it
 ```
 
-`dorq_config` is dorq's own TOML. dorq ships a starting point for fafnir as
-`priors/fafnir.toml`, and the calibration fitted on this warehouse's labels goes
-beside it (see [Calibrate](#calibrate)). Without it dorq runs `--isolated` on its
+`dorq_config` is dorq's own TOML. dorq ships fafnir's starting configuration at
+`/opt/dorq/share/dorq/priors/fafnir.toml`. Point at it from a file of your own,
+which the calibration fitted on this warehouse's labels joins later (see
+[Calibrate](#calibrate)):
+
+```toml
+# /etc/fafnir/dorq.toml
+include = ["/opt/dorq/share/dorq/priors/fafnir.toml"]
+``` Without it dorq runs `--isolated` on its
 defaults, never on a `dorq.toml` that happens to sit in the working directory.
 
 `fafnir status` prints a `dorq` line, with its version and mode, once the engine
@@ -168,8 +174,9 @@ psql -c "\copy (SELECT security_id, trade_date, open, high, low, close, volume
                FROM core.daily_price ORDER BY security_id, trade_date)
          TO 'bars.csv' CSV HEADER"
 dorq calibrate bars.csv --labels labels.jsonl --restore before.csv \
-     --config /etc/fafnir/dorq.toml --holdout 0.3 --out /etc/fafnir/dorq-priors.toml
-echo 'include = ["fafnir.toml", "dorq-priors.toml"]' > /etc/fafnir/dorq.toml
+     --config /etc/fafnir/dorq.toml --holdout 0.3 --out /etc/fafnir/dorq-calibration.toml
+# then, in /etc/fafnir/dorq.toml:
+#   include = ["/opt/dorq/share/dorq/priors/fafnir.toml", "dorq-calibration.toml"]
 ```
 
 The `--holdout` figures are the ones to quote in the go/no-go. The fit changes
