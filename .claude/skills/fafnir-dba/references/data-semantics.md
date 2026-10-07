@@ -189,9 +189,16 @@ From the release that carries ADR 0012, `ingest securities` skips them. The ones
 minted before it stay until an operator runs `fafnir security descope`, once. Until
 then the load no longer refreshes them, though their prices still load. Whether it
 has run is an `ops.ingestion_run` row with endpoint `security-descope`. After it, a
-warrant, right or unit that *is* present was declared on purpose
-(`fafnir track list`), as Granite REIT's `GRP-UN` is. SPAC class A shares are still
-held either way.
+warrant, right or unit that *is* present was kept on purpose. Either it was
+declared (`fafnir track list`), which is for tickers that still list, or it was
+named with `--keep` on that run (the audit row's `kept_by_option`), as Granite
+REIT's delisted `GRP-UN` was. SPAC class A shares are still held either way.
+
+**Never propose `track add` for a delisted ticker.** `ingest tracked` looks only for
+a *listed* security under a declared ticker. It finds none, and mints a new, active
+one that the price step backfills with a duplicate of the history. If FMP has no
+profile for the ticker, it raises `tracked_symbol_unknown_to_source` every night
+instead.
 
 > **Wrong answer:** "fafnir has no data for ABCDW" read as a load failure, or a
 > SPAC's unit or warrant history expected next to its class A shares. Equally, a

@@ -11,7 +11,7 @@ nothing from fafnir, where the repository can use it without a cycle.
 from __future__ import annotations
 
 import re
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 
 #: Instrument kinds kept out of the universe by default (ADR 0012). None of them is
 #: an equity: a warrant and a right are options on a listed share, and a unit is a
@@ -171,3 +171,67 @@ def rename_changes_instrument(
                 "issue's tickers shuffled by the vendor, not a rename"
             )
     return None
+
+
+class DescopeSelection(NamedTuple):
+    """What `security descope` would remove, and what it keeps and why."""
+
+    candidates: list[dict]
+    kept_declared: list[dict]
+    kept_by_request: list[dict]
+    unmatched_keeps: list[str]
+
+
+def select_descope_candidates(
+    securities: Iterable[dict],
+    *,
+    excluded: Iterable[str],
+    declared: Iterable[str] = (),
+    keep: Iterable[str] = (),
+) -> DescopeSelection:
+    """Split ``core.security`` rows into what a descope removes and what it keeps.
+
+    Two ways keep one of an excluded kind, for two different situations:
+
+    * **Declared** (``ref.tracked_symbol``): a ticker that still lists. The nightly
+      loads go on keeping it current, and every future descope skips it.
+    * **Keep**, named for this run: a security that cannot be declared because it
+      no longer lists. Declaring a delisted ticker is a trap -- ``ingest tracked``
+      looks only for a *listed* security under the declared ticker, finds none, and
+      mints a new, active one that the price step then backfills with a duplicate
+      of the history. Granite REIT's ``GRP-UN``, which left the NYSE on 2025-12-31,
+      is the case that needed it.
+
+    A keep that matches no candidate is returned in ``unmatched_keeps`` instead of
+    being ignored, and the caller refuses the run: a misspelt keep would otherwise
+    delete the very security it was meant to save. Tickers compare case-insensitively.
+    """
+    wanted = tuple(excluded)
+    declared_set = {str(s).strip().upper() for s in declared}
+    keep_set = {str(s).strip().upper() for s in keep if s and str(s).strip()}
+    candidates: list[dict] = []
+    kept_declared: list[dict] = []
+    kept_by_request: list[dict] = []
+    matched: set[str] = set()
+    for row in securities:
+        kind = out_of_scope_kind(
+            row.get("primary_symbol"),
+            row.get("company_name"),
+            is_etf=bool(row.get("is_etf")),
+            is_fund=bool(row.get("is_fund")),
+            excluded=wanted,
+        )
+        if kind is None:
+            continue
+        symbol = (row.get("primary_symbol") or "").strip().upper()
+        entry = {**row, "kind": kind}
+        if symbol in keep_set:
+            matched.add(symbol)
+            kept_by_request.append(entry)
+        elif symbol in declared_set:
+            kept_declared.append(entry)
+        else:
+            candidates.append(entry)
+    return DescopeSelection(
+        candidates, kept_declared, kept_by_request, sorted(keep_set - matched)
+    )

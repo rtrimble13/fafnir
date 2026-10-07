@@ -18,6 +18,7 @@ from fafnir.instruments import (
     instrument_kind,
     out_of_scope_kind,
     rename_changes_instrument,
+    select_descope_candidates,
 )
 
 
@@ -178,3 +179,94 @@ def test_the_reason_names_both_sides():
 def test_funds_and_etfs_are_never_refused():
     assert rename_changes_instrument("ABCD", "ABCDU", is_etf=True) is None
     assert rename_changes_instrument("ABC", "ABCW", is_fund=True) is None
+
+
+# ---------------------------------------------------------------------------
+# Choosing what `security descope` removes, and what it keeps
+# ---------------------------------------------------------------------------
+
+
+def _sec(security_id, symbol, name="Abcd Acquisition Corp.", **extra):
+    row = {
+        "security_id": security_id,
+        "primary_symbol": symbol,
+        "company_name": name,
+        "is_etf": False,
+        "is_fund": False,
+    }
+    row.update(extra)
+    return row
+
+
+HELD = [
+    _sec(1, "ABCD"),
+    _sec(2, "ABCDW"),
+    _sec(3, "ABCDU"),
+    _sec(4, "GRP-UN", "Granite Real Estate Investment Trust"),
+    _sec(5, "EFGHR"),
+    _sec(6, "SNOW", "Snowflake Inc."),
+]
+
+
+def _symbols(rows):
+    return sorted(r["primary_symbol"] for r in rows)
+
+
+def test_every_excluded_kind_is_a_candidate_and_nothing_else():
+    sel = select_descope_candidates(HELD, excluded=INSTRUMENT_KINDS)
+    assert _symbols(sel.candidates) == ["ABCDU", "ABCDW", "EFGHR", "GRP-UN"]
+    assert sel.kept_declared == sel.kept_by_request == sel.unmatched_keeps == []
+    assert {r["primary_symbol"]: r["kind"] for r in sel.candidates}["GRP-UN"] == "unit"
+
+
+def test_keep_takes_one_out_of_the_candidates_for_this_run():
+    sel = select_descope_candidates(HELD, excluded=INSTRUMENT_KINDS, keep=["GRP-UN"])
+    assert "GRP-UN" not in _symbols(sel.candidates)
+    assert _symbols(sel.kept_by_request) == ["GRP-UN"]
+    assert sel.unmatched_keeps == []
+
+
+def test_keep_is_case_and_padding_insensitive():
+    sel = select_descope_candidates(HELD, excluded=INSTRUMENT_KINDS, keep=[" grp-un "])
+    assert _symbols(sel.kept_by_request) == ["GRP-UN"]
+
+
+def test_a_declared_symbol_is_kept_separately_from_a_keep():
+    sel = select_descope_candidates(
+        HELD, excluded=INSTRUMENT_KINDS, declared=["ABCDU"], keep=["GRP-UN"]
+    )
+    assert _symbols(sel.kept_declared) == ["ABCDU"]
+    assert _symbols(sel.kept_by_request) == ["GRP-UN"]
+    assert _symbols(sel.candidates) == ["ABCDW", "EFGHR"]
+
+
+def test_a_symbol_both_declared_and_kept_counts_as_matched():
+    sel = select_descope_candidates(
+        HELD, excluded=INSTRUMENT_KINDS, declared=["ABCDU"], keep=["ABCDU"]
+    )
+    assert sel.unmatched_keeps == []
+    assert "ABCDU" not in _symbols(sel.candidates)
+
+
+@pytest.mark.parametrize(
+    "keep",
+    [
+        ["GRP-U"],  # a typo of a real candidate
+        ["SNOW"],  # held, but not of an excluded kind
+        ["ZZZZW"],  # not held at all
+    ],
+)
+def test_a_keep_matching_no_candidate_is_reported_not_ignored(keep):
+    sel = select_descope_candidates(HELD, excluded=INSTRUMENT_KINDS, keep=keep)
+    assert sel.unmatched_keeps == [keep[0]]
+
+
+def test_a_keep_outside_the_kinds_of_this_run_is_unmatched():
+    sel = select_descope_candidates(HELD, excluded=("warrant",), keep=["GRP-UN"])
+    assert _symbols(sel.candidates) == ["ABCDW"]
+    assert sel.unmatched_keeps == ["GRP-UN"]
+
+
+def test_the_cli_offers_keep():
+    params = {p.name for p in cli.security_descope.params}
+    assert "keep_symbols" in params
