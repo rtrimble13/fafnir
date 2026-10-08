@@ -20,7 +20,7 @@ This module is the whole of the integration's moving parts:
     (open and accepted) as every check in :mod:`fafnir.dq.checks`, so dedupe and
     acceptance behave exactly as they do today.
   * **shadow** -- or, until the shadow period has met the plan's cutover criteria,
-    the rows go to ``var/dorq-shadow/<as-of>.jsonl`` and nothing touches the queue.
+    the rows go to ``<dorq_shadow_dir>/<as-of>.jsonl`` and nothing touches the queue.
 
 dorq is deterministic: the same bars, context and config give byte-identical
 output whatever the thread count. That is what lets ``dq recheck`` close a dorq

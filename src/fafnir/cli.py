@@ -3501,7 +3501,7 @@ def _dq_engine(cfg, engine: Optional[str]) -> str:
 @click.option(
     "--shadow/--no-shadow",
     default=None,
-    help="dorq's flags to var/dorq-shadow/ instead of the queue  "
+    help="dorq's flags to [dq] dorq_shadow_dir instead of the queue  "
     "[default: [dq] dorq_shadow, else shadow]",
 )
 @click.option(

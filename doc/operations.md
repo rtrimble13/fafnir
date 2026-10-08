@@ -373,7 +373,7 @@ registration — the whole procedure, with the audit and revocation queries, is
 
 `fafnir dq run` writes flags; `fafnir dq list` and `fafnir dq resolve` are how they
 get worked. With `[dq] engine = "both"`, dorq runs after the SQL checks and, until
-the shadow period ends, writes to `var/dorq-shadow/` rather than the queue; read
+the shadow period ends, writes to `[dq] dorq_shadow_dir` rather than the queue; read
 each night with `fafnir dq compare` ([dorq.md](dorq.md)). The two take the **same** selection options, so the workflow is to
 narrow with `list` until the page is the problem you mean, then re-run the same
 options under `resolve`.
