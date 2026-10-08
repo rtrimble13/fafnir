@@ -79,6 +79,19 @@ horizon_extra_years = 2
 log_level = "info"
 log_dir = "var/fafnir/log"
 
+# --- data quality: the dorq engine (doc/dorq.md, ADR 0013) -------------------
+[dq]
+# Which checks `fafnir dq run` runs: "sql" (default), "dorq" or "both".
+# engine = "both"
+# dorq_path = "/opt/dorq/bin/dorq"        # or FAFNIR_DORQ_PATH
+# dorq_config = "/etc/fafnir/dorq.toml"   # dorq's own settings; empty: its defaults
+# dorq's flags go to dorq_shadow_dir instead of the queue until the shadow period
+# meets the cutover criteria (doc/dorq.md#the-shadow-period).
+# dorq_shadow = true
+# dorq_shadow_dir = "var/dorq-shadow"
+# dorq_lookback_sessions = 260
+# dorq_threads = 0
+
 # --- duk (read CLI) settings -------------------------------------------------
 # duk reuses [api].fmp_key (live mode) and [database] (db mode).
 # default_source: "db" or "live". If unset, duk uses db when a DSN is configured.

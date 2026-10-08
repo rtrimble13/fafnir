@@ -26,8 +26,9 @@ and they are not interchangeable:
 
 - **`dq recheck`** re-evaluates a check against its own open flags and closes the
   ones whose condition is no longer true. It is the negation of the check, run by
-  the same constants, so what it closes cannot come back. Only six checks support
-  it; a check that is not listed cannot be rechecked at all.
+  the same constants, so what it closes cannot come back. Only six SQL checks
+  support it, plus the `dorq_*` checks by re-running dorq (below); a check that is
+  not listed cannot be rechecked at all.
 - **`dq accept`** is a terminal disposition for a condition that is real,
   understood, and has no repair. It sets `accepted_at`, and `add_dq_flag_once`
   skips a condition already accepted — so the writer stops re-detecting it. It
@@ -49,6 +50,7 @@ and they are not interchangeable:
 | `symbol_change_conflict` | symbol-change sweep | `add_dq_flag_once` | no longer re-detected once the row is terminal; the sweep closes it itself when a retry applies the rename | yes | no |
 | `split_invalid`, `dividend_invalid` | action loader | `add_dq_flag_once` | the next load of that action | yes | no |
 | `tracked_symbol_unknown_to_source` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, if the vendor still won't serve it | yes | no |
+| `dorq_*` | `dq run --engine dorq\|both` with `--no-shadow` | `dq.dorq.ingest` (the same two guards as `dq.checks`) | the next dorq run whose window still reports it — nightly, only dates within its `--since`; a `--full` run, any date | yes | yes, by re-running dorq — except the Never three and the cross-sectional `dorq_cohort_gap`, `dorq_cohort_move` |
 
 **The two acceptance traps.** `corporate_action_drift` and
 `security_company_name_drift` are both keyed on `record_key = {"symbol": …}`. An
@@ -758,3 +760,86 @@ succeeded and no command could reach it. Dismissed and ignored rows are untouche
 `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir track rm <SYM> --closed <date>`. **Escalate** a typo in
 `track add`; the operator added a symbol that does not exist, and only they can
 say what they meant.
+
+---
+
+## The `dorq_*` family — dorq's judgement of a bar
+
+Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**
+(`[dq] dorq_shadow = false`). Until the shadow period meets the cutover criteria
+(dorq plan §8), dorq writes to `var/dorq-shadow/<date>.jsonl` instead and the
+queue carries none of these. `doc/dorq.md` covers the engine.
+
+A `dorq_*` flag is not a threshold crossing. dorq weighed the explanations of a
+bar — a bad print, a scale error, an unreported split, a feed outage, a real move —
+and `detail.p_error` is the probability that the bar is a **data error**. Read
+`detail` before anything else:
+
+| Field | What it tells you |
+|---|---|
+| `code`, `check` | dorq's check (`DQ201` bad-print …); `dorq explain <code>` prints its page |
+| `p_error` | P(data error). `error` severity is ≥ 0.9, `warn` ≥ 0.6 |
+| `hypotheses` | each explanation's posterior: the runner-up says what else it could be |
+| `evidence` | the terms behind it (jump size, reversion, volume ratio, tick grid, peers) |
+| `suggested_action` | the repair dorq proposes: a `kind` (`delete_bars`, `add_split`, `rescale`, `redate_split`, `split_history` …) and its fields. The table below maps each to a fafnir command |
+| `provisional` | the newest bars: no "after" yet. The next night judges them again |
+| `dorq.version`, `dorq.config_hash` | which binary and settings wrote it |
+
+**Diagnose with the evidence, not the price chart alone.** Compare `p_error` with
+the runner-up hypothesis. A `dorq_bad_print` at 0.62 whose runner-up is
+`market_move` at 0.38 is a coin with a bias, not a verdict. Read the bars around it
+with `price_history`.
+
+**The map to repairs.** Each code has the repair the outlier classification found
+by hand (`references/outlier-classification.md`, sections in brackets):
+
+| Check | Repair | Close with |
+|---|---|---|
+| `dorq_bad_print`, `dorq_ohlc_close_mismatch` | `prices delete` after probing the vendor (§2f, §3) | the repair, then `dq recheck` |
+| `dorq_unreported_split`, `dorq_cohort_move` | `actions add --split N:D` (§2d) | the repair, then `dq recheck` |
+| `dorq_scale_shift` | `prices rescale` over the era (§2i) | **Never** — see below |
+| `dorq_date_shift` | `prices shift` (§2i) | the repair, then `dq recheck` |
+| `dorq_history_segment` | `security split` (§2h) | the repair, then `dq recheck` |
+| `dorq_split_misdated` | `actions redate` (§2c) | the repair, then `dq recheck` |
+| `dorq_split_without_jump`, `dorq_split_double_applied` | an action or bar repair | **Never** — see below |
+| `dorq_split_ratio_mismatch`, `dorq_dividend_implausible` | correct the action on file | the repair, then `dq recheck` |
+| `dorq_missing_run`, `dorq_cohort_gap` | `ingest prices --symbols … --from … --to …` | the repair, then `dq recheck` |
+| `dorq_stale_feed`, `dorq_repeated_price` | as `stale` | as `stale` |
+
+**Accept when** the evidence shows a real event dorq could not know about — a
+halt, a tender at a fixed price — and say what it was. **Resolve** only a report
+you judged wrong: the next run writes it again if its window still holds the bar,
+and your note becomes a label for the next calibration (`dq export-labels`), so say
+*why* it is not an error.
+
+**Recheck** re-runs dorq over the full history of the securities with open flags
+and closes each flag dorq no longer emits. When the binary has changed since the
+flag was written, the note says so — a newer model, not a repair, may be what
+closed it.
+
+## `dorq_scale_shift` — an era stored at the wrong scale
+
+Never auto-resolve. A run of bars ×100, ×0.01 or ×1000 the level either side,
+with no volume change to make it a split. The repair is `prices rescale` over the
+**whole era** (outlier classification §2i). Resolving one flag leaves every other
+bar of the era wrong, and the adjusted series built on it. Report the era's
+bounds from `detail`, propose the rescale, and leave the flag to `dq recheck` once
+the operator has run it.
+
+## `dorq_split_without_jump` — a split on file the bars never show
+
+Never auto-resolve. Either the split is not real (the vendor fabricated or
+duplicated it; `actions delete`), or the bars already carry it (the history was
+stored adjusted, and the factor applies it a second time). Both corrupt every
+adjusted price before the ex-date, and telling them apart needs the pre-split
+levels (§2b, the AKR/HUN pattern). Report both readings with the numbers; the
+operator decides.
+
+## `dorq_split_double_applied` — the bars apply one split twice
+
+Never auto-resolve. The level moves by the split's ratio at the ex-date and again
+a few sessions later. One of the two moves is a vendor restatement, and every
+adjusted price before it is off by the ratio. The repair is a rescale of the bars
+between the two moves, after probing the vendor's payloads for which one is the
+restatement (§3). Report; do not close.
+

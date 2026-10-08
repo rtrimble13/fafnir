@@ -29,10 +29,11 @@ These are not style guidance. Each one is a way this system gets damaged.
 4. **Never `--force`.** `fafnir security merge-rename --force` overrides guards
    comparing CUSIP/ISIN and overlapping OHLC. If they trip, report the blockers
    and stop.
-5. **Six checks are never yours to auto-resolve**: `price_scale_collapse`,
+5. **Nine checks are never yours to auto-resolve**: `price_scale_collapse`,
    `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`,
-   `price_subresolution_price`, `security_duplicate_identity`. Each is a
-   measurement, an unrepresentable value, or needs a different command
+   `price_subresolution_price`, `security_duplicate_identity`, and dorq's
+   `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied`.
+   Each is a measurement, an unrepresentable value, or needs a different command
    entirely — see the playbooks. This list is also
    `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and `dq_triage` returns
    `never_auto_resolve` per row; a test asserts the two agree.
