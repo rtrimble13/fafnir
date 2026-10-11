@@ -252,6 +252,27 @@ def test_export_writes_calendar_actions_and_nav_metadata(db, fake_dorq):
 
 
 @pytest.mark.integration
+def test_export_keeps_a_zero_dividend(db, fake_dorq):
+    """The feed sends dividends of 0 and the schema keeps them. They go to dorq as
+    stored, and dorq (0.8.0 on) reports them as DQ705 rather than refusing the file."""
+    sid = _mk(db, "DQZD")
+    days = _sessions(db)
+    _walk(db, sid, days[:30])
+    db.execute(
+        "INSERT INTO core.corporate_action (security_id, action_type, ex_date,"
+        " dividend_amount) VALUES (%s, 'dividend', %s, 0), (%s, 'dividend', %s, 0.25)",
+        (sid, days[10], sid, days[20]),
+    )
+    settings = dorq.DorqSettings(path=str(fake_dorq))
+    dorq.run_dorq(db, settings, "NASDAQ", dorq.Window(as_of=days[29]))
+    actions = (fake_dorq.parent / "actions.csv").read_text().splitlines()
+    assert [a.split(",")[1] for a in actions[1:]] == [
+        days[10].isoformat(),
+        days[20].isoformat(),
+    ]
+
+
+@pytest.mark.integration
 def test_the_nightly_window_reads_the_lookback_and_reports_from_the_last_run(db):
     sid = _mk(db, "DQWIN")
     days = _sessions(db)
@@ -441,6 +462,33 @@ def test_real_dorq_finds_a_bad_print_and_is_deterministic(db, tmp_path):
     assert [r["check_name"] for r in hits] == ["dorq_bad_print"]
     assert dorq.ingest(db, a.records)["dorq_bad_print"] >= 1
     assert dorq.ingest(db, a.records) == {}
+
+
+@real_dorq
+@pytest.mark.integration
+def test_real_dorq_reports_a_zero_dividend(db):
+    """On 2026-10-08 the first run on the host stopped at exit 3 over a dividend of
+    0 (dorq 0.7.0). From 0.8.0 dorq reads it and reports it at warn (DQ705), and a
+    dividend above the close is still an error."""
+    days = _sessions(db)
+    sid = _mk(db, "RDZD")
+    _walk(db, sid, days, seed=5)
+    db.execute(
+        "INSERT INTO core.corporate_action (security_id, action_type, ex_date,"
+        " dividend_amount) VALUES (%s, 'dividend', %s, 0), (%s, 'dividend', %s, 500)",
+        (sid, days[100], sid, days[300]),
+    )
+    settings = dorq.DorqSettings(path=REAL_DORQ)
+    run = dorq.run_dorq(db, settings, "NASDAQ", dorq.full_window(db, "NASDAQ"))
+    implausible = {
+        r["record_key"]["trade_date"]: r["severity"]
+        for r in run.records
+        if r["check_name"] == "dorq_dividend_implausible"
+    }
+    assert implausible == {
+        days[100].isoformat(): "warn",
+        days[300].isoformat(): "error",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -10,15 +10,29 @@ rather than instead of them.
 
 ## Install
 
-dorq is a single static binary. Unpack a release archive and link it:
+dorq is a single static binary, and fafnir needs version 0.8.0 or later. Version
+0.7.0 refuses its whole actions file over a dividend of zero, which
+`core.corporate_action` holds (see [What a run does](#what-a-run-does)). Check a
+release archive, unpack it and link it:
 
 ```bash
-version=0.7.0
-curl -fsSLO "https://github.com/rtrimble13/dorq/releases/download/v${version}/dorq-${version}-linux-x86_64.tar.gz"
-sudo tar -xzf "dorq-${version}-linux-x86_64.tar.gz" -C /opt
-sudo ln -sfn "/opt/dorq-${version}" /opt/dorq
+version=0.8.0
+base="https://github.com/rtrimble13/dorq/releases/download/v${version}"
+curl -fsSLO "${base}/dorq-${version}-linux-x86_64.tar.gz"
+curl -fsSLO "${base}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+sudo tar --no-same-owner -xzf "dorq-${version}-linux-x86_64.tar.gz" -C /opt
+sudo ln -sfn "/opt/dorq-${version}-linux-x86_64" /opt/dorq
 /opt/dorq/bin/dorq --version
 ```
+
+The archive unpacks to `/opt/dorq-<version>-linux-x86_64`, which is what the link
+names. Keep `--no-same-owner`. Run as root, tar otherwise keeps the owner recorded
+in the archive. From 0.8.0 that is root, but earlier archives recorded a uid from
+the build machine. On the host that uid belongs to whichever local account has it,
+and that account could then replace a binary the service user runs with the
+warehouse's credentials. To upgrade, unpack the next version beside this one and
+move the link. To roll back, move it back.
 
 Or build it from source with the `release` preset (dorq's README). Either way the
 binary is `/opt/dorq/bin/dorq`, which is `[dq] dorq_path`'s default.
@@ -32,11 +46,20 @@ In `~/.fafnirrc` (all optional):
 engine = "both"            # sql (default) | dorq | both -- what `fafnir dq run` runs
 dorq_path = "/opt/dorq/bin/dorq"          # or FAFNIR_DORQ_PATH
 dorq_config = "/etc/fafnir/dorq.toml"     # dorq's settings; empty: dorq's defaults
-dorq_shadow = true         # dorq's flags to var/dorq-shadow/, not the queue
-dorq_shadow_dir = "var/dorq-shadow"
+dorq_shadow = true         # dorq's flags to dorq_shadow_dir, not the queue
+dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"   # absolute on a host: see below
 dorq_lookback_sessions = 260              # bars per security on a nightly run
 dorq_threads = 0           # 0: one per core; the output does not depend on it
 ```
+
+`dorq_shadow_dir` defaults to `var/dorq-shadow`. Like `log_dir`'s default, it is
+relative to the working directory, which suits a checkout and not a host. The
+systemd units run from `/opt/fafnir`, so the nightly would write inside the
+deployed git checkout. A `fafnir dq compare` run from any other directory would
+then look somewhere else and find nothing. On a host, set an absolute path the
+service user can write, such as one under its home (`/var/lib/fafnir` in
+[install_hetzner.md](install_hetzner.md)). Not one under `/home`: the units run
+with `ProtectHome=read-only`.
 
 `dorq_config` is dorq's own TOML. dorq ships fafnir's starting configuration at
 `/opt/dorq/share/dorq/priors/fafnir.toml`. Point at it from a file of your own,
@@ -46,8 +69,15 @@ which the calibration fitted on this warehouse's labels joins later (see
 ```toml
 # /etc/fafnir/dorq.toml
 include = ["/opt/dorq/share/dorq/priors/fafnir.toml"]
-``` Without it dorq runs `--isolated` on its
-defaults, never on a `dorq.toml` that happens to sit in the working directory.
+```
+
+With `dorq_config` empty, dorq runs `--isolated` on its defaults. It never reads
+a `dorq.toml` that happens to sit in the working directory.
+
+`dorq config show --config /etc/fafnir/dorq.toml` prints the settings in effect
+and their `config_hash`. Every flag carries the hash of the configuration that
+wrote it (`detail.dorq.config_hash`), so a shadow row shows which configuration a
+run actually used. `dorq config show --isolated` gives the hash of the defaults.
 
 `fafnir status` prints a `dorq` line, with its version and mode, once the engine
 includes dorq or a binary is installed.
@@ -64,7 +94,10 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    security_id, trade_date` straight into dorq's stdin. They are raw bars, as
    ADR 0001 stores them. Beside them go three files:
    - `ref.trading_calendar` for the venue (`--exchange`, NASDAQ by default);
-   - `core.corporate_action`, splits and dividends as stored;
+   - `core.corporate_action`, splits and dividends as stored. That includes
+     dividends of zero, which the feed sends for funds and stocks alike and the
+     schema allows. dorq reports each as `dorq_dividend_implausible` (DQ705) at
+     warn: the feed lost the amount, or the event paid no cash;
    - the security master's `asset_type`, exchange and `nav_priced`, by the same
      rule `stale` uses.
 
@@ -81,7 +114,7 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    `dorq_scale_shift` …), `record_key` is `{"trade_date": …}`, and `detail` is
    dorq's whole report (`p_error`, `hypotheses`, `evidence`, `suggested_action`,
    `dorq.version`, `dorq.config_hash`).
-4. **Write.** In shadow mode the rows go to `var/dorq-shadow/<as-of>.jsonl`.
+4. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/<as-of>.jsonl`.
    Otherwise one set-based insert writes them, with the same two guards every SQL
    check carries: a condition already open, or accepted, is not written again. The
    run is recorded in `ops.ingestion_run` (`source = 'dorq'`, endpoint `dq-run` or
@@ -110,7 +143,7 @@ morning:
 ```bash
 fafnir dq compare                                    # the newest shadow night
 fafnir dq compare --labels labels.jsonl              # with precision
-fafnir dq compare var/dorq-shadow/2026-10-06.jsonl --json
+fafnir dq compare /var/lib/fafnir/dorq-shadow/2026-10-06.jsonl --json
 ```
 
 - **Overlap.** Of the `outlier`, `gap` and `stale` flags keyed in the night's

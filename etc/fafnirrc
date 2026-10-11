@@ -88,7 +88,9 @@ log_dir = "var/fafnir/log"
 # dorq's flags go to dorq_shadow_dir instead of the queue until the shadow period
 # meets the cutover criteria (doc/dorq.md#the-shadow-period).
 # dorq_shadow = true
-# dorq_shadow_dir = "var/dorq-shadow"
+# The default, "var/dorq-shadow", is relative to the working directory. On a host,
+# make it absolute: the systemd units run from /opt/fafnir, the deployed checkout.
+# dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"
 # dorq_lookback_sessions = 260
 # dorq_threads = 0
 
