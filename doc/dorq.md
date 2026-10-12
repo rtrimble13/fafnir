@@ -74,10 +74,24 @@ include = ["/opt/dorq/share/dorq/priors/fafnir.toml"]
 With `dorq_config` empty, dorq runs `--isolated` on its defaults. It never reads
 a `dorq.toml` that happens to sit in the working directory.
 
-`dorq config show --config /etc/fafnir/dorq.toml` prints the settings in effect
-and their `config_hash`. Every flag carries the hash of the configuration that
-wrote it (`detail.dorq.config_hash`), so a shadow row shows which configuration a
-run actually used. `dorq config show --isolated` gives the hash of the defaults.
+`dorq config show --config /etc/fafnir/dorq.toml` prints the settings in effect.
+It also prints a hash, but that is not the hash a run stamps on its reports.
+Every flag carries `detail.dorq.config_hash`, and that hash covers the config file
+**and** the options fafnir passes to `dorq check` **and** the calendar's content.
+So it changes when `ref.trading_calendar` changes, even with the config file
+untouched. `config show` takes only `--config` or `--isolated`, so it prints the
+config file's own hash, a different number, and cannot reproduce a run's. On the
+host, `config show` printed `c0195518ff64845f` while every row of the first shadow
+night carried `119a126869e5c4f0`.
+
+Use the run's hash to compare runs with each other. Two runs with the same hash
+were judged under the same settings and calendar. Each run keeps it in
+`ops.ingestion_run`, as `params.dorq_config_hash`. To see which config file a run
+used, read the command line it logged:
+
+```
+dorq: /opt/dorq/bin/dorq check --config /etc/fafnir/dorq.toml - --format fafnir ...
+```
 
 `fafnir status` prints a `dorq` line, with its version and mode, once the engine
 includes dorq or a binary is installed.
@@ -126,8 +140,21 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
 5. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/<as-of>.jsonl`.
    Otherwise one set-based insert writes them, with the same two guards every SQL
    check carries: a condition already open, or accepted, is not written again. The
-   run is recorded in `ops.ingestion_run` (`source = 'dorq'`, endpoint `dq-run` or
-   `dq-shadow`), and its as-of date in `ops.load_watermark`.
+   as-of date goes to `ops.load_watermark`.
+
+**The run's record.** Each run has a row in `ops.ingestion_run` (`source =
+'dorq'`, endpoint `dq-run` or `dq-shadow`), which the MCP `ingestion_runs` tool
+shows. It is written before dorq starts, so a run that fails still leaves one:
+`status = 'failed'`, with dorq's message in `error_message`, and the watermark
+where it was. `started_at` and `finished_at` are the real times. `params` holds:
+
+| Key | What |
+|---|---|
+| `dorq_version` | the binary's version (null on a failed run; dorq's exit message names it) |
+| `dorq_config_hash` | the hash on the run's reports (null when dorq reported nothing) |
+| `dropped` | the reports the filter left out, per check: `{"dorq_stale_feed": 1127}` |
+| `since`, `shadow` | the window's `--since`, and whether the run went to the shadow |
+
 
 **Runtime.** dorq checks while the bars stream in, so a run takes about as long as
 the export. On a test cluster, 2.3M bars took these times:

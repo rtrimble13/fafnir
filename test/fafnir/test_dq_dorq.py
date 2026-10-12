@@ -21,6 +21,7 @@ from click.testing import CliRunner
 from fafnir import cli
 from fafnir.config import FafnirConfig
 from fafnir.db import repository as repo
+from fafnir.db.connection import Database
 from fafnir.dq import dorq
 
 REAL_DORQ = os.environ.get("FAFNIR_TEST_DORQ", "")
@@ -30,13 +31,14 @@ real_dorq = pytest.mark.skipif(
 
 # A fake dorq: `--version` prints a version; `check` saves its arguments and stdin
 # beside itself and prints the rows in FAKE_DORQ_ROWS (a file), or fails with
-# FAKE_DORQ_FAIL.
+# FAKE_DORQ_FAIL. FAKE_DORQ_SLEEP makes the check take that many seconds.
 _FAKE = """#!{python}
-import os, sys, pathlib
+import os, sys, pathlib, time
 here = pathlib.Path(__file__).parent
 if "--version" in sys.argv:
     print("9.9.9-fake")
     sys.exit(0)
+time.sleep(float(os.environ.get("FAKE_DORQ_SLEEP") or 0))
 data = sys.stdin.buffer.read()
 (here / "stdin.csv").write_bytes(data)
 (here / "args.txt").write_text("\\n".join(sys.argv[1:]))
@@ -62,6 +64,7 @@ def fake_dorq(tmp_path, monkeypatch):
     rows.write_text("")
     monkeypatch.setenv("FAKE_DORQ_ROWS", str(rows))
     monkeypatch.delenv("FAKE_DORQ_FAIL", raising=False)
+    monkeypatch.delenv("FAKE_DORQ_SLEEP", raising=False)
     return path
 
 
@@ -385,6 +388,34 @@ def test_a_dorq_error_names_dorqs_own_message(db, fake_dorq, monkeypatch):
         dorq.run(db, settings, "NASDAQ", shadow=True)
 
 
+@pytest.mark.integration
+def test_a_failed_run_is_recorded_and_moves_no_watermark(db, fake_dorq, monkeypatch):
+    """On 2026-10-08 dorq 0.7.0 refused the actions file, and nothing in
+    ops.ingestion_run said a run had happened: the row was written only once dorq
+    had succeeded. The agent has no journal, so the row is its only record."""
+    sid = _mk(db, "DQFAIL")
+    _walk(db, sid, _sessions(db)[:10])
+    monkeypatch.setenv(
+        "FAKE_DORQ_FAIL",
+        'dorq: error: actions.csv line 84466: amount "0.000000" is not a positive'
+        " number",
+    )
+    settings = dorq.DorqSettings(path=str(fake_dorq))
+    # Not autocommit, as the CLI runs it: the connection rolls back on the way out.
+    with pytest.raises(dorq.DorqError, match="dorq 9.9.9-fake exited 2"):
+        with Database(db.dsn) as conn:
+            dorq.run(conn, settings, "NASDAQ", shadow=True)
+    (run,) = db.fetchall(
+        "SELECT status, error_message, finished_at FROM ops.ingestion_run"
+        " WHERE source = 'dorq'"
+    )
+    assert run["status"] == "failed"
+    assert run["error_message"].startswith("DorqError: dorq 9.9.9-fake exited 2: ")
+    assert "is not a positive number" in run["error_message"]
+    assert run["finished_at"] is not None
+    assert dorq.read_watermark(db, dorq.WATERMARK_SHADOW) is None
+
+
 def _stale_feed_night(db, fake_dorq):
     """dorq reports a stale feed on a security still trading and on one that has
     stopped, and a bad print in the stopped one's history. Returns the two."""
@@ -432,6 +463,33 @@ def test_stale_feed_on_a_security_not_trading_never_reaches_the_queue(db, fake_d
             "SELECT check_name, security_id FROM ops.data_quality_flag"
         )
     } == {("dorq_stale_feed", active), ("dorq_bad_print", stopped)}
+
+
+@pytest.mark.integration
+def test_a_run_records_its_hash_what_was_left_out_and_how_long_it_took(
+    db, fake_dorq, tmp_path, monkeypatch
+):
+    """The hash is dorq's own (the config file, its options and the calendar), so
+    `dorq config show` cannot recompute it; the run keeps it. finished_at was now(),
+    the transaction's start, which made every run take no time at all."""
+    _stale_feed_night(db, fake_dorq)
+    monkeypatch.setenv("FAKE_DORQ_SLEEP", "0.3")
+    settings = dorq.DorqSettings(path=str(fake_dorq), shadow_dir=str(tmp_path / "sh"))
+    with Database(db.dsn) as conn:
+        dorq.run(conn, settings, "NASDAQ", shadow=True)
+    run = db.fetchone(
+        "SELECT status, params, finished_at - started_at AS took"
+        " FROM ops.ingestion_run WHERE source = 'dorq'"
+    )
+    assert run["status"] == "success"
+    assert run["params"] == {
+        "dorq_version": "9.9.9-fake",
+        "dorq_config_hash": "x",
+        "dropped": {"dorq_stale_feed": 1},
+        "since": None,
+        "shadow": True,
+    }
+    assert run["took"] >= dt.timedelta(seconds=0.3)
 
 
 @pytest.mark.integration
