@@ -69,11 +69,15 @@ class RunLog:
             self.db.rollback()
         elif self.rows_quarantined > 0:
             status = "partial"
+        # params is written again: a loader may add what it learned during the run
+        # (the delisting sweep's reasons for declining), and ops.ingestion_run is
+        # the only record of a run an agent without the journal can read.
         self.db.execute(
             """
             UPDATE ops.ingestion_run SET
                 rows_inserted = %s, rows_quarantined = %s, symbols_requested = %s,
-                bytes_downloaded = %s, status = %s, error_message = %s, finished_at = now()
+                bytes_downloaded = %s, status = %s, error_message = %s, finished_at = now(),
+                params = %s::jsonb
             WHERE ingestion_run_id = %s
             """,
             (
@@ -83,6 +87,7 @@ class RunLog:
                 self.bytes_downloaded,
                 status,
                 error_message,
+                json.dumps(self.params, default=str),
                 self.run_id,
             ),
         )

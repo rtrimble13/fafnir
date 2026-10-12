@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 from difflib import SequenceMatcher
 from math import isfinite
 from typing import Iterable, NamedTuple, Optional
@@ -81,6 +82,12 @@ SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
 # existing deployment. ensure_venue fills them in where the row has none, so a
 # venue first seen in a vendor payload still gets a name, country and timezone.
 VENUE_ATTRIBUTES = {TXSE: ("Texas Stock Exchange", "US", "America/Chicago")}
+
+# The info flag for a row this load turns inactive although it was still trading
+# (ADR 0014): the vendor's isActivelyTrading went false within this many sessions
+# of the security's last bar. The early warning for a venue transfer.
+INACTIVE_BUT_TRADING_CHECK = "security_inactive_but_trading"
+INACTIVE_BUT_TRADING_SESSIONS = 5
 
 # Securities committed per batch. The bulk list is already in memory, so this is
 # purely a durability boundary, not a rate limit.
@@ -258,6 +265,51 @@ def is_retired_listing(
         if stored and _normalize_company_name(stored) == incoming:
             return row
     return None
+
+
+def flag_inactive_but_trading(
+    db: Database,
+    *,
+    symbol: str,
+    security_id: int,
+    vendor_exchange: Optional[str],
+    run: RunLog,
+    today: date,
+) -> bool:
+    """Flag a row this load is about to turn inactive while it is still trading.
+
+    The vendor's ``isActivelyTrading`` is not evidence that a security stopped
+    trading: FMP called ET inactive on the NYSE the week it moved to TXSE, while
+    quoting its prices and that day's volume. The nightly universe keeps such a row
+    polled (:func:`fafnir.db.repository.nightly_universe`); this says so out loud,
+    because it is how a venue transfer looks before the delisted feed reports it.
+    Only for a last bar within :data:`INACTIVE_BUT_TRADING_SESSIONS` sessions, so a
+    real wind-down the vendor reports late raises nothing. True when flagged.
+    """
+    _, last_bar = repo.security_bar_span(db, security_id)
+    if (
+        last_bar is None
+        or repo.sessions_apart(db, last_bar, today) > INACTIVE_BUT_TRADING_SESSIONS
+    ):
+        return False
+    logger.warning(
+        "%s: the vendor now calls it inactive (venue %s), but its last bar is %s -- "
+        "kept in the price universe; a venue transfer? (%s flag)",
+        symbol,
+        vendor_exchange,
+        last_bar,
+        INACTIVE_BUT_TRADING_CHECK,
+    )
+    return repo.add_dq_flag_once(
+        db,
+        check_name=INACTIVE_BUT_TRADING_CHECK,
+        severity="info",
+        security_id=security_id,
+        table_name="core.security",
+        record_key={"symbol": symbol},
+        detail={"last_bar": last_bar.isoformat(), "vendor_exchange": vendor_exchange},
+        ingestion_run_id=run.run_id,
+    )
 
 
 # Nasdaq's test issues: ZXZZT ("SuperMontage TEST"), ZVZZT, ZWZZT, ZBZZT, ZJZZT.
@@ -446,6 +498,7 @@ def load_securities(
     include_etfs: bool = True,
     limit: Optional[int] = None,
     excluded_kinds: Iterable[str] = INSTRUMENT_KINDS,
+    today: Optional[date] = None,
 ) -> SecurityLoadResult:
     """Load the security master from FMP bulk lists.
 
@@ -458,6 +511,7 @@ def load_securities(
     keeps one, such as a REIT whose stapled units are its only US listing.
     """
     excluded = tuple(excluded_kinds)
+    today = today or date.today()
     with RunLog(
         db,
         source="fmp",
@@ -585,9 +639,25 @@ def load_securities(
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
+            active = bool(entry.get("isActivelyTrading", True))
             if previous is None:
                 new_symbols.append(symbol)
             else:
+                # The upsert below copies the vendor's activity onto the row, unless
+                # an operator's venue holds it (0027).
+                if (
+                    previous.get("is_actively_trading")
+                    and not active
+                    and previous.get("venue_override") is None
+                ):
+                    flag_inactive_but_trading(
+                        db,
+                        symbol=symbol,
+                        security_id=previous["security_id"],
+                        vendor_exchange=exchange,
+                        run=run,
+                        today=today,
+                    )
                 # An update, so there is a stored name to compare against. This is
                 # the one moment both names exist -- the upsert below overwrites
                 # the old one.
@@ -613,7 +683,7 @@ def load_securities(
                 sector_id=sector_id(entry.get("sector")),
                 industry_id=industry_id(entry.get("industry")),
                 country=entry.get("country"),
-                is_actively_trading=bool(entry.get("isActivelyTrading", True)),
+                is_actively_trading=active,
                 is_etf=is_etf,
                 is_fund=bool(entry.get("isFund", False)),
                 market_cap_usd=nums["market_cap_usd"],
@@ -623,7 +693,12 @@ def load_securities(
             # Keep the snapshot current so a symbol repeated within one run (the
             # bulk-list universes can repeat; the screener path dedups upstream)
             # is a refresh, not a second arrival.
-            listed[symbol] = {"security_id": sec_id, "company_name": company_name}
+            listed[symbol] = {
+                "security_id": sec_id,
+                "company_name": company_name,
+                "is_actively_trading": active,
+                "venue_override": (previous or {}).get("venue_override"),
+            }
             count += 1
             run.rows_inserted = count
             # Batched, unlike the price and action loaders: there is no network
