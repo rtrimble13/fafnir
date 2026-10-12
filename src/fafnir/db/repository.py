@@ -23,17 +23,34 @@ from fafnir.instruments import rename_changes_instrument
 
 
 def ensure_exchange(
-    db: Database, code: str, name: str | None = None, country: str | None = None
+    db: Database,
+    code: str,
+    name: str | None = None,
+    country: str | None = None,
+    timezone: str | None = None,
 ) -> None:
+    """Create the venue's row if it is missing, and fill in any attribute it lacks.
+
+    Never overwrites a value already held: the seed's names are the record, and a
+    row created bare on first use (before its attributes were known) is completed
+    the next time a caller knows them.
+    """
     if not code:
         return
     db.execute(
         """
-        INSERT INTO ref.exchange (exchange_code, exchange_name, country)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (exchange_code) DO NOTHING
+        INSERT INTO ref.exchange (exchange_code, exchange_name, country, timezone)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (exchange_code) DO UPDATE SET
+            exchange_name = COALESCE(ref.exchange.exchange_name, EXCLUDED.exchange_name),
+            country       = COALESCE(ref.exchange.country, EXCLUDED.country),
+            timezone      = COALESCE(ref.exchange.timezone, EXCLUDED.timezone),
+            updated_at    = now()
+        WHERE (ref.exchange.exchange_name IS NULL AND EXCLUDED.exchange_name IS NOT NULL)
+           OR (ref.exchange.country IS NULL AND EXCLUDED.country IS NOT NULL)
+           OR (ref.exchange.timezone IS NULL AND EXCLUDED.timezone IS NOT NULL)
         """,
-        (code, name, country),
+        (code, name, country, timezone),
     )
 
 

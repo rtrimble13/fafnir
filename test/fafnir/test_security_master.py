@@ -8,7 +8,9 @@ import pytest
 
 from fafnir.ingest.security_master import (
     COMPANY_NAME_DRIFT_RATIO,
+    LISTED_US_EXCHANGES,
     SCREENER_EXCHANGES,
+    TXSE,
     SourceError,
     _is_us,
     _norm_exchange,
@@ -51,6 +53,36 @@ def test_norm_exchange_canonicalizes_amex():
     assert _norm_exchange(_e("NYSEAMERICAN")) == "AMEX"
     assert _norm_exchange(_e("AMEX")) == "AMEX"
     assert _norm_exchange(_e("NASDAQ")) == "NASDAQ"
+
+
+def test_norm_exchange_names_the_texas_stock_exchange_txse_never_tsx():
+    """TXSE is Texas, and fafnir's own code. TSX is FMP's code for Toronto."""
+    assert _norm_exchange(_e("TXSE")) == TXSE == "TXSE"
+    assert _norm_exchange(_e("txse ")) == TXSE
+    assert _norm_exchange({"exchange": "Texas Stock Exchange"}) == TXSE
+    assert _norm_exchange(_e("TSX")) == "TSX"
+    assert _is_us(_e("TXSE")) is True
+    assert _is_us(_e("TSX")) is False
+
+
+def test_listed_venues_are_the_us_venues_but_otc():
+    assert TXSE in LISTED_US_EXCHANGES and "NYSE" in LISTED_US_EXCHANGES
+    assert "OTC" not in LISTED_US_EXCHANGES
+    assert set(SCREENER_EXCHANGES) <= LISTED_US_EXCHANGES
+
+
+def test_txse_is_not_asked_of_the_screener_until_fmp_has_a_code_for_it():
+    """FMP had no code for TXSE in 2026-10 (ET's profile still named the NYSE). A
+    guess would be rejected, or answered with an unfiltered page; and "TSX" is
+    Toronto. The TODO beside SCREENER_EXCHANGES says how to check."""
+    assert TXSE not in SCREENER_EXCHANGES and "TSX" not in SCREENER_EXCHANGES
+
+
+def test_a_txse_row_on_a_screener_page_is_admitted():
+    """Should FMP name the venue on another venue's page, it normalizes in."""
+    et = {"symbol": "ET", "exchangeShortName": "TXSE", "isEtf": False}
+    fmp = _FakeFMP({"NYSE": [et]})
+    assert [e[0]["symbol"] for e in _us_entries(fmp, include_etfs=True)] == ["ET"]
 
 
 def test_is_us_accepts_real_us_venues():

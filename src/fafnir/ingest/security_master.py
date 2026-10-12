@@ -49,14 +49,38 @@ from fafnir.sources.fmp import FMPClient, SourceError
 
 logger = get_logger("ingest.security")
 
-US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", "OTC"}
+# The Texas Stock Exchange, which began listing in 2026 (ADR 0014). Never "TSX":
+# that is FMP's code for the *Toronto* Stock Exchange, and a screener query for it
+# pulls in Toronto's listings. TXSE is fafnir's own code: FMP had none for it in
+# 2026-10, and went on naming ET's venue as the NYSE after it moved. When FMP does
+# adopt one, add it to _TXSE_ALIASES so it normalizes here, as NYSEAMERICAN does to
+# AMEX.
+TXSE = "TXSE"
+_TXSE_ALIASES = frozenset({TXSE, "TEXAS STOCK EXCHANGE"})
+
+US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", TXSE, "OTC"}
+
+# The venues a security is *listed* on. A move between two of them is a venue
+# transfer, not a delisting; a move to OTC takes a security out of this
+# warehouse's scope, and is one (ADR 0014).
+LISTED_US_EXCHANGES = frozenset(US_EXCHANGES - {"OTC"})
 
 # Codes used to *query* the screener, largest venues first so a --limit run gets
 # the recognizable names. US_EXCHANGES stays the wider acceptance set: it also
 # has to admit the aliases FMP hands back (NYSEAMERICAN, which normalizes to
 # AMEX), and OTC, which is a US venue we simply do not ingest -- this is a
 # listed-equity research warehouse, and OTC roughly doubled the universe.
+#
+# TODO(ADR 0014): add TXSE once FMP's screener accepts a code for it. Check with
+# `GET /stable/company-screener?exchange=<code>&limit=20`: it must return ET, SUN
+# and DDS, and nothing from Toronto. Until then the loop below would only log a
+# rejection, or worse, an unfiltered page re-checked client-side.
 SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
+
+# ref.exchange attributes for a venue the seed list may not have created on an
+# existing deployment. ensure_venue fills them in where the row has none, so a
+# venue first seen in a vendor payload still gets a name, country and timezone.
+VENUE_ATTRIBUTES = {TXSE: ("Texas Stock Exchange", "US", "America/Chicago")}
 
 # Securities committed per batch. The bulk list is already in memory, so this is
 # purely a durability boundary, not a rate limit.
@@ -298,9 +322,18 @@ def _norm_exchange(entry: dict) -> Optional[str]:
     )
     if code in {"NYSEAMERICAN", "AMEX"}:
         return "AMEX"
+    if code in _TXSE_ALIASES:
+        return TXSE
     if code in {"NASDAQ", "NYSE", "BATS", "CBOE", "OTC"}:
         return code
     return code or None
+
+
+def ensure_venue(db: Database, code: Optional[str]) -> None:
+    """Make sure ``ref.exchange`` holds the venue, named where it is known
+    (:data:`VENUE_ATTRIBUTES`). ``core.security.exchange_code`` references it."""
+    if code:
+        repo.ensure_exchange(db, code, *VENUE_ATTRIBUTES.get(code, ()))
 
 
 def _is_us(entry: dict) -> bool:
@@ -525,6 +558,9 @@ def load_securities(
                 skipped_out_of_scope.append(symbol)
                 continue
             previous = listed.get(symbol)
+            # The us-equity-etf filter lives in _us_entries now -- it needs the
+            # screener's fields, which the bulk lists do not carry.
+            exchange = _norm_exchange(entry)
             # Before anything is written or flagged: a name this warehouse has
             # already retired, still being served by the vendor, is not a listing.
             # Inserting it mints a duplicate identity that captures the ticker's
@@ -544,10 +580,7 @@ def load_securities(
                     else symbol
                 )
                 continue
-            # The us-equity-etf filter lives in _us_entries now -- it needs the
-            # screener's fields, which the bulk lists do not carry.
-            exchange = _norm_exchange(entry)
-            repo.ensure_exchange(db, exchange) if exchange else None
+            ensure_venue(db, exchange)
             # The screener carries market cap and beta, so screening data costs
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
@@ -699,12 +732,14 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
             nums = _bounded_security_numerics(
                 db, row=prof, symbol=symbol, run=run, sec_id=sec_id
             )
+            exchange = _norm_exchange(prof)
+            ensure_venue(db, exchange)
             repo.upsert_security(
                 db,
                 primary_symbol=symbol,
                 company_name=prof.get("companyName"),
                 asset_type="etf" if prof.get("isEtf") else "equity",
-                exchange_code=_norm_exchange(prof),
+                exchange_code=exchange,
                 sector_id=sector_id,
                 industry_id=industry_id,
                 currency=prof.get("currency") or "USD",

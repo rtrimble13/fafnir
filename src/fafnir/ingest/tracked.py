@@ -28,7 +28,7 @@ from typing import NamedTuple, Optional
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
-from fafnir.ingest.security_master import _to_float
+from fafnir.ingest.security_master import _to_float, ensure_venue
 from fafnir.logging_config import get_logger
 from fafnir.sources.fmp import FMPClient, payload_hash
 
@@ -158,7 +158,7 @@ def load_tracked(db: Database, fmp: FMPClient) -> TrackedLoadResult:
 
             asset_type = declaration["asset_type"]
             exchange = _declared_exchange(declaration)
-            repo.ensure_exchange(db, exchange) if exchange else None
+            ensure_venue(db, exchange)
             sec_id = repo.upsert_security(
                 db,
                 primary_symbol=symbol,
