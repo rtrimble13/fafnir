@@ -114,7 +114,16 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    `dorq_scale_shift` …), `record_key` is `{"trade_date": …}`, and `detail` is
    dorq's whole report (`p_error`, `hypotheses`, `evidence`, `suggested_action`,
    `dorq.version`, `dorq.config_hash`).
-4. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/<as-of>.jsonl`.
+4. **Filter.** Stale-feed reports (`dorq_stale_feed`, DQ304) on securities that
+   are not actively trading are left out. This is the SQL `stale` check's own rule
+   (`is_actively_trading`), read when the run is made. dorq cannot tell a delisting
+   from a feed outage: on the first shadow night, 1,127 of its 1,195 stale-feed
+   reports were on securities fafnir already knew had stopped trading. Their other
+   reports are kept. A delisted security's bars still go to dorq, so its history
+   is still judged for bad prints, splits and the rest. The run logs how many it
+   left out. `dq recheck` applies the same filter, so it closes an open
+   `dorq_stale_feed` flag once its security stops trading.
+5. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/<as-of>.jsonl`.
    Otherwise one set-based insert writes them, with the same two guards every SQL
    check carries: a condition already open, or accepted, is not written again. The
    run is recorded in `ops.ingestion_run` (`source = 'dorq'`, endpoint `dq-run` or

@@ -804,7 +804,8 @@ by hand (`references/outlier-classification.md`, sections in brackets):
 | `dorq_split_without_jump`, `dorq_split_double_applied` | an action or bar repair | **Never** — see below |
 | `dorq_split_ratio_mismatch`, `dorq_dividend_implausible` | correct the action on file | the repair, then `dq recheck` |
 | `dorq_missing_run`, `dorq_cohort_gap` | `ingest prices --symbols … --from … --to …` | the repair, then `dq recheck` |
-| `dorq_stale_feed`, `dorq_repeated_price` | as `stale` | as `stale` |
+| `dorq_stale_feed` | as `stale`. fafnir leaves out stale-feed reports on securities not actively trading, by `stale`'s own rule, so every one here is on a security still trading | as `stale`. `dq recheck` closes it once the security stops trading |
+| `dorq_repeated_price` | as `stale` | as `stale` |
 
 **Accept when** the evidence shows a real event dorq could not know about — a
 halt, a tender at a fixed price — and say what it was. **Resolve** only a report
