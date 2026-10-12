@@ -33,9 +33,10 @@ on enrichment.
 | `currency` | TEXT | Default `USD`. |
 | `country` | TEXT | |
 | `cik` / `isin` / `cusip` | TEXT | External identifiers (nullable). Populated from the vendor profile, so a security never profiled carries none. A lookup key for `duk ph cik:51143` / `duk ls cusip:459200101`, matched on a normalised form (zero-padding, case and grouping ignored) and indexed as such by migration 0023. Not unique: one CIK covers every share class of an issuer. |
-| `is_actively_trading` | BOOLEAN | False for delisted/inactive. |
+| `is_actively_trading` | BOOLEAN | False for delisted/inactive. The vendor's view, copied by the nightly load: it is not evidence that a listed security stopped trading (FMP called ET inactive the week it moved to TXSE), so the nightly universes also poll a listed row with a bar in the last 30 days (ADR 0014). |
 | `is_etf` / `is_fund` | BOOLEAN | |
 | `ipo_date` | DATE | |
+| `venue_override` / `venue_override_left` | TEXT | An operator-recorded venue (`fafnir security venue-transfer`, migration 0027), and the venue the security left. While set, the nightly upsert keeps `exchange_code` and `is_actively_trading` as they are, until the vendor reports a venue other than `venue_override_left`; then both clear. ADR 0014. |
 | `delisted_date` | DATE | NULL while listed; set (never deleted) on delist. |
 | `source` | TEXT | Origin feed (default `fmp`). `operator` for a security minted by `fafnir security split-history` to hold one issuer's history split off a reused ticker: delisted, carrying a closed `symbol_xref` period, and never fed by the vendor loaders (their universes filter `source <> 'operator'`, and a per-symbol pull that resolves to one is refused). |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. |

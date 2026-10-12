@@ -141,8 +141,9 @@ not for funds. The probe measures NAV across the *largest* distribution on recor
 The command exits non-zero on anything but a pass or `inconclusive`, so it can gate a
 script. It costs 3 requests and writes nothing.
 
-**Retiring a fund.** The delisted feed does not carry funds (and `MUTF` is outside
-`SCREENER_EXCHANGES`, so the sweep cannot reach them). `fafnir track rm VFIAX` stops
+**Retiring a fund.** The delisted feed's rows for funds carry a venue the sweep
+does not read, so it cannot reach them. (The recorded `MUTF` venue is not what keeps
+them out: the sweep filters on the feed's venue, not the security's.) `fafnir track rm VFIAX` stops
 the pulls; `fafnir track rm VFIAX --closed 2027-03-31` also retires the security the
 ordinary way — `delisted_date` stamped, ticker period closed, every bar retained. Use
 `--closed` when the fund actually closed or merged: an untracked-but-active security
@@ -475,11 +476,38 @@ which any command could fold. `mark_delisted` is one-way, so before it runs the
 loader reads the security's own bar span and **declines** a delisting that precedes
 the first bar (it describes an earlier holder) or that the security kept printing
 bars more than `TRADED_AFTER_GRACE_DAYS` (30) past. The grace covers the normal lag
-between a delisting and the feed reporting it. A name that left the exchange and
-kept trading under the same ticker elsewhere is declined too, and goes on loading —
-the cheaper error, and the per-row warning names it for a human. A security with no
-bars contradicts nothing and is marked as before. Declined rows are counted in the
-run's `rows_quarantined`.
+between a delisting and the feed reporting it. A security with no bars contradicts
+nothing and is marked as before.
+
+That bar test cannot catch a **venue transfer**: once a security is marked, the
+price step stops loading it, so the bars after the delisting never arrive. ET and
+five others moved from the NYSE to the Texas Stock Exchange (TXSE) on 2026-10-05,
+and the sweep stamped all six from FMP's delisted feed. FMP's profile was no help:
+it went on calling ET inactive on the NYSE. Its price feed was, so the sweep now
+asks it ([ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)):
+
+- **A recent delisting** is checked first: one within 60 days, with the last
+  stored bar within 10 sessions of the date. The sweep fetches the security's bars
+  from about 10 sessions before the date, one request. A bar strictly after the
+  date declines the record and flags it `security_delisting_contradicted` for an
+  operator to decide: `security venue-transfer` if it moved, `security delist` if
+  it left scope (a move to OTC keeps printing bars too). A bar *on* the date is
+  not enough, because FMP's `delistedDate` is often the last trading day.
+- **A record that flag already names** is declined without asking. That covers an
+  accepted flag (an operator recorded the move) and an open one (still undecided),
+  so an undecided record is never stamped by default.
+
+The run's `params` record `declined` per reason and `prices_requested`.
+`rows_quarantined`, which marks the run `partial`, counts every decline that wants
+a look, but not `known_transfer`, the expected echo of a move already recorded.
+
+The same move froze these securities a second way: the nightly `ingest securities`
+copies the vendor's `isActivelyTrading` onto every listed row, and FMP called them
+inactive. So the nightly price and corporate-action universes are "listed, and
+either actively trading or with a bar in the last 30 days", not
+`is_actively_trading` alone. A venue recorded by `security venue-transfer` is an
+override (migration 0027) that the upsert keeps, with the row's activity, until FMP
+names a venue other than the one the security left.
 
 Prices precede actions so dividend adjustment can value against fresh closes.
 `scripts/daily_update.sh` encodes this order.

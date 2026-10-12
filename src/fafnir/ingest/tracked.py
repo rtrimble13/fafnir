@@ -38,7 +38,9 @@ ENDPOINT = "profile"
 
 # The venue open-end funds are recorded under (migration 0019). Not a real trading
 # venue: it exists so a fund has a non-NULL exchange_code that is demonstrably not
-# one of SCREENER_EXCHANGES, which is what keeps the delisting sweep away from it.
+# one of SCREENER_EXCHANGES. It does not keep the delisting sweep away from a fund:
+# the sweep filters on the venue in the *feed's* row, and funds stay out of it
+# because the feed's own rows for them carry a venue it does not read (ADR 0014).
 FUND_EXCHANGE = "MUTF"
 
 

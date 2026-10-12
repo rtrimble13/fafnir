@@ -47,7 +47,11 @@ These are not style guidance. Each one is a way this system gets damaged.
 6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` and
    `fafnir security descope` are operator commands.** Propose; never run. A
    descope deletes every security of a kind with all its history (ADR 0012), and
-   only a backup brings it back.
+   only a backup brings it back. **`fafnir security venue-transfer` and
+   `fafnir security delist` are not among them.** They record the decision on a
+   `security_delisting_contradicted` flag (ADR 0014), delete nothing, and each is
+   undone by the other. Like `security merge`, they are yours to run after showing
+   the dry run and getting an explicit yes.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
    checkout the venv installs from. Editing it to fix tonight's problem is
    invisible to the repo, destroyed by the next `git pull`, and leaves the
@@ -162,7 +166,9 @@ a revoke that in fact left the security with none.
      data defect  → repair (ingest / adjust / refresh-marts), THEN dq recheck
      market fact  → dq accept, with the evidence in --note (a resolve returns)
      wrong shape  → the command that fixes it (security merge, track rm --closed,
-                    security split-history for two issuers on one row)
+                    security split-history for two issuers on one row,
+                    security venue-transfer | delist for a delisting the
+                    vendor's bars contradict)
      vendor wrong → the correction (actions add|delete|redate, prices delete, or
                     prices shift|rescale for a real price at the wrong date/scale),
                     then dq recheck -- a SQL DELETE comes back on the next load

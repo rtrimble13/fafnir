@@ -227,19 +227,30 @@ split it is silently too small, and nothing flags it.
 ## 20. A venue transfer can arrive as a delisting
 
 FMP's delisted feed has reported a move between exchanges as a delisting. ET, SUN,
-SUNC and USAC moved from the NYSE to the Texas Stock Exchange after the 2026-10-02
-close and kept their tickers. The nightly sweep stamped them delisted 2026-10-05,
-and they stopped receiving bars.
+SUNC, USAC, DDS and DDT moved from the NYSE to the Texas Stock Exchange (**TXSE**;
+TSX is Toronto) after the 2026-10-02 close and kept their tickers. The nightly
+sweep stamped them delisted 2026-10-05, and they stopped receiving bars.
 
-Nothing puts them back on its own:
+FMP's profile and screener are no better guide. A week after the move they still
+named ET's venue as the NYSE and called it `isActivelyTrading: false`, while
+quoting its price and that day's volume. FMP had no code for TXSE. **Its price feed
+is the evidence:** a security that delisted has no bar after its delisting date.
 
-- TXSE is not among the venues the security-master load reads, so the load does not
-  re-admit them.
-- `mark_delisted` is one-way, and no command undoes it.
+Since ADR 0014:
 
-Before reporting a large, liquid name as delisted, check for a venue transfer in
-company investor relations or exchange notices. A wrongly stamped delisting is an
-escalation, because the fix is code (the venue list, an un-delist path) plus an
-operator decision.
+- **Caught.** The delisting sweep declines a recent delisting the vendor has bars
+  after, and flags `security_delisting_contradicted`. The nightly price universe
+  keeps a listed security with a bar in the last 30 days even when FMP calls it
+  inactive, and the universe load raises `security_inactive_but_trading` when it
+  turns such a row inactive.
+- **Decided** by an operator, or by you after a dry run and an explicit yes:
+  `security venue-transfer` for a move between listed venues, `security delist`
+  for a delisting, such as a move to OTC (`references/dq-playbooks.md`).
+- **The venue is fafnir's own.** `exchange_code = 'TXSE'` with a non-null
+  `venue_override` means the move was recorded by hand. The nightly load keeps it
+  until FMP names a venue other than `venue_override_left`.
+
+Before reporting a large, liquid name as delisted, check for bars after its
+`delisted_date` and for these flags, then look for a public notice of a move.
 
 > **Wrong answer:** "ET was delisted on 2026-10-05". It changed venue.
