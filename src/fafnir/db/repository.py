@@ -8,7 +8,7 @@ them into the DataFrame contracts the CLI expects.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, NamedTuple, Optional, Sequence
 
@@ -23,17 +23,34 @@ from fafnir.instruments import rename_changes_instrument
 
 
 def ensure_exchange(
-    db: Database, code: str, name: str | None = None, country: str | None = None
+    db: Database,
+    code: str,
+    name: str | None = None,
+    country: str | None = None,
+    timezone: str | None = None,
 ) -> None:
+    """Create the venue's row if it is missing, and fill in any attribute it lacks.
+
+    Never overwrites a value already held: the seed's names are the record, and a
+    row created bare on first use (before its attributes were known) is completed
+    the next time a caller knows them.
+    """
     if not code:
         return
     db.execute(
         """
-        INSERT INTO ref.exchange (exchange_code, exchange_name, country)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (exchange_code) DO NOTHING
+        INSERT INTO ref.exchange (exchange_code, exchange_name, country, timezone)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (exchange_code) DO UPDATE SET
+            exchange_name = COALESCE(ref.exchange.exchange_name, EXCLUDED.exchange_name),
+            country       = COALESCE(ref.exchange.country, EXCLUDED.country),
+            timezone      = COALESCE(ref.exchange.timezone, EXCLUDED.timezone),
+            updated_at    = now()
+        WHERE (ref.exchange.exchange_name IS NULL AND EXCLUDED.exchange_name IS NOT NULL)
+           OR (ref.exchange.country IS NULL AND EXCLUDED.country IS NOT NULL)
+           OR (ref.exchange.timezone IS NULL AND EXCLUDED.timezone IS NOT NULL)
         """,
-        (code, name, country),
+        (code, name, country, timezone),
     )
 
 
@@ -65,6 +82,15 @@ def get_or_create_industry(db: Database, name: Optional[str]) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Security master
 # ---------------------------------------------------------------------------
+
+
+# Whether an operator's venue (0027) holds against what the vendor sent: it is set,
+# and the vendor names no venue, or still the one the security left (ADR 0014).
+_VENUE_OVERRIDE_HELD = (
+    "(core.security.venue_override IS NOT NULL"
+    " AND (EXCLUDED.exchange_code IS NULL"
+    " OR EXCLUDED.exchange_code = core.security.venue_override_left))"
+)
 
 
 def upsert_security(
@@ -121,9 +147,20 @@ def upsert_security(
             asset_type          = EXCLUDED.asset_type,
             -- COALESCE so a caller without the field (enrich_profiles on a profile
             -- that omits it) cannot blank the venue; otherwise this is what records
-            -- a transfer onto the existing security.
-            exchange_code       = COALESCE(EXCLUDED.exchange_code,
-                                           core.security.exchange_code),
+            -- a transfer onto the existing security. An operator's venue
+            -- (`security venue-transfer`, 0027) holds while the vendor still names
+            -- the venue the security left, or none: FMP had no code for TXSE and
+            -- went on reporting ET on the NYSE, inactive, after it moved. Once the
+            -- vendor names any other venue it has caught up, and the override clears.
+            exchange_code       = CASE WHEN {held}
+                                       THEN core.security.venue_override
+                                       ELSE COALESCE(EXCLUDED.exchange_code,
+                                                     core.security.exchange_code)
+                                  END,
+            venue_override      = CASE WHEN {held}
+                                       THEN core.security.venue_override END,
+            venue_override_left = CASE WHEN {held}
+                                       THEN core.security.venue_override_left END,
             -- COALESCE for the same reason as the venue above, and it is the
             -- same class of bug: a caller that does not carry a classification
             -- must not blank the one already stored. Without this the nightly
@@ -139,7 +176,12 @@ def upsert_security(
                                            core.security.industry_id),
             currency            = EXCLUDED.currency,
             country             = EXCLUDED.country,
-            is_actively_trading = EXCLUDED.is_actively_trading,
+            -- Held with the operator's venue: the vendor calling a moved security
+            -- inactive on the venue it left is the same stale view.
+            is_actively_trading = CASE WHEN {held}
+                                       THEN core.security.is_actively_trading
+                                       ELSE EXCLUDED.is_actively_trading
+                                  END,
             is_etf              = EXCLUDED.is_etf,
             is_fund             = EXCLUDED.is_fund,
             -- COALESCE: a caller without screener fields (enrich_profiles, the
@@ -154,7 +196,7 @@ def upsert_security(
             cusip               = COALESCE(EXCLUDED.cusip, core.security.cusip),
             updated_at          = now()
         RETURNING security_id
-        """,
+        """.format(held=_VENUE_OVERRIDE_HELD),
         (
             primary_symbol,
             company_name,
@@ -274,6 +316,40 @@ def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> boo
         (delisted_date, security_id),
     )
     return True
+
+
+def sessions_apart(db: Database, a: date, b: date, exchange_code: str = "NYSE") -> int:
+    """Open sessions after the earlier date, up to and including the later one.
+
+    Counted on the venue's calendar (every US venue keeps the same holidays), or on
+    weekdays where the calendar does not span the dates: outside its span, no row
+    means unknown, not closed.
+    """
+    lo, hi = sorted((a, b))
+    if lo == hi:
+        return 0
+    start = lo + timedelta(days=1)
+    found = open_sessions(db, exchange_code, start, hi)
+    if found is None or start < found[1] or hi > found[2]:
+        days = (lo + timedelta(days=n) for n in range(1, (hi - lo).days + 1))
+        return sum(1 for d in days if d.weekday() < 5)
+    return len(found[0])
+
+
+def median_volume_before(
+    db: Database, security_id: int, on_or_before: date, bars: int = 20
+) -> Optional[float]:
+    """The median volume of the security's last ``bars`` stored bars up to a date."""
+    val = db.fetchval(
+        """
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY volume)
+          FROM (SELECT volume FROM core.daily_price
+                 WHERE security_id = %s AND trade_date <= %s AND volume IS NOT NULL
+                 ORDER BY trade_date DESC LIMIT %s) recent
+        """,
+        (security_id, on_or_before, bars),
+    )
+    return float(val) if val is not None else None
 
 
 def security_bar_span(
@@ -737,6 +813,129 @@ def reopen_symbol_period(db: Database, *, security_id: int, symbol: str) -> bool
             """,
             (security_id, symbol, symbol, security_id, symbol, security_id),
         )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reversing a delisting that was a venue transfer (ADR 0014)
+# ---------------------------------------------------------------------------
+
+
+def open_ticker_holders(db: Database, symbol: str) -> list[int]:
+    """Every security holding an open ``core.symbol_xref`` period on the ticker."""
+    return [
+        int(r["security_id"])
+        for r in db.fetchall(
+            """
+            SELECT DISTINCT security_id FROM core.symbol_xref
+             WHERE symbol = %s AND valid_to IS NULL ORDER BY 1
+            """,
+            (symbol,),
+        )
+    ]
+
+
+def periods_closed_by_delisting(
+    db: Database, *, security_id: int, delisted_date: date
+) -> list[dict]:
+    """The ticker periods :func:`mark_delisted` closed on this security.
+
+    It closes every open period at ``GREATEST(valid_from, delisted_date)``, so a
+    period ending there is one of them -- provided it is still the ticker's latest
+    period, which a later issuer re-listing the ticker would have superseded.
+    """
+    return db.fetchall(
+        """
+        SELECT x.symbol, x.valid_from, x.valid_to
+          FROM core.symbol_xref x
+         WHERE x.security_id = %s
+           AND x.valid_to = GREATEST(x.valid_from, %s::date)
+           AND x.valid_from = (SELECT max(y.valid_from) FROM core.symbol_xref y
+                                WHERE y.symbol = x.symbol)
+         ORDER BY x.symbol, x.valid_from
+        """,
+        (security_id, delisted_date),
+    )
+
+
+class VenueTransferRefused(Exception):
+    """The security changed between a venue transfer's plan and its write."""
+
+
+def reverse_delisting(
+    db: Database,
+    *,
+    security_id: int,
+    delisted_date: date,
+    periods: Sequence[dict],
+) -> None:
+    """Undo :func:`mark_delisted` for a security that never stopped trading.
+
+    The security is listed again, and the ticker periods the delisting closed
+    (``periods``, from :func:`periods_closed_by_delisting`) are re-opened rather
+    than a new one inserted: the ticker never changed hands. Raises
+    :class:`VenueTransferRefused` when the row or a period is not as planned; the
+    caller's transaction then rolls back whatever was written.
+    """
+    row = db.fetchone(
+        """
+        UPDATE core.security
+           SET is_actively_trading = TRUE, delisted_date = NULL, updated_at = now()
+         WHERE security_id = %s AND delisted_date = %s
+        RETURNING security_id
+        """,
+        (security_id, delisted_date),
+    )
+    if row is None:
+        raise VenueTransferRefused(
+            f"security {security_id} is no longer delisted on {delisted_date}"
+        )
+    for p in periods:
+        reopened = db.execute(
+            """
+            UPDATE core.symbol_xref x SET valid_to = NULL
+             WHERE x.security_id = %s AND x.symbol = %s AND x.valid_from = %s
+               AND x.valid_to = %s
+               AND NOT EXISTS (SELECT 1 FROM core.symbol_xref o
+                                WHERE o.symbol = x.symbol AND o.valid_to IS NULL)
+            """,
+            (security_id, p["symbol"], p["valid_from"], p["valid_to"]),
+        )
+        if reopened != 1:
+            raise VenueTransferRefused(
+                f"the {p['symbol']} period from {p['valid_from']} could not be "
+                "re-opened: another security holds the ticker open"
+            )
+
+
+def record_venue_override(
+    db: Database, *, security_id: int, venue: str, left: Optional[str]
+) -> None:
+    """Record the operator's venue, which the nightly upsert keeps (0027).
+
+    The security is also marked actively trading: the vendor calling a moved
+    security inactive on the venue it left is the stale view the override holds out
+    against. ``left`` is that venue; once the vendor reports any other, the upsert
+    clears the override. The venue's ``ref.exchange`` row must exist.
+    """
+    db.execute(
+        """
+        UPDATE core.security
+           SET exchange_code = %s, venue_override = %s, venue_override_left = %s,
+               is_actively_trading = TRUE, updated_at = now()
+         WHERE security_id = %s
+        """,
+        (venue, venue, left, security_id),
+    )
+
+
+def clear_venue_override(db: Database, security_id: int) -> None:
+    db.execute(
+        """
+        UPDATE core.security SET venue_override = NULL, venue_override_left = NULL
+         WHERE security_id = %s AND venue_override IS NOT NULL
+        """,
+        (security_id,),
     )
 
 
@@ -1668,10 +1867,14 @@ def listed_securities(db: Database, source: str = "fmp") -> dict[str, dict]:
         row["primary_symbol"]: {
             "security_id": row["security_id"],
             "company_name": row["company_name"],
+            "is_actively_trading": row["is_actively_trading"],
+            "venue_override": row["venue_override"],
         }
         for row in db.fetchall(
             """
-            SELECT security_id, primary_symbol, company_name FROM core.security
+            SELECT security_id, primary_symbol, company_name, is_actively_trading,
+                   venue_override
+              FROM core.security
              WHERE delisted_date IS NULL AND source = %s
             """,
             (source,),
@@ -3273,6 +3476,33 @@ def revoke_operator_override(
 # "two rows share this ticker" check has nothing true to say about it.
 VENDOR_FED_SECURITY = "source <> 'operator'"
 
+# A security with a bar this recent stays in the nightly universe even when the
+# vendor calls it inactive (ADR 0014).
+RECENT_BAR_DAYS = 30
+
+
+def nightly_universe(alias: str = "") -> str:
+    """The securities a nightly load polls: listed, and either actively trading or
+    with a bar in the last :data:`RECENT_BAR_DAYS` days.
+
+    Not ``is_actively_trading`` alone. The nightly security-master load copies the
+    vendor's ``isActivelyTrading`` onto every listed row, and FMP called ET, SUN and
+    four others inactive on the NYSE the week they moved to TXSE, while quoting
+    their prices. Polling only active rows would have frozen them even had the
+    delisting sweep never fired. A security the vendor has served no bar for in
+    thirty days drops out, so a real wind-down stops being polled. The
+    ``trade_date`` bound also keeps the probe to the partitions it needs.
+
+    ``alias`` qualifies the columns, e.g. ``"s."``.
+    """
+    return (
+        f"{alias}delisted_date IS NULL AND ({alias}is_actively_trading"
+        " OR EXISTS (SELECT 1 FROM core.daily_price recent_bar"
+        f" WHERE recent_bar.security_id = {alias or 'core.security.'}security_id"
+        f" AND recent_bar.trade_date >= current_date - {RECENT_BAR_DAYS}))"
+    )
+
+
 # What counts as the date a DQ flag is about. The per-session checks key on
 # trade_date, stale on last_date, the price loader's quarantines on date.
 _FLAG_DATE_SQL = (
@@ -4432,7 +4662,7 @@ def securities_without_actions_watermark(
     per-symbol full pull, and the absence of a watermark row is the whole test. Same
     rule the price loader already uses: no watermark, full history, once.
     """
-    where = "" if include_inactive else "AND s.is_actively_trading "
+    where = "" if include_inactive else f"AND {nightly_universe('s.')} "
     rows = db.fetchall(
         f"""
         SELECT s.security_id, s.primary_symbol
@@ -4464,7 +4694,7 @@ def universe_securities(db: Database, *, include_inactive: bool = False) -> list
     passes ``include_inactive`` because a universe of only the survivors is exactly
     what makes a history survivorship-biased.
     """
-    where = "AND is_actively_trading " if not include_inactive else ""
+    where = f"AND {nightly_universe()} " if not include_inactive else ""
     rows = db.fetchall(f"""
         SELECT security_id, primary_symbol FROM core.security
          WHERE {VENDOR_FED_SECURITY}
@@ -4488,7 +4718,7 @@ def securities_by_asset_type(
     """
     if not asset_types:
         return []
-    where = "" if include_inactive else "AND is_actively_trading "
+    where = "" if include_inactive else f"AND {nightly_universe()} "
     rows = db.fetchall(
         f"""
         SELECT security_id, primary_symbol FROM core.security
@@ -4517,7 +4747,7 @@ def actions_reconciliation_slice(
     """
     if buckets < 1:
         raise ValueError("buckets must be >= 1")
-    where = "" if include_inactive else "AND is_actively_trading "
+    where = "" if include_inactive else f"AND {nightly_universe()} "
     rows = db.fetchall(
         f"""
         SELECT security_id, primary_symbol FROM core.security
@@ -4657,6 +4887,25 @@ def add_dq_flag(
             severity,
             json.dumps(detail) if detail else None,
         ),
+    )
+
+
+def condition_status(
+    db: Database, *, security_id: int, check_name: str, record_key: dict
+) -> Optional[str]:
+    """``accepted`` if this exact condition was ever accepted (``dq accept``),
+    ``open`` if it is flagged and unresolved, else None. Matched the way
+    :func:`add_dq_flag_once` matches a condition: on the whole record_key."""
+    import json
+
+    return db.fetchval(
+        """
+        SELECT CASE WHEN bool_or(accepted_at IS NOT NULL) THEN 'accepted'
+                    WHEN bool_or(resolved_at IS NULL) THEN 'open' END
+          FROM ops.data_quality_flag
+         WHERE security_id = %s AND check_name = %s AND record_key = %s::jsonb
+        """,
+        (security_id, check_name, json.dumps(record_key)),
     )
 
 

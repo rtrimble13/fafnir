@@ -65,6 +65,48 @@ def _xref(db, sid):
 
 
 # ---------------------------------------------------------------------------
+# Venues
+# ---------------------------------------------------------------------------
+
+
+def test_a_venue_created_bare_is_named_later_and_never_renamed(db):
+    """A venue first met in a payload is created with no attributes; the first
+    caller that knows them fills them in, and nothing overwrites the record."""
+
+    def row():
+        return db.fetchone(
+            "SELECT exchange_name, country, timezone FROM ref.exchange"
+            " WHERE exchange_code = 'ZZVENUE'"
+        )
+
+    db.execute("DELETE FROM ref.exchange WHERE exchange_code = 'ZZVENUE'")
+    try:
+        repo.ensure_exchange(db, "ZZVENUE")
+        assert row() == {"exchange_name": None, "country": None, "timezone": None}
+        repo.ensure_exchange(db, "ZZVENUE", "Zed Venue", "US", "America/Chicago")
+        repo.ensure_exchange(db, "ZZVENUE", "Another Name", "CA", "America/Toronto")
+        assert row() == {
+            "exchange_name": "Zed Venue",
+            "country": "US",
+            "timezone": "America/Chicago",
+        }
+    finally:
+        db.execute("DELETE FROM ref.exchange WHERE exchange_code = 'ZZVENUE'")
+
+
+def test_txse_is_seeded_as_the_texas_stock_exchange(db):
+    security_master.ensure_venue(db, security_master.TXSE)
+    assert db.fetchone(
+        "SELECT exchange_name, country, timezone FROM ref.exchange"
+        " WHERE exchange_code = 'TXSE'"
+    ) == {
+        "exchange_name": "Texas Stock Exchange",
+        "country": "US",
+        "timezone": "America/Chicago",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Renames keep one company one security
 # ---------------------------------------------------------------------------
 

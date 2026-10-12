@@ -19,8 +19,8 @@ preconditions.
 | Tier | Checks | What a sweep may do |
 |---|---|---|
 | **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price`, `security_duplicate_identity`, `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
-| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification`, and every other `dorq_*` check at `error` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
-| **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `tracked_symbol_unknown_to_source`, `dorq_*` at `warn` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
+| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification`, `security_delisting_contradicted` (the repair is `security venue-transfer` or `security delist`, which close it; never a resolve), and every other `dorq_*` check at `error` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
+| **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `security_inactive_but_trading`, `tracked_symbol_unknown_to_source`, `dorq_*` at `warn` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
 
 `sparse_coverage` is not yet placed in a tier. Until it is, treat it as **report
 only**: nothing about it has been repaired, so closing one frees its slot and the
@@ -110,6 +110,11 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 ### `security_company_name_drift`
 - The price history continues sensibly across the change, and the note names
   which it was: a rebrand, or a vendor abbreviation.
+
+### `security_inactive_but_trading`
+- The security's bars have stopped (a wind-down the vendor reported promptly), and
+  the note says when. A security still printing bars is a move:
+  `security venue-transfer` closes it instead.
 
 ### `security_missing_classification`
 - The universe load has run **since** the fix that carries the screener's

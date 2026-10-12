@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 from difflib import SequenceMatcher
 from math import isfinite
 from typing import Iterable, NamedTuple, Optional
@@ -49,14 +50,44 @@ from fafnir.sources.fmp import FMPClient, SourceError
 
 logger = get_logger("ingest.security")
 
-US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", "OTC"}
+# The Texas Stock Exchange, which began listing in 2026 (ADR 0014). Never "TSX":
+# that is FMP's code for the *Toronto* Stock Exchange, and a screener query for it
+# pulls in Toronto's listings. TXSE is fafnir's own code: FMP had none for it in
+# 2026-10, and went on naming ET's venue as the NYSE after it moved. When FMP does
+# adopt one, add it to _TXSE_ALIASES so it normalizes here, as NYSEAMERICAN does to
+# AMEX.
+TXSE = "TXSE"
+_TXSE_ALIASES = frozenset({TXSE, "TEXAS STOCK EXCHANGE"})
+
+US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", TXSE, "OTC"}
+
+# The venues a security is *listed* on. A move between two of them is a venue
+# transfer, not a delisting; a move to OTC takes a security out of this
+# warehouse's scope, and is one (ADR 0014).
+LISTED_US_EXCHANGES = frozenset(US_EXCHANGES - {"OTC"})
 
 # Codes used to *query* the screener, largest venues first so a --limit run gets
 # the recognizable names. US_EXCHANGES stays the wider acceptance set: it also
 # has to admit the aliases FMP hands back (NYSEAMERICAN, which normalizes to
 # AMEX), and OTC, which is a US venue we simply do not ingest -- this is a
 # listed-equity research warehouse, and OTC roughly doubled the universe.
+#
+# TODO(ADR 0014): add TXSE once FMP's screener accepts a code for it. Check with
+# `GET /stable/company-screener?exchange=<code>&limit=20`: it must return ET, SUN
+# and DDS, and nothing from Toronto. Until then the loop below would only log a
+# rejection, or worse, an unfiltered page re-checked client-side.
 SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
+
+# ref.exchange attributes for a venue the seed list may not have created on an
+# existing deployment. ensure_venue fills them in where the row has none, so a
+# venue first seen in a vendor payload still gets a name, country and timezone.
+VENUE_ATTRIBUTES = {TXSE: ("Texas Stock Exchange", "US", "America/Chicago")}
+
+# The info flag for a row this load turns inactive although it was still trading
+# (ADR 0014): the vendor's isActivelyTrading went false within this many sessions
+# of the security's last bar. The early warning for a venue transfer.
+INACTIVE_BUT_TRADING_CHECK = "security_inactive_but_trading"
+INACTIVE_BUT_TRADING_SESSIONS = 5
 
 # Securities committed per batch. The bulk list is already in memory, so this is
 # purely a durability boundary, not a rate limit.
@@ -236,6 +267,51 @@ def is_retired_listing(
     return None
 
 
+def flag_inactive_but_trading(
+    db: Database,
+    *,
+    symbol: str,
+    security_id: int,
+    vendor_exchange: Optional[str],
+    run: RunLog,
+    today: date,
+) -> bool:
+    """Flag a row this load is about to turn inactive while it is still trading.
+
+    The vendor's ``isActivelyTrading`` is not evidence that a security stopped
+    trading: FMP called ET inactive on the NYSE the week it moved to TXSE, while
+    quoting its prices and that day's volume. The nightly universe keeps such a row
+    polled (:func:`fafnir.db.repository.nightly_universe`); this says so out loud,
+    because it is how a venue transfer looks before the delisted feed reports it.
+    Only for a last bar within :data:`INACTIVE_BUT_TRADING_SESSIONS` sessions, so a
+    real wind-down the vendor reports late raises nothing. True when flagged.
+    """
+    _, last_bar = repo.security_bar_span(db, security_id)
+    if (
+        last_bar is None
+        or repo.sessions_apart(db, last_bar, today) > INACTIVE_BUT_TRADING_SESSIONS
+    ):
+        return False
+    logger.warning(
+        "%s: the vendor now calls it inactive (venue %s), but its last bar is %s -- "
+        "kept in the price universe; a venue transfer? (%s flag)",
+        symbol,
+        vendor_exchange,
+        last_bar,
+        INACTIVE_BUT_TRADING_CHECK,
+    )
+    return repo.add_dq_flag_once(
+        db,
+        check_name=INACTIVE_BUT_TRADING_CHECK,
+        severity="info",
+        security_id=security_id,
+        table_name="core.security",
+        record_key={"symbol": symbol},
+        detail={"last_bar": last_bar.isoformat(), "vendor_exchange": vendor_exchange},
+        ingestion_run_id=run.run_id,
+    )
+
+
 # Nasdaq's test issues: ZXZZT ("SuperMontage TEST"), ZVZZT, ZWZZT, ZBZZT, ZJZZT.
 _TEST_ISSUE_SYMBOL = re.compile(r"^Z[A-Z]ZZT$")
 # A venue name that, next to the word TEST, marks an exchange's own test security.
@@ -298,9 +374,18 @@ def _norm_exchange(entry: dict) -> Optional[str]:
     )
     if code in {"NYSEAMERICAN", "AMEX"}:
         return "AMEX"
+    if code in _TXSE_ALIASES:
+        return TXSE
     if code in {"NASDAQ", "NYSE", "BATS", "CBOE", "OTC"}:
         return code
     return code or None
+
+
+def ensure_venue(db: Database, code: Optional[str]) -> None:
+    """Make sure ``ref.exchange`` holds the venue, named where it is known
+    (:data:`VENUE_ATTRIBUTES`). ``core.security.exchange_code`` references it."""
+    if code:
+        repo.ensure_exchange(db, code, *VENUE_ATTRIBUTES.get(code, ()))
 
 
 def _is_us(entry: dict) -> bool:
@@ -413,6 +498,7 @@ def load_securities(
     include_etfs: bool = True,
     limit: Optional[int] = None,
     excluded_kinds: Iterable[str] = INSTRUMENT_KINDS,
+    today: Optional[date] = None,
 ) -> SecurityLoadResult:
     """Load the security master from FMP bulk lists.
 
@@ -425,6 +511,7 @@ def load_securities(
     keeps one, such as a REIT whose stapled units are its only US listing.
     """
     excluded = tuple(excluded_kinds)
+    today = today or date.today()
     with RunLog(
         db,
         source="fmp",
@@ -525,6 +612,9 @@ def load_securities(
                 skipped_out_of_scope.append(symbol)
                 continue
             previous = listed.get(symbol)
+            # The us-equity-etf filter lives in _us_entries now -- it needs the
+            # screener's fields, which the bulk lists do not carry.
+            exchange = _norm_exchange(entry)
             # Before anything is written or flagged: a name this warehouse has
             # already retired, still being served by the vendor, is not a listing.
             # Inserting it mints a duplicate identity that captures the ticker's
@@ -544,17 +634,30 @@ def load_securities(
                     else symbol
                 )
                 continue
-            # The us-equity-etf filter lives in _us_entries now -- it needs the
-            # screener's fields, which the bulk lists do not carry.
-            exchange = _norm_exchange(entry)
-            repo.ensure_exchange(db, exchange) if exchange else None
+            ensure_venue(db, exchange)
             # The screener carries market cap and beta, so screening data costs
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
+            active = bool(entry.get("isActivelyTrading", True))
             if previous is None:
                 new_symbols.append(symbol)
             else:
+                # The upsert below copies the vendor's activity onto the row, unless
+                # an operator's venue holds it (0027).
+                if (
+                    previous.get("is_actively_trading")
+                    and not active
+                    and previous.get("venue_override") is None
+                ):
+                    flag_inactive_but_trading(
+                        db,
+                        symbol=symbol,
+                        security_id=previous["security_id"],
+                        vendor_exchange=exchange,
+                        run=run,
+                        today=today,
+                    )
                 # An update, so there is a stored name to compare against. This is
                 # the one moment both names exist -- the upsert below overwrites
                 # the old one.
@@ -580,7 +683,7 @@ def load_securities(
                 sector_id=sector_id(entry.get("sector")),
                 industry_id=industry_id(entry.get("industry")),
                 country=entry.get("country"),
-                is_actively_trading=bool(entry.get("isActivelyTrading", True)),
+                is_actively_trading=active,
                 is_etf=is_etf,
                 is_fund=bool(entry.get("isFund", False)),
                 market_cap_usd=nums["market_cap_usd"],
@@ -590,7 +693,12 @@ def load_securities(
             # Keep the snapshot current so a symbol repeated within one run (the
             # bulk-list universes can repeat; the screener path dedups upstream)
             # is a refresh, not a second arrival.
-            listed[symbol] = {"security_id": sec_id, "company_name": company_name}
+            listed[symbol] = {
+                "security_id": sec_id,
+                "company_name": company_name,
+                "is_actively_trading": active,
+                "venue_override": (previous or {}).get("venue_override"),
+            }
             count += 1
             run.rows_inserted = count
             # Batched, unlike the price and action loaders: there is no network
@@ -699,12 +807,14 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
             nums = _bounded_security_numerics(
                 db, row=prof, symbol=symbol, run=run, sec_id=sec_id
             )
+            exchange = _norm_exchange(prof)
+            ensure_venue(db, exchange)
             repo.upsert_security(
                 db,
                 primary_symbol=symbol,
                 company_name=prof.get("companyName"),
                 asset_type="etf" if prof.get("isEtf") else "equity",
-                exchange_code=_norm_exchange(prof),
+                exchange_code=exchange,
                 sector_id=sector_id,
                 industry_id=industry_id,
                 currency=prof.get("currency") or "USD",

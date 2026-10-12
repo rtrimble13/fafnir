@@ -28,7 +28,7 @@ from typing import NamedTuple, Optional
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
-from fafnir.ingest.security_master import _to_float
+from fafnir.ingest.security_master import _to_float, ensure_venue
 from fafnir.logging_config import get_logger
 from fafnir.sources.fmp import FMPClient, payload_hash
 
@@ -38,7 +38,9 @@ ENDPOINT = "profile"
 
 # The venue open-end funds are recorded under (migration 0019). Not a real trading
 # venue: it exists so a fund has a non-NULL exchange_code that is demonstrably not
-# one of SCREENER_EXCHANGES, which is what keeps the delisting sweep away from it.
+# one of SCREENER_EXCHANGES. It does not keep the delisting sweep away from a fund:
+# the sweep filters on the venue in the *feed's* row, and funds stay out of it
+# because the feed's own rows for them carry a venue it does not read (ADR 0014).
 FUND_EXCHANGE = "MUTF"
 
 
@@ -158,7 +160,7 @@ def load_tracked(db: Database, fmp: FMPClient) -> TrackedLoadResult:
 
             asset_type = declaration["asset_type"]
             exchange = _declared_exchange(declaration)
-            repo.ensure_exchange(db, exchange) if exchange else None
+            ensure_venue(db, exchange)
             sec_id = repo.upsert_security(
                 db,
                 primary_symbol=symbol,

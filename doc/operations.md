@@ -571,6 +571,100 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.
 
+### Venue transfers
+
+A company that moves its listing to another exchange and keeps its ticker can
+look delisted to the vendor. On 2026-10-05 ET, SUN, SUNC, USAC, DDS and DDT moved
+from the NYSE to the Texas Stock Exchange (**TXSE**; never TSX, which is Toronto).
+FMP's delisted feed reported each move as a delisting, its screener and profile
+called each security inactive on the NYSE, and both froze them. FMP's price feed
+went on serving their bars. [ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)
+records the design.
+
+**What the nightly does now.**
+
+- **The delisting sweep** asks the price feed before stamping a recent delisting.
+  If the vendor has bars *after* the date, the security is left trading and
+  flagged `security_delisting_contradicted` (warn). Its `detail` holds the feed's
+  venue, the bars after the date (count, first, last), and the median volume
+  before and after.
+- **The price universe** keeps a listed security with a bar in the last 30 days,
+  whatever the vendor's `isActivelyTrading` says. When the universe load turns a
+  row inactive while its last bar is within 5 sessions, it raises
+  `security_inactive_but_trading` (info): often the first sign of a move.
+
+**Deciding a `security_delisting_contradicted` flag.** The bars cannot tell a move
+between listed venues from a move to OTC, so the flag waits for you. Until you
+decide, the sweep declines that record every night (`pending_decision`), and the
+run is marked `partial`. Volume does not decide it either: USAC traded 18% of its
+median on its first TXSE day.
+
+1. Look for a public notice of a move: the issuer's investor relations or press
+   releases, or the new exchange's listing alerts.
+2. **It moved to another listed venue** → `security venue-transfer`.
+3. **It left for OTC, or stopped trading** → `security delist`.
+4. Neither is clear → leave the flag open. The security keeps loading.
+
+```bash
+fafnir security venue-transfer 12441 --venue TXSE --date 2026-10-05 \
+    -m "NYSE->TXSE 2026-10-05 (Energy Transfer press release, 2026-09-10)" --dry-run
+fafnir security venue-transfer 12441 --venue TXSE --date 2026-10-05 \
+    -m "NYSE->TXSE 2026-10-05 (Energy Transfer press release, 2026-09-10)" --yes
+fafnir security delist 4321 --date 2025-12-31 \
+    -m "Left the NYSE for OTCQX (issuer notice)" --dry-run
+fafnir db refresh-marts
+```
+
+**What `venue-transfer` does**, whether or not the sweep has stamped the security:
+
+- **The dry run** prints:
+  - the row before and after, and the ticker period it re-opens;
+  - the vendor's bars after `--date` (one request);
+  - the price watermark the next nightly resumes from;
+  - the feed records it settles, and the flags it accepts or resolves.
+- **The real run:**
+  - reverses a stamped delisting, re-opening the ticker period it closed;
+  - records the venue as an override the nightly load keeps, with the security
+    active, until FMP names a venue other than the one it left (migration 0027);
+  - accepts the contradiction flag for each feed record the move settles (the
+    stamped delisting, and one dated `--date`), so the sweep declines them
+    without asking, and resolves any `security_inactive_but_trading` flag;
+  - records an audit row in `ops.ingestion_run` (source `operator`, endpoint
+    `security-venue-transfer`).
+- **It refuses** a ticker another listed security holds (fold that one in with
+  `security merge` first), and one the vendor has no bar for *after* `--date`.
+  A move to **OTC** is a delisting here: use `security delist`.
+- **Prices load on their own.** The next nightly `ingest prices` resumes from the
+  watermark, less the overlap, so the bars since the move arrive before `dq run`
+  and raise no `gap` flags.
+
+**An announced move** (OBK, 2026-10-13) needs nothing in advance: the sweep and the
+price universe keep it loading. Record it with `venue-transfer --date 2026-10-13`
+once the vendor serves a bar after that date, whether or not it has been flagged,
+stamped or turned inactive by then.
+
+**A feed record dated otherwise than the move** raises one more flag the night the
+sweep sees it. Run `venue-transfer` again, which accepts it, or `dq accept` it with
+the same note.
+
+**Checking a night's sweep.** The run records what it declined and why:
+
+```sql
+SELECT started_at, status, rows_inserted AS marked, rows_quarantined,
+       params->'declined' AS declined, params->'prices_requested' AS requests
+  FROM ops.ingestion_run WHERE endpoint = 'delisted-companies'
+ ORDER BY started_at DESC LIMIT 5;
+```
+
+The `declined` reasons are:
+
+- `known_transfer`: an accepted flag names the record (`venue-transfer` settled it);
+- `pending_decision`: an open flag names it, and waits for you;
+- `still_trading`: the vendor had bars after the date tonight, and a flag was raised;
+- `fetch_failed`: the bars could not be read, so the sweep asks again tomorrow;
+- `precedes_first_bar` and `traded_after`: the security's own bars contradict the
+  delisting.
+
 ## Reconciliation
 
 `scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the

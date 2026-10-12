@@ -50,6 +50,8 @@ and they are not interchangeable:
 | `symbol_change_conflict` | symbol-change sweep | `add_dq_flag_once` | no longer re-detected once the row is terminal; the sweep closes it itself when a retry applies the rename | yes | no |
 | `split_invalid`, `dividend_invalid` | action loader | `add_dq_flag_once` | the next load of that action | yes | no |
 | `tracked_symbol_unknown_to_source` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, if the vendor still won't serve it | yes | no |
+| `security_delisting_contradicted` | `ingest delisted` | `add_dq_flag_once` | the next sweep, while the vendor has bars after the date and the record is within 60 days. **Never a bare resolve**: `security venue-transfer` accepts it, `security delist` resolves it | yes — and an acceptance is how the sweep knows the record is a move | no |
+| `security_inactive_but_trading` (info) | `ingest securities` | `add_dq_flag_once` | the next load that turns the row inactive again within 5 sessions of a bar | yes | no |
 | `dorq_*` | `dq run --engine dorq\|both` with `--no-shadow` | `dq.dorq.ingest` (the same two guards as `dq.checks`) | the next dorq run whose window still reports it — nightly, only dates within its `--since`; a `--full` run, any date | yes | yes, by re-running dorq — except the Never three and the cross-sectional `dorq_cohort_gap`, `dorq_cohort_move` |
 
 **The two acceptance traps.** `corporate_action_drift` and
@@ -326,11 +328,15 @@ SELECT s.primary_symbol, s.is_actively_trading, s.delisted_date, s.is_fund,
 
 - **Delisted but unmarked** → `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest delisted`, then
   resolve. The security stopped trading; the flag was right and is now explained.
-- **A tracked fund** → NAV publication lags, and the `MUTF` pseudo-venue is
-  outside `SCREENER_EXCHANGES` so the delisted sweep cannot reach it. If the fund
+- **A tracked fund** → NAV publication lags, and the delisted sweep will not
+  retire it: the feed's own rows for funds carry a venue the sweep does not read
+  (its recorded `MUTF` pseudo-venue is not what keeps it out). If the fund
   has actually closed: `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir track rm <SYM> --closed <date>` —
   not a `dq resolve`, because `track rm` alone leaves it active and it will be
   flagged stale again every night.
+- **A name stamped delisted, or turned inactive, that kept trading** → a venue
+  transfer (ADR 0014). Not a `stale` flag (the check reads active securities only),
+  but the same question; see `security_delisting_contradicted` below.
 - **A live, liquid name** → **never resolve.** The loader is failing for it. Look
   at `ingestion_runs` and the watermark; a watermark stuck behind a quarantined
   bar is the usual cause, and the fix is the `price_*` playbook below.
@@ -760,6 +766,77 @@ succeeded and no command could reach it. Dismissed and ignored rows are untouche
 `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir track rm <SYM> --closed <date>`. **Escalate** a typo in
 `track add`; the operator added a symbol that does not exist, and only they can
 say what they meant.
+
+---
+
+## `security_delisting_contradicted` — the vendor has bars after a delisting
+
+Warn. FMP's delisted feed reported a delisting, and its price feed has bars
+**after** the date, so the sweep did not stamp it (ADR 0014). The security is still
+listed and loading. `detail` holds:
+
+- `feed_venue`, the venue the feed says it left;
+- `bars_after`, `first_after` and `last_after`;
+- `median_volume_before_20` and `median_volume_after`.
+
+The record key is `{"symbol", "delisted_date"}`: one feed record.
+
+**Diagnose.** The bars cannot tell a move between listed venues from a move to OTC:
+GRP-UN kept printing after it left the NYSE for OTCQX. Volume will not tell them
+apart either: USAC traded 18% of its median on its first TXSE day. Look for a public
+notice: the issuer's investor relations or press releases, or the new exchange's
+listing alerts.
+
+**Decide**, after showing the dry run and getting an explicit yes (standing rules 2
+and 6):
+
+```bash
+# It moved to another listed venue (ET: NYSE -> TXSE on 2026-10-05):
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir security venue-transfer <id> --venue TXSE \
+    --date <first session on the new venue> -m "<from>->TXSE <date> (<source>)" \
+    --by claude --dry-run
+# It left for OTC, or stopped trading:
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir security delist <id> --date <date> \
+    -m "<why> (<source>)" --by claude --dry-run
+```
+
+Then `fafnir db refresh-marts`.
+
+- **`venue-transfer`** accepts this flag, which is how the sweep declines the
+  record from then on (`known_transfer`). It also reverses a stamped delisting,
+  and records the venue as an override the nightly load keeps.
+- **`delist`** stamps the delisting and resolves this flag.
+- **Refused because another security holds the ticker**: fold that duplicate in
+  with `security merge` first.
+- **Neither is clear**: leave it open. The sweep declines the record every night
+  while the flag is open (`pending_decision`), so the security keeps loading.
+
+**Never a bare `dq resolve`.** It frees the slot, the sweep asks the vendor again,
+and once the record is past its 60 days it is stamped by default.
+
+**Close with:** `security venue-transfer` (accepts it) or `security delist`
+(resolves it).
+
+---
+
+## `security_inactive_but_trading` — the vendor turned a still-trading row inactive
+
+Info. The universe load copied the vendor's `isActivelyTrading: false` onto a row
+whose last bar is within 5 sessions. FMP did this to ET, and five others, the week
+they moved to TXSE, while quoting their prices. The security stays in the nightly
+price universe while it has a bar in the last 30 days, so nothing is frozen. This
+flag is the early warning, often before the delisted feed reports a move.
+
+**Diagnose.** Bars after the flag's `last_bar` mean it is still trading: look for a
+public notice of a move. No bars for weeks means a wind-down the vendor reported
+promptly.
+
+**Close with:**
+
+- a move: `security venue-transfer`, which resolves it and holds the row active
+  against the next load;
+- a wind-down: `dq resolve` with the evidence once the bars have stopped. The
+  security drops out of the price universe 30 days after its last bar.
 
 ---
 

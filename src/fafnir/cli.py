@@ -376,16 +376,19 @@ def ingest_tracked(ctx):
 @click.pass_context
 def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
     """Load daily OHLCV (incremental by default)."""
+    from fafnir.db import repository as repo
     from fafnir.ingest import daily_price
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
     with Database(cfg.dsn) as database:
-        # The nightly run wants active names only -- a delisted security will
-        # never have another bar, so re-polling it burns requests forever. A
+        # The nightly run wants the trading names only -- a delisted security will
+        # never have another bar, so re-polling it burns requests forever. Trading
+        # is not the vendor's isActivelyTrading alone: a listed security with a bar
+        # in the last 30 days stays in (repo.nightly_universe, ADR 0014). A
         # historical backfill wants everything, or the resulting history only
         # contains companies that happened to survive to today.
-        where = "" if include_inactive else "AND is_actively_trading "
+        where = "" if include_inactive else f"AND {repo.nightly_universe()} "
         syms = _split_symbols(symbols) or [
             r["primary_symbol"]
             for r in database.fetchall(
@@ -1473,6 +1476,368 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("venue-transfer")
+@click.argument("security_id", type=int)
+@click.option(
+    "--venue",
+    required=True,
+    help="The listed US venue it trades on now, e.g. TXSE (Texas; never TSX, "
+    "which is Toronto).",
+)
+@click.option(
+    "--date",
+    "moved_on",
+    required=True,
+    metavar="YYYY-MM-DD",
+    help="Its first session on that venue.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence for the move. Required -- it is the whole record.",
+)
+@click.option("--by", "recorded_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_venue_transfer(
+    ctx, security_id, venue, moved_on, note, recorded_by, dry_run, yes
+):
+    """Record that a security moved to another listed venue (ADR 0014).
+
+    \b
+      fafnir security venue-transfer 12441 --venue TXSE --date 2026-10-05 \\
+          -m "NYSE->TXSE 2026-10-05 (Energy Transfer press release)" --dry-run
+
+    For a security that moved and kept its ticker: ET and five others moved from
+    the NYSE to the Texas Stock Exchange on 2026-10-05, FMP's delisted feed reported
+    each as a delisting, and the sweep stamped them. Whether or not the sweep has
+    stamped it:
+
+    \b
+      * a stamped delisting is reversed: listed again, and the ticker period it
+        closed re-opened (the ticker never changed hands);
+      * the venue is recorded as an override the nightly load keeps, with the
+        security active, until FMP names a venue other than the one it left;
+      * the delisting sweep's security_delisting_contradicted flag is accepted for
+        each feed record the move settles, so the sweep declines it without
+        asking; any security_inactive_but_trading flag is resolved;
+      * an ops.ingestion_run row (source 'operator', endpoint
+        'security-venue-transfer') holds the row before and after.
+
+    Refuses a ticker another security now holds, and one the vendor has no bar for
+    after --date: the dry run shows those bars (1 request). Never for a move to OTC,
+    which is a delisting here: use `security delist`. The next nightly
+    `ingest prices` resumes from the watermark, so the bars since load on their own.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import venue_transfer as vt
+    from fafnir.ingest.delisted import CONTRADICTED_CHECK
+    from fafnir.ingest.runlog import RunLog
+    from fafnir.ingest.security_master import INACTIVE_BUT_TRADING_CHECK, ensure_venue
+
+    cfg = ctx.obj["config"]
+    if recorded_by is None:
+        recorded_by = _os_user()
+    moved = _parse_date(moved_on)
+
+    with Database(cfg.dsn) as database:
+        plan = vt.plan_venue_transfer(
+            database, security_id=security_id, venue_code=venue, moved_on=moved
+        )
+        if plan.symbol is not None:
+            click.echo(
+                f"Security {security_id} {plan.symbol} ({plan.company_name or ''})"
+            )
+        if plan.refusals:
+            for refusal in plan.refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        evidence = vt.vendor_bars_after(
+            _fmp_client(cfg), plan.symbol, after=moved, today=dt.date.today()
+        )
+
+        stamped = plan.delisted_date is not None
+        click.echo(f"  {'':<10} {'before':<12} after")
+        click.echo(f"  {'listed':<10} {'no' if stamped else 'yes':<12} yes")
+        click.echo(f"  {'active':<10} {'yes' if plan.active_before else 'no':<12} yes")
+        click.echo(f"  {'delisted':<10} {str(plan.delisted_date or '-'):<12} -")
+        click.echo(
+            f"  {'venue':<10} {str(plan.exchange_before):<12} {plan.venue}, held "
+            f"until the vendor names a venue other than {plan.left}"
+        )
+        for p in plan.periods:
+            click.echo(
+                f"Ticker period re-opened: {p['symbol']} {p['valid_from']}.."
+                f"{p['valid_to']} -> {p['valid_from']}..open"
+            )
+        if evidence.bars:
+            first, last = evidence.bars[0], evidence.bars[-1]
+            volume = last.get("volume")
+            click.echo(
+                f"Vendor bars after {moved}: {len(evidence.bars)}, "
+                f"{str(first.get('date'))[:10]}..{str(last.get('date'))[:10]}; the "
+                f"latest close {last.get('close')} volume "
+                + (
+                    f"{volume:,.0f}"
+                    if isinstance(volume, (int, float))
+                    else str(volume)
+                )
+            )
+        if plan.watermark is not None:
+            resume = plan.watermark - dt.timedelta(days=cfg.overlap_days)
+            click.echo(
+                f"Prices: watermark {plan.watermark}. The next nightly `ingest prices` "
+                f"resumes from {resume} and loads the bars since."
+            )
+        else:
+            click.echo(
+                "Prices: no watermark. The next nightly `ingest prices` loads its "
+                f"full history from {cfg.calendar_start_year}."
+            )
+        click.echo(
+            "Feed records settled, which the sweep then declines without asking: "
+            + ", ".join(f"{k['symbol']} {k['delisted_date']}" for k in plan.arm_keys)
+        )
+        if plan.open_contradictions or plan.open_inactive:
+            click.echo(
+                "Flags: "
+                + ", ".join(
+                    [f"accept {i}" for i in plan.open_contradictions]
+                    + [f"resolve {i}" for i in plan.open_inactive]
+                )
+            )
+        refusals = vt.evidence_refusals(evidence, symbol=plan.symbol, moved_on=moved)
+        if refusals:
+            for refusal in refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Record {plan.symbol} ({security_id}) as moved to {plan.venue} on "
+                f"{moved}?",
+                abort=True,
+            )
+
+        flag_note = f"Moved to {plan.venue} on {moved}: {note}"
+        # The RunLog row commits first, and its exit commits the change with the
+        # outcome; nothing is printed in between (see security descope).
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-venue-transfer",
+            params={
+                "security_id": security_id,
+                "symbol": plan.symbol,
+                "note": note,
+                "by": recorded_by,
+                "date": moved,
+                "before": {
+                    "is_actively_trading": plan.active_before,
+                    "delisted_date": plan.delisted_date,
+                    "exchange_code": plan.exchange_before,
+                },
+                "after": {
+                    "is_actively_trading": True,
+                    "delisted_date": None,
+                    "exchange_code": plan.venue,
+                    "venue_override_left": plan.left,
+                },
+                "periods_reopened": [
+                    f"{p['symbol']} {p['valid_from']}..{p['valid_to']}"
+                    for p in plan.periods
+                ],
+                "vendor_bars_after": len(evidence.bars),
+                "feed_records_settled": plan.arm_keys,
+            },
+        ) as run:
+            if stamped:
+                try:
+                    repo.reverse_delisting(
+                        database,
+                        security_id=security_id,
+                        delisted_date=plan.delisted_date,
+                        periods=plan.periods,
+                    )
+                except repo.VenueTransferRefused as exc:
+                    raise click.ClickException(
+                        f"{exc} -- it changed since the plan above. Re-run to see "
+                        "the current one."
+                    ) from exc
+            ensure_venue(database, plan.venue)
+            repo.record_venue_override(
+                database, security_id=security_id, venue=plan.venue, left=plan.left
+            )
+            for key in plan.arm_keys:
+                repo.add_dq_flag_once(
+                    database,
+                    check_name=CONTRADICTED_CHECK,
+                    security_id=security_id,
+                    table_name="core.security",
+                    record_key=key,
+                    detail={"recorded_by": "security venue-transfer"},
+                    ingestion_run_id=run.run_id,
+                )
+            accepted = repo.accept_dq_flags(
+                database,
+                repo.DqFilter(
+                    state="open",
+                    checks=(CONTRADICTED_CHECK,),
+                    security_ids=(security_id,),
+                ),
+                note=flag_note,
+                accepted_by=recorded_by,
+            )
+            resolved = []
+            if plan.open_inactive:
+                resolved = repo.resolve_dq_flags(
+                    database,
+                    repo.DqFilter(
+                        state="open",
+                        checks=(INACTIVE_BUT_TRADING_CHECK,),
+                        security_ids=(security_id,),
+                    ),
+                    note=flag_note,
+                    resolved_by=recorded_by,
+                )
+            run.symbols_requested = 1
+            run.params.update(flags_accepted=accepted, flags_resolved=resolved)
+            run_id = run.run_id
+
+    click.echo(
+        f"Recorded {plan.symbol} ({security_id}) as moved to {plan.venue} on {moved}, "
+        f"as {recorded_by} (ops.ingestion_run {run_id})."
+    )
+    click.echo(
+        f"Accepted {_plural(len(accepted), 'feed record')} as this move"
+        + (f"; resolved {_plural(len(resolved), 'DQ flag')}." if resolved else ".")
+    )
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("delist")
+@click.argument("security_id", type=int)
+@click.option(
+    "--date",
+    "delisted_on",
+    required=True,
+    metavar="YYYY-MM-DD",
+    help="The delisting date to record.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why it is a delisting. Required -- it is the whole record.",
+)
+@click.option("--by", "delisted_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_delist(ctx, security_id, delisted_on, note, delisted_by, dry_run, yes):
+    """Confirm a delisting the sweep declined (ADR 0014).
+
+    \b
+      fafnir security delist 4321 --date 2025-12-31 \\
+          -m "Left the NYSE for OTCQX (issuer notice)" --dry-run
+
+    The delisting sweep will not stamp a recent delisting the vendor still has
+    bars after: it flags security_delisting_contradicted instead. That is right
+    for a venue transfer (`security venue-transfer`) and wrong for a security that
+    left this warehouse's scope while still trading, such as a move to OTC (GRP-UN,
+    2025-12-31). This stamps it the way the sweep would: delisted on --date, the
+    ticker's open period closed, every bar kept. Any operator venue override is
+    cleared, and the contradiction and inactive-but-trading flags are resolved
+    with the note. An ops.ingestion_run row (source 'operator', endpoint
+    'security-delist') records it. Reversible with `security venue-transfer`.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import venue_transfer as vt
+    from fafnir.ingest.delisted import CONTRADICTED_CHECK
+    from fafnir.ingest.runlog import RunLog
+    from fafnir.ingest.security_master import INACTIVE_BUT_TRADING_CHECK
+
+    cfg = ctx.obj["config"]
+    if delisted_by is None:
+        delisted_by = _os_user()
+    when = _parse_date(delisted_on)
+
+    with Database(cfg.dsn) as database:
+        plan = vt.plan_delist(database, security_id=security_id, delisted_on=when)
+        if plan.symbol is not None:
+            click.echo(
+                f"Security {security_id} {plan.symbol} ({plan.company_name or ''}) on "
+                f"{plan.exchange}"
+            )
+        if plan.refusals:
+            for refusal in plan.refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        click.echo(f"Delisted on {when}; last stored bar {plan.last_bar or 'none'}.")
+        for p in plan.periods:
+            click.echo(f"Ticker period closed: {p['symbol']} {p['valid_from']}..")
+        click.echo(
+            "Flags resolved: " + (", ".join(map(str, plan.open_flags)) or "none open")
+        )
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Stamp {plan.symbol} ({security_id}) delisted on {when}?", abort=True
+            )
+
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-delist",
+            params={
+                "security_id": security_id,
+                "symbol": plan.symbol,
+                "note": note,
+                "by": delisted_by,
+                "delisted_date": when,
+                "exchange_code": plan.exchange,
+                "last_bar": plan.last_bar,
+            },
+        ) as run:
+            if not repo.mark_delisted(
+                database, security_id=security_id, delisted_date=when
+            ):
+                raise click.ClickException(
+                    f"{plan.symbol} ({security_id}) was delisted since the plan above. "
+                    "Nothing was changed."
+                )
+            repo.clear_venue_override(database, security_id)
+            resolved = []
+            if plan.open_flags:
+                resolved = repo.resolve_dq_flags(
+                    database,
+                    repo.DqFilter(
+                        state="open",
+                        checks=(CONTRADICTED_CHECK, INACTIVE_BUT_TRADING_CHECK),
+                        security_ids=(security_id,),
+                    ),
+                    note=f"Delisted on {when}: {note}",
+                    resolved_by=delisted_by,
+                )
+            run.symbols_requested = 1
+            run.params["flags_resolved"] = resolved
+            run_id = run.run_id
+
+    click.echo(
+        f"Delisted {plan.symbol} ({security_id}) on {when} as {delisted_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
+    if resolved:
+        click.echo(f"Resolved {_plural(len(resolved), 'DQ flag')}.")
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
