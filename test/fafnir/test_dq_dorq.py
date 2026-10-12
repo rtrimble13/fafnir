@@ -21,6 +21,7 @@ from click.testing import CliRunner
 from fafnir import cli
 from fafnir.config import FafnirConfig
 from fafnir.db import repository as repo
+from fafnir.db.connection import Database
 from fafnir.dq import dorq
 
 REAL_DORQ = os.environ.get("FAFNIR_TEST_DORQ", "")
@@ -30,13 +31,14 @@ real_dorq = pytest.mark.skipif(
 
 # A fake dorq: `--version` prints a version; `check` saves its arguments and stdin
 # beside itself and prints the rows in FAKE_DORQ_ROWS (a file), or fails with
-# FAKE_DORQ_FAIL.
+# FAKE_DORQ_FAIL. FAKE_DORQ_SLEEP makes the check take that many seconds.
 _FAKE = """#!{python}
-import os, sys, pathlib
+import os, sys, pathlib, time
 here = pathlib.Path(__file__).parent
 if "--version" in sys.argv:
     print("9.9.9-fake")
     sys.exit(0)
+time.sleep(float(os.environ.get("FAKE_DORQ_SLEEP") or 0))
 data = sys.stdin.buffer.read()
 (here / "stdin.csv").write_bytes(data)
 (here / "args.txt").write_text("\\n".join(sys.argv[1:]))
@@ -62,6 +64,7 @@ def fake_dorq(tmp_path, monkeypatch):
     rows.write_text("")
     monkeypatch.setenv("FAKE_DORQ_ROWS", str(rows))
     monkeypatch.delenv("FAKE_DORQ_FAIL", raising=False)
+    monkeypatch.delenv("FAKE_DORQ_SLEEP", raising=False)
     return path
 
 
@@ -173,6 +176,13 @@ def _mk(db, symbol, asset_type="equity", is_fund=False):
             "UPDATE core.security SET is_fund = true WHERE security_id = %s", (sid,)
         )
     return sid
+
+
+def _stop_trading(db, sid):
+    db.execute(
+        "UPDATE core.security SET is_actively_trading = false WHERE security_id = %s",
+        (sid,),
+    )
 
 
 def _sessions(db, start=dt.date(2023, 1, 3), end=dt.date(2024, 12, 31)):
@@ -379,6 +389,110 @@ def test_a_dorq_error_names_dorqs_own_message(db, fake_dorq, monkeypatch):
 
 
 @pytest.mark.integration
+def test_a_failed_run_is_recorded_and_moves_no_watermark(db, fake_dorq, monkeypatch):
+    """On 2026-10-08 dorq 0.7.0 refused the actions file, and nothing in
+    ops.ingestion_run said a run had happened: the row was written only once dorq
+    had succeeded. The agent has no journal, so the row is its only record."""
+    sid = _mk(db, "DQFAIL")
+    _walk(db, sid, _sessions(db)[:10])
+    monkeypatch.setenv(
+        "FAKE_DORQ_FAIL",
+        'dorq: error: actions.csv line 84466: amount "0.000000" is not a positive'
+        " number",
+    )
+    settings = dorq.DorqSettings(path=str(fake_dorq))
+    # Not autocommit, as the CLI runs it: the connection rolls back on the way out.
+    with pytest.raises(dorq.DorqError, match="dorq 9.9.9-fake exited 2"):
+        with Database(db.dsn) as conn:
+            dorq.run(conn, settings, "NASDAQ", shadow=True)
+    (run,) = db.fetchall(
+        "SELECT status, error_message, finished_at FROM ops.ingestion_run"
+        " WHERE source = 'dorq'"
+    )
+    assert run["status"] == "failed"
+    assert run["error_message"].startswith("DorqError: dorq 9.9.9-fake exited 2: ")
+    assert "is not a positive number" in run["error_message"]
+    assert run["finished_at"] is not None
+    assert dorq.read_watermark(db, dorq.WATERMARK_SHADOW) is None
+
+
+def _stale_feed_night(db, fake_dorq):
+    """dorq reports a stale feed on a security still trading and on one that has
+    stopped, and a bad print in the stopped one's history. Returns the two."""
+    active = _mk(db, "DQSFA")
+    stopped = _mk(db, "DQSFD")
+    days = _sessions(db)
+    _walk(db, active, days[:40])
+    _walk(db, stopped, days[:40], seed=2)
+    _stop_trading(db, stopped)
+    _emit(
+        fake_dorq,
+        [
+            _row(active, days[30].isoformat(), check="dorq_stale_feed", code="DQ304"),
+            _row(stopped, days[30].isoformat(), check="dorq_stale_feed", code="DQ304"),
+            _row(stopped, days[20].isoformat()),
+        ],
+    )
+    return active, stopped
+
+
+@pytest.mark.integration
+def test_stale_feed_on_a_security_not_trading_is_left_out_of_the_shadow(
+    db, fake_dorq, tmp_path
+):
+    """The SQL `stale` check judges only securities still trading. DQ304 cannot
+    tell a delisting from an outage, so fafnir holds it to the same rule. The rest
+    of the stopped security's history is still judged."""
+    active, stopped = _stale_feed_night(db, fake_dorq)
+    settings = dorq.DorqSettings(path=str(fake_dorq), shadow_dir=str(tmp_path / "sh"))
+    out = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert out.detected == {"dorq_bad_print": 1, "dorq_stale_feed": 1}
+    assert {
+        (r["check_name"], r["security_id"]) for r in dorq.read_shadow(out.shadow_file)
+    } == {("dorq_stale_feed", active), ("dorq_bad_print", stopped)}
+
+
+@pytest.mark.integration
+def test_stale_feed_on_a_security_not_trading_never_reaches_the_queue(db, fake_dorq):
+    active, stopped = _stale_feed_night(db, fake_dorq)
+    out = dorq.run(db, dorq.DorqSettings(path=str(fake_dorq)), "NASDAQ", shadow=False)
+    assert out.flagged == {"dorq_bad_print": 1, "dorq_stale_feed": 1}
+    assert {
+        (r["check_name"], r["security_id"])
+        for r in db.fetchall(
+            "SELECT check_name, security_id FROM ops.data_quality_flag"
+        )
+    } == {("dorq_stale_feed", active), ("dorq_bad_print", stopped)}
+
+
+@pytest.mark.integration
+def test_a_run_records_its_hash_what_was_left_out_and_how_long_it_took(
+    db, fake_dorq, tmp_path, monkeypatch
+):
+    """The hash is dorq's own (the config file, its options and the calendar), so
+    `dorq config show` cannot recompute it; the run keeps it. finished_at was now(),
+    the transaction's start, which made every run take no time at all."""
+    _stale_feed_night(db, fake_dorq)
+    monkeypatch.setenv("FAKE_DORQ_SLEEP", "0.3")
+    settings = dorq.DorqSettings(path=str(fake_dorq), shadow_dir=str(tmp_path / "sh"))
+    with Database(db.dsn) as conn:
+        dorq.run(conn, settings, "NASDAQ", shadow=True)
+    run = db.fetchone(
+        "SELECT status, params, finished_at - started_at AS took"
+        " FROM ops.ingestion_run WHERE source = 'dorq'"
+    )
+    assert run["status"] == "success"
+    assert run["params"] == {
+        "dorq_version": "9.9.9-fake",
+        "dorq_config_hash": "x",
+        "dropped": {"dorq_stale_feed": 1},
+        "since": None,
+        "shadow": True,
+    }
+    assert run["took"] >= dt.timedelta(seconds=0.3)
+
+
+@pytest.mark.integration
 def test_cli_engine_both_runs_sql_and_dorq(db, fake_dorq, tmp_path, monkeypatch):
     sid = _mk(db, "DQCLI")
     days = _sessions(db)
@@ -491,6 +605,32 @@ def test_real_dorq_reports_a_zero_dividend(db):
     }
 
 
+@real_dorq
+@pytest.mark.integration
+def test_real_dorq_stale_feed_is_left_out_for_a_security_not_trading(db):
+    """The first shadow night reported DQ304 on 1,195 securities; 1,127 of them had
+    stopped trading, such as CMCSV, delisted 192 sessions before the as-of date."""
+    days = _sessions(db)
+    live = _mk(db, "RDSL")
+    quiet = _mk(db, "RDSQ")
+    delisted = _mk(db, "RDSD")
+    _walk(db, live, days, seed=21)
+    _walk(db, quiet, days[:-60], seed=22)
+    _walk(db, delisted, days[:-80], seed=23)
+    _stop_trading(db, delisted)
+    run = dorq.run_dorq(
+        db,
+        dorq.DorqSettings(path=REAL_DORQ),
+        "NASDAQ",
+        dorq.full_window(db, "NASDAQ"),
+    )
+    stale = {
+        r["security_id"] for r in run.records if r["check_name"] == "dorq_stale_feed"
+    }
+    assert stale == {quiet}
+    assert run.dropped == {"dorq_stale_feed": 1}
+
+
 # ---------------------------------------------------------------------------
 # dq recheck: rerun and negate (DR-0705)
 # ---------------------------------------------------------------------------
@@ -550,6 +690,39 @@ def test_recheck_closes_what_dorq_no_longer_emits(db, fake_dorq):
         for line in (fake_dorq.parent / "stdin.csv").read_text().splitlines()[1:]
     }
     assert sent == {still, gone}
+
+
+@pytest.mark.integration
+def test_recheck_closes_a_stale_feed_flag_once_the_security_stops_trading(
+    db, fake_dorq
+):
+    """dorq still reports the stale feed; fafnir's rule leaves it out, as the SQL
+    `stale` check would, so the flag is no longer emitted."""
+    from fafnir.dq import recheck as rc
+
+    active = _mk(db, "RCKSA")
+    stopped = _mk(db, "RCKSD")
+    days = _sessions(db)
+    _walk(db, active, days[:50])
+    _walk(db, stopped, days[:50], seed=3)
+    rows = [
+        _row(sid, days[40].isoformat(), check="dorq_stale_feed", code="DQ304")
+        for sid in (active, stopped)
+    ]
+    dorq.ingest(db, rows)
+    _stop_trading(db, stopped)
+    _emit(fake_dorq, rows)
+    (result,) = rc.recheck_dorq(db, dorq.DorqSettings(path=str(fake_dorq)))
+    assert result.check_name == "dorq_stale_feed"
+    assert result.open_flags == 2
+    assert list(result.stale_flag_ids) == [
+        db.fetchval(
+            "SELECT dq_flag_id FROM ops.data_quality_flag WHERE security_id = %s",
+            (stopped,),
+        )
+    ]
+    # The note must not claim dorq stopped reporting it.
+    assert "on a security no longer actively trading" in result.reason
 
 
 @pytest.mark.integration

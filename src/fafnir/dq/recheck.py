@@ -473,6 +473,11 @@ def recheck_dorq(
             f"re-running dorq {run.version} over the security's full history no longer "
             "reports it"
         )
+        if run.dropped.get(name):
+            reason += (
+                ", or reports it on a security no longer actively trading, which "
+                "fafnir leaves out"
+            )
         older = sorted(
             {
                 f["version"]

@@ -14,7 +14,8 @@ This module is the whole of the integration's moving parts:
     small CSV files.
   * **run** -- ``dorq check --format fafnir``: one JSON object per line, already
     shaped as an ``ops.data_quality_flag`` row, with ``check_name`` prefixed
-    ``dorq_``.
+    ``dorq_``. Stale-feed reports on securities that have stopped trading are left
+    out, as the SQL ``stale`` check leaves them out.
   * **ingest** -- the rows land in a temporary table and are written with one
     set-based ``INSERT ... SELECT`` carrying **the same two NOT EXISTS guards**
     (open and accepted) as every check in :mod:`fafnir.dq.checks`, so dedupe and
@@ -63,6 +64,14 @@ SINCE_OVERLAP_SESSIONS = 5
 CROSS_SECTIONAL_CHECKS = frozenset(
     {"dorq_cohort_gap", "dorq_cohort_move", "dorq_market_day"}
 )
+
+#: dorq's stale-feed check (DQ304): bars that stop before the as-of date by more
+#: sessions than the series' density explains. dorq cannot tell a delisting from a
+#: feed outage, so every security that has stopped trading is stale to it, every
+#: night. fafnir can tell, and :func:`fafnir.dq.checks.check_freshness` judges
+#: only securities still actively trading; :func:`drop_not_trading` holds dorq's
+#: reports to that same rule.
+STALE_FEED_CHECK = "dorq_stale_feed"
 
 # The watermark rows (ops.load_watermark) a run advances: the as-of date it judged
 # up to. Separate for the queue and the shadow, so a shadow night does not move the
@@ -386,12 +395,20 @@ def bars_copy_statement(
 
 @dataclass
 class RunResult:
-    """What one dorq run produced."""
+    """What one dorq run produced.
+
+    ``records`` are dorq's reports less those fafnir leaves out, which ``dropped``
+    counts per check. ``config_hash`` is the hash dorq stamped on its reports
+    (None when it reported nothing): it covers the config file, the command-line
+    options and the calendar's content, so ``dorq config show`` cannot give it.
+    """
 
     version: str
     window: Window
     records: list[dict] = field(default_factory=list)
     bytes_sent: int = 0
+    config_hash: Optional[str] = None
+    dropped: dict[str, int] = field(default_factory=dict)
 
     def by_check(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -408,12 +425,17 @@ def run_dorq(
     *,
     security_ids: Optional[Sequence[int]] = None,
 ) -> RunResult:
-    """Export, run dorq, and parse its output. Writes nothing to the warehouse.
+    """Export, run dorq, and parse its output, less the stale-feed reports on
+    securities not actively trading (:func:`drop_not_trading`). Writes nothing to
+    the warehouse.
 
     The bars go from ``COPY`` straight into dorq's stdin, so the 150M-row history
     never lands on disk. dorq's stdout goes to a temporary file rather than a pipe
     -- reading a pipe while writing another invites a deadlock -- and is parsed
     once dorq has exited.
+
+    The filter is applied here rather than by each caller, so the nightly run,
+    ``--full`` and ``dq recheck`` all see the same reports.
     """
     version = dorq_version(settings)
     with tempfile.TemporaryDirectory(prefix="fafnir-dorq-") as tmp:
@@ -446,7 +468,7 @@ def run_dorq(
             status = proc.wait()
         if status != 0:
             tail = err_path.read_text(errors="replace").strip()[-2000:]
-            raise DorqError(f"dorq exited {status}: {tail or 'no message'}")
+            raise DorqError(f"dorq {version} exited {status}: {tail or 'no message'}")
         records = [
             json.loads(line)
             for line in out_path.read_text(encoding="utf-8").splitlines()
@@ -455,7 +477,63 @@ def run_dorq(
     logger.info(
         "dorq %s: %d violations from %.1f MB of bars", version, len(records), sent / 1e6
     )
-    return RunResult(version=version, window=window, records=records, bytes_sent=sent)
+    # Read before the filter: the hash is dorq's, whatever fafnir then leaves out.
+    config_hash = (
+        ((records[0].get("detail") or {}).get("dorq") or {}).get("config_hash")
+        if records
+        else None
+    )
+    records, dropped = drop_not_trading(db, records)
+    return RunResult(
+        version=version,
+        window=window,
+        records=records,
+        bytes_sent=sent,
+        config_hash=config_hash,
+        dropped=dropped,
+    )
+
+
+def drop_not_trading(
+    db: Database, records: Sequence[dict]
+) -> tuple[list[dict], dict[str, int]]:
+    """Leave out the :data:`STALE_FEED_CHECK` reports on securities not actively
+    trading; return the rows kept and the count left out per check.
+
+    The rule is the SQL ``stale`` check's own (``WHERE s.is_actively_trading``),
+    read when the run is made. Nothing else is touched: a delisted security's bars
+    still go to dorq, and its history is judged for bad prints, splits and the
+    rest as before, so the judgement carries no survivorship bias. A row with no
+    security (a cross-sectional report) is kept.
+    """
+
+    def stale_feed(r: dict) -> bool:
+        return r["check_name"] == STALE_FEED_CHECK and r.get("security_id") is not None
+
+    ids = sorted({int(r["security_id"]) for r in records if stale_feed(r)})
+    if not ids:
+        return list(records), {}
+    inactive = {
+        int(r["security_id"])
+        for r in db.fetchall(
+            """
+            SELECT security_id FROM core.security
+             WHERE security_id = ANY(%s) AND NOT is_actively_trading
+            """,
+            (ids,),
+        )
+    }
+    kept = [
+        r for r in records if not (stale_feed(r) and int(r["security_id"]) in inactive)
+    ]
+    left_out = len(records) - len(kept)
+    if not left_out:
+        return kept, {}
+    logger.info(
+        "dorq: left out %d stale-feed reports on securities not actively trading",
+        left_out,
+    )
+    return kept, {STALE_FEED_CHECK: left_out}
 
 
 def _stream_bars(
@@ -615,8 +693,12 @@ def read_shadow(path: Path) -> list[dict]:
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def start_run(db: Database, version: str, window: Window, shadow: bool) -> int:
-    """An ``ops.ingestion_run`` row for the run: lineage for every flag it writes."""
+def start_run(db: Database, window: Window, shadow: bool) -> int:
+    """An ``ops.ingestion_run`` row for the run: lineage for every flag it writes.
+
+    Opened before dorq runs, so a run that fails still has a row. The version is
+    known only once dorq has answered, so :func:`finish_run` fills it in.
+    """
     return int(
         db.fetchval(
             """
@@ -630,7 +712,7 @@ def start_run(db: Database, version: str, window: Window, shadow: bool) -> int:
                 WATERMARK_SHADOW if shadow else WATERMARK_QUEUE,
                 json.dumps(
                     {
-                        "dorq_version": version,
+                        "dorq_version": None,
                         "since": window.since.isoformat() if window.since else None,
                         "shadow": shadow,
                     }
@@ -643,16 +725,27 @@ def start_run(db: Database, version: str, window: Window, shadow: bool) -> int:
 
 
 def finish_run(
-    db: Database, run_id: int, *, status: str, flagged: int = 0, error: str = ""
+    db: Database,
+    run_id: int,
+    *,
+    status: str,
+    flagged: int = 0,
+    error: str = "",
+    params: Optional[dict] = None,
 ) -> None:
+    """Close the run's row, merging ``params`` into those it opened with.
+
+    ``finished_at`` is ``clock_timestamp()``, not ``now()``: ``now()`` is when the
+    transaction began, which is before dorq ran.
+    """
     db.execute(
         """
         UPDATE ops.ingestion_run
            SET status = %s, rows_inserted = %s, error_message = NULLIF(%s, ''),
-               finished_at = now()
+               params = params || %s::jsonb, finished_at = clock_timestamp()
          WHERE ingestion_run_id = %s
         """,
-        (status, flagged, error[:2000], run_id),
+        (status, flagged, error[:2000], json.dumps(params or {}), run_id),
     )
 
 
@@ -681,6 +774,11 @@ def run(
     for `fafnir dq compare`. Either way the run is recorded in ops.ingestion_run
     and its watermark advanced, so the next night reports from where this one
     stopped.
+
+    The run's row is committed before dorq starts, and its outcome when it ends,
+    failure included: ``ops.ingestion_run`` is the only record of a run an agent
+    without the journal can read. A failed run is re-raised, so the CLI still
+    exits non-zero, and leaves the watermark where it was.
     """
     endpoint = WATERMARK_SHADOW if shadow else WATERMARK_QUEUE
     window = (
@@ -691,18 +789,39 @@ def run(
     if window.as_of is None:
         logger.info("dorq: no bars on an open session yet; nothing to check")
         return DqRunOutcome(version="", window=window, detected={}, flagged={})
-    result = run_dorq(db, settings, exchange_code, window)
-    run_id = start_run(db, result.version, window, shadow)
-    shadow_file = None
-    flagged: dict[str, int] = {}
-    if shadow:
-        shadow_file = write_shadow(
-            result.records, shadow_path(settings.shadow_dir, window.as_of)
-        )
-    else:
-        flagged = ingest(db, result.records, ingestion_run_id=run_id)
-    finish_run(db, run_id, status="success", flagged=sum(flagged.values()))
+    run_id = start_run(db, window, shadow)
+    db.commit()
+    try:
+        result = run_dorq(db, settings, exchange_code, window)
+        shadow_file = None
+        flagged: dict[str, int] = {}
+        if shadow:
+            shadow_file = write_shadow(
+                result.records, shadow_path(settings.shadow_dir, window.as_of)
+            )
+        else:
+            flagged = ingest(db, result.records, ingestion_run_id=run_id)
+    except BaseException as exc:
+        # As RunLog does: a COPY cut short when dorq exits can leave the
+        # transaction aborted, so discard the uncommitted tail before recording
+        # the failure.
+        db.rollback()
+        finish_run(db, run_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+        db.commit()
+        raise
+    finish_run(
+        db,
+        run_id,
+        status="success",
+        flagged=sum(flagged.values()),
+        params={
+            "dorq_version": result.version,
+            "dorq_config_hash": result.config_hash,
+            "dropped": result.dropped,
+        },
+    )
     write_watermark(db, endpoint, window.as_of)
+    db.commit()
     return DqRunOutcome(
         version=result.version,
         window=window,

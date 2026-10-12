@@ -767,8 +767,9 @@ say what they meant.
 
 Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**
 (`[dq] dorq_shadow = false`). Until the shadow period meets the cutover criteria
-(dorq plan §8), dorq writes to `var/dorq-shadow/<date>.jsonl` instead and the
-queue carries none of these. `doc/dorq.md` covers the engine.
+(dorq plan §8), dorq writes to `<dorq_shadow_dir>/<as-of>.jsonl` instead
+(`/var/lib/fafnir/dorq-shadow` on the host) and the queue carries none of these.
+`doc/dorq.md` covers the engine.
 
 A `dorq_*` flag is not a threshold crossing. dorq weighed the explanations of a
 bar — a bad print, a scale error, an unreported split, a feed outage, a real move —
@@ -803,8 +804,20 @@ by hand (`references/outlier-classification.md`, sections in brackets):
 | `dorq_split_misdated` | `actions redate` (§2c) | the repair, then `dq recheck` |
 | `dorq_split_without_jump`, `dorq_split_double_applied` | an action or bar repair | **Never** — see below |
 | `dorq_split_ratio_mismatch`, `dorq_dividend_implausible` | correct the action on file | the repair, then `dq recheck` |
+| `dorq_bad_context_row` | correct or delete the action on file (`actions delete`, then `actions add`). A skipped split can also surface as `dorq_unreported_split`: fix the row first | the repair, then `dq recheck` |
 | `dorq_missing_run`, `dorq_cohort_gap` | `ingest prices --symbols … --from … --to …` | the repair, then `dq recheck` |
-| `dorq_stale_feed`, `dorq_repeated_price` | as `stale` | as `stale` |
+| `dorq_frequency_gap` | a thin series dorq reads as weekly or monthly, missing whole periods: re-fetch them with `ingest prices`. If the vendor has no bar, the security did not trade | the repair, then `dq recheck`; **accept** a period with no trading |
+| `dorq_stale_feed` | as `stale`. fafnir leaves out stale-feed reports on securities not actively trading, by `stale`'s own rule, so every one here is on a security still trading | as `stale`. `dq recheck` closes it once the security stops trading |
+| `dorq_repeated_price` | as `stale` | as `stale` |
+| `dorq_zero_range_with_volume` | re-fetch the bar. Check first for a cash takeover pinning the price (below) | the repair, then `dq recheck`; **accept** a deal-price pin |
+| `dorq_move_on_zero_volume` | probe the vendor (§3), then re-fetch the bar; `prices delete` if it re-serves an indicative quote | the repair, then `dq recheck` |
+| `dorq_volume_scale_shift` | `prices rescale --factor 1 --volume-factor V` over the era (§2i), or re-fetch it | the repair, then `dq recheck` |
+| `dorq_non_session_bar` | `prices delete --non-session`, after the weekday check under `outlier`: a history dated a day early wants `prices shift` (§2i) | the repair, then `dq recheck` |
+| `dorq_precision_shift` | an era of computed, back-adjusted prices in the raw feed (WZRD, SMUP): `prices rescale` it to as-traded once an outside source confirms the scale (§2i) | the repair, then `dq recheck` |
+
+NAV-priced funds never carry `dorq_zero_range_with_volume` or the volume checks:
+the `nav_funds` profile in dorq's `priors/fafnir.toml` ignores them for those
+series, because a fund strikes one price a day on no volume.
 
 **Accept when** the evidence shows a real event dorq could not know about — a
 halt, a tender at a fixed price — and say what it was. **Resolve** only a report
@@ -842,4 +855,36 @@ a few sessions later. One of the two moves is a vendor restatement, and every
 adjusted price before it is off by the ratio. The repair is a rescale of the bars
 between the two moves, after probing the vendor's payloads for which one is the
 restatement (§3). Report; do not close.
+
+## `dorq_zero_range_with_volume` — a flat bar on ordinary volume
+
+Open, high, low and close are one price, on at least the series' median traded
+volume, among nearby bars that do have a range. dorq reads it as a lost range: a
+close copied into the other three fields, or a price at a scale that rounds the
+range away (`price_scale_collapse`'s pattern).
+
+**Check for a cash takeover first.** In a security's final sessions, a flat bar
+on heavy volume is usually the deal price pinning the stock, which is a market
+fact. On the first shadow night (2026-10-09), 640 reports had ranged bars nearby.
+27 of them fell within 7 days of the series' last bar, including 20 of the 117 on
+securities trading 10,000 shares a day or more. The largest:
+
+| Symbol | Session | Flat at | Volume | Delisted |
+|---|---|---:|---:|---|
+| HOLX (Hologic) | 2026-04-07 | 76.01 | 101,956,189 | 2026-04-08 |
+| EXAS (Exact Sciences) | 2026-03-23 | 104.91 | 21,562,141 | 2026-03-24 |
+| RNAM (Avidity) | 2026-02-26 | 71.34 | 16,835,884 | 2026-03-02 |
+
+Check `delisted_date` and the last sessions' closes. A delisting within days of
+the bar, with the closes before it at or near one price, is the pin. **Accept**
+it, and name the deal in the note.
+
+Otherwise re-fetch the bar (`ingest prices --symbols <SYM> --from <d> --to <d>`).
+If the vendor serves the same flat bar on a price small enough for its range to
+round away, it is `price_scale_collapse`'s case: report it, and do not resolve.
+
+**Under dorq 0.8.0, most of these reports are something else.** 15,632 of the
+first night's 16,272 were thin ETFs printing one 100-share lot a day, where a
+single trade makes a flat bar. That is a dorq defect, to be fixed in dorq. Do not
+work those one by one, and do not filter them in fafnir.
 
