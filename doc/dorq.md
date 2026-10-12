@@ -142,6 +142,11 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    check carries: a condition already open, or accepted, is not written again. The
    as-of date goes to `ops.load_watermark`.
 
+   A shadow file is named by its as-of date, and a second run for the same date
+   replaces it. A manual `fafnir dq run --engine dorq` after that night's nightly
+   therefore replaces the nightly's file. It reports only from five sessions
+   before the nightly's as-of date, so `dq compare` then sees less of the night.
+
 **The run's record.** Each run has a row in `ops.ingestion_run` (`source =
 'dorq'`, endpoint `dq-run` or `dq-shadow`), which the MCP `ingestion_runs` tool
 shows. It is written before dorq starts, so a run that fails still leaves one:
@@ -154,7 +159,6 @@ where it was. `started_at` and `finished_at` are the real times. `params` holds:
 | `dorq_config_hash` | the hash on the run's reports (null when dorq reported nothing) |
 | `dropped` | the reports the filter left out, per check: `{"dorq_stale_feed": 1127}` |
 | `since`, `shadow` | the window's `--since`, and whether the run went to the shadow |
-
 
 **Runtime.** dorq checks while the bars stream in, so a run takes about as long as
 the export. On a test cluster, 2.3M bars took these times:
@@ -210,6 +214,10 @@ It must hold over at least 20 sessions. Then set `dorq_shadow = false`.
 fafnir dq export-labels --out labels.jsonl --restore before.csv
 ```
 
+Write them anywhere but the shadow directory. `dq compare` takes the last
+`*.jsonl` there as the newest night, and `labels.jsonl` sorts after the dated
+files.
+
 These are the warehouse's own decisions, in dorq's label format (dorq's
 doc/labels.md):
 
@@ -236,17 +244,39 @@ and adds what the tables cannot say on their own.
 
 ## Calibrate
 
-dorq fits its priors to the labels:
+dorq fits its priors to the labels. It scores the moves it fits on exactly as
+`dorq check` would (dorq's doc/calibration.md), so give it the context `dq run`
+gives `dorq check`: the venue calendar, the corporate actions and the security
+metadata. Without `--actions`, the splits on file cannot explain the jumps they
+cause, and the price model would be fitted on different evidence from what
+production judges with. The second step below writes the three files with
+`dq run`'s own code, so they match what the nightly sends:
 
 ```bash
 psql -c "\copy (SELECT security_id, trade_date, open, high, low, close, volume
                FROM core.daily_price ORDER BY security_id, trade_date)
          TO 'bars.csv' CSV HEADER"
+/opt/fafnir/.venv/bin/python - <<'EOF'   # calendar.csv, actions.csv, meta.csv
+from pathlib import Path
+from fafnir.config import FafnirConfig
+from fafnir.db.connection import Database
+from fafnir.dq.dorq import export_context
+
+with Database(FafnirConfig().dsn) as db:
+    export_context(db, Path.cwd(), "NASDAQ")
+EOF
 dorq calibrate bars.csv --labels labels.jsonl --restore before.csv \
-     --config /etc/fafnir/dorq.toml --holdout 0.3 --out /etc/fafnir/dorq-calibration.toml
+     --config /etc/fafnir/dorq.toml \
+     --calendar-file calendar.csv --calendar-exchange NASDAQ \
+     --actions actions.csv --meta meta.csv \
+     --holdout 0.3 --out /etc/fafnir/dorq-calibration.toml
 # then, in /etc/fafnir/dorq.toml:
 #   include = ["/opt/dorq/share/dorq/priors/fafnir.toml", "dorq-calibration.toml"]
 ```
+
+Do not pass `--clean-unlabelled`. It counts every scored move that no label
+matches as a market fact, and dorq's doc keeps it for data where every fault is
+labelled, as with dorq-synth. The warehouse's labels are not that complete.
 
 The `--holdout` figures are the ones to quote in the go/no-go. The fit changes
 `detail.dorq.config_hash`, so every flag records which calibration wrote it.
