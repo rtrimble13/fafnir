@@ -142,10 +142,22 @@ def test_overlap_counts_both_directions(db, tmp_path):
     c = cmp.compare(db, shadow, labels=labels)
     assert c.window_from == dt.date(2024, 3, 1)
     assert c.window_to == dt.date(2024, 3, 8)
-    assert c.by_sql_check == {
+    assert {
+        k: {"flags": e["flags"], "also_dorq": e["also_dorq"]}
+        for k, e in c.by_sql_check.items()
+    } == {
         "outlier": {"flags": 2, "also_dorq": 1},
         "gap": {"flags": 1, "also_dorq": 1},
         "stale": {"flags": 0, "also_dorq": 0},
+    }
+    # No run recorded the file, so every open flag holds as it stands now.
+    assert c.state_at is None
+    assert c.by_sql_check["outlier"]["holding"] == 2
+    assert c.by_sql_check["outlier"]["unmatched"] == {
+        "holding": 1,
+        "closed": 0,
+        "traded_since": 0,
+        "inactive": 0,
     }
     assert c.by_code == {
         "DQ201": {"reports": 1, "also_sql": 1},
@@ -189,3 +201,286 @@ def test_cli_compare_reads_the_newest_shadow_file(db, tmp_path, monkeypatch):
     result = CliRunner().invoke(cli.main, ["--config", str(rc), "dq", "compare"])
     assert result.exit_code != 0
     assert "No shadow file" in result.output
+
+
+# ---------------------------------------------------------------------------
+# What `dq compare` got wrong on the 2026-10-12 shadow night
+# ---------------------------------------------------------------------------
+
+
+def _run_row(db, as_of, since, *, started="2024-03-09 04:00+00", params=None):
+    """The ops.ingestion_run row of the shadow run that wrote ``as_of``'s file."""
+    db.execute(
+        "INSERT INTO ops.ingestion_run (source, endpoint, params, window_from,"
+        " window_to, status, started_at, finished_at)"
+        " VALUES ('dorq', 'dq-shadow', %s::jsonb, '2023-06-01', %s, 'success', %s, %s)",
+        (
+            json.dumps(
+                {"since": since, "shadow": True, "full": False, **(params or {})}
+            ),
+            as_of,
+            started,
+            started,
+        ),
+    )
+
+
+def _flag(
+    db,
+    sid,
+    check,
+    key,
+    *,
+    detected="2024-03-08 23:00+00",
+    resolved=None,
+    accepted=False,
+):
+    db.execute(
+        "INSERT INTO ops.data_quality_flag (security_id, table_name, record_key,"
+        " check_name, severity, detected_at, resolved_at, resolved_by,"
+        " resolution_note, accepted_at, accepted_by, accepted_note)"
+        " VALUES (%s, 'core.daily_price', %s::jsonb, %s, 'warn', %s, %s, %s, %s, %s,"
+        " %s, %s)",
+        (
+            sid,
+            json.dumps(key),
+            check,
+            detected,
+            resolved,
+            "t" if resolved else None,
+            "n" if resolved else None,
+            resolved if accepted else None,
+            "t" if accepted else None,
+            "n" if accepted else None,
+        ),
+    )
+
+
+def _bar(db, sid, day):
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": sid,
+                "trade_date": dt.date.fromisoformat(day),
+                "open": 10,
+                "high": 10,
+                "low": 10,
+                "close": 10,
+                "volume": 1000,
+            }
+        ],
+    )
+
+
+def _sql(c, check):
+    e = c.by_sql_check[check]
+    return (e["flags"], e["also_dorq"], e["holding"], e["holding_also_dorq"])
+
+
+@pytest.mark.integration
+def test_a_stale_flag_keyed_before_the_window_is_matched_within_the_slack(db, tmp_path):
+    """SBXD and four others: the SQL flag is keyed on the last bar's date (10-02),
+    DQ304 on the first missing session (10-05). The slack paired them, but the
+    fetch asked only for flags dated inside the window."""
+    sid = _mk(db, "CMPST")
+    _run_row(db, "2024-03-08", "2024-03-04")
+    _flag(db, sid, "stale", {"last_date": "2024-03-01"})
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow(
+        [_row(sid, "2024-03-04", code="DQ304", check="dorq_stale_feed")], shadow
+    )
+    c = cmp.compare(db, shadow)
+    assert c.window_from == dt.date(2024, 3, 4)
+    assert _sql(c, "stale") == (1, 1, 1, 1)
+    assert c.by_code["DQ304"] == {"reports": 1, "also_sql": 1}
+
+
+@pytest.mark.integration
+def test_a_misdated_split_matches_the_move_it_explains(db, tmp_path):
+    """ZBAO and WORX: DQ701 is keyed at the split's ex-date; the move the SQL
+    outlier sits on is its move_date."""
+    sid = _mk(db, "CMPSP")
+    _run_row(db, "2024-03-15", "2024-03-01")
+    _flag(db, sid, "outlier", {"trade_date": "2024-03-05"})
+    row = _row(sid, "2024-03-12", code="DQ701", check="dorq_split_misdated")
+    row["detail"]["detail"] = {"move_date": "2024-03-05"}
+    shadow = tmp_path / "2024-03-15.jsonl"
+    dorq.write_shadow([row], shadow)
+    c = cmp.compare(db, shadow)
+    assert _sql(c, "outlier") == (1, 1, 1, 1)
+    assert c.by_code["DQ701"] == {"reports": 1, "also_sql": 1}
+
+    # A week from the flag, without the move date it would match nothing.
+    del row["detail"]["detail"]
+    dorq.write_shadow([row], shadow)
+    assert _sql(cmp.compare(db, shadow), "outlier") == (1, 0, 1, 0)
+
+
+@pytest.mark.integration
+def test_a_cohort_row_covers_the_securities_it_names(db, tmp_path):
+    """XRPN, VCIG and SBFM: dorq named each in a DQ601 cohort row, which has no
+    security_id, so it covered no one; and DQ601 was not an outlier successor."""
+    a, b, other = (_mk(db, s) for s in ("CMPCA", "CMPCB", "CMPCC"))
+    _run_row(db, "2024-03-08", "2024-03-04")
+    for sid in (a, b, other):
+        _flag(db, sid, "outlier", {"trade_date": "2024-03-05"})
+    row = _row(None, "2024-03-05", code="DQ601", check="dorq_cohort_move")
+    row["detail"]["detail"] = {"members": [str(a), b]}
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow([row], shadow)
+    c = cmp.compare(db, shadow)
+    assert _sql(c, "outlier") == (3, 2, 3, 2)
+    # One report, however many it names.
+    assert c.by_code["DQ601"] == {"reports": 1, "also_sql": 1}
+
+    # dorq up to 0.8.1 names no members: the row covers no one.
+    del row["detail"]["detail"]
+    dorq.write_shadow([row], shadow)
+    c = cmp.compare(db, shadow)
+    assert _sql(c, "outlier") == (3, 0, 3, 0)
+    assert c.by_code["DQ601"] == {"reports": 1, "also_sql": 0}
+
+
+@pytest.mark.integration
+def test_recall_counts_the_conditions_that_held_when_dorq_ran(db, tmp_path):
+    """Of 2026-10-12's 21 unmatched stale flags, 12 were on securities that had
+    traded since and 5 were closed. Recall is on the conditions that held -- as
+    they stood when dorq ran, so the night's figures do not move as the queue is
+    worked."""
+    held, traded, traded_late, delisted, closed, closed_late, later = (
+        _mk(db, f"CMPS{i}") for i in range(7)
+    )
+    _run_row(db, "2024-03-08", "2024-03-04", started="2024-03-09 04:00+00")
+    for sid in (held, traded, traded_late, delisted):
+        _flag(db, sid, "stale", {"last_date": "2024-03-04"})
+    for sid, day in ((traded, "2024-03-04"), (traded, "2024-03-06")):
+        _bar(db, sid, day)
+    # Its next bar came after the night: on the night, it still held.
+    for sid, day in ((traded_late, "2024-03-04"), (traded_late, "2024-03-11")):
+        _bar(db, sid, day)
+    db.execute(
+        "UPDATE core.security SET is_actively_trading = false,"
+        " delisted_date = '2024-03-07' WHERE security_id = %s",
+        (delisted,),
+    )
+    key = {"trade_date": "2024-03-05"}
+    _flag(db, closed, "outlier", key, resolved="2024-03-08 12:00+00")
+    _flag(db, closed_late, "outlier", key, resolved="2024-03-10 12:00+00")
+    _flag(db, later, "outlier", key, detected="2024-03-10 23:00+00")  # not the night's
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow(
+        [_row(held, "2024-03-05", code="DQ304", check="dorq_stale_feed")], shadow
+    )
+
+    def check(c):
+        assert c.state_at == dt.datetime(2024, 3, 9, 4, 0, tzinfo=dt.timezone.utc)
+        assert _sql(c, "stale") == (4, 1, 2, 1)
+        assert c.by_sql_check["stale"]["unmatched"] == {
+            "holding": 1,
+            "closed": 0,
+            "traded_since": 1,
+            "inactive": 1,
+        }
+        assert _sql(c, "outlier") == (2, 0, 1, 0)
+        assert c.by_sql_check["outlier"]["unmatched"] == {
+            "holding": 1,
+            "closed": 1,
+            "traded_since": 0,
+            "inactive": 0,
+        }
+
+    check(cmp.compare(db, shadow))
+    text = cmp.format_comparison(cmp.compare(db, shadow))
+    assert "2 holding" not in text and "1 traded since, 1 inactive" in text
+
+    # A week on, the queue worked: the night's figures stand.
+    db.execute(
+        "UPDATE ops.data_quality_flag SET resolved_at = now(), resolved_by = 't',"
+        " resolution_note = 'n' WHERE resolved_at IS NULL"
+    )
+    _bar(db, held, "2024-03-12")
+    check(cmp.compare(db, shadow))
+
+
+@pytest.mark.integration
+def test_a_backfilled_securitys_flags_are_compared_at_every_date(db, tmp_path):
+    """CELG-RI's ten SQL outliers sit years before the window. Once dorq judges
+    its whole history, compare has to fetch them too, or every match is "dorq
+    only" and recall never sees them."""
+    new = _mk(db, "CMPBN")
+    other = _mk(db, "CMPBO")
+    _run_row(
+        db,
+        "2024-03-08",
+        "2024-03-04",
+        params={"backfill": {"securities": 1, "security_ids": [new], "reports": 1}},
+    )
+    _flag(db, new, "outlier", {"trade_date": "2023-06-12"})
+    _flag(db, other, "outlier", {"trade_date": "2023-06-12"})  # not judged tonight
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow([_row(new, "2023-06-12")], shadow)
+    c = cmp.compare(db, shadow)
+    assert c.backfill_securities == 1
+    assert _sql(c, "outlier") == (1, 1, 1, 1)
+    assert c.by_code["DQ201"] == {"reports": 1, "also_sql": 1}
+    assert "Backfill    : the whole history of 1 securities" in cmp.format_comparison(c)
+
+
+@pytest.mark.integration
+def test_a_report_on_an_accepted_flag_is_called_out(db, tmp_path):
+    """INV's outlier was accepted as a market fact. A report on it counts against
+    dorq's precision -- with --labels, when dorq-eval's matching says so."""
+    sid = _mk(db, "CMPAC")
+    _run_row(db, "2024-03-08", "2024-03-04")
+    _flag(
+        db,
+        sid,
+        "outlier",
+        {"trade_date": "2024-03-05"},
+        resolved="2024-03-06 12:00+00",
+        accepted=True,
+    )
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow([_row(sid, "2024-03-05")], shadow)
+    labels = _labels(
+        tmp_path, {"series": str(sid), "date": "2024-03-05", "class": "market_fact"}
+    )
+    c = cmp.compare(db, shadow, labels=labels)
+    assert c.on_accepted == 1
+    assert _sql(c, "outlier") == (1, 1, 0, 0)  # closed before the night
+    assert c.precision_warn.false == 1
+    assert "accepted as a market fact: 1" in cmp.format_comparison(c)
+
+
+@pytest.mark.integration
+def test_compare_json_keeps_its_keys(db, tmp_path, monkeypatch):
+    sid = _mk(db, "CMPJS")
+    shadow_dir = tmp_path / "shadow"
+    _run_row(db, "2024-03-08", "2024-03-04")
+    _flag(db, sid, "outlier", {"trade_date": "2024-03-05"})
+    dorq.write_shadow([_row(sid, "2024-03-05")], shadow_dir / "2024-03-08.jsonl")
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(
+        f'[database]\ndsn = "{db.dsn}"\n[dq]\ndorq_shadow_dir = "{shadow_dir}"\n'
+    )
+    monkeypatch.delenv("FAFNIR_DSN", raising=False)
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(rc), "dq", "compare", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert {
+        "shadow_file",
+        "window",
+        "dorq_reports",
+        "by_code",
+        "by_sql_check",
+        "precision",
+    } <= set(payload)
+    assert payload["window"] == ["2024-03-04", "2024-03-08"]
+    assert payload["by_code"] == {"DQ201": {"reports": 1, "also_sql": 1}}
+    outlier = payload["by_sql_check"]["outlier"]
+    assert (outlier["flags"], outlier["also_dorq"]) == (1, 1)
+    assert (outlier["holding"], outlier["holding_also_dorq"]) == (1, 1)
+    assert payload["state_at"].startswith("2024-03-09T04:00:00")

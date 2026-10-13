@@ -18,11 +18,14 @@
 SHELL=/bin/bash
 FAFNIR_HOME=/opt/fafnir
 
-# Daily incremental update (Mon-Fri evening, after settlement).
-30 22 * * 1-5  set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/daily_update.sh >> var/fafnir/log/cron_daily.log 2>&1
-
-# Mid-evening data-quality sweep.
-0 23 * * 1-5   set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/run_dq_checks.sh >> var/fafnir/log/cron_dq.log 2>&1
+# Daily incremental update (Mon-Fri evening, after settlement), then the
+# data-quality sweep over what it loaded -- one entry, so DQ starts when the load
+# ends. cron has no ordering: a DQ entry on its own clock started while the load
+# was still running (it takes over an hour) and judged a half-loaded night, every
+# security not yet loaded looking stale. `;`, not `&&`: as under systemd (the
+# fafnir-dq unit is After=, not Requires=, fafnir-daily), DQ still runs after a
+# failed load, and then a stale security really is stale.
+30 22 * * 1-5  set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && { scripts/daily_update.sh >> var/fafnir/log/cron_daily.log 2>&1; scripts/run_dq_checks.sh >> var/fafnir/log/cron_dq.log 2>&1; }
 
 # Weekly reconciliation over a rotating sample (Sunday).
 0 6 * * 0      set -a; . /etc/fafnir/fafnir.env; set +a; cd $FAFNIR_HOME && scripts/reconcile.sh AAPL,MSFT,SPY,BRK-B >> var/fafnir/log/cron_reconcile.log 2>&1

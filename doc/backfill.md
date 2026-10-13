@@ -229,7 +229,8 @@ crontab /opt/fafnir/etc/crontab.example     # edit paths/times first
 ```
 
 `daily_update.sh` is incremental and idempotent
-(`ensure-horizon` → prices → actions → adjust → refresh-marts → dq), so a missed
+(`ensure-horizon` → prices → actions → adjust → refresh-marts, then DQ from
+`run_dq_checks.sh`), so a missed
 day is caught up automatically and the partition/calendar horizon keeps rolling
 forward on its own.
 

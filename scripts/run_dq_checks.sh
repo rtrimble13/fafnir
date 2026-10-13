@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# run_dq_checks.sh -- standalone data-quality sweep (gaps, outliers, freshness).
-# Writes flags to ops.data_quality_flag. Run from cron more frequently than a
-# full load if you want tighter monitoring.
+# run_dq_checks.sh -- the nightly data-quality sweep (gaps, outliers, freshness,
+# and dorq when [dq] engine says so). Writes flags to ops.data_quality_flag.
+#
+# The one scheduled DQ run: the fafnir-dq unit runs it after fafnir-daily (and the
+# example crontab chains it after daily_update.sh). Run it once per load: dorq's
+# shadow file is one per night, and a second run for the same night replaces it.
 #
 # The summary comes from `fafnir dq list`, so this needs no psql and no
 # FAFNIR_DSN of its own -- the CLI reads the same config the sweep just used.

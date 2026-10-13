@@ -4,7 +4,11 @@
 # Order matters. The universe is reconciled before any data is pulled -- renames,
 # then new listings, then delistings -- so the price step runs against a universe
 # that matches what is actually trading today. Then prices (so dividend adjustment
-# can value against fresh closes), actions, factors, marts, DQ.
+# can value against fresh closes), actions, factors, marts.
+#
+# Data quality is not run here: it is the fafnir-dq unit's job, after this one
+# (scripts/run_dq_checks.sh, ordered After=fafnir-daily). Running it here as well
+# ran it twice a night, and the second dorq run replaced the first's shadow file.
 #
 # Each step is idempotent and incremental (watermark-driven), so a missed day is
 # caught up automatically on the next run.
@@ -84,9 +88,6 @@ fafnir adjust --changed
 
 echo "==> Refresh marts"
 fafnir db refresh-marts
-
-echo "==> Data-quality checks"
-fafnir dq run
 
 echo "==> daily_update finished"
 fafnir status

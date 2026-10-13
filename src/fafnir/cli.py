@@ -3931,6 +3931,19 @@ def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full):
                     f"dorq {out.version} ({span}): {_plural(detected, 'violation')},"
                     f" DQ flags written: {out.flagged}"
                 )
+            b = out.backfill
+            if b and b["securities"]:
+                n = b["securities"]
+                whose = f"{n} {'security' if n == 1 else 'securities'}"
+                click.echo(
+                    f"  backfill: {whose} with history before {b['before']} new or"
+                    " rewritten -- "
+                    + (
+                        f"not judged, {b['skipped']}; use --full"
+                        if b.get("skipped")
+                        else f"{_plural(b['reports'], 'violation')}, included above"
+                    )
+                )
 
 
 @dq.command("compare")
@@ -3956,10 +3969,12 @@ def dq_compare(ctx, shadow_file, labels, slack, as_json):
       fafnir dq compare                       # the newest shadow file
       fafnir dq compare var/dorq-shadow/2026-10-06.jsonl --labels labels.jsonl
 
-    Overlap: of the outlier / gap / stale flags keyed in the night's window, how
-    many dorq also reports, and how many of dorq's reports no SQL check made.
-    Precision, with --labels: the share of dorq's reports that were real data
-    errors, at warn and at error. Reads only.
+    Overlap: of the outlier / gap / stale flags keyed in the night's window
+    (within the slack), how many dorq also reports, and how many of dorq's reports
+    no SQL check made. Recall is on the flags whose condition still held when
+    dorq ran, as the run found them; the rest are counted by why. Precision, with
+    --labels: the share of dorq's reports that were real data errors, at warn and
+    at error. Reads only.
     """
     from pathlib import Path
 

@@ -50,6 +50,7 @@ dorq_shadow = true         # dorq's flags to dorq_shadow_dir, not the queue
 dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"   # absolute on a host: see below
 dorq_lookback_sessions = 260              # bars per security on a nightly run
 dorq_threads = 0           # 0: one per core; the output does not depend on it
+dorq_backfill_max = 500    # most securities a night's backfill judges (see Window)
 ```
 
 `dorq_shadow_dir` defaults to `var/dorq-shadow`. Like `log_dir`'s default, it is
@@ -123,6 +124,40 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    judges staleness against the market's latest open session (`--as-of`). `--full`
    reads and reports everything. The first run has no previous date and reports
    the whole lookback.
+
+   A second run for an as-of date already judged reports over the same span as
+   that night's run, not from five sessions before the night itself. Step 5,
+   **Write**, says why.
+
+   **Backfill.** A bar is judged on the nights whose window it falls in. History
+   that arrives, or changes, behind the window falls in none. CELG-RI was minted
+   on 2026-10-13 with bars back to 2022. The SQL checks have no window: they
+   rescan every security's whole history each night, and wrote ten outliers on
+   its history that night. dorq never saw those bars. So after the window, a
+   nightly run judges the
+   **whole history** of each security whose history before the window is new or
+   was rewritten since the previous night's run started:
+   - minted since (`core.security.first_seen_at`), with bars before the window;
+   - an operator override made or revoked since, on a date before the window:
+     `prices delete|shift|rescale`, `actions add|delete|redate`, and
+     `security split-history` (both sides of it).
+
+   It is the call `dq recheck` makes: those securities' bars, no `--since`. Of its
+   reports it keeps those dated before the window (the window's own dates are the
+   nightly run's), less cross-sectional rows (a cohort of a few new names means
+   nothing) and stale-feed rows (the window judged staleness), and less any the
+   night already holds. A re-run of the night measures "since" from the same
+   previous night, so it takes the same securities.
+
+   Above `dorq_backfill_max` securities (500 by default; the busiest night since
+   2026-09-15 minted 112) the pass is skipped with a warning: that many is a
+   universe rebuild, and wants `--full`. A failure in the pass fails the run, so
+   the watermark stays where it was and the next night takes the same securities.
+
+   Not caught: `security merge` (and `merge-rename`, `dedupe`), which moves one
+   security's bars onto another and leaves no dated record; and a history
+   re-pulled for a security that already had one. Run `--full` after either if it
+   matters.
 3. **Run.** `dorq check --format fafnir --exit-zero`. Each line is an
    `ops.data_quality_flag` row: `check_name` is `dorq_<check>` (`dorq_bad_print`,
    `dorq_scale_shift` …), `record_key` is `{"trade_date": …}`, and `detail` is
@@ -143,9 +178,15 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    as-of date goes to `ops.load_watermark`.
 
    A shadow file is named by its as-of date, and a second run for the same date
-   replaces it. A manual `fafnir dq run --engine dorq` after that night's nightly
-   therefore replaces the nightly's file. It reports only from five sessions
-   before the nightly's as-of date, so `dq compare` then sees less of the night.
+   replaces it. `dq compare` reads one file a night, so the second run judges the
+   same night: it takes `--since` from that night's run (the newest successful
+   nightly run of the same endpoint for that date) and the same backfill
+   securities. On unchanged data its file is byte for byte the first's; after a
+   repair, it is a fair re-judgement of the same span. Up to v1.4.0 the second
+   run reported only from five sessions before the night's own as-of date, and the
+   nightly ran DQ twice (the daily, then `fafnir-dq`), so every night's file was
+   the narrower one. DQ now runs once a night, from `fafnir-dq`
+   ([operations.md](operations.md)).
 
 **The run's record.** Each run has a row in `ops.ingestion_run` (`source =
 'dorq'`, endpoint `dq-run` or `dq-shadow`), which the MCP `ingestion_runs` tool
@@ -158,7 +199,8 @@ where it was. `started_at` and `finished_at` are the real times. `params` holds:
 | `dorq_version` | the binary's version (null on a failed run; dorq's exit message names it) |
 | `dorq_config_hash` | the hash on the run's reports (null when dorq reported nothing) |
 | `dropped` | the reports the filter left out, per check: `{"dorq_stale_feed": 1127}` |
-| `since`, `shadow` | the window's `--since`, and whether the run went to the shadow |
+| `since`, `shadow`, `full` | the window's `--since`, whether the run went to the shadow, and whether it was `--full` |
+| `backfill` | a nightly run's backfill: `securities` (how many), `security_ids`, `before` (the window's first date), `reports` (added). When skipped, `skipped` says why and `security_ids` is empty |
 
 **Runtime.** dorq checks while the bars stream in, so a run takes about as long as
 the export. On a test cluster, 2.3M bars took these times:
@@ -191,22 +233,68 @@ fafnir dq compare /var/lib/fafnir/dorq-shadow/2026-10-06.jsonl --json
 
   | SQL check | dorq codes |
   |---|---|
-  | `outlier` | DQ2xx, DQ7xx |
+  | `outlier` | DQ2xx, DQ601, DQ7xx |
   | `gap` | DQ301, DQ303 |
   | `stale` | DQ304, DQ501 |
 
   Also: how many of dorq's reports no SQL check made.
+
+  A flag is "also reported" when a successor report is about its security within
+  the slack (`--slack`, three calendar days) of its date. So the flags fetched are
+  those keyed from the window's first date less the slack to its last date plus
+  the slack: a `stale` flag is keyed on the last bar's date, and DQ304 on the
+  first missing session after it, so the two straddle the window's start. Every
+  flag on a security the night backfilled is fetched too, at any date. A report
+  is about:
+  - the dates it spans, and the move a misdated split explains (DQ701 is keyed
+    at the split's ex-date, the move at `detail.detail.move_date`);
+  - its security, or for a cross-sectional row (no security), each security in
+    `detail.detail.members`. dorq up to 0.8.1 does not write `members`, so its
+    cohort rows cover no one. A cohort row counts once among dorq's reports.
+
+  A flag written after the run is not one the night could have matched, and is
+  left out.
+- **Holding.** Recall is measured on the flags whose condition still **held**
+  when dorq ran: open at the run's start (not resolved or accepted by then), and
+  for `stale`, on a security with no bar between its `last_date` and the night,
+  and not delisted by then. A `stale` flag stays open until `dq recheck` closes
+  it, so a security that has traded since still carries one. On 2026-10-12, 12 of
+  the 21 stale flags dorq did not report were like that, and 5 more were closed.
+  The state is read as of the run, from `ops.ingestion_run`, not as it stands
+  when `compare` is run. A night's figures therefore do not drift as the queue is
+  worked. The flags dorq did not report are counted by why: still holding (a
+  miss), closed, traded since, inactive.
+
+  A report on a flag the queue *accepted* as a market fact is counted at the
+  foot. With `--labels` it counts as false when it is of a DQ2xx code on that
+  security and date. A cohort row or misdated split there is unlabelled: labels
+  match as dorq-eval's do, not as the overlap does.
 - **Precision.** Against the labels, the share of dorq's reports that were real
   data errors, at warn and at error. Matching is dorq-eval's: a fault label within
   three days, with the code it expects, and a market fact on its date.
 
 dorq plan §8 sets the cutover bar:
 - precision of 0.85 or better at warn, and 0.95 or better at error;
-- recall no lower than the SQL checks';
+- recall no lower than the SQL checks', on the conditions still holding;
 - at least 70% fewer new flags a night;
 - an expected calibration error of 0.05 or less.
 
 It must hold over at least 20 sessions. Then set `dorq_shadow = false`.
+
+### Known false positives in dorq ≤ 0.8.1
+
+Two kinds of report are false positives until dorq's next release fixes them.
+Count them against dorq, but do not repair anything for them:
+- **A cash dividend on file** is ignored by the price model. The ex-date's drop
+  is reported as DQ203 (`dorq_unreported_split`) or DQ201 (`dorq_bad_print`):
+  about 140 a year, mostly December fund distributions. The tell is a dividend
+  on file at that date with `prev_close − dividend ≈ close`.
+- **A split on file whose ratio matches the move** is reported anyway when share
+  volume does not shift with it, as DQ202 (`dorq_scale_shift`): about 100 a year.
+  The tell is `detail.hypotheses.explained_split`.
+
+The cutover waits for the release that fixes both, and its 20 shadow sessions
+start after it. The fafnir-dba skill's playbooks say how to work each one.
 
 ## Labels
 

@@ -31,9 +31,12 @@ real_dorq = pytest.mark.skipif(
 
 # A fake dorq: `--version` prints a version; `check` saves its arguments and stdin
 # beside itself and prints the rows in FAKE_DORQ_ROWS (a file), or fails with
-# FAKE_DORQ_FAIL. FAKE_DORQ_SLEEP makes the check take that many seconds.
+# FAKE_DORQ_FAIL. FAKE_DORQ_SLEEP makes the check take that many seconds. Each
+# check's arguments are also appended to calls.txt, one line a call. With
+# FAKE_DORQ_FILTER it prints only the rows a real dorq could: on a security it was
+# sent bars for (or on none: a cohort row), dated from its --since.
 _FAKE = """#!{python}
-import os, sys, pathlib, time
+import csv, io, json, os, sys, pathlib, time
 here = pathlib.Path(__file__).parent
 if "--version" in sys.argv:
     print("9.9.9-fake")
@@ -42,6 +45,8 @@ time.sleep(float(os.environ.get("FAKE_DORQ_SLEEP") or 0))
 data = sys.stdin.buffer.read()
 (here / "stdin.csv").write_bytes(data)
 (here / "args.txt").write_text("\\n".join(sys.argv[1:]))
+with (here / "calls.txt").open("a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
 for name in ("--calendar-file", "--actions", "--meta"):
     if name in sys.argv:
         src = pathlib.Path(sys.argv[sys.argv.index(name) + 1])
@@ -50,7 +55,17 @@ if os.environ.get("FAKE_DORQ_FAIL"):
     sys.stderr.write(os.environ["FAKE_DORQ_FAIL"] + "\\n")
     sys.exit(2)
 rows = os.environ.get("FAKE_DORQ_ROWS")
-if rows:
+if rows and os.environ.get("FAKE_DORQ_FILTER"):
+    sent = {{r["security_id"] for r in csv.DictReader(io.StringIO(data.decode()))}}
+    since = sys.argv[sys.argv.index("--since") + 1] if "--since" in sys.argv else ""
+    for line in pathlib.Path(rows).read_text().splitlines():
+        r = json.loads(line)
+        if r["security_id"] is not None and str(r["security_id"]) not in sent:
+            continue
+        if r["record_key"]["trade_date"] < since:
+            continue
+        sys.stdout.write(line + "\\n")
+elif rows:
     sys.stdout.write(pathlib.Path(rows).read_text())
 """
 
@@ -65,6 +80,7 @@ def fake_dorq(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_DORQ_ROWS", str(rows))
     monkeypatch.delenv("FAKE_DORQ_FAIL", raising=False)
     monkeypatch.delenv("FAKE_DORQ_SLEEP", raising=False)
+    monkeypatch.delenv("FAKE_DORQ_FILTER", raising=False)
     return path
 
 
@@ -482,13 +498,17 @@ def test_a_run_records_its_hash_what_was_left_out_and_how_long_it_took(
         " FROM ops.ingestion_run WHERE source = 'dorq'"
     )
     assert run["status"] == "success"
+    backfill = run["params"].pop("backfill")
     assert run["params"] == {
         "dorq_version": "9.9.9-fake",
         "dorq_config_hash": "x",
         "dropped": {"dorq_stale_feed": 1},
         "since": None,
         "shadow": True,
+        "full": False,
     }
+    # The first night has no previous one to have missed anything since.
+    assert backfill["securities"] == 0 and backfill["reports"] == 0
     assert run["took"] >= dt.timedelta(seconds=0.3)
 
 
@@ -810,3 +830,314 @@ def test_real_dorq_recheck_closes_a_bad_print_once_it_is_deleted(db):
     )
     (after,) = rc.recheck_dorq(db, settings)
     assert after.stale == 1
+
+
+# ---------------------------------------------------------------------------
+# A second run for a night already judged
+#
+# On 2026-10-12 the daily ran `dq run` and fafnir-dq ran it again. The second
+# dorq run took its --since from the watermark the first had just moved, so it
+# reported from five sessions before *that* night, and its shadow file replaced
+# the first's: `dq compare` saw a narrower night.
+# ---------------------------------------------------------------------------
+
+
+def _night(db, fake_dorq, tmp_path, symbol="DQRR"):
+    sid = _mk(db, symbol)
+    days = _sessions(db)
+    _walk(db, sid, days[:300])
+    _emit(fake_dorq, [_row(sid, days[296].isoformat())])
+    settings = dorq.DorqSettings(path=str(fake_dorq), shadow_dir=str(tmp_path / "sh"))
+    return sid, days, settings
+
+
+@pytest.mark.integration
+def test_a_second_run_for_the_same_night_judges_the_same_window(
+    db, fake_dorq, tmp_path
+):
+    sid, days, settings = _night(db, fake_dorq, tmp_path)
+    dorq.write_watermark(db, dorq.WATERMARK_SHADOW, days[290])  # the last night
+    first = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert first.window.since == days[290 - dorq.SINCE_OVERLAP_SESSIONS]
+    night = first.shadow_file.read_bytes()
+
+    again = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert again.window == first.window
+    assert again.shadow_file == first.shadow_file
+    assert again.shadow_file.read_bytes() == night
+
+    # A new night reports from five sessions before this one, as it always did.
+    _walk(db, sid, days[:301])
+    later = dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW)
+    assert later.as_of == days[300]
+    assert later.since == days[299 - dorq.SINCE_OVERLAP_SESSIONS]
+
+
+@pytest.mark.integration
+def test_a_rerun_of_the_first_night_reports_the_whole_lookback_again(
+    db, fake_dorq, tmp_path
+):
+    _, _, settings = _night(db, fake_dorq, tmp_path)
+    first = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert first.window.since is None
+    assert dorq.run(db, settings, "NASDAQ", shadow=True).window == first.window
+
+
+@pytest.mark.integration
+def test_the_queue_run_reproduces_its_own_night(db, fake_dorq, tmp_path):
+    _, days, settings = _night(db, fake_dorq, tmp_path)
+    dorq.write_watermark(db, dorq.WATERMARK_QUEUE, days[290])
+    first = dorq.run(db, settings, "NASDAQ", shadow=False)
+    assert first.window.since == days[290 - dorq.SINCE_OVERLAP_SESSIONS]
+    assert dorq.run(db, settings, "NASDAQ", shadow=False).window == first.window
+    # The shadow has had no night of its own.
+    assert dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW).since is None
+
+
+@pytest.mark.integration
+def test_a_full_run_does_not_set_a_nightly_reruns_window(db, fake_dorq, tmp_path):
+    """A --full run reports from no date at all. A nightly re-run of the same date
+    takes the nightly's window, not that."""
+    _, days, settings = _night(db, fake_dorq, tmp_path)
+    dorq.write_watermark(db, dorq.WATERMARK_SHADOW, days[290])
+    nightly = dorq.run(db, settings, "NASDAQ", shadow=True)
+    full = dorq.run(db, settings, "NASDAQ", shadow=True, full=True)
+    assert full.window.since is None and full.backfill is None
+    assert db.fetchval(
+        "SELECT params->'full' FROM ops.ingestion_run ORDER BY ingestion_run_id DESC"
+        " LIMIT 1"
+    )
+    assert dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW) == (
+        nightly.window
+    )
+
+
+@pytest.mark.integration
+def test_a_night_only_a_full_run_judged_reports_from_five_sessions_back(
+    db, fake_dorq, tmp_path
+):
+    _, days, settings = _night(db, fake_dorq, tmp_path)
+    dorq.run(db, settings, "NASDAQ", shadow=True, full=True)
+    window = dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW)
+    assert window.since == days[299 - dorq.SINCE_OVERLAP_SESSIONS]
+
+
+# ---------------------------------------------------------------------------
+# Backfill: history behind the window that is new or was rewritten
+#
+# CELG-RI was minted on 2026-10-13 with bars back to 2022. The SQL checks, which
+# have no window, wrote ten outliers on its history that night. dorq read bars
+# from 2025-09-30 and reported from 10-05, so it never judged them.
+# ---------------------------------------------------------------------------
+
+
+def _backfill_world(db, fake_dorq, tmp_path, monkeypatch):
+    """One night judged (shadow and queue), then a security minted with years of
+    history and a x3 print in it. Returns the old security, the new one, the
+    sessions, and the settings."""
+    monkeypatch.setenv("FAKE_DORQ_FILTER", "1")
+    days = _sessions(db)
+    old = _mk(db, "DQBFO")
+    _walk(db, old, days[:300])
+    settings = dorq.DorqSettings(path=str(fake_dorq), shadow_dir=str(tmp_path / "sh"))
+    for endpoint, shadow in (
+        (dorq.WATERMARK_SHADOW, True),
+        (dorq.WATERMARK_QUEUE, False),
+    ):
+        dorq.write_watermark(db, endpoint, days[290])
+        dorq.run(db, settings, "NASDAQ", shadow=shadow)
+
+    new = _mk(db, "DQBFN")
+    _walk(db, new, days[:301], seed=3, bad={days[100]: 3.0})
+    _walk(db, old, days[:301])
+    _emit(
+        fake_dorq,
+        [
+            _row(new, days[100].isoformat()),  # the x3 print, long behind the window
+            _row(new, days[150].isoformat(), check="dorq_stale_feed", code="DQ304"),
+            _row(None, days[100].isoformat(), check="dorq_cohort_move", code="DQ601"),
+            _row(new, days[298].isoformat()),  # inside the window: the nightly's
+            _row(old, days[100].isoformat()),  # old history, not new: never judged
+        ],
+    )
+    (fake_dorq.parent / "calls.txt").unlink(missing_ok=True)
+    return old, new, days, settings
+
+
+def _reports(path):
+    return sorted(
+        (r["check_name"], r["security_id"], r["record_key"]["trade_date"])
+        for r in dorq.read_shadow(path)
+    )
+
+
+@pytest.mark.integration
+def test_a_new_securitys_history_behind_the_window_is_judged(
+    db, fake_dorq, tmp_path, monkeypatch
+):
+    old, new, days, settings = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
+    out = dorq.run(db, settings, "NASDAQ", shadow=True)
+    since = days[299 - dorq.SINCE_OVERLAP_SESSIONS]
+    assert out.window.since == since
+    # The x3 print is reported; the pass's cohort and stale-feed rows are not.
+    assert _reports(out.shadow_file) == [
+        ("dorq_bad_print", new, days[100].isoformat()),
+        ("dorq_bad_print", new, days[298].isoformat()),
+    ]
+    assert out.detected == {"dorq_bad_print": 2}
+    expected = {
+        "securities": 1,
+        "security_ids": [new],
+        "before": since.isoformat(),
+        "reports": 1,
+    }
+    assert out.backfill == expected
+    assert (
+        db.fetchval(
+            "SELECT params->'backfill' FROM ops.ingestion_run"
+            " ORDER BY ingestion_run_id DESC LIMIT 1"
+        )
+        == expected
+    )
+    # The pass is the whole history of the new security alone, with no --since.
+    calls = (fake_dorq.parent / "calls.txt").read_text().splitlines()
+    assert len(calls) == 2
+    assert "--since" in calls[0] and "--since" not in calls[1]
+    sent = {
+        line.split(",")[0]
+        for line in (fake_dorq.parent / "stdin.csv").read_text().splitlines()[1:]
+    }
+    assert sent == {str(new)}
+
+    # The next night it is not new.
+    _walk(db, old, days[:302])
+    nxt = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert nxt.backfill["securities"] == 0
+    assert len((fake_dorq.parent / "calls.txt").read_text().splitlines()) == 3
+
+
+@pytest.mark.integration
+def test_a_rerun_of_the_night_keeps_the_pass(db, fake_dorq, tmp_path, monkeypatch):
+    """A re-run measures "new" from the night before, not from the first run of
+    the same night, which would leave the pass empty and the file without it."""
+    _, new, _, settings = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
+    first = dorq.run(db, settings, "NASDAQ", shadow=True)
+    night = first.shadow_file.read_bytes()
+    again = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert again.backfill["security_ids"] == [new]
+    assert again.shadow_file.read_bytes() == night
+
+
+@pytest.mark.integration
+def test_the_queue_run_takes_the_pass_too(db, fake_dorq, tmp_path, monkeypatch):
+    _, new, days, settings = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
+    out = dorq.run(db, settings, "NASDAQ", shadow=False)
+    assert out.flagged == {"dorq_bad_print": 2}
+    assert out.backfill["security_ids"] == [new]
+    assert {
+        r["d"]
+        for r in db.fetchall(
+            "SELECT record_key->>'trade_date' AS d FROM ops.data_quality_flag"
+            " WHERE security_id = %s",
+            (new,),
+        )
+    } == {days[100].isoformat(), days[298].isoformat()}
+
+
+@pytest.mark.integration
+def test_over_the_cap_the_pass_is_skipped_with_a_warning(
+    db, fake_dorq, tmp_path, monkeypatch, caplog
+):
+    import dataclasses
+
+    _, new, days, settings = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
+    settings = dataclasses.replace(settings, backfill_max=0)
+    monkeypatch.setattr(dorq.logger, "propagate", True)
+    with caplog.at_level("WARNING"):
+        out = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert "dorq_backfill_max" in caplog.text
+    assert out.backfill["securities"] == 1
+    assert out.backfill["security_ids"] == []
+    assert out.backfill["skipped"] == "over dorq_backfill_max (0)"
+    assert _reports(out.shadow_file) == [("dorq_bad_print", new, days[298].isoformat())]
+    assert len((fake_dorq.parent / "calls.txt").read_text().splitlines()) == 1
+
+
+@pytest.mark.integration
+def test_an_operator_rewrite_behind_the_window_puts_its_security_in_the_pass(
+    db, fake_dorq, tmp_path
+):
+    days = _sessions(db)
+    names = ("DQOPR", "DQOPD", "DQOPS", "DQOPT", "DQOPV", "DQOPQ")
+    rescaled, deleted, source, dest, revoked, quiet = (_mk(db, n) for n in names)
+    for i, sid in enumerate((rescaled, deleted, source, dest, revoked, quiet)):
+        _walk(db, sid, days[:300], seed=i + 1)
+
+    def override(sid, day, detail="{}"):
+        return db.fetchval(
+            "INSERT INTO ops.operator_override (security_id, target, key_date,"
+            " operation, detail, note, created_by)"
+            " VALUES (%s, 'daily_price', %s, 'delete', %s::jsonb, 'n', 't')"
+            " RETURNING override_id",
+            (sid, day, detail),
+        )
+
+    # Made before the last night: already judged.
+    undone = override(revoked, days[20])
+    override(quiet, days[21])
+    settings = dorq.DorqSettings(path=str(fake_dorq), shadow_dir=str(tmp_path / "sh"))
+    dorq.write_watermark(db, dorq.WATERMARK_SHADOW, days[290])
+    dorq.run(db, settings, "NASDAQ", shadow=True)
+
+    # Since: an era rescaled, long behind the window.
+    olds = repo.stored_bars(db, rescaled, days[10], days[12])
+    repo.replace_operator_bars(
+        db,
+        security_id=rescaled,
+        kind="rescale",
+        params={"price_factor": "10", "volume_factor": "0.1"},
+        changes=[
+            (o, {**o, **{k: o[k] * 10 for k in ("open", "high", "low", "close")}})
+            for o in olds
+        ],
+        note="cents era",
+        created_by="t",
+    )
+    # A bar deleted inside the window: the nightly run judges that itself.
+    repo.delete_operator_bars(
+        db, security_id=deleted, trade_dates=[days[298]], note="bad", created_by="t"
+    )
+    # History moved from one security to another: both sides changed.
+    override(source, days[30], json.dumps({"split": {"destination_security_id": dest}}))
+    # An older edit taken back.
+    db.execute(
+        "UPDATE ops.operator_override SET revoked_at = now(), revoked_by = 't'"
+        " WHERE override_id = %s",
+        (undone,),
+    )
+    _walk(db, quiet, days[:301], seed=6)  # the next session
+
+    window = dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW)
+    assert dorq.backfill_securities(db, dorq.WATERMARK_SHADOW, window) == sorted(
+        [rescaled, source, dest, revoked]
+    )
+    # Its own endpoint: the queue has had no night, so nothing is "since" it.
+    assert dorq.backfill_securities(db, dorq.WATERMARK_QUEUE, window) == []
+
+
+@pytest.mark.integration
+def test_cli_says_what_the_pass_judged(db, fake_dorq, tmp_path, monkeypatch):
+    _, _, _, _ = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(
+        f'[database]\ndsn = "{db.dsn}"\n'
+        f'[dq]\ndorq_path = "{fake_dorq}"\ndorq_shadow_dir = "{tmp_path / "sh"}"\n'
+    )
+    monkeypatch.delenv("FAFNIR_DSN", raising=False)
+    monkeypatch.delenv("FAFNIR_DORQ_PATH", raising=False)
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(rc), "dq", "run", "--engine", "dorq"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "backfill: 1 security with history before" in result.output
+    assert "1 violation, included above" in result.output

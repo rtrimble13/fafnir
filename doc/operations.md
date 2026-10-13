@@ -41,7 +41,13 @@ crontab etc/crontab.example   # edit paths/times first
 
 The daily job performs, in order:
 `ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked →
-ingest delisted → ingest prices → ingest actions → adjust → refresh-marts → dq run`.
+ingest delisted → ingest prices → ingest actions → adjust → refresh-marts`.
+
+Data quality is a second job, `fafnir-dq` (`scripts/run_dq_checks.sh`), which runs
+once the daily has finished; the cron example chains it in the same entry. It is
+the night's only `dq run`: a DQ failure does not mark the load failed, and its
+queue summary goes to its own log. Run DQ once per load: dorq's shadow file is one
+per night.
 
 The first four steps are **universe maintenance**, and their order is load-bearing:
 
