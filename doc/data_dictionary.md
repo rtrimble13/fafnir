@@ -422,7 +422,7 @@ whole-endpoint (non per-symbol) mark.
 | `historical-price-eod/non-split-adjusted` | the security | bars are loaded through this date |
 | `corporate-actions` | the security | its full action history has been pulled, as of this date |
 | `corporate-actions-calendar` | `0` | the market-wide calendars have been read through this date |
-| `dq-run`, `dq-shadow` (source `dorq`) | `0` | dorq has judged bars through this as-of date, into the queue or the shadow file; the next nightly run reports from five sessions before it |
+| `dq-run`, `dq-shadow` (source `dorq`) | `0` | dorq has judged bars through this as-of date, into the queue or the shadow file; the next nightly run reports from five sessions before it, and a re-run for the same date over the same span as that night's run |
 
 The `corporate-actions` row is a presence flag as much as a date: its *absence* is what
 puts a newly minted security on the full-history path, so it is stamped with the run

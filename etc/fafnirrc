@@ -93,6 +93,10 @@ log_dir = "var/fafnir/log"
 # dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"
 # dorq_lookback_sessions = 260
 # dorq_threads = 0
+# A nightly run also judges the whole history of securities whose history before
+# its window is new (minted since the last run) or was rewritten by an operator
+# command. Above this many it skips that pass with a warning; use --full.
+# dorq_backfill_max = 500
 
 # --- duk (read CLI) settings -------------------------------------------------
 # duk reuses [api].fmp_key (live mode) and [database] (db mode).

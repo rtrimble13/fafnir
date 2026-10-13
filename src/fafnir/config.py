@@ -18,7 +18,8 @@ Config sections
     exclude_instruments
 ``[dq]``
     engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir,
-    dorq_lookback_sessions, dorq_threads -- see :mod:`fafnir.dq.dorq`
+    dorq_lookback_sessions, dorq_threads, dorq_backfill_max -- see
+    :mod:`fafnir.dq.dorq`
 
 Environment overrides
 ---------------------
@@ -303,6 +304,13 @@ class FafnirConfig:
     def dorq_threads(self) -> int:
         """dorq worker threads; 0 is one per core. The output does not depend on it."""
         return max(0, int(self._get("dq", "dorq_threads", 0)))
+
+    @property
+    def dorq_backfill_max(self) -> int:
+        """The most securities a nightly run judges the whole history of, for history
+        that is new or was rewritten before its window. Above it the pass is skipped
+        with a warning: that many is a universe rebuild, which wants ``--full``."""
+        return max(0, int(self._get("dq", "dorq_backfill_max", 500)))
 
     def is_loaded(self) -> bool:
         return bool(self._data)

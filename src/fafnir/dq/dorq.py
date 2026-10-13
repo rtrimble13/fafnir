@@ -73,6 +73,10 @@ CROSS_SECTIONAL_CHECKS = frozenset(
 #: reports to that same rule.
 STALE_FEED_CHECK = "dorq_stale_feed"
 
+#: The reports a backfill pass (:func:`backfill`) leaves out. A cohort of a few new
+#: names means nothing, and the nightly window has already judged staleness.
+BACKFILL_LEFT_OUT = CROSS_SECTIONAL_CHECKS | {STALE_FEED_CHECK}
+
 # The watermark rows (ops.load_watermark) a run advances: the as-of date it judged
 # up to. Separate for the queue and the shadow, so a shadow night does not move the
 # window of the run that writes flags.
@@ -97,6 +101,7 @@ class DorqSettings:
     threads: int = 0
     lookback_sessions: int = 260
     shadow_dir: str = "var/dorq-shadow"
+    backfill_max: int = 500
 
     def base_args(self) -> list[str]:
         args = [self.path, "check"]
@@ -114,6 +119,7 @@ def settings_from(cfg) -> DorqSettings:
         threads=cfg.dorq_threads,
         lookback_sessions=cfg.dorq_lookback_sessions,
         shadow_dir=cfg.dorq_shadow_dir,
+        backfill_max=cfg.dorq_backfill_max,
     )
 
 
@@ -216,6 +222,49 @@ def write_watermark(db: Database, endpoint: str, as_of: dt.date) -> None:
     )
 
 
+def night_run(
+    db: Database, endpoint: str, as_of: dt.date, *, nightly_only: bool = False
+) -> Optional[dict]:
+    """The newest successful run of ``endpoint`` for ``as_of``: the one whose shadow
+    file stands for that night, since each run for a date replaces the file. None
+    when there is none.
+
+    ``nightly_only`` passes over ``--full`` runs. Those carry ``full`` in their
+    params; a run from before that key was recorded is told by its window, since
+    only a full run reads every bar (``window_from`` null).
+    """
+    return db.fetchone(
+        """
+        SELECT ingestion_run_id, started_at, window_from, params,
+               params->>'since' AS since
+          FROM ops.ingestion_run
+         WHERE source = %s AND endpoint = %s AND window_to = %s AND status = 'success'
+           AND (NOT %s
+                OR NOT COALESCE((params->>'full')::boolean, window_from IS NULL))
+         ORDER BY ingestion_run_id DESC
+         LIMIT 1
+        """,
+        (WATERMARK_SOURCE, endpoint, as_of, nightly_only),
+    )
+
+
+def previous_night_start(
+    db: Database, endpoint: str, as_of: dt.date
+) -> Optional[dt.datetime]:
+    """When the newest successful run of ``endpoint`` for a date before ``as_of``
+    started: what a run for ``as_of`` -- the night's first, or a re-run of it --
+    has had a chance to see. None before the first night."""
+    return db.fetchval(
+        """
+        SELECT started_at FROM ops.ingestion_run
+         WHERE source = %s AND endpoint = %s AND window_to < %s AND status = 'success'
+         ORDER BY window_to DESC, ingestion_run_id DESC
+         LIMIT 1
+        """,
+        (WATERMARK_SOURCE, endpoint, as_of),
+    )
+
+
 def nightly_window(
     db: Database,
     exchange_code: str,
@@ -227,12 +276,23 @@ def nightly_window(
 
     The first run has no previous as-of and reports the whole lookback -- which is
     what the SQL checks do on their first night too.
+
+    A second run for a date already judged reports over the same span as that
+    night's run did, not from five sessions before the night itself: its shadow
+    file replaces the first's, so it has to be the same night's judgement. On
+    unchanged data it is byte for byte the same file; after a repair, a fair
+    re-judgement of the same span.
     """
     as_of = market_latest(db, exchange_code)
     if as_of is None:
         return Window(as_of=None)
     bars_from = session_back(db, exchange_code, as_of, lookback_sessions)
     previous = read_watermark(db, endpoint)
+    if previous == as_of:
+        first = night_run(db, endpoint, as_of, nightly_only=True)
+        if first is not None:
+            since = dt.date.fromisoformat(first["since"]) if first["since"] else None
+            return Window(as_of=as_of, bars_from=bars_from, since=since)
     since = None
     if previous is not None:
         since = session_back(db, exchange_code, previous, SINCE_OVERLAP_SESSIONS + 1)
@@ -411,10 +471,14 @@ class RunResult:
     dropped: dict[str, int] = field(default_factory=dict)
 
     def by_check(self) -> dict[str, int]:
-        out: dict[str, int] = {}
-        for r in self.records:
-            out[r["check_name"]] = out.get(r["check_name"], 0) + 1
-        return dict(sorted(out.items()))
+        return count_by_check(self.records)
+
+
+def count_by_check(records: Iterable[dict]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in records:
+        out[r["check_name"]] = out.get(r["check_name"], 0) + 1
+    return dict(sorted(out.items()))
 
 
 def run_dorq(
@@ -577,6 +641,156 @@ def _stream_bars(
 
 
 # ---------------------------------------------------------------------------
+# Backfill: history the nightly window never reads
+# ---------------------------------------------------------------------------
+#
+# The nightly window reads ``dorq_lookback_sessions`` of bars and reports from
+# ``since``, so a bar is judged on the nights whose window it falls in. History
+# that arrives, or changes, *behind* the window falls in none: a security minted
+# tonight with years of bars (CELG-RI, minted 2026-10-13 with bars back to 2022),
+# or an era an operator rescaled. The SQL ``outlier`` and ``gap`` checks have no
+# window and rescan every security's whole history each night, so they judge it on
+# its first night. Without this pass dorq never would.
+
+
+def backfill_securities(db: Database, endpoint: str, window: Window) -> list[int]:
+    """The securities whose history before ``window`` is new or was rewritten since
+    the run for the previous night started (:func:`previous_night_start`).
+
+    * **New:** minted since (``core.security.first_seen_at``), with bars before the
+      window. A listing with no older bars is the window's alone.
+    * **Rewritten:** an operator override made or revoked since, on a date before
+      the window: ``prices delete|shift|rescale``, ``actions add|delete|redate``,
+      ``security split-history`` -- the source, and the destination its overrides
+      name.
+
+    Not caught: ``security merge`` (and ``merge-rename``, ``dedupe``), which moves
+    one security's bars onto another and leaves no dated record; nor a history
+    re-pulled for a security that already had one. Those want ``--full``.
+
+    Empty on the first night, and on a ``--full`` window: there is no "before".
+    """
+    horizon = window.since or window.bars_from
+    if window.as_of is None or horizon is None:
+        return []
+    after = previous_night_start(db, endpoint, window.as_of)
+    if after is None:
+        return []
+    rows = db.fetchall(
+        """
+        WITH touched AS (
+            SELECT security_id, detail FROM ops.operator_override
+             WHERE (created_at > %(after)s OR revoked_at > %(after)s)
+               AND key_date < %(horizon)s
+        )
+        SELECT s.security_id FROM core.security s
+         WHERE s.first_seen_at > %(after)s
+           AND EXISTS (SELECT 1 FROM core.daily_price p
+                        WHERE p.security_id = s.security_id
+                          AND p.trade_date < %(horizon)s)
+        UNION
+        SELECT security_id FROM touched
+        UNION
+        SELECT (detail->'split'->>'destination_security_id')::bigint FROM touched
+         WHERE detail->'split'->>'destination_security_id' IS NOT NULL
+        ORDER BY 1
+        """,
+        {"after": after, "horizon": horizon},
+    )
+    return [int(r["security_id"]) for r in rows]
+
+
+def report_date(record: dict) -> Optional[dt.date]:
+    """The date a fafnir-format row is about: its ``record_key``'s ``trade_date``,
+    else dorq's ``date``. None when it has neither."""
+    text = (record.get("record_key") or {}).get("trade_date") or (
+        record.get("detail") or {}
+    ).get("date")
+    try:
+        return dt.date.fromisoformat(str(text)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _condition(record: dict) -> tuple:
+    return (
+        record["check_name"],
+        record.get("security_id"),
+        record_key_json(record.get("record_key")),
+    )
+
+
+def backfill(
+    db: Database,
+    settings: DorqSettings,
+    exchange_code: str,
+    window: Window,
+    security_ids: Sequence[int],
+    records: Sequence[dict],
+) -> tuple[list[dict], dict]:
+    """Judge the whole history of ``security_ids`` and add what it finds before the
+    window to the night's ``records``. Returns the records and what the pass did,
+    for the run's ``params``.
+
+    It is the call ``dq recheck`` makes: every bar of those securities, no
+    ``--since``. Of its reports it keeps those dated before the window -- the
+    window's own dates are the nightly run's to judge, with the context it had --
+    less :data:`BACKFILL_LEFT_OUT`, and less any the night already holds.
+
+    Above ``settings.backfill_max`` securities it logs a warning and judges none.
+    """
+    before = window.since or window.bars_from
+    info: dict = {
+        "securities": len(security_ids),
+        "security_ids": list(security_ids),
+        "before": before.isoformat() if before else None,
+        "reports": 0,
+    }
+    if not security_ids or before is None:
+        return list(records), info
+    if len(security_ids) > settings.backfill_max:
+        logger.warning(
+            "dorq: %d securities have new or rewritten history before %s, over "
+            "[dq] dorq_backfill_max (%d): their history is not judged tonight. "
+            "A universe rebuild wants `fafnir dq run --engine dorq --full`.",
+            len(security_ids),
+            before,
+            settings.backfill_max,
+        )
+        info["security_ids"] = []
+        info["skipped"] = f"over dorq_backfill_max ({settings.backfill_max})"
+        return list(records), info
+    result = run_dorq(
+        db,
+        settings,
+        exchange_code,
+        Window(as_of=window.as_of),
+        security_ids=security_ids,
+    )
+    seen = {_condition(r) for r in records}
+    added = []
+    for r in result.records:
+        if r["check_name"] in BACKFILL_LEFT_OUT:
+            continue
+        day = report_date(r)
+        if day is not None and day >= before:
+            continue
+        if _condition(r) in seen:
+            continue
+        seen.add(_condition(r))
+        added.append(r)
+    info["reports"] = len(added)
+    logger.info(
+        "dorq: backfill judged the whole history of %d securities, %d reports "
+        "before %s",
+        len(security_ids),
+        len(added),
+        before,
+    )
+    return list(records) + added, info
+
+
+# ---------------------------------------------------------------------------
 # Ingest and shadow
 # ---------------------------------------------------------------------------
 
@@ -693,7 +907,7 @@ def read_shadow(path: Path) -> list[dict]:
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def start_run(db: Database, window: Window, shadow: bool) -> int:
+def start_run(db: Database, window: Window, shadow: bool, full: bool = False) -> int:
     """An ``ops.ingestion_run`` row for the run: lineage for every flag it writes.
 
     Opened before dorq runs, so a run that fails still has a row. The version is
@@ -715,6 +929,7 @@ def start_run(db: Database, window: Window, shadow: bool) -> int:
                         "dorq_version": None,
                         "since": window.since.isoformat() if window.since else None,
                         "shadow": shadow,
+                        "full": full,
                     }
                 ),
                 window.bars_from,
@@ -758,6 +973,7 @@ class DqRunOutcome:
     detected: dict[str, int]
     flagged: dict[str, int]
     shadow_file: Optional[Path] = None
+    backfill: Optional[dict] = None
 
 
 def run(
@@ -775,6 +991,11 @@ def run(
     and its watermark advanced, so the next night reports from where this one
     stopped.
 
+    A nightly run then judges the history before its window that is new or was
+    rewritten (:func:`backfill_securities`, :func:`backfill`), and records which
+    securities in ``params.backfill``. A failure there fails the run, so the
+    watermark stays and the next night takes the same securities again.
+
     The run's row is committed before dorq starts, and its outcome when it ends,
     failure included: ``ops.ingestion_run`` is the only record of a run an agent
     without the journal can read. A failed run is re-raised, so the CLI still
@@ -789,18 +1010,29 @@ def run(
     if window.as_of is None:
         logger.info("dorq: no bars on an open session yet; nothing to check")
         return DqRunOutcome(version="", window=window, detected={}, flagged={})
-    run_id = start_run(db, window, shadow)
+    run_id = start_run(db, window, shadow, full=full)
     db.commit()
     try:
         result = run_dorq(db, settings, exchange_code, window)
+        records = result.records
+        backfilled = None
+        if not full:
+            records, backfilled = backfill(
+                db,
+                settings,
+                exchange_code,
+                window,
+                backfill_securities(db, endpoint, window),
+                records,
+            )
         shadow_file = None
         flagged: dict[str, int] = {}
         if shadow:
             shadow_file = write_shadow(
-                result.records, shadow_path(settings.shadow_dir, window.as_of)
+                records, shadow_path(settings.shadow_dir, window.as_of)
             )
         else:
-            flagged = ingest(db, result.records, ingestion_run_id=run_id)
+            flagged = ingest(db, records, ingestion_run_id=run_id)
     except BaseException as exc:
         # As RunLog does: a COPY cut short when dorq exits can leave the
         # transaction aborted, so discard the uncommitted tail before recording
@@ -818,6 +1050,7 @@ def run(
             "dorq_version": result.version,
             "dorq_config_hash": result.config_hash,
             "dropped": result.dropped,
+            **({"backfill": backfilled} if backfilled is not None else {}),
         },
     )
     write_watermark(db, endpoint, window.as_of)
@@ -825,9 +1058,10 @@ def run(
     return DqRunOutcome(
         version=result.version,
         window=window,
-        detected=result.by_check(),
+        detected=count_by_check(records),
         flagged=flagged,
         shadow_file=shadow_file,
+        backfill=backfilled,
     )
 
 
