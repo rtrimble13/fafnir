@@ -455,8 +455,10 @@ refused.
 
 ```
 ensure-partitions → symbol-changes → securities → delisted →
-prices → actions → adjust --changed → refresh-marts → dq run
+prices → actions → adjust --changed → refresh-marts
 ```
+
+then, as its own job after the load, `dq run` (`fafnir-dq`).
 
 The universe is reconciled before any data is pulled, so prices run against what is
 actually trading today. `ingest delisted` keeps its place and its behaviour, with

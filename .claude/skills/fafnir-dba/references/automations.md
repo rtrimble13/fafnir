@@ -2,14 +2,26 @@
 
 ## What runs, and why the order is load-bearing
 
-One scheduled job: `scripts/daily_update.sh`, after US settlement. Incremental and
-idempotent — a missed day is caught up on the next run.
+Two scheduled jobs, one after the other, after US settlement. Both are
+incremental and idempotent — a missed day is caught up on the next run.
 
-```
-ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
-  → ingest delisted → ingest prices → ingest actions → adjust --changed
-  → db refresh-marts → dq run → status
-```
+1. **The daily load**, `fafnir-daily` (`scripts/daily_update.sh`, `daily.log`):
+
+   ```
+   ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
+     → ingest delisted → ingest prices → ingest actions → adjust --changed
+     → db refresh-marts → status
+   ```
+
+2. **DQ**, `fafnir-dq` (`scripts/run_dq_checks.sh`, `dq.log`): `dq run` (the SQL
+   checks, then dorq per `[dq] engine`), then `dq list`. Its timer is 23:00 ET, but
+   the unit is `After=fafnir-daily.service`, so it starts when the load ends. A
+   DQ failure (dorq exiting) does not mark the load failed.
+
+   It is the night's **only** `dq run`. Up to v1.4.0 the daily ran one too, so
+   there were two `dq-shadow` runs a night and the second, narrower one replaced
+   the first's shadow file. One `dq-shadow` row in `ops.ingestion_run` a night,
+   started after `fafnir-daily` ended, is the healthy shape.
 
 The first four are **universe maintenance** and their order is not arbitrary:
 
