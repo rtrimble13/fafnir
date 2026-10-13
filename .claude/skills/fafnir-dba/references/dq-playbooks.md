@@ -52,7 +52,7 @@ and they are not interchangeable:
 | `tracked_symbol_unknown_to_source` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, if the vendor still won't serve it | yes | no |
 | `security_delisting_contradicted` | `ingest delisted` | `add_dq_flag_once` | the next sweep, while the vendor has bars after the date and the record is within 60 days. **Never a bare resolve**: `security venue-transfer` accepts it, `security delist` resolves it | yes — and an acceptance is how the sweep knows the record is a move | no |
 | `security_inactive_but_trading` (info) | `ingest securities` | `add_dq_flag_once` | the next load that turns the row inactive again within 5 sessions of a bar | yes | no |
-| `dorq_*` | `dq run --engine dorq\|both` with `--no-shadow` | `dq.dorq.ingest` (the same two guards as `dq.checks`) | the next dorq run whose window still reports it — nightly, only dates within its `--since`; a `--full` run, any date | yes | yes, by re-running dorq — except the Never three and the cross-sectional `dorq_cohort_gap`, `dorq_cohort_move` |
+| `dorq_*` | `dq run --engine dorq\|both` with `--no-shadow` | `dq.dorq.ingest` (the same two guards as `dq.checks`) | the next dorq run whose window still reports it — nightly, only dates within its `--since`, plus any date of a security whose history was new or rewritten since the night before (the backfill); a `--full` run, any date | yes | yes, by re-running dorq — except the Never three and the cross-sectional `dorq_cohort_gap`, `dorq_cohort_move` |
 
 **The two acceptance traps.** `corporate_action_drift` and
 `security_company_name_drift` are both keyed on `record_key = {"symbol": …}`. An
@@ -907,14 +907,38 @@ and closes each flag dorq no longer emits. When the binary has changed since the
 flag was written, the note says so — a newer model, not a repair, may be what
 closed it.
 
+## `dorq_bad_print`, `dorq_unreported_split` — check for a cash dividend first
+
+**On dorq ≤ 0.8.1** (`detail.dorq.version`), before any repair: is there a cash
+dividend on file at the report's date (`fafnir actions list --symbol <SYM>`) that
+explains the drop, `prev_close − dividend ≈ close`? dorq up to 0.8.1 ignores the
+dividends on file, so a large distribution's ex-date drop reads as a bad print
+(DQ201) or an unreported split (DQ203). That is about 140 a year, mostly December
+fund distributions.
+
+That is a known false positive. **Resolve** it, and put the dividend in the note:
+`cash dividend 2.41 on file at the ex-date; prev_close 48.10 − 2.41 = close 45.69;
+dorq ≤ 0.8.1 ignores dividends`. The note becomes a `market_fact` label for the
+code (`dq export-labels`), which is what it is. Do not accept it: an accepted
+`dorq_*` flag exports as a `data_error`. Do not delete the bar or add a split.
+dorq's next release reads the dividend (doc/dorq.md, "Known false positives").
+
 ## `dorq_scale_shift` — an era stored at the wrong scale
 
-Never auto-resolve. A run of bars ×100, ×0.01 or ×1000 the level either side,
-with no volume change to make it a split. The repair is `prices rescale` over the
-**whole era** (outlier classification §2i). Resolving one flag leaves every other
-bar of the era wrong, and the adjusted series built on it. Report the era's
-bounds from `detail`, propose the rescale, and leave the flag to `dq recheck` once
-the operator has run it.
+**On dorq ≤ 0.8.1, check first for a split on file at that date whose ratio
+matches the move**: `detail.hypotheses.explained_split` is present. dorq up to
+0.8.1 reports such a split anyway when share volume does not shift with it,
+about 100 a year. That is the known false positive, not an era at the wrong scale.
+Report it with the split row (`fafnir actions list --symbol <SYM>`). **Don't
+rescale**: the bars are right, and the split on file already explains them. It
+stays Never-tier: the operator closes it.
+
+Otherwise: never auto-resolve. A run of bars ×100, ×0.01 or ×1000 the level
+either side, with no volume change to make it a split. The repair is `prices
+rescale` over the **whole era** (outlier classification §2i). Resolving one flag
+leaves every other bar of the era wrong, and the adjusted series built on it.
+Report the era's bounds from `detail`, propose the rescale, and leave the flag to
+`dq recheck` once the operator has run it.
 
 ## `dorq_split_without_jump` — a split on file the bars never show
 

@@ -85,6 +85,19 @@ leave it open. "I could not check" is not "it is fine".
   market-fact label at the next `dq export-labels`, so the note is training data.
 - Never batch across codes: one batch, one `code`.
 
+### `dorq_bad_print`, `dorq_unreported_split` written by dorq ≤ 0.8.1 — a dividend
+The one `dorq_*` report a sweep may propose to resolve **at `error`** without a
+repair: there is nothing to repair. dorq up to 0.8.1 ignores the cash dividends
+on file (doc/dorq.md, "Known false positives").
+- `detail.dorq.version` is 0.8.1 or older.
+- A cash dividend on file at the flag's date explains the drop: `prev_close −
+  dividend ≈ close`, within a cent or two.
+- The note names the dividend and the arithmetic. It becomes a market-fact label.
+- Resolve, never accept: an accepted `dorq_*` flag exports as a `data_error`.
+
+The other known false positive, a `dorq_scale_shift` on a split on file whose
+ratio matches the move, stays **Never**: report it with the split row.
+
 ### `stale`
 Only the two determinate branches:
 - `delisted_date IS NOT NULL` or `is_actively_trading = false` — the security
