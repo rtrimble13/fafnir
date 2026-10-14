@@ -249,8 +249,12 @@ fafnir dq compare /var/lib/fafnir/dorq-shadow/2026-10-06.jsonl --json
   - the dates it spans, and the move a misdated split explains (DQ701 is keyed
     at the split's ex-date, the move at `detail.detail.move_date`);
   - its security, or for a cross-sectional row (no security), each security in
-    `detail.detail.members`. dorq up to 0.8.1 does not write `members`, so its
-    cohort rows cover no one. A cohort row counts once among dorq's reports.
+    `detail.detail.members`. dorq 0.9 writes it as a comma-separated string of
+    series ids (`"9161,10640,11237"`), because every value in a dorq report's
+    `detail.detail` is a scalar; a list is read too. `compare` before v1.4.2 read
+    only a list, so v1.4.1's figures under-credit DQ601. dorq up to 0.8.1 does
+    not write `members`, so its cohort rows cover no one. A cohort row counts
+    once among dorq's reports.
 
   A flag written after the run is not one the night could have matched, and is
   left out.

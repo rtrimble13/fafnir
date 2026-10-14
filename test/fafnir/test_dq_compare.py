@@ -92,6 +92,53 @@ def test_a_bad_label_names_its_line(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Reading dorq's rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "members, ids",
+    [
+        ("9161,10640,11237", (9161, 10640, 11237)),
+        (" 12, 7 ,,x", (7, 12)),
+        ("12,12", (12,)),
+        ([3, "2"], (2, 3)),
+        ("", ()),
+        (None, ()),
+        ({}, ()),
+    ],
+)
+def test_members_are_read_from_dorqs_string_or_a_list(members, ids):
+    assert cmp._ids(members) == ids
+
+
+#: A DQ601 row as dorq 0.9.0 wrote it, verbatim from the shadow file of
+#: 2026-10-13. A hand-built fixture with ``members`` as a list is how v1.4.1 came
+#: to read a format dorq never writes.
+DORQ_090_COHORT_ROW = (
+    '{"check_name": "dorq_cohort_move", "detail": {"check": "cohort-move",'
+    ' "classification": "data_error", "code": "DQ601", "date": "2026-10-05",'
+    ' "detail": {"factor": 0.6487437185929649, "members":'
+    ' "9161,10640,11237,405953,660856", "ratio": "3:2", "series_moving": 5},'
+    ' "dorq": {"config_hash": "334f0095e5da4998", "version": "0.9.0"},'
+    ' "evidence": [], "hypotheses": {}, "label": null, "line": null, "message":'
+    ' "5 series move ×0.6487 (≈ a 3:2 split) on 2026-10-05: 9161,'
+    " 10640, 11237, 405953, 660856: a vendor's mass adjustment, or splits the"
+    ' actions file is missing", "p_error": 1, "provisional": false, "record_key":'
+    ' {"trade_date": "2026-10-05"}, "series": null, "severity": "warn", "source":'
+    ' "XNYS, with calendar.csv for 1990-01-02..2028-12-29", "suggested_action":'
+    ' null}, "record_key": {"trade_date": "2026-10-05"}, "security_id": null,'
+    ' "severity": "warn", "table_name": "core.daily_price"}'
+)
+
+
+def test_a_dorq_090_cohort_row_names_its_members():
+    r = cmp.Report.of(json.loads(DORQ_090_COHORT_ROW))
+    assert r.members == (9161, 10640, 11237, 405953, 660856)
+    assert r.securities == (9161, 10640, 11237, 405953, 660856)
+
+
+# ---------------------------------------------------------------------------
 # Against the queue
 # ---------------------------------------------------------------------------
 
@@ -318,15 +365,23 @@ def test_a_misdated_split_matches_the_move_it_explains(db, tmp_path):
 
 
 @pytest.mark.integration
-def test_a_cohort_row_covers_the_securities_it_names(db, tmp_path):
+@pytest.mark.parametrize(
+    "members",
+    [
+        pytest.param(lambda a, b: f"{a},{b}", id="dorq"),  # as dorq 0.9 writes it
+        pytest.param(lambda a, b: [str(a), b], id="list"),
+    ],
+)
+def test_a_cohort_row_covers_the_securities_it_names(db, tmp_path, members):
     """XRPN, VCIG and SBFM: dorq named each in a DQ601 cohort row, which has no
-    security_id, so it covered no one; and DQ601 was not an outlier successor."""
+    security_id, so it covered no one; and DQ601 was not an outlier successor.
+    v1.4.1 read only a list, and dorq writes a comma-separated string."""
     a, b, other = (_mk(db, s) for s in ("CMPCA", "CMPCB", "CMPCC"))
     _run_row(db, "2024-03-08", "2024-03-04")
     for sid in (a, b, other):
         _flag(db, sid, "outlier", {"trade_date": "2024-03-05"})
     row = _row(None, "2024-03-05", code="DQ601", check="dorq_cohort_move")
-    row["detail"]["detail"] = {"members": [str(a), b]}
+    row["detail"]["detail"] = {"members": members(a, b)}
     shadow = tmp_path / "2024-03-08.jsonl"
     dorq.write_shadow([row], shadow)
     c = cmp.compare(db, shadow)
