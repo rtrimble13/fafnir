@@ -21,8 +21,8 @@ flags reach the queue:
 An SQL flag counts as "also reported" when a report of a successor code is about
 its security within ``slack`` calendar days of its date. A report is about the
 dates it spans, and the move a misdated split explains (DQ701's ``move_date``); a
-cross-sectional row is about each security it names (``members``, from dorq
-0.9).
+cross-sectional row is about each security it names (``members``, from dorq 0.9:
+a comma-separated string of series ids, as dorq writes it; a list is read too).
 
 Matching against labels follows dorq's own evaluation tool (dorq-eval), and none
 of the above: a report matches a fault label on the same security whose dates
@@ -68,6 +68,9 @@ def _date(text) -> Optional[dt.date]:
 
 
 def _ids(values) -> tuple[int, ...]:
+    # dorq writes a comma-separated string: every value in its detail is a scalar.
+    if isinstance(values, str):
+        values = values.split(",")
     out = []
     for v in values if isinstance(values, list) else ():
         try:
@@ -84,7 +87,9 @@ class Report:
     ``also`` holds the other dates it is about: a misdated split (DQ701) is keyed
     at the split's ex-date, and the move it explains is ``detail.detail.move_date``.
     ``members`` are the securities a cross-sectional row (no ``security_id``)
-    names, from ``detail.detail.members``; without them it is about no one.
+    names, from ``detail.detail.members``: a comma-separated string of series ids,
+    as dorq writes it (``"9161,10640"``), or a list. Without them it is about no
+    one.
     """
 
     security_id: Optional[int]
