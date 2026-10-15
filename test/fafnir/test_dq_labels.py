@@ -155,6 +155,10 @@ def test_repairs_become_faults_with_the_bars_as_they_stood(db):
         "scale_era": 1,
         "split_added": 1,
     }
+    made = db.fetchval(
+        "SELECT created_at FROM ops.operator_override WHERE security_id = %s",
+        (deleted,),
+    )
     assert by_kind["bar_deleted"] == {
         "series": str(deleted),
         "first": days[10].isoformat(),
@@ -163,6 +167,9 @@ def test_repairs_become_faults_with_the_bars_as_they_stood(db):
         "kind": "bar_deleted",
         "source": "operator_override",
         "note": "bad print",
+        # A repair stops being a statement about what dorq reads once it is made.
+        "decided_at": made.isoformat(),
+        "applies_until": made.isoformat(),
     }
     assert by_kind["scale_era"]["expect"] == "DQ202"
     assert (by_kind["scale_era"]["first"], by_kind["scale_era"]["last"]) == (

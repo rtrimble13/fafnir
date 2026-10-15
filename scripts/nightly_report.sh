@@ -63,7 +63,10 @@ Write a plain-text email body, at most 40 lines. Structure:
    MOVED against the previous run; raw totals alone are not news. price_*
    checks repeat per re-detection by design, so their flag counts are not
    counts of distinct problems -- report their security counts instead.
-4. "Needs a human" -- a short bulleted list, or "nothing" if clean.
+4. "Vendor gaps" -- the securities in the VENDOR GAPS section, one line
+   each (symbol, last bar, sessions behind), or "none". Say which are new
+   since the previous run. These are for an FMP ticket, not a DQ resolve.
+5. "Needs a human" -- a short bulleted list, or "nothing" if clean.
 
 Report on tonight; use the previous block only to say what changed. No
 preamble, no markdown headers or bold, no invented numbers. Where evidence is

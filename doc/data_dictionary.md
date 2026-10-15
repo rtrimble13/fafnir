@@ -363,7 +363,16 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 `ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),
 `check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/`dorq_*`/...), `severity`
 (`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`,
-`resolved_by`, `resolution_note`.
+`resolved_by`, `resolution_note`, `accepted_at`/`accepted_by`/`accepted_note` (0024),
+`judgement_basis` (0028).
+
+`judgement_basis` says how a closure was judged: `per_flag` (`dq accept|resolve
+--per-flag`: this flag's own evidence was looked at), `by_rule` (`--by-rule`: closed as
+one of a class), or NULL (not said). Only a closed flag carries one, and `dq reopen`
+clears it with the rest of the resolution. 0028 marked `by_rule` the closures whose
+note says so ("without per-flag verification", "Classified by rule", "not individually
+verified": the 23,903 outlier acceptances of 2026-09-10/11). `dq export-labels` writes
+it as a label's `verified`.
 
 Read and worked with `fafnir dq list` / `fafnir dq resolve` (see
 [operations.md](operations.md#working-the-dq-queue)). Since migration 0017 a
@@ -396,8 +405,13 @@ stored, so it is written with `add_dq_flag_once` (one row per corrupted bar, not
 per nightly overlap) and `repository.count_price_quarantines` excludes it by name via
 `NON_QUARANTINE_PRICE_CHECKS`. Counting it would let a stored-but-corrupted bar spend
 the watermark budget of a *rejected* bar on the same date and release ingestion past
-one nobody had looked at. Anything added to that family later has to make the same
-choice explicitly.
+one nobody had looked at. `price_restatement_conflict` (v1.5.0) is the second such
+check: the nightly load kept the stored bar and the vendor's re-read disagrees with it
+beyond `[prices] restatement_max_ratio` / `restatement_max_volume_ratio`; it is
+written once per open `(symbol, date)` and listed in `NON_QUARANTINE_PRICE_CHECKS`.
+`price_split_scale_mismatch` is a real quarantine (a new bar at a split-adjusted scale
+was not stored) and repeats like the others. Anything added to that family later has
+to make the same choice explicitly.
 
 Since migration 0016 the schema holds the rule too — `ux_dq_flag_open_condition`,
 unique on `(check_name, security_id, record_key)` where `resolved_at IS NULL` and the
@@ -411,7 +425,15 @@ each condition so `detected_at` still says when the problem was first seen.
 `p_error`, the hypotheses and evidence, the suggested repair and `dorq.version` /
 `dorq.config_hash`. The cross-sectional ones (`dorq_cohort_gap`, `dorq_cohort_move`)
 have a NULL `security_id`. They are written with the same open/accepted guards as
-the SQL checks, by a run recorded in `ops.ingestion_run` with `source = 'dorq'`.
+the SQL checks, by a run recorded in `ops.ingestion_run` with `source = 'dorq'`. A
+cross-sectional row's `record_key` carries the cohort's split `ratio` beside its
+`trade_date` (v1.5.0; dorq 0.10 writes it itself): two cohorts on one date are two
+conditions.
+
+Other checks added in v1.5.0: `split_duplicate_suspect` (`fafnir adjust`: two splits
+of one ratio within ten sessions; keyed `{"ex_dates": [d1, d2]}`) and
+`tracked_symbol_delisted` (`ingest tracked`: a declared ticker whose identity is a
+delisted security; keyed `{"symbol": ...}`).
 
 ### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
 `last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
@@ -444,11 +466,35 @@ and `fafnir security split-history`; undone by `fafnir override revoke`
 | `operation` | TEXT CHECK | `delete`: the row was removed, and while active the loaders set aside a vendor row at this key. `add`: the operator wrote the row (`source = operator`). A bar is only ever added as a recorded transform of a vendor bar -- the table refuses a bar `add` without `detail.transform` -- and the price loader sets aside a vendor bar on the date of either operation. |
 | `detail` | JSONB | `delete`: the row as it stood. `add`: the values written. A re-date pair names the other half (`redated_to_override` / `redated_from_override`). A bar shift or rescale carries `transform`: `kind` (`shift` / `rescale`), its parameters (`days`, or `price_factor` and `volume_factor`), the other half (`to_override` / `from_override`, `to_date` / `from_date`), and `edit` -- the id of the edit's first override, shared by every override of one command. A key moved by `security split-history` carries `split` = `{source_security_id, destination_security_id, kind}`, where `kind` is `moved`, `duplicate` (the destination already held it identically), or `restored` (an earlier `prices delete`, now also materialised on the destination); `--undo` reads exactly these. |
 | `note` / `created_by` / `created_at` | TEXT / TEXT / TIMESTAMPTZ | The evidence and the owner. `note` may not be blank. |
+| `reason` | TEXT CHECK (0028) | Why: `data_error` (the row was wrong; the default, and every row before 0028), `out_of_scope` (the security does not belong -- its data was removed, not repaired), `cleanup` (bookkeeping). Set with `--reason` on every command above; changed after the fact with `fafnir override set-reason`, which appends `{from, to, note, by, at}` to `detail.reason_history`. Only `data_error` overrides are exported as labels. |
 | `revoked_at` / `revoked_by` / `revoked_note` | | Set by `override revoke`. Revoking a `delete` lifts the suppression only; revoking an `add` removes the operator's row. A bar shift or rescale is revoked whole: any of its overrides revokes every one of the `edit`, removes the operator bars and writes the vendor bars back from `detail.row`. A bar shift or rescale undone this way also puts back any corporate action a `--with-actions` shift re-dated. A key carrying a `split` marker is refused: revoking it alone would lift the suppression while the destination kept its copy, so a split is reversed whole by `security split-history --undo`. |
 
 At most one active override per `(security_id, target, action_type, key_date,
 operation)`: a `delete` and an `add` may share a key, which is how a wrong vendor row
 is replaced by a corrected one.
+
+### `ops.dq_label` — labels a person stated. **Grain:** `label_id`.
+What someone checked and found true about a stretch of one series, or a cohort, for
+measuring dorq (doc/dorq.md, "Labels"). Written by `fafnir dq label add|import` and
+`dq accept|resolve --label`; revoked by `dq label revoke` (and by `dq reopen`, for a
+label stated with that flag's closure). Merged into `dq export-labels`, where a row
+here wins over a derived label on the same security, overlapping dates and class.
+Changes no data and no flag (migration 0028). Active means `revoked_at IS NULL`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `label_id` | BIGINT IDENTITY PK | |
+| `security_id` | BIGINT | NULL for a cross-sectional label (dorq's series `*`). No FK, as `operator_override`. |
+| `members` | BIGINT[] | A cohort label's securities: it covers only the cross-sectional rows naming one of them. |
+| `first_date` / `last_date` | DATE | The span. |
+| `class` | TEXT CHECK | `data_error`, `context_gap` or `market_fact`. |
+| `kind` | TEXT | `feed_gap`, `odd_lots_only`, `distribution`, `dividend_units`, `wrong_instrument`, `bad_print`, `cohort_fact`, or free text. |
+| `expect` / `codes` | TEXT | A fault's expected codes (`DQ202\|DQ205`); a market fact's code prefix (default `DQ2`). |
+| `note`, `verified` | TEXT, BOOLEAN | What was checked; whether on the bars or an outside source. |
+| `source` | TEXT | Free text: `dq_flag:893223`, `hand-2026-10-15`, `cli`. |
+| `decided_by` / `decided_at` | TEXT / TIMESTAMPTZ | |
+| `applies_until` | TIMESTAMPTZ | When a repair changed what dorq reads; a shadow night that ran after it is not judged by the label. NULL: always applies. |
+| `revoked_at` / `revoked_by` / `revoked_note` | | |
 
 ---
 

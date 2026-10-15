@@ -712,11 +712,65 @@ def report_date(record: dict) -> Optional[dt.date]:
         return None
 
 
-def _condition(record: dict) -> tuple:
+def member_ids(values) -> list[int]:
+    """The securities a cross-sectional row names (``detail.detail.members``).
+
+    dorq 0.9 writes them as a comma-separated string (``"9161,10640"``): every value
+    in a report's ``detail.detail`` is a scalar. A list is read too. dorq up to
+    0.8.1 writes none.
+    """
+    if isinstance(values, str):
+        values = values.split(",")
+    out = set()
+    for v in values if isinstance(values, (list, tuple)) else ():
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
+def condition_record_key(record: dict) -> dict:
+    """The record_key that tells one of dorq's conditions from another.
+
+    A row about one security is keyed as dorq keys it. A cross-sectional row (no
+    security) is not: dorq up to 0.9 keys a cohort row on its date alone, so a 2:1
+    group and a 3:2 group on one date (DQ601, 2026-10-06) share a key, and any
+    (check, security, record_key) dedupe merges them -- in the compare's sets, in
+    the backfill's, and in the queue, where the second is never written. The
+    group's ``ratio`` is added, unless dorq has put one in the key itself (dorq
+    0.10 does).
+
+    Not its ``members``: a cohort's membership changes from night to night as
+    evidence arrives (the 3:2 group of 2026-10-06 named six series on the 10-12
+    night and five on 10-13), and dorq up to 0.8.1 writes none, so keying on it
+    would make the same cohort a new condition every time it was re-judged. The
+    members are used only for a row that carries no ratio at all.
+    """
+    key = dict(record.get("record_key") or {})
+    if record.get("security_id") is not None:
+        return key
+    inner = (record.get("detail") or {}).get("detail")
+    inner = inner if isinstance(inner, dict) else {}
+    if "ratio" in key or "members" in key:
+        return key
+    if inner.get("ratio") not in (None, ""):
+        key["ratio"] = inner["ratio"]
+    else:
+        members = member_ids(inner.get("members"))
+        if members:
+            key["members"] = members
+    return key
+
+
+def condition_key(record: dict) -> tuple:
+    """One condition, as (check_name, security_id, record_key as canonical JSON):
+    what the compare counts, the backfill dedupes and the queue writes once."""
+    sid = record.get("security_id")
     return (
         record["check_name"],
-        record.get("security_id"),
-        record_key_json(record.get("record_key")),
+        int(sid) if sid is not None else None,
+        record_key_json(condition_record_key(record)),
     )
 
 
@@ -767,7 +821,7 @@ def backfill(
         Window(as_of=window.as_of),
         security_ids=security_ids,
     )
-    seen = {_condition(r) for r in records}
+    seen = {condition_key(r) for r in records}
     added = []
     for r in result.records:
         if r["check_name"] in BACKFILL_LEFT_OUT:
@@ -775,9 +829,9 @@ def backfill(
         day = report_date(r)
         if day is not None and day >= before:
             continue
-        if _condition(r) in seen:
+        if condition_key(r) in seen:
             continue
-        seen.add(_condition(r))
+        seen.add(condition_key(r))
         added.append(r)
     info["reports"] = len(added)
     logger.info(
@@ -834,7 +888,9 @@ def ingest(
                         (
                             int(sid) if sid is not None else None,
                             r.get("table_name") or "core.daily_price",
-                            json.dumps(r.get("record_key") or {}),
+                            # The condition's key, not dorq's alone: two cohorts on
+                            # one date are two conditions (condition_record_key).
+                            json.dumps(condition_record_key(r)),
                             r["check_name"],
                             r.get("severity") or "warn",
                             json.dumps(r.get("detail") or {}),
@@ -1033,6 +1089,7 @@ def run(
             )
         else:
             flagged = ingest(db, records, ingestion_run_id=run_id)
+        holding = _holding_snapshot(db, run_id, window, backfilled)
     except BaseException as exc:
         # As RunLog does: a COPY cut short when dorq exits can leave the
         # transaction aborted, so discard the uncommitted tail before recording
@@ -1051,6 +1108,7 @@ def run(
             "dorq_config_hash": result.config_hash,
             "dropped": result.dropped,
             **({"backfill": backfilled} if backfilled is not None else {}),
+            **({"holding": holding} if holding is not None else {}),
         },
     )
     write_watermark(db, endpoint, window.as_of)
@@ -1063,6 +1121,39 @@ def run(
         shadow_file=shadow_file,
         backfill=backfilled,
     )
+
+
+def _holding_snapshot(
+    db: Database, run_id: int, window: Window, backfilled: Optional[dict]
+) -> Optional[dict]:
+    """The SQL flags' state as the run found them, for `dq compare` (C3).
+
+    ``core.daily_price`` as it stands later is not what the night read: the vendor
+    delivers missing bars late, so a stale flag that held when dorq ran reads as
+    "traded since" a day later, and the re-read overwrites ``loaded_at`` and
+    ``ingestion_run_id``, so the run-time state cannot be rebuilt from the bars.
+    Computed by the comparison's own rule, as of the run's start.
+    """
+    from fafnir.dq import compare as cmp
+
+    started_at = db.fetchval(
+        "SELECT started_at FROM ops.ingestion_run WHERE ingestion_run_id = %s",
+        (run_id,),
+    )
+    snapshot = cmp.holding_snapshot(
+        db,
+        window_from=window.since or window.bars_from,
+        as_of=window.as_of,
+        started_at=started_at,
+        backfilled=(backfilled or {}).get("security_ids") or [],
+    )
+    if snapshot is None:
+        logger.warning(
+            "dorq: more than %d open SQL flags to snapshot; `dq compare` will "
+            "recompute this run's holding states instead",
+            cmp.SNAPSHOT_MAX_FLAGS,
+        )
+    return snapshot
 
 
 def record_key_json(record_key: Optional[dict]) -> str:

@@ -44,6 +44,10 @@ and they are not interchangeable:
 | `gap`, `sparse_coverage`, `outlier`, `stale`, `security_duplicate_identity`, `security_missing_classification` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes — except `security_duplicate_identity` |
 | `dividend_no_prior_close`, `dividend_exceeds_price`, `adjustment_factor_extreme`, `adjustment_failed` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security | yes | `dividend_no_prior_close` only |
 | `price_scale_collapse` | price loader | `add_dq_flag_once` | a re-read of that bar | yes | no |
+| `price_restatement_conflict` | nightly price load (not `--from`) | `add_dq_flag_once` | a nightly re-read of that date while the vendor still restates it beyond the guard. An explicit `ingest prices --from` re-fetch of the date **resolves it itself** | yes | no |
+| `price_split_scale_mismatch` | price loader | `add_dq_flag` (**no dedupe**: a quarantine) | every re-read of that bar | **no** | no |
+| `split_duplicate_suspect` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security, while both splits are on file | yes | no |
+| `tracked_symbol_delisted` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, while the declaration names a delisted identity | yes | no |
 | `price_cross_field_violation`, `price_non_positive_price`, `price_subresolution_price`, `price_price_out_of_range`, `price_missing_or_nonnumeric_ohlc` | price loader | `add_dq_flag` (**no dedupe**) | *every* re-read of that bar — overlap window, watermark holds, backfills | **no** | no |
 | `security_company_name_drift` | security master | `add_dq_flag_once` | not re-written: the upsert stores the new name | yes — **for the whole ticker** | no |
 | `corporate_action_drift` | action reconciliation | `add_dq_flag_once` | the next reconciliation of that symbol, if the drift persists | yes — **for the whole symbol** | no |
@@ -359,6 +363,26 @@ stopped (a closed fund) retire it properly first — `track rm <SYM> --closed <d
 — and the recheck closes the flag on its own. **Accept** only a security that will
 never take another bar and cannot be retired.
 
+### A live name the vendor stopped serving
+
+`fafnir source vendor-gaps` lists them: in the nightly universe, behind by two or
+more sessions, the newest payload an open-ended request that returned nothing after
+the last bar, 95% of the venue ahead, and not on the delisted feed. On 2026-10-14
+that was ten names that traded every day (FPAS, XJUL, XAPR, XFEB, CMCI, VAIC, CHIP,
+MYCP, VMSD, VAI). The nightly report has the section.
+
+- **Report, don't close.** The security trades; the vendor does not serve it. Its
+  `stale` flag is right and stays open. Never resolve or accept it, and never
+  `track rm` or delist it on the strength of the vendor's silence.
+- Confirm once with `source probe-prices --symbol <SYM> --date <latest>`: no bar in
+  either feed is the vendor, not the load. A bar there is the loader's problem: see
+  the watermark, above.
+- The list is the evidence for an FMP ticket (an operator task). If the vendor
+  catches up, the next load fills the bars and `dq recheck --check stale` closes the
+  flags; if a label is wanted meanwhile, state it:
+  `dq label add --security-id <id> --first <first missing> --kind feed_gap
+  --verified -m "<the outside source that shows it trading>"`.
+
 ---
 
 ## The `price_*` family — what closing one actually does
@@ -445,6 +469,117 @@ A security quoted between roughly 5e-7 and 1.5e-6 produces these continuously.
 **Returns and volatility computed over a run of them are fictional, not merely
 wrong** — say that plainly when reporting. Resolving the flag does not fix the
 bar; it deletes the only record of what was lost.
+
+---
+
+## `price_restatement_conflict` — the vendor restates a stored bar
+
+Warn, **repair-first**. The nightly re-read of the last five sessions served a bar
+that differs from the stored one by more than `[prices] restatement_max_ratio`
+(close, 1.25) or `restatement_max_volume_ratio` (volume, 3), either way. The loader
+kept the stored bar and wrote this, once per open `(symbol, date)`. It is not a
+quarantine: it spends no watermark budget, and the watermark moved past the date.
+
+`detail` has `stored` (OHLCV and the `ingestion_run_id` that stored it), `incoming`,
+`close_ratio`, `volume_ratio`, `over` (which tripped) and `splits_near` (any split
+on file within 30 days).
+
+**Which side is right?** FMP's first print usually is. What it restated from
+2026-09-16 to 10-14:
+- **another instrument's level** (OUSL ~11 -> ~58, QCJL ~26 -> 0.07, KEO, MILK,
+  XNDX): keep the stored bar. Probe; the series' outside history (issuer page)
+  settles it;
+- **a split's scale before the split** (GCDT x6, ZBAO x50, `splits_near` names it):
+  keep the stored bar;
+- **a correction of a wrong first print** (SKYD 10-02: a phantom 2:1 first print,
+  correctly re-served at 9.5): the incoming side is right, and the guard blocked it.
+  That is its documented cost.
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices --symbol <SYM> --date <d>
+```
+
+**Repair.** Stored side right: nothing to change; the vendor's wrong re-read is held
+off every night. Incoming side right: re-fetch the date explicitly, which overwrites,
+prints what it restated, and resolves this flag itself:
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --symbols <SYM> --from <d> --to <d>
+```
+
+Read the restated table it prints: ZBAO's re-fetch put the prices right and returned
+volume x50 in the same breath. If neither side is right, `prices delete` the bar.
+
+**Close with:** the explicit re-fetch (it resolves the conflict on every date it
+wrote). Stored side right and the vendor still restates nightly: **accept**, with the
+evidence (`--per-flag --label data_error --kind wrong_instrument` when it is another
+instrument), so the nightly stops re-asking; the stored bar stays protected either
+way. If the vendor has since gone back to serving the stored value (probe), resolve
+with that in the note. Never resolve on the count.
+
+---
+
+## `price_split_scale_mismatch` — a new bar at a coming split's scale
+
+Warn, a **quarantine** (repeats per re-read, holds the watermark). A bar with no
+stored copy, dated within 30 days before a split on file, whose close is the last
+stored close times the split's price factor (x50 for a 1:50) within 10%, on a
+volume consistent with the vendor's adjusted bar. It was not stored. `detail` names
+the split, the factor and which volume shape it matched.
+
+**Repair-first.** Probe the date (`source probe-prices`): the split-adjusted feed
+should equal the incoming bar. Then re-fetch once the vendor serves the raw bar, or
+let the watermark budget release it and fill the gap by hand-checked re-fetch. If
+the split on file is itself wrong (misdated, a phantom), fix the action (`actions
+delete|redate`) and re-fetch. **Close with:** the re-fetch that stores the raw bar,
+then resolve with the evidence. Never accept: it is a bar the warehouse does not hold.
+
+---
+
+## `split_duplicate_suspect` — one split on file twice
+
+Warn, **repair-first**, written by `adjust`. Two split rows on one security with the
+same ratio, no more than ten sessions apart (GLE 1:10 on 10-07 and 10-08; NXGL 1:20
+on 10-09 and 10-12). The bars move once, and the adjusted series moves twice:
+adjusted prices before the earlier date were x100 and x400. No SQL check saw them;
+dorq's DQ701 did. `detail.splits` gives the close ratio across each ex-date against
+the split factor, and `moves_on` the date the raw closes actually move.
+
+**Repair.** Probe the split-adjusted feed on the bar before each ex-date: the
+cumulative split it applies shows which one it knows.
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices --symbol <SYM> --date <bar before each ex-date>
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir actions list --symbol <SYM> --type split
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir actions delete <the other id> --dry-run \
+    --by claude -m "duplicate of the <ratio> on <moves_on>: closes move once, on <d>; probe: ..."
+```
+
+**Close with:** the `actions delete` (factors recompute in the same transaction; the
+next `adjust` writes no flag), then resolve with the delete's override id. Never
+resolved by a run. The delete becomes a `split_deleted` label at the next export.
+
+---
+
+## `tracked_symbol_delisted` — a declared ticker over a delisted row
+
+Warn. `ingest tracked` found a declaration whose vendor profile describes a
+security fafnir holds as delisted (same CUSIP, or the same normalised name), and
+minted nothing. Before v1.5.0 it minted a new row every night, which the delisting
+sweep then stamped (BURU: 815532 on 10-13, 833074 on 10-14, beside 286436).
+`detail.delisted_security_id` names the row.
+
+**A repair either way:**
+- **It relisted** (a real move back to a venue: the vendor's bars continue, an
+  exchange notice says so) — `security venue-transfer <id>` reverses the delisting,
+  after which the declaration finds a listed row and loads into it.
+- **It is gone** (OTC, wound up, the declaration was a mistake) —
+  `track rm <SYM>`.
+
+**Close with:** the venue transfer or the `track rm`, then resolve with which and
+why. `track add --allow-delisted` is not a fix: it declares a ticker that now
+belongs to a different issuer, and `ingest tracked` still mints nothing over a
+delisted row of the same identity.
 
 ---
 

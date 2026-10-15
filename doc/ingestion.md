@@ -186,6 +186,80 @@ Two details follow from the endpoint choice:
 
 Full rationale and the migration consequences: [adr/0004](adr/0004-unadjusted-price-feed.md).
 
+## What FMP restates, and the guard
+
+The nightly price load re-reads the last `overlap_days` (5) sessions of every
+symbol, to pick up late corrections. FMP's first print of a bar is usually right;
+what it serves on a later read of the same date often is not. Between 2026-09-16 and
+10-14, the re-read replaced first prints with:
+
+- **another instrument's prices**: one fund's history became another's level from
+  one night to the next (a ~11 first print re-served at ~58; a ~26 one at 0.07), every
+  night, in both directions;
+- **a split's scale, before the split**: four sessions re-served at x6 the day after
+  a 1:6 reverse split went ex, and five at x50 the week before a 1:50 -- prices only,
+  the volumes within 8% of the first prints;
+- **a phantom split's scale**: two sessions at a 2:1 scale FMP took from a warrant
+  dividend it had recorded as a split.
+
+An operator re-fetch (`ingest prices --symbols S --from D --to D`) repaired those --
+and one of them returned the prices right and the volume x50, at the same time.
+
+So a **nightly** load (no `--from`) never overwrites a stored bar by more than
+`[prices] restatement_max_ratio` (close, default 1.25) or
+`restatement_max_volume_ratio` (volume, default 3), either direction. It keeps the
+stored bar and writes `price_restatement_conflict` -- once per open `(symbol,
+date)`, with the stored OHLCV and the run that stored it, the incoming OHLCV, both
+ratios and any split on file within 30 days. The date still counts as loaded, so the
+watermark moves past it. A zero volume on either side is no ratio and restates
+nothing.
+
+An **explicit** re-fetch (`--from`) overwrites, as before, and:
+- prints every bar it restated beyond the thresholds, close and volume, old -> new
+  (the table that would have shown the x50 volume on the spot);
+- records them in its run's `params.restated` (the first 500) and
+  `params.restated_count`;
+- resolves the open `price_restatement_conflict` on every date it wrote, with
+  `operator re-fetch, run N` and the old and new values.
+
+The guard's cost is deliberate. Sometimes the first print is the wrong one (the
+phantom-scale bars above; a 0.07 first print later served as 25.52): the guard keeps
+it and raises a conflict rather than accept the vendor's correction. A blocked
+correction is visible and costs one re-fetch; a silently stored wrong-instrument
+restatement cost weeks. There is no "consistent with the neighbours" tie-break: on a
+series whose stored history is already the wrong instrument it would accept the
+wrong re-read and refuse the right first print. The playbook probes the vendor and
+re-fetches the side that is right.
+
+**A new bar at a split's scale.** A bar with no stored copy has nothing to protect,
+so the guard above cannot apply. When it is dated within 30 days before a split on
+file, its close is the last stored close times the split's price factor (x50 for a
+1:50, x0.5 for a 2:1) within 10%, and its volume is within 25% of the 20-session
+median times the inverse factor or times one (FMP has served both shapes), it is
+quarantined as `price_split_scale_mismatch`: not stored, and holding the watermark
+like any quarantine. Splits nearer 1:1 than 3:2 are not judged: a 5:4 split's
+factor is inside an ordinary day's range.
+
+**One split on file twice.** `fafnir adjust` flags two splits of one ratio within ten
+sessions as `split_duplicate_suspect`, naming the one the raw closes move across
+(GLE's 1:10 sat on 10-07 and 10-08, and adjusted prices were x100 before the earlier
+date; NXGL's 1:20 on 10-09 and 10-12). Delete the other with `actions delete`, after
+`source probe-prices` on the bar before each ex-date shows which one the
+split-adjusted feed applies.
+
+**Symbols FMP stopped serving.** `fafnir source vendor-gaps` lists live securities
+whose newest payload was an open-ended request that returned nothing after their
+last bar, while 95% of their venue moved on and the delisted feed does not name
+them. On 2026-10-14 that was ten securities that traded every day (last bars 09-29
+to 10-08). The list is for an FMP ticket; their `stale` flags stay open. The
+delisting sweep lands its payload (from v1.5.0) so the report can check it.
+
+**A declared ticker over a delisted row.** `ingest tracked` mints nothing for a
+declared ticker whose vendor profile names a delisted security (same CUSIP, or the
+same normalised name): it flags `tracked_symbol_delisted` instead. BURU was declared
+while its only row was delisted, and every night a new row was minted and stamped
+delisted by the sweep. `track add` refuses such a ticker unless `--allow-delisted`.
+
 ## Corporate actions
 
 `ingest actions` has three modes, set by `[general] actions_mode` and overridable per

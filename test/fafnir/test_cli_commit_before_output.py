@@ -64,7 +64,7 @@ def _fake_resolve(monkeypatch, events):
         lambda db, filt=None: {"flags": 2, "securities": 1, "checks": 1},
     )
 
-    def resolve(db, filt, *, note=None, resolved_by=None):
+    def resolve(db, filt, *, note=None, resolved_by=None, judgement_basis=None):
         events.append("resolve")
         return list(filt.flag_ids)
 
@@ -106,7 +106,7 @@ def test_a_reader_that_stops_early_does_not_undo_the_resolve(monkeypatch, log):
 
 
 def test_reopen_commits_before_it_reports(monkeypatch, log):
-    def reopen(db, flag_ids):
+    def reopen(db, flag_ids, *, reopened_by="unknown"):
         log.append("reopen")
         return list(flag_ids), []
 

@@ -78,7 +78,10 @@ fafnir dq list                                   # open flags by check and sever
 fafnir dq list --detail --check gap --symbol AAPL
 fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
 fafnir dq run --engine both                      # + dorq, in shadow (doc/dorq.md)
-fafnir dq compare --labels labels.jsonl          # dorq vs the SQL checks and labels
+fafnir dq compare --labels-from-db               # dorq vs the SQL checks and labels
+fafnir dq label add --security-id 601133 --first 2026-10-05 --kind feed_gap \
+    --verified -m "trades on the issuer page; FMP has no bar"   # state a label
+fafnir source vendor-gaps                        # live names FMP stopped serving
 
 # 7. Read with duk (db mode)
 duk ph AAPL --adj -S db

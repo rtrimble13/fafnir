@@ -416,6 +416,7 @@ def apply_plan(
     note: str,
     created_by: str,
     with_actions: bool = False,
+    reason: str = repo.DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, list[int], list[tuple[int, int, int]]]:
     """Write a checked plan. Returns ``(edit_id, override_ids, moved_actions)``.
 
@@ -435,6 +436,7 @@ def apply_plan(
         changes=plan.changes,
         note=note,
         created_by=created_by,
+        reason=reason,
     )
     moved: list[tuple[int, int, int]] = []
     if plan.kind == "shift" and with_actions and plan.actions:
@@ -448,6 +450,7 @@ def apply_plan(
                 new_ex_date=a["ex_date"] + timedelta(days=days),
                 note=f"{note} [moved with bar edit {edit_id}]",
                 created_by=created_by,
+                reason=reason,
             )
             # Both halves join the edit. Without this the note is the only thing
             # tying them to it, and `override revoke` -- which the command itself

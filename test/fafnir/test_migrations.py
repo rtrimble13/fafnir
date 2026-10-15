@@ -102,3 +102,43 @@ def test_target_stops_even_when_target_is_already_applied(migrated_dsn):
     through and apply every later migration on the second run.
     """
     assert m.migrate(migrated_dsn, target="0003") == []
+
+
+def test_0028_marks_the_closures_their_notes_call_by_rule(migrated_dsn):
+    """The 23,903 acceptances of 2026-09-10/11 say in their note that nobody looked
+    at each bar. 0028 records that as judgement_basis = by_rule; everything else
+    stays unsaid."""
+    from fafnir.db.connection import Database
+
+    with Database(migrated_dsn, autocommit=True) as db:
+        db.execute("TRUNCATE ops.operator_override, ops.data_quality_flag")
+        for note, accepted in (
+            ("Accepted at operator direction 2026-09-10: Classified by rule", True),
+            ("bulk: not individually verified", True),
+            ("closed without per-flag verification", False),
+            ("checked the bars: earnings", True),
+        ):
+            db.execute(
+                "INSERT INTO ops.data_quality_flag (check_name, record_key,"
+                " resolved_at, resolved_by, resolution_note, accepted_at,"
+                " accepted_by, accepted_note)"
+                " VALUES ('outlier', '{}'::jsonb, now(), 't', %s,"
+                " CASE WHEN %s THEN now() END, CASE WHEN %s THEN 't' END,"
+                " CASE WHEN %s THEN %s END)",
+                (note, accepted, accepted, accepted, note),
+            )
+    later = [v for v, _, state in m.status(migrated_dsn) if v >= "0028"]
+    assert "0028" in m.rollback(migrated_dsn, steps=len(later))
+    m.migrate(migrated_dsn)
+    with Database(migrated_dsn, autocommit=True) as db:
+        rows = db.fetchall(
+            "SELECT resolution_note, judgement_basis FROM ops.data_quality_flag"
+            " ORDER BY dq_flag_id"
+        )
+        db.execute("TRUNCATE ops.data_quality_flag")
+    assert [r["judgement_basis"] for r in rows] == [
+        "by_rule",
+        "by_rule",
+        "by_rule",
+        None,
+    ]

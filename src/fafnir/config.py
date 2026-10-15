@@ -16,6 +16,9 @@ Config sections
 ``[general]``
     log_level, log_dir, universe, request_rate_per_min, overlap_days,
     exclude_instruments
+``[prices]``
+    restatement_max_ratio, restatement_max_volume_ratio -- see
+    :mod:`fafnir.ingest.daily_price`
 ``[dq]``
     engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir,
     dorq_lookback_sessions, dorq_threads, dorq_backfill_max -- see
@@ -183,6 +186,24 @@ class FafnirConfig:
     def overlap_days(self) -> int:
         """Re-pull overlap window (days) to absorb late corrections/re-adjustments."""
         return int(self._get("general", "overlap_days", 5))
+
+    @property
+    def restatement_max_ratio(self) -> float:
+        """How far a nightly re-read may move a stored close, either way, before the
+        loader keeps the stored bar and flags the conflict
+        (``price_restatement_conflict``)."""
+        return self._ratio_setting("restatement_max_ratio", 1.25)
+
+    @property
+    def restatement_max_volume_ratio(self) -> float:
+        """The same, for volume."""
+        return self._ratio_setting("restatement_max_volume_ratio", 3.0)
+
+    def _ratio_setting(self, key: str, default: float) -> float:
+        value = float(self._get("prices", key, default))
+        if value <= 1:
+            raise ValueError(f"[prices] {key} must be above 1, not {value}")
+        return value
 
     @property
     def actions_overlap_days(self) -> int:

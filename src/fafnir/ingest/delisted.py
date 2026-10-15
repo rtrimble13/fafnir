@@ -41,7 +41,7 @@ from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
 from fafnir.ingest.security_master import LISTED_US_EXCHANGES, _norm_exchange
 from fafnir.logging_config import get_logger
-from fafnir.sources.fmp import FMPClient, SourceError
+from fafnir.sources.fmp import FMPClient, SourceError, payload_hash
 
 logger = get_logger("ingest.delisted")
 
@@ -233,6 +233,19 @@ def load_delisted(
         params={"max_pages": max_pages},
     ) as run:
         rows = fmp.delisted_companies(max_pages=max_pages)
+        # Landed like every other payload: `fafnir source vendor-gaps` reads the
+        # newest one to tell a security FMP stopped serving from one it delisted.
+        repo.land_payload(
+            db,
+            endpoint=ENDPOINT,
+            params={"max_pages": max_pages},
+            symbol=None,
+            http_status=200,
+            payload=rows,
+            payload_hash=payload_hash(rows),
+            nbytes=0,
+            ingestion_run_id=run.run_id,
+        )
         marked = 0
         seen = 0
         undated = 0

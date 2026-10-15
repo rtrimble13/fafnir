@@ -74,6 +74,29 @@ fafnir status
 It changes nothing, by design — it exists because these checks are spread across
 the fafnir CLI, the OS and psql, which makes them easy to half-do at 8am.
 
+### Vendor gaps in the nightly report
+
+`scripts/collect_facts.sh` runs `fafnir source vendor-gaps` (reads only) into a
+`VENDOR GAPS` section, and the morning email lists them with what is new since the
+previous night. Each is a live security FMP stopped serving: in the nightly
+universe, its last bar two or more sessions behind, its newest payload an
+open-ended request that returned nothing newer, 95% of its venue ahead of it, and
+not on the delisted feed. They are for an FMP ticket (an operator task), not for the
+queue: their `stale` flags stay open (`references/dq-playbooks.md`, `stale`).
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source vendor-gaps --json
+```
+
+### What the price load holds back
+
+From v1.5.0 the nightly price load never overwrites a stored bar by more than
+`[prices] restatement_max_ratio` (1.25, close) or `restatement_max_volume_ratio` (3):
+it keeps the bar and flags `price_restatement_conflict`. A night with many is the
+vendor restating, not the load failing; `ops.ingestion_run` stays `success`. An
+explicit `ingest prices --from` re-fetch overwrites, records `params.restated` and
+`restated_count`, and resolves the conflicts on its dates.
+
 ## The two budgets
 
 **Bandwidth** — 50 GB/month on the FMP Professional plan:

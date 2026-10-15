@@ -28,13 +28,23 @@ from typing import NamedTuple, Optional
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
-from fafnir.ingest.security_master import _to_float, ensure_venue
+from fafnir.ingest.security_master import (
+    _normalize_company_name,
+    _to_float,
+    ensure_venue,
+)
 from fafnir.logging_config import get_logger
 from fafnir.sources.fmp import FMPClient, payload_hash
 
 logger = get_logger("ingest.tracked")
 
 ENDPOINT = "profile"
+
+# A declared ticker whose only security is delisted, under the same identity. Minting
+# over it is a loop: BURU was declared on 2026-09-30 while its row (286436) was
+# delisted, so every night `ingest tracked` found no *listed* row and minted another
+# (815532 on 10-13, 833074 on 10-14), which the delisting sweep then stamped.
+DELISTED_CHECK = "tracked_symbol_delisted"
 
 # The venue open-end funds are recorded under (migration 0019). Not a real trading
 # venue: it exists so a fund has a non-NULL exchange_code that is demonstrably not
@@ -49,13 +59,31 @@ class TrackedLoadResult(NamedTuple):
 
     ``minted`` is the list worth reading in the nightly log: a declaration that has
     just become a security_id has no price watermark, so the very next
-    ``ingest prices`` pulls its full available history.
+    ``ingest prices`` pulls its full available history. ``delisted`` are the
+    declarations not minted because their identity is a delisted security's.
     """
 
     total: int
     minted: list[str]
     renamed: list[tuple[str, str]]
     missing: list[str]
+    delisted: list[tuple[str, int]] = []
+
+
+def delisted_identity(db: Database, symbol: str, profile: dict) -> Optional[dict]:
+    """The delisted security a declaration's vendor profile describes, or None.
+
+    The same company is the same CUSIP, or the same normalised name: a ticker reused
+    by a new issuer is neither, and is minted as before.
+    """
+    cusip = (profile.get("cusip") or "").strip().upper()
+    name = _normalize_company_name(profile.get("companyName") or profile.get("name"))
+    for row in repo.delisted_rows_for_symbol(db, symbol):
+        if cusip and (row.get("cusip") or "").strip().upper() == cusip:
+            return row
+        if name and _normalize_company_name(row.get("company_name")) == name:
+            return row
+    return None
 
 
 def _declared_exchange(declaration: dict) -> Optional[str]:
@@ -88,6 +116,7 @@ def load_tracked(db: Database, fmp: FMPClient) -> TrackedLoadResult:
         minted: list[str] = []
         renamed: list[tuple[str, str]] = []
         missing: list[str] = []
+        delisted: list[tuple[str, int]] = []
         count = 0
 
         for declaration in declarations:
@@ -158,6 +187,43 @@ def load_tracked(db: Database, fmp: FMPClient) -> TrackedLoadResult:
                 db.commit()
                 continue
 
+            if existing is None:
+                retired = delisted_identity(db, symbol, profile)
+                if retired is not None:
+                    # Not minted: the row would be the delisted company again, and the
+                    # delisting sweep would stamp it again tonight. A human decides:
+                    # it relisted (`security venue-transfer`), or it is gone
+                    # (`track rm`).
+                    delisted.append((symbol, int(retired["security_id"])))
+                    logger.warning(
+                        "%s is declared but its only security (%s) was delisted on "
+                        "%s; not minting another. Relisted: `fafnir security "
+                        "venue-transfer %s`; gone: `fafnir track rm %s`.",
+                        symbol,
+                        retired["security_id"],
+                        retired["delisted_date"],
+                        retired["security_id"],
+                        symbol,
+                    )
+                    repo.add_dq_flag_once(
+                        db,
+                        check_name=DELISTED_CHECK,
+                        severity="warn",
+                        table_name="ref.tracked_symbol",
+                        record_key={"symbol": symbol},
+                        detail={
+                            "delisted_security_id": int(retired["security_id"]),
+                            "delisted_date": str(retired["delisted_date"]),
+                            "company_name": retired["company_name"],
+                            "cusip": retired["cusip"],
+                            "profile_name": profile.get("companyName"),
+                            "profile_cusip": profile.get("cusip"),
+                        },
+                        ingestion_run_id=run.run_id,
+                    )
+                    db.commit()
+                    continue
+
             asset_type = declaration["asset_type"]
             exchange = _declared_exchange(declaration)
             ensure_venue(db, exchange)
@@ -216,4 +282,11 @@ def load_tracked(db: Database, fmp: FMPClient) -> TrackedLoadResult:
                 len(missing),
                 ", ".join(missing),
             )
-        return TrackedLoadResult(count, minted, renamed, missing)
+        if delisted:
+            logger.warning(
+                "%d declared symbol(s) name a delisted security and were not minted: "
+                "%s",
+                len(delisted),
+                ", ".join(f"{s} ({sid})" for s, sid in delisted),
+            )
+        return TrackedLoadResult(count, minted, renamed, missing, delisted)
