@@ -19,13 +19,13 @@ read through the `duk` CLI.
   [confirming the price feed](backfill.md#confirming-the-price-feed) and
   [clearing data for a reload](backfill.md#clearing-data-for-a-reload)
 - [Ingestion](ingestion.md) — FMP endpoint→table map, idempotency, watermarks, the
-  adjustment step
+  restatement guard, the adjustment step
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,
   [working the DQ queue](operations.md#working-the-dq-queue),
   [venue transfers](operations.md#venue-transfers) ([ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)),
   reconciliation, recovery, backups
 - [dorq](dorq.md) — the Bayesian data-quality engine: install, configure, the
-  shadow period, `dq compare`, `dq export-labels`, calibration
+  shadow period, `dq compare`, labels (`dq export-labels`, `dq label`), calibration
   ([ADR 0013](adr/0013-dorq-dq-engine.md))
 - [duk CLI](duk.md) — reading the warehouse (db) vs the API (live)
 - [Operations Agent](agent.md) — running an agent on the host for DQ triage,

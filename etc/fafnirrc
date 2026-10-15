@@ -79,6 +79,15 @@ horizon_extra_years = 2
 log_level = "info"
 log_dir = "var/fafnir/log"
 
+# --- prices: the restatement guard (doc/ingestion.md) ------------------------
+[prices]
+# The nightly re-read of the last few sessions never overwrites a stored bar by more
+# than these ratios (either direction): it keeps the stored bar and flags
+# price_restatement_conflict. An explicit `ingest prices --from` re-fetch overwrites,
+# and prints what it restated.
+# restatement_max_ratio = 1.25
+# restatement_max_volume_ratio = 3
+
 # --- data quality: the dorq engine (doc/dorq.md, ADR 0013) -------------------
 [dq]
 # Which checks `fafnir dq run` runs: "sql" (default), "dorq" or "both".

@@ -35,15 +35,18 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `ops.ingestion_run` | one row per load |
 | `ops.data_quality_flag` | `dq_flag_id`; one per open condition, except `price_*` |
 | `ops.load_watermark` | `(source, endpoint, security_id)`; `security_id = 0` means whole-endpoint |
+| `ops.operator_override` | `override_id`; one per operator edit, `reason` = `data_error`/`out_of_scope`/`cleanup` |
+| `ops.dq_label` | `label_id`; a label a person stated (`dq label`, `--label`); `security_id` NULL for a cohort (`members`) |
 | `landing.fmp_raw` | `raw_id` — endpoint + symbol + `fetched_at` |
 | `meta.schema_migration` | `version` |
 
 **What landing actually keeps.** `landing.fmp_raw` holds the payloads for prices,
-dividends, splits, both corporate-action calendars and symbol changes. It does
-**not** hold `stock-list` (the screener) or `delisted-companies` — those two
-loaders never call `land_payload`. So neither the screener nor the delisted sweep
-can be audited after the fact, and **a join against landing for a screener or
-delisting question returns nothing and looks like a finding**. On 2026-09-10 that
+dividends, splits, both corporate-action calendars and symbol changes, and from
+v1.5.0 the delisted sweep's (`delisted-companies`, one row per run, `symbol` NULL).
+It does **not** hold `stock-list` (the screener), and no delisted payload before
+v1.5.0. So the screener cannot be audited after the fact, and **a join against
+landing for a screener question, or a delisting before v1.5.0, returns nothing and
+looks like a finding**. On 2026-09-10 that
 produced a confident "173/173 off-screener" that was an artefact of the missing
 rows. To ask whether the screener still lists a name, read
 `core.security.updated_at`, which the nightly load stamps.

@@ -101,7 +101,10 @@ hold logic). Everything else is one row per *open condition*.
 > re-quarantining the same bar nightly.
 
 `dq_totals` separates them: read `distinct_condition_flags` for the count of
-problems.
+problems. Two `price_*` checks are not quarantines and do not repeat:
+`price_scale_collapse` and `price_restatement_conflict` (the bar was stored, or kept)
+are one row per open condition. `price_split_scale_mismatch` is a quarantine and
+repeats like the rest.
 
 ## 9. Open DQ is a count of problems, not of runs
 
@@ -254,3 +257,27 @@ Before reporting a large, liquid name as delisted, check for bars after its
 `delisted_date` and for these flags, then look for a public notice of a move.
 
 > **Wrong answer:** "ET was delisted on 2026-10-05". It changed venue.
+
+## 21. FMP restates bars, and the warehouse keeps the first print
+
+FMP's first print of a bar is usually right; what it serves on a later read of the
+same date often is not. From 2026-09-16 the nightly re-read of the last five
+sessions stored another fund's prices over first prints (OUSL ~11 -> ~58, QCJL ~26
+-> 0.07), prices at the scale of a split not yet gone ex (GCDT x6, ZBAO x50, volumes
+unchanged), and a phantom split's scale (SKYD x2). An operator re-fetch once
+returned prices right and volume x50.
+
+Since v1.5.0 the nightly load keeps the stored bar when the re-read moves the close
+by more than 1.25x or the volume by more than 3x, either way, and flags
+`price_restatement_conflict` with both sides. Only an explicit `ingest prices --from`
+overwrites, and it prints what it restated.
+
+> **Wrong answer:** "the vendor corrected it, so the stored bar is stale." Read the
+> conflict's `detail`: the first print is usually the right one, and when it is not
+> (SKYD 10-02), a probe and a re-fetch put it right in one step.
+
+> **Wrong answer:** "core.daily_price.loaded_at says the bar was loaded last night,
+> so that is what dorq read." The 5-session re-read rewrites `loaded_at` and
+> `ingestion_run_id` on every overlap; `dq compare` reads the run's own holding
+> snapshot instead.
+

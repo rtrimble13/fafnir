@@ -499,6 +499,8 @@ def test_a_run_records_its_hash_what_was_left_out_and_how_long_it_took(
     )
     assert run["status"] == "success"
     backfill = run["params"].pop("backfill")
+    # No SQL flags open: the snapshot `dq compare` reads is empty, not absent.
+    assert run["params"].pop("holding")["states"] == {}
     assert run["params"] == {
         "dorq_version": "9.9.9-fake",
         "dorq_config_hash": "x",

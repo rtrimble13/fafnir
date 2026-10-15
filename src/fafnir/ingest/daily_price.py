@@ -24,10 +24,24 @@ what the payload happens to omit -- see :func:`_is_nav_priced` and
 satisfies every constraint on core.daily_price as written, and a distribution
 back-adjusts through core.adjustment_factor exactly as a cash dividend does. See
 doc/adr/0006-curated-fund-universe.md.
+
+RESTATEMENTS. FMP's first print of a bar is usually right; what it serves on a later
+read of the same date often is not. Between 2026-09-16 and 10-14 the nightly re-read
+of the last five sessions replaced first prints with another fund's prices (OUSL
+~11 -> ~58, QCJL ~26 -> 0.07), with prices at the scale of a split not yet gone ex
+(GCDT x6, ZBAO x50) and with a phantom split's scale (SKYD x2) -- and stored every
+one. So a nightly load never overwrites a stored bar by more than
+``[prices] restatement_max_ratio`` (close) or ``restatement_max_volume_ratio``
+(volume), either way: it keeps the stored bar and flags
+``price_restatement_conflict`` (:func:`restatement_detail`). An explicit operator
+re-fetch (``ingest prices --from``) overwrites as before, and reports every bar it
+restated beyond those ratios. A split-scaled bar with no stored copy to protect is
+quarantined instead (:func:`split_scale_detail`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Optional
@@ -92,6 +106,43 @@ SCALE_COLLAPSE_CHECK = "price_scale_collapse"
 _MONEY_SCALE = Decimal("0.000001")  # NUMERIC(20, 6) -> 6 decimal places
 _MONEY_MAX = Decimal(10) ** 14  # NUMERIC(20, 6) -> 14 integer digits
 _VOLUME_MAX = 2**63 - 1  # BIGINT
+
+# A nightly re-read that would move a stored bar further than the guard allows. Not a
+# quarantine: the stored bar stays, so it is written once per open condition
+# (add_dq_flag_once), and repository.NON_QUARANTINE_PRICE_CHECKS lists it so it does
+# not spend a rejected bar's watermark budget. See RESTATEMENTS above.
+RESTATEMENT_CHECK = "price_restatement_conflict"
+
+# A new bar at a split-adjusted scale, before a split on file. A quarantine: the bar
+# is not stored, and it holds the watermark like any other (MAX_QUARANTINE_HOLDS).
+SPLIT_SCALE_CHECK = "price_split_scale_mismatch"
+
+# Calendar days either side of a conflicting bar searched for a split on file, which
+# is the usual reason a vendor restates a bar (GCDT, ZBAO, SKYD).
+RESTATEMENT_SPLIT_DAYS = 30
+
+# An explicit re-fetch records at most this many restated bars in its run's params;
+# a full re-backfill across a feed change would otherwise write every bar there.
+RESTATED_PARAMS_MAX = 500
+
+# The split-scale guard (split_scale_detail): a split on file this many calendar
+# days after a new bar, a close within this share of the split's price factor of the
+# last stored close, a volume within this share of the expected one, and a split at
+# least this far from 1:1 (a 5:4 split's factor is inside an ordinary day's range).
+SPLIT_SCALE_DAYS = 30
+SPLIT_SCALE_PRICE_TOLERANCE = 0.10
+SPLIT_SCALE_VOLUME_TOLERANCE = 0.25
+SPLIT_SCALE_MIN_FACTOR = 1.5
+SPLIT_SCALE_MEDIAN_SESSIONS = 20
+
+
+@dataclass(frozen=True)
+class RestatementGuard:
+    """How far a nightly re-read may move a stored bar, either way."""
+
+    max_ratio: float = 1.25
+    max_volume_ratio: float = 3.0
+
 
 # FMP's unadjusted (and dividend-adjusted) endpoints prefix the OHLC field names
 # with "adj"; the `full` endpoint does not. The prefix is a naming convention on
@@ -465,6 +516,118 @@ def _drop_suppressed(bars: list[dict], suppressed: frozenset) -> tuple[list[dict
     return kept, len(bars) - len(kept)
 
 
+def _fold(new, old) -> Optional[float]:
+    """``max(new/old, old/new)`` for two positive values; None when either is not
+    (a zero volume is no ratio, so it restates nothing)."""
+    try:
+        n, o = float(new), float(old)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0 or o <= 0:
+        return None
+    return max(n / o, o / n)
+
+
+def _bar_json(row: dict) -> dict:
+    return {
+        f: (str(row[f]) if isinstance(row.get(f), Decimal) else row.get(f))
+        for f in ("open", "high", "low", "close", "volume")
+    }
+
+
+def restatement_detail(
+    stored: dict, row: dict, guard: RestatementGuard
+) -> Optional[dict]:
+    """Evidence that ``row`` restates the ``stored`` bar beyond ``guard``, else None.
+
+    Either side counts: a close more than ``max_ratio`` away (OUSL ~11 -> ~58, QCJL
+    26 -> 0.07), or a volume more than ``max_volume_ratio`` away (ZBAO's re-fetch,
+    x50 at the same prices).
+    """
+    close = _fold(row["close"], stored["close"])
+    volume = _fold(row["volume"], stored["volume"])
+    over = []
+    if close is not None and close > guard.max_ratio:
+        over.append("close")
+    if volume is not None and volume > guard.max_volume_ratio:
+        over.append("volume")
+    if not over:
+        return None
+    return {
+        "over": over,
+        "close_ratio": round(float(row["close"]) / float(stored["close"]), 6),
+        "volume_ratio": (
+            round(float(row["volume"]) / float(stored["volume"]), 6)
+            if volume is not None
+            else None
+        ),
+        "stored": {
+            **_bar_json(stored),
+            "ingestion_run_id": stored.get("ingestion_run_id"),
+        },
+        "incoming": _bar_json(row),
+    }
+
+
+def split_scale_detail(
+    row: dict,
+    prev_close,
+    median_volume: Optional[float],
+    split: dict,
+) -> Optional[dict]:
+    """Evidence that a new bar sits at a split-adjusted scale, else None (G2).
+
+    A bar dated before a split on file, whose close is the last stored close times
+    the split's price factor (``den/num``: x50 for a 1:50, x0.5 for a 2:1), within
+    :data:`SPLIT_SCALE_PRICE_TOLERANCE`. Its volume must look like the vendor's
+    adjusted bar too, within :data:`SPLIT_SCALE_VOLUME_TOLERANCE` of the 20-session
+    median times either the inverse factor (an adjustment applied consistently) or
+    one (the price alone adjusted -- the shape FMP actually served: GCDT's x6 and
+    ZBAO's x50 bars carried their first prints' volumes, within 8%). A real move of
+    exactly a split's factor on ordinary volume, in the weeks before that split,
+    is what this cannot tell apart, so splits nearer 1:1 than
+    :data:`SPLIT_SCALE_MIN_FACTOR` are not judged: a 5:4 split's factor is inside an
+    ordinary day's range.
+    """
+    num, den = split.get("split_numerator"), split.get("split_denominator")
+    try:
+        factor = float(den) / float(num)
+        moved = float(row["close"]) / float(prev_close)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if factor <= 0 or max(factor, 1 / factor) < SPLIT_SCALE_MIN_FACTOR:
+        return None
+    if abs(moved / factor - 1) > SPLIT_SCALE_PRICE_TOLERANCE:
+        return None
+    if not median_volume or not row.get("volume"):
+        return None
+    vol = float(row["volume"]) / float(median_volume)
+    shapes = {"adjusted": 1 / factor, "unchanged": 1.0}
+    shape = next(
+        (
+            name
+            for name, expected in shapes.items()
+            if abs(vol / expected - 1) <= SPLIT_SCALE_VOLUME_TOLERANCE
+        ),
+        None,
+    )
+    if shape is None:
+        return None
+    return {
+        "reason": "split_scale_mismatch",
+        "close": str(row["close"]),
+        "prev_close": str(prev_close),
+        "close_ratio": round(moved, 6),
+        "split_ex_date": str(split["ex_date"]),
+        "split": split.get("split")
+        or f"{split['split_numerator']}:{split['split_denominator']}",
+        "price_factor": round(factor, 6),
+        "volume": row.get("volume"),
+        "median_volume": median_volume,
+        "volume_shape": shape,
+    }
+
+
 def _window_start(
     start_date: Optional[date],
     watermark: Optional[date],
@@ -499,6 +662,8 @@ def load_symbol_prices(
     overlap_days: int = 5,
     stats: Optional[dict] = None,
     backfill_start: Optional[date] = None,
+    guard: Optional[RestatementGuard] = None,
+    restated: Optional[list] = None,
 ) -> int:
     """Load one symbol's prices within the (incremental) window.
 
@@ -506,12 +671,20 @@ def load_symbol_prices(
     something in aggregate -- see :func:`load_prices`, which uses them to tell a
     genuinely empty load apart from a successful one. ``backfill_start`` is where a
     symbol with no watermark starts (see :func:`_window_start`).
+
+    ``guard`` bounds what the load may restate (RESTATEMENTS, in the module
+    docstring). A load with no ``start_date`` is the nightly incremental one: a bar
+    that would restate a stored one beyond the guard is not written, and is flagged.
+    With a ``start_date`` it is an explicit re-fetch, which overwrites, appends what
+    it restated to ``restated`` and resolves the conflicts on the dates it covered.
     """
 
     def _tally(key: str) -> None:
         if stats is not None:
             stats[key] = stats.get(key, 0) + 1
 
+    guard = guard or RestatementGuard()
+    explicit = start_date is not None
     sec_id = repo.resolve_security_id(db, symbol)
     if sec_id is None:
         logger.warning("Unknown symbol %s; skipping (load securities first)", symbol)
@@ -650,6 +823,25 @@ def load_symbol_prices(
                 ingestion_run_id=run.run_id,
             )
 
+    stored = repo.stored_bars_on(db, sec_id, [r["trade_date"] for r in clean])
+    clean, held, scaled = _guard_bars(
+        db,
+        sec_id,
+        symbol,
+        clean,
+        stored,
+        explicit=explicit,
+        guard=guard,
+        run=run,
+        restated=restated,
+    )
+    for qd in scaled:
+        quarantined_dates.append(qd)
+    if stats is not None and held:
+        stats["restatement_conflicts"] = stats.get("restatement_conflicts", 0) + len(
+            held
+        )
+
     written = repo.upsert_daily_prices(db, clean, ingestion_run_id=run.run_id)
 
     # Advance the watermark only up to the latest *contiguous* clean date: never
@@ -666,7 +858,9 @@ def load_symbol_prices(
         if repo.count_price_quarantines(db, sec_id, qd.isoformat())
         < MAX_QUARANTINE_HOLDS
     ]
-    clean_dates = [r["trade_date"] for r in clean]
+    # A date whose re-read was held still has its stored bar: it is not a hole, and
+    # the watermark may pass it.
+    clean_dates = [r["trade_date"] for r in clean] + held
     if holding:
         cutoff = min(holding)
         safe_dates = [d for d in clean_dates if d < cutoff]
@@ -704,6 +898,182 @@ def load_symbol_prices(
 
     run.rows_inserted += written
     return written
+
+
+def _guard_bars(
+    db: Database,
+    sec_id: int,
+    symbol: str,
+    clean: list[dict],
+    stored: dict,
+    *,
+    explicit: bool,
+    guard: RestatementGuard,
+    run: RunLog,
+    restated: Optional[list],
+) -> tuple[list[dict], list[date], list[date]]:
+    """Hold back what a load must not write. Returns ``(to_write, held_dates,
+    quarantined_dates)``.
+
+    * A bar with a stored copy that it restates beyond ``guard``: on a nightly load
+      the stored bar stays and ``price_restatement_conflict`` is flagged (the date is
+      held, not quarantined); on an explicit re-fetch it is written, reported in
+      ``restated`` and the run's params, and the date's open conflict is resolved.
+    * A bar with no stored copy at a split-adjusted scale: quarantined
+      (``price_split_scale_mismatch``), on any load.
+    """
+    to_write: list[dict] = []
+    held: list[date] = []
+    scaled: list[date] = []
+    conflicts: list[tuple[dict, dict, dict]] = []
+    for row in clean:
+        old = stored.get(row["trade_date"])
+        if old is None:
+            to_write.append(row)
+            continue
+        detail = restatement_detail(old, row, guard)
+        if detail is not None:
+            conflicts.append((row, old, detail))
+            if not explicit:
+                held.append(row["trade_date"])
+                continue
+        to_write.append(row)
+
+    if conflicts:
+        splits = repo.splits_near(
+            db,
+            sec_id,
+            min(r["trade_date"] for r, _, _ in conflicts)
+            - timedelta(days=RESTATEMENT_SPLIT_DAYS),
+            max(r["trade_date"] for r, _, _ in conflicts)
+            + timedelta(days=RESTATEMENT_SPLIT_DAYS),
+        )
+    for row, old, detail in conflicts:
+        d = row["trade_date"]
+        near = [
+            {"ex_date": str(s["ex_date"]), "split": s["split"]}
+            for s in splits
+            if abs((s["ex_date"] - d).days) <= RESTATEMENT_SPLIT_DAYS
+        ]
+        if not explicit:
+            logger.warning(
+                "%s %s: the vendor restates the stored bar (close %s -> %s, volume "
+                "%s -> %s); kept the stored one and flagged %s",
+                symbol,
+                d,
+                old["close"],
+                row["close"],
+                old["volume"],
+                row["volume"],
+                RESTATEMENT_CHECK,
+            )
+            repo.add_dq_flag_once(
+                db,
+                check_name=RESTATEMENT_CHECK,
+                severity="warn",
+                security_id=sec_id,
+                table_name="core.daily_price",
+                record_key={"symbol": symbol, "date": d.isoformat()},
+                detail={**detail, "splits_near": near},
+                ingestion_run_id=run.run_id,
+            )
+            continue
+        entry = {
+            "symbol": symbol,
+            "security_id": sec_id,
+            "date": d.isoformat(),
+            "over": detail["over"],
+            "close": [str(old["close"]), str(row["close"])],
+            "volume": [old["volume"], row["volume"]],
+        }
+        if restated is not None:
+            restated.append(entry)
+        logged = run.params.setdefault("restated", [])
+        if len(logged) < RESTATED_PARAMS_MAX:
+            logged.append(entry)
+        run.params["restated_count"] = run.params.get("restated_count", 0) + 1
+
+    if explicit:
+        written = {r["trade_date"]: r for r in to_write}
+        for flag in repo.open_restatement_conflicts(
+            db, sec_id, RESTATEMENT_CHECK, list(written)
+        ):
+            d = date.fromisoformat(flag["d"])
+            old, new = stored.get(d) or {}, written[d]
+            repo.resolve_dq_flags(
+                db,
+                repo.DqFilter(flag_ids=(int(flag["dq_flag_id"]),)),
+                note=(
+                    f"operator re-fetch, run {run.run_id}: close "
+                    f"{old.get('close')} -> {new['close']}, volume "
+                    f"{old.get('volume')} -> {new['volume']}"
+                ),
+                resolved_by="ingest prices",
+            )
+
+    fresh = [r for r in to_write if r["trade_date"] not in stored]
+    if not fresh:
+        return to_write, held, scaled
+    splits_after = repo.splits_near(
+        db,
+        sec_id,
+        min(r["trade_date"] for r in fresh) + timedelta(days=1),
+        max(r["trade_date"] for r in fresh) + timedelta(days=SPLIT_SCALE_DAYS),
+    )
+    if not splits_after:
+        return to_write, held, scaled
+    out: list[dict] = []
+    for row in to_write:
+        d = row["trade_date"]
+        upcoming = [
+            s
+            for s in splits_after
+            if d < s["ex_date"] <= d + timedelta(days=SPLIT_SCALE_DAYS)
+        ]
+        if d in stored or not upcoming:
+            out.append(row)
+            continue
+        prev = repo.close_before(db, sec_id, d)
+        median = repo.median_volume_before(
+            db, sec_id, d, bars=SPLIT_SCALE_MEDIAN_SESSIONS
+        )
+        detail = next(
+            (
+                found
+                for s in upcoming
+                if prev is not None
+                and (found := split_scale_detail(row, prev, median, s)) is not None
+            ),
+            None,
+        )
+        if detail is None:
+            out.append(row)
+            continue
+        logger.warning(
+            "%s %s: close %s is the last close %s at the scale of the %s split of "
+            "%s; quarantined as %s",
+            symbol,
+            d,
+            row["close"],
+            prev,
+            detail["split"],
+            detail["split_ex_date"],
+            SPLIT_SCALE_CHECK,
+        )
+        run.rows_quarantined += 1
+        # A quarantine, so add_dq_flag: its repeats are the watermark's budget.
+        repo.add_dq_flag(
+            db,
+            check_name=SPLIT_SCALE_CHECK,
+            severity="warn",
+            security_id=sec_id,
+            table_name="core.daily_price",
+            record_key={"symbol": symbol, "date": d.isoformat()},
+            detail=detail,
+            ingestion_run_id=run.run_id,
+        )
+        scaled.append(d)
+    return out, held, scaled
 
 
 def _guard_split_adjusted_changeover(db: Database, start_date: Optional[date]) -> None:
@@ -744,11 +1114,14 @@ def load_prices(
     end_date: Optional[date] = None,
     overlap_days: int = 5,
     backfill_start: Optional[date] = None,
+    guard: Optional[RestatementGuard] = None,
+    restated: Optional[list] = None,
 ) -> int:
     """Load prices for many symbols.
 
     ``backfill_start`` is where a symbol loaded for the first time (no watermark, no
     explicit window) starts; the CLI passes the configured calendar_start_year.
+    ``guard`` and ``restated``: see :func:`load_symbol_prices`.
 
     Raises rather than returning a quiet zero when the load cannot have worked.
     A run that reports success having written nothing is the most expensive kind
@@ -784,6 +1157,8 @@ def load_prices(
                 overlap_days=overlap_days,
                 stats=stats,
                 backfill_start=backfill_start,
+                guard=guard,
+                restated=restated,
             )
             # One symbol -- its landing payload, bars, DQ flags and watermark --
             # is the unit of work. Committing here is what makes the backfill
@@ -818,6 +1193,15 @@ def load_prices(
                 "%d of %d symbols returned no bars in the requested window",
                 empty,
                 len(symbols),
+            )
+        conflicts = stats.get("restatement_conflicts", 0)
+        if conflicts:
+            logger.warning(
+                "Kept %d stored bar(s) the vendor restated beyond the guard; flagged "
+                "as %s (fafnir dq list --check %s)",
+                conflicts,
+                RESTATEMENT_CHECK,
+                RESTATEMENT_CHECK,
             )
         non_session = stats.get("non_session", 0)
         if non_session:

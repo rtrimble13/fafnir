@@ -2183,6 +2183,23 @@ def listed_security_for_declaration(
     )
 
 
+def delisted_rows_for_symbol(
+    db: Database, symbol: str, source: str = "fmp"
+) -> list[dict]:
+    """The delisted securities that retired under ``symbol``, newest first, with what
+    identifies them: the name and CUSIP a declaration's profile is weighed against
+    before a row is minted over them (:func:`fafnir.ingest.tracked.load_tracked`)."""
+    return db.fetchall(
+        """
+        SELECT security_id, primary_symbol, company_name, cusip, delisted_date
+          FROM core.security
+         WHERE source = %s AND primary_symbol = %s AND delisted_date IS NOT NULL
+         ORDER BY delisted_date DESC, security_id DESC
+        """,
+        (source, symbol),
+    )
+
+
 def retarget_tracked_symbol(
     db: Database, *, old_symbol: str, new_symbol: str, source: str = "fmp"
 ) -> bool:
@@ -2290,6 +2307,69 @@ def upsert_daily_prices(
             loaded_at = now()
         """,
         params,
+    )
+
+
+def stored_bars_on(
+    db: Database, security_id: int, trade_dates: Sequence[date]
+) -> dict[date, dict]:
+    """The stored bars of one security on these dates, by date: what a load is about
+    to overwrite. One query, so the price loader can read before it writes."""
+    if not trade_dates:
+        return {}
+    return {
+        r["trade_date"]: r
+        for r in db.fetchall(
+            """
+            SELECT trade_date, open, high, low, close, volume, vwap, source,
+                   ingestion_run_id
+              FROM core.daily_price
+             WHERE security_id = %s AND trade_date = ANY(%s)
+            """,
+            (security_id, list(trade_dates)),
+        )
+    }
+
+
+def splits_near(db: Database, security_id: int, lo: date, hi: date) -> list[dict]:
+    """The splits on file for one security with an ex-date from ``lo`` to ``hi``."""
+    rows = db.fetchall(
+        """
+        SELECT ex_date, split_numerator, split_denominator
+          FROM core.corporate_action
+         WHERE security_id = %s AND action_type = 'split'
+           AND ex_date BETWEEN %s AND %s
+         ORDER BY ex_date
+        """,
+        (security_id, lo, hi),
+    )
+
+    def ratio(v) -> str:
+        return format(Decimal(v).normalize(), "f") if v is not None else "?"
+
+    return [
+        {
+            **r,
+            "split": f"{ratio(r['split_numerator'])}:{ratio(r['split_denominator'])}",
+        }
+        for r in rows
+    ]
+
+
+def open_restatement_conflicts(
+    db: Database, security_id: int, check_name: str, trade_dates: Sequence[date]
+) -> list[dict]:
+    """The open conflict flags (``record_key.date``) on these dates."""
+    if not trade_dates:
+        return []
+    return db.fetchall(
+        """
+        SELECT dq_flag_id, record_key->>'date' AS d
+          FROM ops.data_quality_flag
+         WHERE check_name = %s AND security_id = %s AND resolved_at IS NULL
+           AND record_key->>'date' = ANY(%s)
+        """,
+        (check_name, security_id, [d.isoformat() for d in trade_dates]),
     )
 
 
@@ -2438,6 +2518,14 @@ def delete_corporate_action(
 
 OPERATOR_SOURCE = "operator"
 
+#: Why an operator edit was made (ops.operator_override.reason, migration 0028).
+#: Only a ``data_error`` override is a statement that the vendor's row was wrong,
+#: and so only those become labels (fafnir.dq.labels). ``out_of_scope`` is data
+#: removed because the security does not belong (CELG-RI, 2026-10-14); ``cleanup``
+#: is bookkeeping, such as a merge's leftovers.
+OVERRIDE_REASONS = ("data_error", "out_of_scope", "cleanup")
+DEFAULT_OVERRIDE_REASON = "data_error"
+
 
 class OverrideRefused(RuntimeError):
     """An operator edit that would leave the rows, or their record, ambiguous."""
@@ -2467,16 +2555,18 @@ def _insert_override(
     detail: dict,
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> int:
     import json
 
+    _check_reason(reason)
     return int(
         db.fetchval(
             """
             INSERT INTO ops.operator_override
                 (security_id, target, action_type, key_date, operation, detail,
-                 note, created_by)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                 note, created_by, reason)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING override_id
             """,
             (
@@ -2488,9 +2578,17 @@ def _insert_override(
                 json.dumps(detail, default=str),
                 note,
                 created_by,
+                reason,
             ),
         )
     )
+
+
+def _check_reason(reason: str) -> None:
+    if reason not in OVERRIDE_REASONS:
+        raise OverrideRefused(
+            f"Unknown override reason {reason!r}: one of {', '.join(OVERRIDE_REASONS)}."
+        )
 
 
 def corporate_action_by_id(db: Database, corporate_action_id: int) -> Optional[dict]:
@@ -2629,6 +2727,7 @@ def delete_operator_action(
     note: str,
     created_by: str,
     detail_extra: Optional[dict] = None,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> int:
     """Remove a corporate action and suppress its key. Returns the override id.
 
@@ -2665,6 +2764,7 @@ def delete_operator_action(
         detail={"row": _jsonable(row), **(detail_extra or {})},
         note=note,
         created_by=created_by,
+        reason=reason,
     )
     db.execute(
         "DELETE FROM core.corporate_action WHERE corporate_action_id = %s",
@@ -2686,6 +2786,7 @@ def add_operator_action(
     note: str,
     created_by: str,
     detail_extra: Optional[dict] = None,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, int]:
     """Write a corporate action the feed has wrong or missing.
 
@@ -2765,6 +2866,7 @@ def add_operator_action(
         },
         note=note,
         created_by=created_by,
+        reason=reason,
     )
     return action_id, override_id
 
@@ -2776,6 +2878,7 @@ def redate_operator_action(
     new_ex_date: date,
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, int, int]:
     """Move a corporate action to another ex-date.
 
@@ -2817,6 +2920,7 @@ def redate_operator_action(
         note=note,
         created_by=created_by,
         detail_extra={"redated_to": new_ex_date.isoformat()},
+        reason=reason,
     )
     new_id, add_id = add_operator_action(
         db,
@@ -2833,6 +2937,7 @@ def redate_operator_action(
             "redated_from": row["ex_date"].isoformat(),
             "redated_from_override": delete_id,
         },
+        reason=reason,
     )
     db.execute(
         "UPDATE ops.operator_override SET detail = detail || %s WHERE override_id = %s",
@@ -2848,6 +2953,7 @@ def delete_operator_bars(
     trade_dates: Sequence[date],
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> list[int]:
     """Remove bars and suppress their dates. Returns one override id per bar removed.
 
@@ -2892,6 +2998,7 @@ def delete_operator_bars(
                 detail={"row": _jsonable(bar)},
                 note=note,
                 created_by=created_by,
+                reason=reason,
             )
         )
         db.execute(
@@ -2987,6 +3094,7 @@ def replace_operator_bars(
     changes: Sequence[tuple[dict, dict]],
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, list[int]]:
     """Replace vendor bars with transformed copies, recorded as one edit.
 
@@ -3007,6 +3115,7 @@ def replace_operator_bars(
 
     if kind not in PRICE_TRANSFORM_KINDS:
         raise OverrideRefused(f"Unknown bar transform {kind!r}.")
+    _check_reason(reason)
     if not changes:
         raise OverrideRefused("No bars to replace.")
     olds = [old for old, _ in changes]
@@ -3021,8 +3130,8 @@ def replace_operator_bars(
         """
         INSERT INTO ops.operator_override
             (security_id, target, action_type, key_date, operation, detail, note,
-             created_by)
-        SELECT %s, 'daily_price', NULL, x.key_date, 'delete', x.detail, %s, %s
+             created_by, reason)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'delete', x.detail, %s, %s, %s
           FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
          ORDER BY x.key_date
         RETURNING override_id, key_date
@@ -3031,6 +3140,7 @@ def replace_operator_bars(
             security_id,
             note,
             created_by,
+            reason,
             json.dumps(
                 [
                     {
@@ -3077,8 +3187,8 @@ def replace_operator_bars(
         """
         INSERT INTO ops.operator_override
             (security_id, target, action_type, key_date, operation, detail, note,
-             created_by)
-        SELECT %s, 'daily_price', NULL, x.key_date, 'add', x.detail, %s, %s
+             created_by, reason)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'add', x.detail, %s, %s, %s
           FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
          ORDER BY x.key_date
         RETURNING override_id, key_date
@@ -3087,6 +3197,7 @@ def replace_operator_bars(
             security_id,
             note,
             created_by,
+            reason,
             json.dumps(
                 [
                     {
@@ -3358,7 +3469,7 @@ def list_operator_overrides(
         f"""
         SELECT o.override_id, o.security_id, s.primary_symbol, o.target,
                o.action_type, o.key_date, o.operation, o.detail, o.note,
-               o.created_by, o.created_at, o.revoked_at, o.revoked_by,
+               o.reason, o.created_by, o.created_at, o.revoked_at, o.revoked_by,
                o.revoked_note
           FROM ops.operator_override o
           LEFT JOIN core.security s USING (security_id)
@@ -3446,6 +3557,84 @@ def revoke_operator_override(
         (revoked_by, note, override_id),
     )
     return row
+
+
+def overrides_for_reason(
+    db: Database,
+    *,
+    override_ids: Sequence[int] = (),
+    security_id: Optional[int] = None,
+    target: Optional[str] = None,
+    created_on: Optional[date] = None,
+) -> list[dict]:
+    """The overrides `fafnir override set-reason` would touch, oldest first.
+
+    By id (any state, so a revoked edit can still be re-described), or by security,
+    narrowed by target and the day it was made (active ones only). A filter without
+    a security is refused by the caller: re-describing every override in the
+    warehouse is not a thing anyone means.
+    """
+    if override_ids:
+        return db.fetchall(
+            """
+            SELECT override_id, security_id, target, action_type, key_date,
+                   operation, reason, created_at, revoked_at
+              FROM ops.operator_override
+             WHERE override_id = ANY(%s)
+             ORDER BY override_id
+            """,
+            ([int(i) for i in override_ids],),
+        )
+    if security_id is None:
+        raise ValueError("select overrides by id, or by --security-id")
+    return db.fetchall(
+        """
+        SELECT override_id, security_id, target, action_type, key_date,
+               operation, reason, created_at, revoked_at
+          FROM ops.operator_override
+         WHERE security_id = %s AND revoked_at IS NULL
+           AND (%s::text IS NULL OR target = %s::text)
+           AND (%s::date IS NULL OR created_at::date = %s::date)
+         ORDER BY override_id
+        """,
+        (security_id, target, target, created_on, created_on),
+    )
+
+
+def set_override_reason(
+    db: Database,
+    *,
+    override_ids: Sequence[int],
+    reason: str,
+    note: str,
+    set_by: str,
+) -> list[int]:
+    """Re-describe why overrides were made. Returns the ids whose reason changed.
+
+    Only ``reason`` changes. The original note stays as it was, and the change is
+    appended to ``detail.reason_history`` -- from, to, the note, who and when -- so
+    the record still says what the operator thought at the time. A row already
+    carrying ``reason`` is left alone.
+    """
+    _check_reason(reason)
+    if not (note and note.strip()):
+        raise OverrideRefused("A reason change needs a note: it is the whole record.")
+    rows = db.fetchall(
+        """
+        UPDATE ops.operator_override
+           SET detail = jsonb_set(
+                   detail, '{reason_history}',
+                   COALESCE(detail->'reason_history', '[]'::jsonb)
+                   || jsonb_build_array(jsonb_build_object(
+                          'from', reason, 'to', %s::text, 'note', %s::text,
+                          'by', %s::text, 'at', now()))),
+               reason = %s
+         WHERE override_id = ANY(%s) AND reason <> %s
+        RETURNING override_id
+        """,
+        (reason, note, set_by, reason, [int(i) for i in override_ids], reason),
+    )
+    return sorted(int(r["override_id"]) for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -5017,7 +5206,7 @@ def add_dq_flag_once(
 # budget that releases the watermark once it is spent. A stored-but-corrupted bar
 # buying down a rejected bar's budget would let ingestion walk past a bar nobody had
 # actually looked at.
-NON_QUARANTINE_PRICE_CHECKS = ("price_scale_collapse",)
+NON_QUARANTINE_PRICE_CHECKS = ("price_scale_collapse", "price_restatement_conflict")
 
 
 def count_price_quarantines(db: Database, security_id: int, date_iso: str) -> int:
@@ -5295,12 +5484,26 @@ def open_dq_flag_ids_for_record(
     return [int(r["dq_flag_id"]) for r in rows]
 
 
+#: How a closure was judged (ops.data_quality_flag.judgement_basis, migration 0028):
+#: ``per_flag`` -- the closer looked at this flag's own evidence; ``by_rule`` -- it
+#: was closed as one of a class. Exported as a label's ``verified``.
+JUDGEMENT_BASES = ("per_flag", "by_rule")
+
+
+def _check_basis(judgement_basis: Optional[str]) -> None:
+    if judgement_basis is not None and judgement_basis not in JUDGEMENT_BASES:
+        raise ValueError(
+            f"judgement_basis must be one of {', '.join(JUDGEMENT_BASES)} or None"
+        )
+
+
 def resolve_dq_flags(
     db: Database,
     filt: DqFilter,
     *,
     note: Optional[str] = None,
     resolved_by: Optional[str] = None,
+    judgement_basis: Optional[str] = None,
 ) -> list[int]:
     """Close the flags the filter selects, stamping who and why. Returns the ids
     actually closed.
@@ -5324,15 +5527,17 @@ def resolve_dq_flags(
             "resolve_dq_flags needs flag ids or at least one filter; refusing to "
             "close the whole queue"
         )
+    _check_basis(judgement_basis)
     where, params = _dq_where(filt._replace(state="open"))
     rows = db.fetchall(
         f"""
         UPDATE ops.data_quality_flag
-           SET resolved_at = now(), resolved_by = %s, resolution_note = %s
+           SET resolved_at = now(), resolved_by = %s, resolution_note = %s,
+               judgement_basis = %s
          {where}
         RETURNING dq_flag_id
         """,
-        [resolved_by, note, *params],
+        [resolved_by, note, judgement_basis, *params],
     )
     return [int(r["dq_flag_id"]) for r in rows]
 
@@ -5343,6 +5548,7 @@ def accept_dq_flags(
     *,
     note: str,
     accepted_by: str,
+    judgement_basis: Optional[str] = None,
 ) -> list[int]:
     """Accept conditions as real, permanent and unfixable. Returns the ids closed.
 
@@ -5367,22 +5573,24 @@ def accept_dq_flags(
             "accept_dq_flags needs a note: an accepted flag is a standing decision "
             "to stop looking, and the note is the whole record of why"
         )
+    _check_basis(judgement_basis)
     where, params = _dq_where(filt._replace(state="open"))
     rows = db.fetchall(
         f"""
         UPDATE ops.data_quality_flag
            SET resolved_at = now(), resolved_by = %s, resolution_note = %s,
-               accepted_at = now(), accepted_by = %s, accepted_note = %s
+               accepted_at = now(), accepted_by = %s, accepted_note = %s,
+               judgement_basis = %s
          {where}
         RETURNING dq_flag_id
         """,
-        [accepted_by, note, accepted_by, note, *params],
+        [accepted_by, note, accepted_by, note, judgement_basis, *params],
     )
     return [int(r["dq_flag_id"]) for r in rows]
 
 
 def reopen_dq_flags(
-    db: Database, flag_ids: Sequence[int]
+    db: Database, flag_ids: Sequence[int], *, reopened_by: str = "unknown"
 ) -> tuple[list[int], list[int]]:
     """Undo a resolution: back to open, provenance cleared. Returns
     ``(reopened, conflicted)``.
@@ -5410,7 +5618,7 @@ def reopen_dq_flags(
                     """
                     UPDATE ops.data_quality_flag
                        SET resolved_at = NULL, resolved_by = NULL,
-                           resolution_note = NULL,
+                           resolution_note = NULL, judgement_basis = NULL,
                            -- Acceptance goes with it. A row that is open again is
                            -- one nobody has decided about, and leaving accepted_at
                            -- set would keep the checks skipping the condition while
@@ -5427,7 +5635,186 @@ def reopen_dq_flags(
             continue
         if row is not None:
             reopened.append(int(row["dq_flag_id"]))
+    # A label stated with the closure (`dq accept|resolve --label`) was that
+    # decision, and goes with it.
+    revoke_flag_labels(
+        db, reopened, note="flag reopened (dq reopen)", revoked_by=reopened_by
+    )
     return reopened, conflicted
+
+
+# ---------------------------------------------------------------------------
+# Stated labels (ops.dq_label, migration 0028)
+# ---------------------------------------------------------------------------
+#
+# What a person said was true about a stretch of a series, for measuring dorq.
+# fafnir.dq.labels merges these with the labels it derives from the repairs and
+# judgements; this is only the storage.
+
+LABEL_CLASSES = ("data_error", "context_gap", "market_fact")
+
+_LABEL_COLUMNS = (
+    "security_id",
+    "members",
+    "first_date",
+    "last_date",
+    "class",
+    "kind",
+    "expect",
+    "codes",
+    "note",
+    "verified",
+    "source",
+    "decided_by",
+    "decided_at",
+    "applies_until",
+)
+
+
+def insert_dq_labels(db: Database, rows: Sequence[dict]) -> list[int]:
+    """Write stated labels; return their ids in order.
+
+    Each row carries the columns of ops.dq_label. ``decided_at`` defaults to now;
+    ``members`` and ``applies_until`` to NULL.
+    """
+    import json
+
+    if not rows:
+        return []
+    payload = [
+        {
+            **{c: r.get(c) for c in _LABEL_COLUMNS},
+            "first_date": _iso_date(r["first_date"]),
+            "last_date": _iso_date(r.get("last_date") or r["first_date"]),
+            "members": (
+                sorted({int(m) for m in r["members"]}) if r.get("members") else None
+            ),
+            "verified": bool(r.get("verified")),
+            "n": n,
+        }
+        for n, r in enumerate(rows)
+    ]
+    out = db.fetchall(
+        """
+        INSERT INTO ops.dq_label
+            (security_id, members, first_date, last_date, class, kind, expect,
+             codes, note, verified, source, decided_by, decided_at, applies_until)
+        SELECT x.security_id, x.members, x.first_date, x.last_date, x.class, x.kind,
+               NULLIF(x.expect, ''), NULLIF(x.codes, ''), x.note, x.verified,
+               x.source, x.decided_by, COALESCE(x.decided_at, now()), x.applies_until
+          FROM jsonb_to_recordset(%s::jsonb) AS x(
+                 security_id bigint, members bigint[], first_date date,
+                 last_date date, class text, kind text, expect text, codes text,
+                 note text, verified boolean, source text, decided_by text,
+                 decided_at timestamptz, applies_until timestamptz, n bigint)
+         ORDER BY x.n
+        RETURNING label_id
+        """,
+        (json.dumps(payload, default=str),),
+    )
+    return [int(r["label_id"]) for r in out]
+
+
+def _iso_date(value) -> str:
+    return value.isoformat() if isinstance(value, date) else str(value)[:10]
+
+
+def list_dq_labels(
+    db: Database,
+    *,
+    security_id: Optional[int] = None,
+    since: Optional[date] = None,
+    kind: Optional[str] = None,
+    include_revoked: bool = False,
+    label_ids: Sequence[int] = (),
+) -> list[dict]:
+    """Stated labels, by security then date. ``since`` keeps the labels whose span
+    reaches it."""
+    clauses, params = ["TRUE"], []
+    if security_id is not None:
+        clauses.append("(l.security_id = %s OR %s = ANY(l.members))")
+        params += [security_id, security_id]
+    if since is not None:
+        clauses.append("l.last_date >= %s")
+        params.append(since)
+    if kind:
+        clauses.append("l.kind = %s")
+        params.append(kind)
+    if label_ids:
+        clauses.append("l.label_id = ANY(%s)")
+        params.append([int(i) for i in label_ids])
+    if not include_revoked:
+        clauses.append("l.revoked_at IS NULL")
+    return db.fetchall(
+        f"""
+        SELECT l.label_id, l.security_id, s.primary_symbol, l.members, l.first_date,
+               l.last_date, l.class, l.kind, l.expect, l.codes, l.note, l.verified,
+               l.source, l.decided_by, l.decided_at, l.applies_until, l.revoked_at,
+               l.revoked_by, l.revoked_note
+          FROM ops.dq_label l
+          LEFT JOIN core.security s ON s.security_id = l.security_id
+         WHERE {' AND '.join(clauses)}
+         ORDER BY l.security_id NULLS FIRST, l.first_date, l.label_id
+        """,
+        params,
+    )
+
+
+def revoke_dq_labels(
+    db: Database, label_ids: Sequence[int], *, note: str, revoked_by: str
+) -> list[int]:
+    """Take stated labels back, keeping their record. Returns the ids revoked."""
+    if not (note and note.strip()):
+        raise ValueError("revoking a label needs a note")
+    rows = db.fetchall(
+        """
+        UPDATE ops.dq_label
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE label_id = ANY(%s) AND revoked_at IS NULL
+        RETURNING label_id
+        """,
+        (revoked_by, note, [int(i) for i in label_ids]),
+    )
+    return sorted(int(r["label_id"]) for r in rows)
+
+
+def revoke_flag_labels(
+    db: Database, flag_ids: Sequence[int], *, note: str, revoked_by: str
+) -> list[int]:
+    """Revoke the labels stated with these flags' closures (source dq_flag:<id>)."""
+    if not flag_ids:
+        return []
+    rows = db.fetchall(
+        """
+        UPDATE ops.dq_label
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE source = ANY(%s) AND revoked_at IS NULL
+        RETURNING label_id
+        """,
+        (revoked_by, note, [f"dq_flag:{int(i)}" for i in flag_ids]),
+    )
+    return sorted(int(r["label_id"]) for r in rows)
+
+
+def flags_for_labels(db: Database, flag_ids: Sequence[int]) -> list[dict]:
+    """What a label stated with a flag's closure needs: its security, the date it
+    is about (and a dorq report's end date), its check and dorq code."""
+    if not flag_ids:
+        return []
+    return db.fetchall(
+        f"""
+        SELECT f.dq_flag_id, f.security_id, f.check_name,
+               {_FLAG_DATE_SQL} AS d,
+               CASE WHEN f.detail->>'end_date' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                    THEN (f.detail->>'end_date')::date END AS end_date,
+               f.detail->>'code' AS code,
+               f.detail->'detail'->>'members' AS members
+          FROM ops.data_quality_flag f
+         WHERE f.dq_flag_id = ANY(%s)
+         ORDER BY f.dq_flag_id
+        """,
+        ([int(i) for i in flag_ids],),
+    )
 
 
 # ---------------------------------------------------------------------------

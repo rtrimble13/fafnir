@@ -62,6 +62,7 @@ class _FakeDB:
         self.accepted = set(accepted)
         self.marked: list[tuple[int, date]] = []
         self.flags: list[dict] = []
+        self.landed: list[dict] = []
         self.commits = 0
 
     def commit(self) -> None:
@@ -135,6 +136,9 @@ def patched(monkeypatch):
         return True
 
     monkeypatch.setattr(mod.repo, "add_dq_flag_once", flag_once)
+    monkeypatch.setattr(
+        mod.repo, "land_payload", lambda db, **payload: db.landed.append(payload)
+    )
     monkeypatch.setattr(mod.repo, "median_volume_before", lambda *a, **kw: 7.6e6)
     # No calendar: sessions are counted as weekdays.
     monkeypatch.setattr(mod.repo, "open_sessions", lambda *a, **kw: None)
@@ -187,6 +191,17 @@ def test_is_idempotent(patched):
     # Second sweep: mark_delisted refuses to re-stamp an already-delisted row.
     assert load_delisted(db, _FakeFMP(rows))[0] == 0
     assert len(db.marked) == 1
+
+
+def test_the_sweep_lands_the_feed_it_read(patched):
+    """`source vendor-gaps` reads the newest one: a security the feed names is
+    delisted, not a symbol the vendor stopped serving."""
+    db = _FakeDB({"ACME": 1})
+    rows = [{"symbol": "ACME", "exchange": "NASDAQ", "delistedDate": "2026-08-17"}]
+    load_delisted(db, _FakeFMP(rows))
+    (landed,) = db.landed
+    assert landed["endpoint"] == "delisted-companies"
+    assert landed["payload"] == rows and landed["ingestion_run_id"] == 7
 
 
 def test_full_sweep_pages_deeper_than_the_nightly_tail(patched):

@@ -52,6 +52,12 @@ section "WAREHOUSE STATUS"
 section "OPEN DQ QUEUE"
 "${FAF[@]}" dq list 2>&1
 
+# Live securities the vendor has stopped serving (fafnir source vendor-gaps): a
+# `stale` flag on one of these is not a security that stopped trading, and the
+# list is what goes in the FMP ticket. Read-only.
+section "VENDOR GAPS (live securities FMP stopped serving)"
+"${FAF[@]}" source vendor-gaps 2>&1
+
 # NOT the `backups` section: /var/backups/fafnir is 0750 fafnir:fafnir and this
 # runs as the agent, so that check can only ever report a false "no dump found".
 # The dump is covered honestly by fafnir-dump.service's exit status above.

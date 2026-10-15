@@ -151,6 +151,8 @@ a revoke that in fact left the security with none.
 | Whether a symbol has stopped advancing | `watermarks` |
 | One security, end to end | `security_profile` |
 | A price series | `price_history` (say raw or adjusted) |
+| Live names the vendor stopped serving | `fafnir source vendor-gaps` (reads only) |
+| dorq against the SQL checks and the labels | `fafnir dq compare --labels-from-db` (reads only) |
 | Timers, journal, disk, backups | `scripts/monitor.sh` (changes nothing) |
 | To change something | the `fafnir` CLI, under `sudo -u fafnir` |
 
@@ -173,7 +175,8 @@ a revoke that in fact left the security with none.
                     prices shift|rescale for a real price at the wrong date/scale),
                     then dq recheck -- a SQL DELETE comes back on the next load
      neither      → escalate; leave it open
-6. sudo -u fafnir $F <disposition> <ids> --by claude --note "<evidence>"
+6. sudo -u fafnir $F <disposition> <ids> --by claude --note "<evidence>" \
+       [--per-flag | --by-rule] [--label CLASS --kind K]
 7. verify in SQL that it committed (rule 10)
 ```
 
@@ -193,6 +196,35 @@ SELECT (record_key->>'trade_date')::date AS d, count(*) AS securities
 
 A date with a large count is not two hundred problems. It is one, and resolving
 the flags individually is the wrong answer to it.
+
+## Labels: record what you judged
+
+dorq is measured against labels (`fafnir dq compare --labels-from-db`; doc/dorq.md),
+and the labels are the decisions this queue records. A label is derived on its own
+only where the disposition is unambiguous: a repair (`reason` data_error), an
+outlier or `dorq_*` flag accepted or resolved. Everything else is stated, and the
+moment to state it is when you judge:
+
+- **`--per-flag` when the note carries per-security evidence**, `--by-rule` when the
+  batch was closed by a rule. That is the label's `verified`.
+- **`--label CLASS --kind K` on the accept or resolve** writes the label with the
+  closure, in one transaction, keyed to each flag's security and date: a feed gap
+  (`data_error --kind feed_gap`), a stale feed on odd lots
+  (`market_fact --kind odd_lots_only`), a real distribution
+  (`market_fact --kind distribution`, two labels), another instrument's prices
+  (`data_error --kind wrong_instrument`).
+- **`dq label add`** for one that goes with no flag (`--cohort --members ...
+  --kind cohort_fact` for a cohort of real moves). `dq label import` for a file.
+  Like `dq accept`: show the dry run, act on a yes.
+- **`override set-reason`** when an edit was not a data error: a scope removal is
+  `out_of_scope`, a merge's leftovers `cleanup`.
+
+What makes a good label:
+- **verified** on the bars or an outside source, and the note says which;
+- **one decision**, never a bulk class (a batch closed by rule is never labelled);
+- **a repair's label expires at the repair** (`applies_until`): don't restate a
+  repaired fault as a timeless one;
+- **a scope removal is not an error**.
 
 ## The proactive sweep
 
