@@ -27,7 +27,9 @@ read through the `duk` CLI.
 - [dorq](dorq.md) — the Bayesian data-quality engine: install, configure, the
   shadow period, `dq compare`, labels (`dq export-labels`, `dq label`), calibration
   ([ADR 0013](adr/0013-dorq-dq-engine.md))
-- [duk CLI](duk.md) — reading the warehouse (db) vs the API (live)
+- [duk CLI](duk.md) — reading the warehouse (db) vs the API (live); also
+  [from Claude Code on a laptop](duk.md#from-claude-code-on-a-laptop): the socket
+  tunnel, the agent role, and the Bash sandbox
 - [Operations Agent](agent.md) — running an agent on the host for DQ triage,
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation
 - [Nightly Report Email](nightly_report.md) — the agent's morning summary of the

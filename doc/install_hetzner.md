@@ -1311,12 +1311,13 @@ you alerts on them.
 
 ## 11. Reading the warehouse from your laptop
 
-> **Two follow-ups to this section.** The shared-`fafnir_app`-password path below
+> **Follow-ups to this section.** The shared-`fafnir_app`-password path below
 > is the simplest thing that works and is what this install produces. Per-person
 > roles with no password at all — the SSH key as the only credential — are
 > [ADR 0008](adr/0008-remote-duk-access-and-mcp.md), and adding a reader under
 > that model is [operations.md](operations.md#adding-a-reader-a-person-or-an-agent).
-> Running an *agent* on this host is [agent.md](agent.md).
+> Running an *agent* on this host is [agent.md](agent.md); reading the warehouse
+> from Claude Code on your laptop is [duk.md](duk.md#from-claude-code-on-a-laptop).
 
 Postgres is not exposed (§3.7), so tunnel it over the SSH port you already allow:
 

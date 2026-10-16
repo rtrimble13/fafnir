@@ -349,12 +349,33 @@ ALTER ROLE rob SET default_transaction_read_only = on;
 ALTER ROLE rob SET statement_timeout = '60s';
 ALTER ROLE rob SET idle_in_transaction_session_timeout = '60s';
 ALTER ROLE rob CONNECTION LIMIT 8;
+
+-- The same person's agents (Claude Code on their laptop, an MCP client) get a role
+-- of their own: a smaller budget, and NOLOGIN stops them without stopping the
+-- person (ADR 0008 §2).
+CREATE ROLE rob_mcp LOGIN IN ROLE fafnir_app;
+ALTER ROLE rob_mcp SET default_transaction_read_only = on;
+ALTER ROLE rob_mcp SET statement_timeout = '20s';
+ALTER ROLE rob_mcp SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE rob_mcp CONNECTION LIMIT 4;
 ```
 
 ```
 # /etc/postgresql/16/main/pg_ident.conf
 fafnirmap  rob  rob
+fafnirmap  rob  rob_mcp
 ```
+
+```
+# /etc/postgresql/16/main/pg_hba.conf -- once per installation, not per person,
+# and ABOVE "local all all peer": first match wins. Without it that generic line
+# admits only a role named exactly like the OS user, so rob connects and rob_mcp
+# fails with 'Peer authentication failed'. agent.md adds the same line.
+local   all   +fafnir_app   peer map=fafnirmap
+```
+
+Then `sudo systemctl reload postgresql@16-main`. Using these roles from Claude Code
+on the laptop is [duk.md](duk.md#from-claude-code-on-a-laptop).
 
 No database password is issued at any tier — the SSH key is the credential and
 peer authentication over the socket is the mechanism. Revocation has two
