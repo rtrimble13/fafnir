@@ -254,3 +254,171 @@ and `.company_summary()` do the I/O and return plain dicts; `duk.company_summary
 is pure functions over those dicts (`build_summary`, `render_text`, `render_flat`,
 `render_candidates`) with no SQL and no click, so the whole report can be built and
 asserted without a database. `build_summary`'s output is the `--json` contract.
+
+## From Claude Code on a laptop
+
+A Claude Code session on your laptop reads the warehouse the way you do: its Bash
+tool runs `duk` as your OS user, with your `~/.dukrc` and your SSH tunnel. Three
+things need settling first: the shape of the tunnel, the role Claude's queries run
+as, and Claude Code's Bash sandbox. What follows was measured on Ubuntu 24.04
+(OpenSSH 9.6p1, PostgreSQL 16, every migration applied), running `duk` directly and
+inside `@anthropic-ai/sandbox-runtime` 0.0.79, the package Claude Code builds its
+sandbox on. Where a line rests on Claude Code's documentation instead, it says so.
+
+### The server: two roles and one `pg_hba` line
+
+Add yourself as a reader with **both** of a person's roles, `rob` for you and
+`rob_mcp` for your agents, as
+[operations.md](operations.md#adding-a-reader-a-person-or-an-agent) describes. That
+includes the `+fafnir_app` rule in `pg_hba.conf`: it is what lets the OS user `rob`
+become `rob_mcp`. Without it the generic `local all all peer` line admits only a role
+named exactly like the OS user, and every Claude connection fails with
+`Peer authentication failed for user "rob_mcp"`.
+
+### The tunnel: a socket, kept up by a service
+
+Forward the server's Postgres socket to a **local socket file**, not a local port,
+and run it as a service outside Claude:
+
+```
+# ~/.ssh/config                      (once: mkdir -m 700 ~/.fafnir)
+Host fafnir-tunnel
+    HostName <SERVER_IP>
+    User rob
+    IdentityFile ~/.ssh/id_ed25519_fafnir
+    IdentitiesOnly yes
+    LocalForward %d/.fafnir/.s.PGSQL.15432 /var/run/postgresql/.s.PGSQL.5432
+    StreamLocalBindUnlink yes
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    ControlMaster no
+    BatchMode yes
+```
+
+```ini
+# ~/.config/systemd/user/fafnir-tunnel.service     (Linux)
+[Unit]
+Description=SSH tunnel to the fafnir warehouse
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N fafnir-tunnel
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+`systemctl --user enable --now fafnir-tunnel`. On macOS, run the same
+`/usr/bin/ssh -N fafnir-tunnel` as a launchd agent in `~/Library/LaunchAgents` with
+`RunAtLoad` and `KeepAlive`.
+
+- **A socket, not `127.0.0.1:15432`.** On Linux a sandboxed command's `localhost` is
+  its own, so a port forward cannot be reached from inside the sandbox under any
+  setting, while a socket can be let through. A port forward also authenticates
+  *anyone* on the laptop who can reach it as you: a second local user connected
+  through one as `rob`. The socket is created mode `0600`, OpenSSH's default
+  `StreamLocalBindMask`, and the same user got `Permission denied`.
+- **A supervised `ssh -N`, not `ssh -fN` with `ControlPersist`.** ADR 0008's
+  `ControlPersist 30m` closes the tunnel 30 minutes after its last forwarded
+  connection, and `duk` holds one only while a command runs, so the tunnel is gone
+  half an hour after the last query. Here a dead link makes ssh exit and the service
+  restarts it: the tunnel was back seconds after the server dropped the session,
+  the restart delay plus one SSH handshake.
+- **Outside Claude.** Plain `ssh` cannot connect from inside the sandbox, and
+  Claude has no need to hold the tunnel. `BatchMode yes` makes ssh fail rather than
+  prompt, so the key comes from your ssh-agent. Give it a passphrase: commands
+  Claude runs can read `~/.ssh`.
+
+Your own `~/.dukrc` then names the socket's **directory**, as an absolute path
+(libpq does not expand `~`, and appends `.s.PGSQL.<port>` itself):
+
+```toml
+[database]
+dsn = "host=/home/rob/.fafnir port=15432 dbname=fafnir user=rob application_name=duk"
+```
+
+### Claude Code settings
+
+Merge
+[`etc/agent/claude-code-laptop.settings.json.example`](../etc/agent/claude-code-laptop.settings.json.example)
+into `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "FAFNIR_DSN": "host=/home/rob/.fafnir port=15432 dbname=fafnir user=rob_mcp application_name=duk-claude"
+  },
+  "permissions": { "allow": ["Bash(duk *)"] },
+  "sandbox": { "excludedCommands": ["duk *"] }
+}
+```
+
+- **`env.FAFNIR_DSN`** runs Claude's `duk` as `rob_mcp`. Its queries are then told
+  apart from yours in `pg_stat_activity` and the server log, get the agent budget
+  (20 s statement timeout, 4 connections), and `ALTER ROLE rob_mcp NOLOGIN` stops
+  them while you keep working. The variable wins over `~/.dukrc`. This is
+  attribution, not enforcement: your OS account maps to both roles, and both read
+  `mart` and `ref` only, read-only, so nothing Claude can reach changes.
+- **`permissions.allow`** spares a prompt on every `duk` call.
+- **`sandbox.excludedCommands`** is for when the sandbox is on (below), and inert
+  while it is off.
+
+User-level, not a project's `.claude/settings.json`: the DSN names you, and where an
+administrator makes the sandbox admin-required, Claude Code ignores
+`excludedCommands` entries in a project's `.claude/` files.
+
+### The Bash sandbox
+
+Claude Code's Bash sandbox is **off by default**, and then nothing more is needed.
+Turned on (`/sandbox`, or `sandbox.enabled`), it stops a sandboxed `duk` reaching
+the tunnel's socket:
+
+| Sandbox setting | Linux (measured) | macOS (Claude Code docs; not measured) |
+|---|---|---|
+| none | ✖ `connection is bad: no error details available`. Only with Claude Code's optional seccomp filter installed; without it Unix sockets are not blocked at all | ✖ |
+| `network.allowUnixSockets: ["<socket path>"]` | ✖ ignored: seccomp cannot filter by path | ✅ |
+| `network.allowAllUnixSockets: true` | ✅ but opens *every* socket to every sandboxed command, `docker.sock` included | ✅ same caveat |
+| `excludedCommands: ["duk *"]` | ✅ `duk` runs unsandboxed, as `duk` run directly did | ✅ |
+| a `127.0.0.1` port forward | ✖ under every setting | needs `allowLocalBinding`, which opens every localhost port |
+
+The example uses `excludedCommands`, which works on both. An excluded command runs
+with your full access, `-o` to any path included; that is the trade. On macOS,
+`allowUnixSockets` with the socket's absolute path is narrower, since `duk` stays
+sandboxed, if you would rather.
+
+`excludedCommands` matches the text of the whole call, and every command in the call
+has to match. `duk ph AAPL --adj -n 20` leaves the sandbox; `duk ph AAPL | head`,
+`cd x && duk …` and `duk … > out.csv` stay in it and fail as above. Limit with `-n`,
+save with `-o`. `rc` and `ti` read local files and need no exception at all.
+
+### Tell Claude what the failures look like
+
+`duk` reports psycopg's connection errors, which name neither the tunnel nor the
+sandbox. A few lines in the `CLAUDE.md` of the project where Claude uses `duk`:
+
+```markdown
+## fafnir data
+- Read with `duk -S db …`, one plain `duk` command per call: no pipes, redirects,
+  `cd` or `&&`. Limit rows with `-n`; save with `-o file.csv`.
+- "Connection refused" or "No such file or directory" on ~/.fafnir/.s.PGSQL.15432:
+  the SSH tunnel is down. Tell me; never start ssh yourself.
+- "connection is bad: no error details available": the Bash sandbox blocked the
+  socket (doc/duk.md, "The Bash sandbox").
+```
+
+### Or the MCP server
+
+`fafnir-mcp --profile read` serves the same reads as MCP tools, with result sizes
+capped. MCP servers run outside the Bash sandbox, so the section above does not
+apply to it. Register it from
+[`etc/agent/mcp-laptop.json.example`](../etc/agent/mcp-laptop.json.example) with
+`FAFNIR_DSN` pointed at the socket (`host=/home/rob/.fafnir port=15432 dbname=fafnir
+user=rob_mcp application_name=fafnir-mcp`); through the tunnel,
+`fafnir-mcp --profile read --check` reports `rob_mcp`, read-only, with `mart` and
+`ref` only. One caveat: on a socket DSN, its connection error says PostgreSQL is not
+running, because a socket DSN means "on the host" to it. On a laptop it means the
+tunnel is down. Reach for `duk` when Claude should write files (`-o`) or run `rc` and
+`ti` on them.
