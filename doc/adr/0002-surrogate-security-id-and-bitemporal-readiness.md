@@ -1,6 +1,7 @@
 # ADR 0002: Surrogate security_id, symbol history, and bitemporal readiness
 
-- Status: Accepted
+- Status: Accepted; extended by [ADR 0015](0015-multi-vendor-provenance-and-precedence.md)
+  (several vendors write to one `security_id`; `source` says who supplied each row)
 - Date: 2026-06-27
 
 ## Context
