@@ -21,7 +21,9 @@ from duk.sharadar_api import (
     price_table_api,
 )
 
-SECRET = "sh_7f3c2a9b1d4e5f60718293a4b5c6d7e8"
+# A deliberately low-entropy fixture: the tests only need a value that must not
+# appear in a log or a message, and a realistic-looking key trips secret scanners.
+SECRET = "test-sharadar-key-not-a-secret"
 
 # Two bars of a stock that later split 2:1: the split-adjusted fields are half
 # the as-traded values, closeunadj is as traded, closeadj carries a dividend too.
