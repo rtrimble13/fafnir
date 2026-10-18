@@ -41,7 +41,13 @@ crontab etc/crontab.example   # edit paths/times first
 
 The daily job performs, in order:
 `ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked →
-ingest delisted → ingest prices → ingest actions → adjust → refresh-marts → dq run`.
+ingest delisted → ingest prices → ingest actions → adjust → refresh-marts`.
+
+Data quality is a second job, `fafnir-dq` (`scripts/run_dq_checks.sh`), which runs
+once the daily has finished; the cron example chains it in the same entry. It is
+the night's only `dq run`: a DQ failure does not mark the load failed, and its
+queue summary goes to its own log. Run DQ once per load: dorq's shadow file is one
+per night.
 
 The first four steps are **universe maintenance**, and their order is load-bearing:
 
@@ -343,12 +349,33 @@ ALTER ROLE rob SET default_transaction_read_only = on;
 ALTER ROLE rob SET statement_timeout = '60s';
 ALTER ROLE rob SET idle_in_transaction_session_timeout = '60s';
 ALTER ROLE rob CONNECTION LIMIT 8;
+
+-- The same person's agents (Claude Code on their laptop, an MCP client) get a role
+-- of their own: a smaller budget, and NOLOGIN stops them without stopping the
+-- person (ADR 0008 §2).
+CREATE ROLE rob_mcp LOGIN IN ROLE fafnir_app;
+ALTER ROLE rob_mcp SET default_transaction_read_only = on;
+ALTER ROLE rob_mcp SET statement_timeout = '20s';
+ALTER ROLE rob_mcp SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE rob_mcp CONNECTION LIMIT 4;
 ```
 
 ```
 # /etc/postgresql/16/main/pg_ident.conf
 fafnirmap  rob  rob
+fafnirmap  rob  rob_mcp
 ```
+
+```
+# /etc/postgresql/16/main/pg_hba.conf -- once per installation, not per person,
+# and ABOVE "local all all peer": first match wins. Without it that generic line
+# admits only a role named exactly like the OS user, so rob connects and rob_mcp
+# fails with 'Peer authentication failed'. agent.md adds the same line.
+local   all   +fafnir_app   peer map=fafnirmap
+```
+
+Then `sudo systemctl reload postgresql@16-main`. Using these roles from Claude Code
+on the laptop is [duk.md](duk.md#from-claude-code-on-a-laptop).
 
 No database password is issued at any tier — the SSH key is the credential and
 peer authentication over the socket is the mechanism. Revocation has two
@@ -372,7 +399,9 @@ registration — the whole procedure, with the audit and revocation queries, is
 ## Working the DQ queue
 
 `fafnir dq run` writes flags; `fafnir dq list` and `fafnir dq resolve` are how they
-get worked. The two take the **same** selection options, so the workflow is to
+get worked. With `[dq] engine = "both"`, dorq runs after the SQL checks and, until
+the shadow period ends, writes to `[dq] dorq_shadow_dir` rather than the queue; read
+each night with `fafnir dq compare` ([dorq.md](dorq.md)). The two take the **same** selection options, so the workflow is to
 narrow with `list` until the page is the problem you mean, then re-run the same
 options under `resolve`.
 
@@ -569,6 +598,100 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.
 
+### Venue transfers
+
+A company that moves its listing to another exchange and keeps its ticker can
+look delisted to the vendor. On 2026-10-05 ET, SUN, SUNC, USAC, DDS and DDT moved
+from the NYSE to the Texas Stock Exchange (**TXSE**; never TSX, which is Toronto).
+FMP's delisted feed reported each move as a delisting, its screener and profile
+called each security inactive on the NYSE, and both froze them. FMP's price feed
+went on serving their bars. [ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)
+records the design.
+
+**What the nightly does now.**
+
+- **The delisting sweep** asks the price feed before stamping a recent delisting.
+  If the vendor has bars *after* the date, the security is left trading and
+  flagged `security_delisting_contradicted` (warn). Its `detail` holds the feed's
+  venue, the bars after the date (count, first, last), and the median volume
+  before and after.
+- **The price universe** keeps a listed security with a bar in the last 30 days,
+  whatever the vendor's `isActivelyTrading` says. When the universe load turns a
+  row inactive while its last bar is within 5 sessions, it raises
+  `security_inactive_but_trading` (info): often the first sign of a move.
+
+**Deciding a `security_delisting_contradicted` flag.** The bars cannot tell a move
+between listed venues from a move to OTC, so the flag waits for you. Until you
+decide, the sweep declines that record every night (`pending_decision`), and the
+run is marked `partial`. Volume does not decide it either: USAC traded 18% of its
+median on its first TXSE day.
+
+1. Look for a public notice of a move: the issuer's investor relations or press
+   releases, or the new exchange's listing alerts.
+2. **It moved to another listed venue** → `security venue-transfer`.
+3. **It left for OTC, or stopped trading** → `security delist`.
+4. Neither is clear → leave the flag open. The security keeps loading.
+
+```bash
+fafnir security venue-transfer 12441 --venue TXSE --date 2026-10-05 \
+    -m "NYSE->TXSE 2026-10-05 (Energy Transfer press release, 2026-09-10)" --dry-run
+fafnir security venue-transfer 12441 --venue TXSE --date 2026-10-05 \
+    -m "NYSE->TXSE 2026-10-05 (Energy Transfer press release, 2026-09-10)" --yes
+fafnir security delist 4321 --date 2025-12-31 \
+    -m "Left the NYSE for OTCQX (issuer notice)" --dry-run
+fafnir db refresh-marts
+```
+
+**What `venue-transfer` does**, whether or not the sweep has stamped the security:
+
+- **The dry run** prints:
+  - the row before and after, and the ticker period it re-opens;
+  - the vendor's bars after `--date` (one request);
+  - the price watermark the next nightly resumes from;
+  - the feed records it settles, and the flags it accepts or resolves.
+- **The real run:**
+  - reverses a stamped delisting, re-opening the ticker period it closed;
+  - records the venue as an override the nightly load keeps, with the security
+    active, until FMP names a venue other than the one it left (migration 0027);
+  - accepts the contradiction flag for each feed record the move settles (the
+    stamped delisting, and one dated `--date`), so the sweep declines them
+    without asking, and resolves any `security_inactive_but_trading` flag;
+  - records an audit row in `ops.ingestion_run` (source `operator`, endpoint
+    `security-venue-transfer`).
+- **It refuses** a ticker another listed security holds (fold that one in with
+  `security merge` first), and one the vendor has no bar for *after* `--date`.
+  A move to **OTC** is a delisting here: use `security delist`.
+- **Prices load on their own.** The next nightly `ingest prices` resumes from the
+  watermark, less the overlap, so the bars since the move arrive before `dq run`
+  and raise no `gap` flags.
+
+**An announced move** (OBK, 2026-10-13) needs nothing in advance: the sweep and the
+price universe keep it loading. Record it with `venue-transfer --date 2026-10-13`
+once the vendor serves a bar after that date, whether or not it has been flagged,
+stamped or turned inactive by then.
+
+**A feed record dated otherwise than the move** raises one more flag the night the
+sweep sees it. Run `venue-transfer` again, which accepts it, or `dq accept` it with
+the same note.
+
+**Checking a night's sweep.** The run records what it declined and why:
+
+```sql
+SELECT started_at, status, rows_inserted AS marked, rows_quarantined,
+       params->'declined' AS declined, params->'prices_requested' AS requests
+  FROM ops.ingestion_run WHERE endpoint = 'delisted-companies'
+ ORDER BY started_at DESC LIMIT 5;
+```
+
+The `declined` reasons are:
+
+- `known_transfer`: an accepted flag names the record (`venue-transfer` settled it);
+- `pending_decision`: an open flag names it, and waits for you;
+- `still_trading`: the vendor had bars after the date tonight, and a flag was raised;
+- `fetch_failed`: the bars could not be read, so the sweep asks again tomorrow;
+- `precedes_first_bar` and `traded_after`: the security's own bars contradict the
+  delisting.
+
 ## Reconciliation
 
 `scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the
@@ -612,6 +735,55 @@ the compared window is not by itself a reason for the two to disagree.
   A `v0.2.0-3-gabc1234` from `describe` means three commits past the tag — the host
   is on something between releases, which is worth knowing before you conclude a
   defect is unfixed.
+
+### Descoping an instrument kind
+
+[ADR 0012](adr/0012-warrants-rights-units-out-of-scope.md) takes warrants, rights
+and units out of scope. Deploying the release stops new ones being minted.
+Removing the ones already held is a one-time operator step, and it is
+**irreversible**:
+
+```bash
+F="sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir"
+scripts/backup_dump.sh                                # 1. a restorable copy first
+K="--keep GRP-UN"   # Granite REIT's units: delisted from NYSE 2025-12-31, history kept
+$F security descope $K --dry-run > descope-dry-run.txt    # 2. read every line
+$F security descope $K -m "ADR 0012" --yes > descope.txt  # 3. one transaction
+$F db refresh-marts                                   # 4. drop them from the marts
+```
+
+- **Keeping one.** A ticker that still lists is declared once with
+  `fafnir track add`, and every descope skips it. A security that no longer lists
+  is named with `--keep SYMBOL` on each run instead, because declaring a delisted
+  ticker makes `ingest tracked` mint it again as a new security. Both show at the
+  top of the dry run (`Kept, declared …` / `Kept, --keep …`). A `--keep` that names
+  nothing the run would remove stops the run before anything changes.
+- **If `GRP-UN` was declared** under the earlier version of this runbook, undo that
+  before the descope: `$F track rm GRP-UN`. If `ingest tracked` has run since, check
+  `SELECT security_id, delisted_date FROM core.security WHERE primary_symbol =
+  'GRP-UN'`. A second, listed row is the duplicate it minted. Fold it into the
+  delisted original with `$F security merge <duplicate_id> <original_id>
+  --dry-run`, then without `--dry-run`, before the descope. `--keep GRP-UN` keeps
+  every row under the ticker, the duplicate included.
+- **What goes with each security:** bars, corporate actions, factors, profiles,
+  ticker periods, watermarks, operator overrides and DQ flags. Rename records are
+  kept, with `security_id` set to NULL.
+- **Renames still in conflict that name one of them are dismissed**, and their
+  `symbol_change_conflict` flags resolved. The dry run lists each one (`Unresolved
+  rename, dismissed with them: …`). Left open, they could never resolve, or, with
+  their blocker gone, would be left to the sweep to decide alone.
+- **The audit record** is the `ops.ingestion_run` row with source `operator` and
+  endpoint `security-descope`. It names every symbol and id removed, every rename
+  dismissed, and what was kept (`kept_declared`, `kept_by_option`).
+- **Order matters.** Run this only after the release that stops the minting is
+  deployed. Before that, the next nightly load mints the removed securities back,
+  with full history. For the same reason, a `--kind` that
+  `[general] exclude_instruments` does not exclude is refused.
+- **Not while the nightly job runs.** It still loads prices for these securities
+  until they are gone, and its inserts collide with the deletes. Either the
+  descope fails and rolls back whole, or the night's whole `ingest prices` run
+  aborts on the first bar for a security the descope removed. Check
+  `systemctl list-timers 'fafnir-*'` and run it in the day.
 
 ## Recovery
 

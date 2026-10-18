@@ -954,8 +954,11 @@ actually trading that day:
 
 ```
 ensure-horizon → symbol-changes → securities → delisted →
-prices → actions → adjust → refresh-marts → dq run
+prices → actions → adjust → refresh-marts
 ```
+
+DQ is not part of it: `dq run` is the `fafnir-dq` unit's job, which runs after the
+daily (§8.1).
 
 The first two steps are wrapped so a source outage warns and continues rather than
 costing the night's prices; the failure still lands as a `failed` row in
@@ -1050,7 +1053,10 @@ tail -40 /var/log/fafnir/daily.log
 The DQ sweep and the weekly reconciliation get the same treatment — they are the
 `dq` and `reconcile` jobs of `install_timers.sh` (Mon–Fri 23:00 ET and Sun 06:00 ET
 by default), built from `etc/systemd/fafnir-dq.*` and `etc/systemd/fafnir-reconcile.*`.
-[`etc/crontab.example`](../etc/crontab.example) is the cron equivalent.
+`fafnir-dq` is ordered `After=fafnir-daily.service`, so on a night the load is
+still running at 23:00 the sweep waits for it rather than judging a half-loaded
+night. It is the night's only DQ run. [`etc/crontab.example`](../etc/crontab.example)
+is the cron equivalent.
 
 To change a schedule afterwards, use a drop-in rather than editing the generated
 unit — the next `install_timers.sh` run overwrites it:
@@ -1074,8 +1080,11 @@ since a US evening slot is the next day in UTC:
 
 | Intent (US Eastern) | UTC in EDT (Mar–Nov) | UTC in EST (Nov–Mar) |
 |---|---|---|
-| Mon–Fri 22:30 daily update | `30 2 * * 2-6` | `30 3 * * 2-6` |
-| Mon–Fri 23:00 DQ sweep | `0 3 * * 2-6` | `0 4 * * 2-6` |
+| Mon–Fri 22:30 daily update, then the DQ sweep | `30 2 * * 2-6` | `30 3 * * 2-6` |
+
+The DQ sweep has no slot of its own: it is chained after `daily_update.sh` in the
+same entry. cron cannot order two entries, and a sweep on its own clock would start
+while the load (over an hour) is still running.
 
 Fixed-UTC cron drifts by an hour twice a year. That is harmless here — the loaders are
 incremental and idempotent, and a missed day is caught up on the next run — but the
@@ -1302,12 +1311,13 @@ you alerts on them.
 
 ## 11. Reading the warehouse from your laptop
 
-> **Two follow-ups to this section.** The shared-`fafnir_app`-password path below
+> **Follow-ups to this section.** The shared-`fafnir_app`-password path below
 > is the simplest thing that works and is what this install produces. Per-person
 > roles with no password at all — the SSH key as the only credential — are
 > [ADR 0008](adr/0008-remote-duk-access-and-mcp.md), and adding a reader under
 > that model is [operations.md](operations.md#adding-a-reader-a-person-or-an-agent).
-> Running an *agent* on this host is [agent.md](agent.md).
+> Running an *agent* on this host is [agent.md](agent.md); reading the warehouse
+> from Claude Code on your laptop is [duk.md](duk.md#from-claude-code-on-a-laptop).
 
 Postgres is not exposed (§3.7), so tunnel it over the SSH port you already allow:
 

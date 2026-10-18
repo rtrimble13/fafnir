@@ -17,6 +17,10 @@ relative link or `#anchor` in the docs that does not resolve. Run both locally w
 `python3 scripts/check_docs_touched.py --base origin/main` and
 `python3 scripts/check_doc_links.py`.
 
+The gate reports; it does not block. It is deliberately not a required status
+check in branch protection (Sharadar plan v2), so a red `docs-gate` is a prompt to
+add the docs or the label, and the reviewer decides.
+
 ## Cutting a release
 
 ```bash
@@ -63,6 +67,32 @@ more:
   command, never the agent's (ADR 0010).
 
 Check the timers survived it — `scripts/monitor.sh` — and that the next nightly ran.
+
+### Upgrade notes
+
+**v1.5.0** adds migration `0028_labels_and_override_reasons`: the operator applies it
+(`fafnir db migrate`) after the pull. It adds `ops.operator_override.reason`
+(existing rows become `data_error`), `ops.data_quality_flag.judgement_basis` (marking
+the closures whose note says they were closed by rule as `by_rule`: an UPDATE over the
+closed flags, seconds on a queue of a million rows), and the table `ops.dq_label`.
+`fafnir_ops` reads and `fafnir_ingest` writes the new table through the default
+privileges of 0001 and 0021, as for every `ops` table. Until it is applied, every
+command that reads the new columns fails; the nightly price load does not need it.
+
+After it, by hand and once (dry run first; each is an operator-record edit an agent
+may run on an explicit yes):
+
+```bash
+fafnir override set-reason --security-id 809739 --target daily_price \
+    --reason out_of_scope -m "CELG-RI removed for scope 2026-10-14, not a data error" --dry-run
+fafnir dq label import hand-20261015.jsonl --verified --dry-run
+```
+
+The release also changes what the nightly writes: a vendor restatement beyond
+`[prices] restatement_max_ratio` / `restatement_max_volume_ratio` is now kept out and
+flagged `price_restatement_conflict` instead of stored (doc/ingestion.md), and the
+delisting sweep lands its payload. `fafnir source vendor-gaps` has a section in the
+nightly report.
 
 ## Which number to trust
 

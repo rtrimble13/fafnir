@@ -12,7 +12,9 @@ identifiers, at one request per symbol.
 The vendor keeps listing names for months after they stop trading, and the upsert
 cannot see a delisted row (its arbiter is the partial index over
 ``delisted_date IS NULL``). :func:`is_retired_listing` is what stops those entries
-being minted as new securities night after night.
+being minted as new securities night after night. The same holds for a ticker a
+rename moved a security away from: the vendor keeps listing the old ticker too,
+and it is weighed against the renamed security's names the same way.
 
 Delisted/inactive securities are never deleted; a reconciliation step
 (``fafnir ingest delisted``) flips ``is_actively_trading``/``delisted_date``.
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 from difflib import SequenceMatcher
 from math import isfinite
 from typing import Iterable, NamedTuple, Optional
@@ -41,19 +44,50 @@ from typing import Iterable, NamedTuple, Optional
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
+from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
 from fafnir.logging_config import get_logger
 from fafnir.sources.fmp import FMPClient, SourceError
 
 logger = get_logger("ingest.security")
 
-US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", "OTC"}
+# The Texas Stock Exchange, which began listing in 2026 (ADR 0014). Never "TSX":
+# that is FMP's code for the *Toronto* Stock Exchange, and a screener query for it
+# pulls in Toronto's listings. TXSE is fafnir's own code: FMP had none for it in
+# 2026-10, and went on naming ET's venue as the NYSE after it moved. When FMP does
+# adopt one, add it to _TXSE_ALIASES so it normalizes here, as NYSEAMERICAN does to
+# AMEX.
+TXSE = "TXSE"
+_TXSE_ALIASES = frozenset({TXSE, "TEXAS STOCK EXCHANGE"})
+
+US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSEAMERICAN", "BATS", "CBOE", TXSE, "OTC"}
+
+# The venues a security is *listed* on. A move between two of them is a venue
+# transfer, not a delisting; a move to OTC takes a security out of this
+# warehouse's scope, and is one (ADR 0014).
+LISTED_US_EXCHANGES = frozenset(US_EXCHANGES - {"OTC"})
 
 # Codes used to *query* the screener, largest venues first so a --limit run gets
 # the recognizable names. US_EXCHANGES stays the wider acceptance set: it also
 # has to admit the aliases FMP hands back (NYSEAMERICAN, which normalizes to
 # AMEX), and OTC, which is a US venue we simply do not ingest -- this is a
 # listed-equity research warehouse, and OTC roughly doubled the universe.
+#
+# TODO(ADR 0014): add TXSE once FMP's screener accepts a code for it. Check with
+# `GET /stable/company-screener?exchange=<code>&limit=20`: it must return ET, SUN
+# and DDS, and nothing from Toronto. Until then the loop below would only log a
+# rejection, or worse, an unfiltered page re-checked client-side.
 SCREENER_EXCHANGES = ("NASDAQ", "NYSE", "AMEX", "BATS", "CBOE")
+
+# ref.exchange attributes for a venue the seed list may not have created on an
+# existing deployment. ensure_venue fills them in where the row has none, so a
+# venue first seen in a vendor payload still gets a name, country and timezone.
+VENUE_ATTRIBUTES = {TXSE: ("Texas Stock Exchange", "US", "America/Chicago")}
+
+# The info flag for a row this load turns inactive although it was still trading
+# (ADR 0014): the vendor's isActivelyTrading went false within this many sessions
+# of the security's last bar. The early warning for a venue transfer.
+INACTIVE_BUT_TRADING_CHECK = "security_inactive_but_trading"
+INACTIVE_BUT_TRADING_SESSIONS = 5
 
 # Securities committed per batch. The bulk list is already in memory, so this is
 # purely a durability boundary, not a rate limit.
@@ -182,7 +216,13 @@ def check_company_name_drift(
 def is_retired_listing(
     incoming_name: Optional[str], retired: list[dict]
 ) -> Optional[dict]:
-    """The delisted row this vendor entry is a stale echo of, or None.
+    """The retired row this vendor entry is a stale echo of, or None.
+
+    ``retired`` holds the delisted rows for the entry's ticker and, for a ticker a
+    rename moved a security away from, one row per name of that renamed security
+    (:func:`repo.renamed_away_securities`), including any name a merge of an
+    earlier re-mint recorded. Both are names the warehouse has already retired
+    from the ticker.
 
     FMP keeps serving a name on the screener for months after it stops trading,
     and :func:`repo.upsert_security` cannot see that it is already held: its
@@ -227,6 +267,51 @@ def is_retired_listing(
     return None
 
 
+def flag_inactive_but_trading(
+    db: Database,
+    *,
+    symbol: str,
+    security_id: int,
+    vendor_exchange: Optional[str],
+    run: RunLog,
+    today: date,
+) -> bool:
+    """Flag a row this load is about to turn inactive while it is still trading.
+
+    The vendor's ``isActivelyTrading`` is not evidence that a security stopped
+    trading: FMP called ET inactive on the NYSE the week it moved to TXSE, while
+    quoting its prices and that day's volume. The nightly universe keeps such a row
+    polled (:func:`fafnir.db.repository.nightly_universe`); this says so out loud,
+    because it is how a venue transfer looks before the delisted feed reports it.
+    Only for a last bar within :data:`INACTIVE_BUT_TRADING_SESSIONS` sessions, so a
+    real wind-down the vendor reports late raises nothing. True when flagged.
+    """
+    _, last_bar = repo.security_bar_span(db, security_id)
+    if (
+        last_bar is None
+        or repo.sessions_apart(db, last_bar, today) > INACTIVE_BUT_TRADING_SESSIONS
+    ):
+        return False
+    logger.warning(
+        "%s: the vendor now calls it inactive (venue %s), but its last bar is %s -- "
+        "kept in the price universe; a venue transfer? (%s flag)",
+        symbol,
+        vendor_exchange,
+        last_bar,
+        INACTIVE_BUT_TRADING_CHECK,
+    )
+    return repo.add_dq_flag_once(
+        db,
+        check_name=INACTIVE_BUT_TRADING_CHECK,
+        severity="info",
+        security_id=security_id,
+        table_name="core.security",
+        record_key={"symbol": symbol},
+        detail={"last_bar": last_bar.isoformat(), "vendor_exchange": vendor_exchange},
+        ingestion_run_id=run.run_id,
+    )
+
+
 # Nasdaq's test issues: ZXZZT ("SuperMontage TEST"), ZVZZT, ZWZZT, ZBZZT, ZJZZT.
 _TEST_ISSUE_SYMBOL = re.compile(r"^Z[A-Z]ZZT$")
 # A venue name that, next to the word TEST, marks an exchange's own test security.
@@ -261,19 +346,26 @@ class SecurityLoadResult(NamedTuple):
     tonight" is the difference between a load you can ignore and one you can audit.
 
     ``skipped_retired`` is the same argument for the entries this load declined:
-    names the vendor still lists that this warehouse has already retired. A steady
-    handful is normal -- the vendor lags a delisting by weeks. A number that climbs
-    every night means the delisting sweep and the screener disagree about the
-    universe, which is worth seeing rather than inferring from a row count.
+    names the vendor still lists that this warehouse has already retired, by a
+    delisting or by a rename. A steady handful is normal -- the vendor lags both by
+    weeks. A number that climbs every night means the delisting sweep and the
+    screener disagree about the universe, which is worth seeing rather than
+    inferring from a row count.
 
     ``skipped_test_issues`` are the exchanges' own test securities, which are not
     listings at all (:func:`is_exchange_test_issue`).
+
+    ``skipped_out_of_scope`` are warrants, rights and units the vendor lists and
+    this warehouse does not carry (:func:`out_of_scope_kind`, ADR 0012). A few new
+    ones a night is SPAC issuance; the count is reported so the filter is visible
+    rather than inferred from a universe that silently got smaller.
     """
 
     total: int
     new_symbols: list[str]
     skipped_retired: list[str]
     skipped_test_issues: list[str]
+    skipped_out_of_scope: list[str]
 
 
 def _norm_exchange(entry: dict) -> Optional[str]:
@@ -282,9 +374,18 @@ def _norm_exchange(entry: dict) -> Optional[str]:
     )
     if code in {"NYSEAMERICAN", "AMEX"}:
         return "AMEX"
+    if code in _TXSE_ALIASES:
+        return TXSE
     if code in {"NASDAQ", "NYSE", "BATS", "CBOE", "OTC"}:
         return code
     return code or None
+
+
+def ensure_venue(db: Database, code: Optional[str]) -> None:
+    """Make sure ``ref.exchange`` holds the venue, named where it is known
+    (:data:`VENUE_ATTRIBUTES`). ``core.security.exchange_code`` references it."""
+    if code:
+        repo.ensure_exchange(db, code, *VENUE_ATTRIBUTES.get(code, ()))
 
 
 def _is_us(entry: dict) -> bool:
@@ -396,12 +497,21 @@ def load_securities(
     universe: str = "us-equity-etf",
     include_etfs: bool = True,
     limit: Optional[int] = None,
+    excluded_kinds: Iterable[str] = INSTRUMENT_KINDS,
+    today: Optional[date] = None,
 ) -> SecurityLoadResult:
     """Load the security master from FMP bulk lists.
 
     Returns the number upserted and the tickers that were not in the master
     before this run -- new listings entering scope.
+
+    ``excluded_kinds`` are instrument kinds never written (``[general]
+    exclude_instruments``; empty admits everything). A symbol in the declared
+    universe (``ref.tracked_symbol``) is exempt: declaring it is how an operator
+    keeps one, such as a REIT whose stapled units are its only US listing.
     """
+    excluded = tuple(excluded_kinds)
+    today = today or date.today()
     with RunLog(
         db,
         source="fmp",
@@ -442,9 +552,23 @@ def load_securities(
         # refresh?"; only this answers "is this arrival real?" -- see
         # :func:`is_retired_listing` for why the upsert cannot answer it itself.
         retired = repo.delisted_securities(db)
+        # A ticker is retired by a rename as surely as by a delisting: the security
+        # moved to its new ticker and stays listed, so the old one is in neither
+        # map above, and the vendor's lingering entry for it would otherwise be
+        # minted as a copy of the renamed company (see
+        # :func:`repo.renamed_away_securities`). Same strict name test, so a
+        # different issuer taking the freed ticker still lists.
+        for symbol, renames in repo.renamed_away_securities(db).items():
+            retired.setdefault(symbol, []).extend(renames)
         new_symbols: list[str] = []
         skipped_retired: list[str] = []
+        skipped_labels: list[str] = []
         skipped_test_issues: list[str] = []
+        skipped_out_of_scope: list[str] = []
+        # Read once: a handful of declarations against ~21k entries.
+        declared = (
+            {r["symbol"] for r in repo.list_tracked_symbols(db)} if excluded else set()
+        )
         # Memoised for the run. get_or_create_* is two round-trips (an
         # ON CONFLICT DO NOTHING insert, then a select), and the screener carries
         # a classification on every one of ~21k entries drawn from a taxonomy of
@@ -474,27 +598,66 @@ def load_securities(
                 # already minted for one stays until an operator removes it.
                 skipped_test_issues.append(symbol)
                 continue
+            # Before anything is written, like the test issues: an excluded
+            # instrument is not refreshed either, so a row minted before the
+            # filter existed simply stops changing until `security descope`
+            # removes it.
+            if symbol not in declared and out_of_scope_kind(
+                symbol,
+                company_name,
+                is_etf=is_etf,
+                is_fund=bool(entry.get("isFund", False)),
+                excluded=excluded,
+            ):
+                skipped_out_of_scope.append(symbol)
+                continue
             previous = listed.get(symbol)
+            # The us-equity-etf filter lives in _us_entries now -- it needs the
+            # screener's fields, which the bulk lists do not carry.
+            exchange = _norm_exchange(entry)
             # Before anything is written or flagged: a name this warehouse has
             # already retired, still being served by the vendor, is not a listing.
             # Inserting it mints a duplicate identity that captures the ticker's
             # xref period and hides the row holding the price history.
-            if previous is None and is_retired_listing(
-                company_name, retired.get(symbol, [])
-            ):
+            echo = (
+                is_retired_listing(company_name, retired.get(symbol, []))
+                if previous is None
+                else None
+            )
+            if echo is not None:
                 skipped_retired.append(symbol)
+                # Labelled for the log, so a night's rename echoes can be told
+                # from its delisting echoes without a query.
+                skipped_labels.append(
+                    f"{symbol} (renamed {echo['renamed_to']})"
+                    if "renamed_to" in echo
+                    else symbol
+                )
                 continue
-            # The us-equity-etf filter lives in _us_entries now -- it needs the
-            # screener's fields, which the bulk lists do not carry.
-            exchange = _norm_exchange(entry)
-            repo.ensure_exchange(db, exchange) if exchange else None
+            ensure_venue(db, exchange)
             # The screener carries market cap and beta, so screening data costs
             # nothing beyond this call -- `--enrich` is only needed for the
             # long-form description now (0010).
             nums = _bounded_security_numerics(db, row=entry, symbol=symbol, run=run)
+            active = bool(entry.get("isActivelyTrading", True))
             if previous is None:
                 new_symbols.append(symbol)
             else:
+                # The upsert below copies the vendor's activity onto the row, unless
+                # an operator's venue holds it (0027).
+                if (
+                    previous.get("is_actively_trading")
+                    and not active
+                    and previous.get("venue_override") is None
+                ):
+                    flag_inactive_but_trading(
+                        db,
+                        symbol=symbol,
+                        security_id=previous["security_id"],
+                        vendor_exchange=exchange,
+                        run=run,
+                        today=today,
+                    )
                 # An update, so there is a stored name to compare against. This is
                 # the one moment both names exist -- the upsert below overwrites
                 # the old one.
@@ -520,7 +683,7 @@ def load_securities(
                 sector_id=sector_id(entry.get("sector")),
                 industry_id=industry_id(entry.get("industry")),
                 country=entry.get("country"),
-                is_actively_trading=bool(entry.get("isActivelyTrading", True)),
+                is_actively_trading=active,
                 is_etf=is_etf,
                 is_fund=bool(entry.get("isFund", False)),
                 market_cap_usd=nums["market_cap_usd"],
@@ -530,7 +693,12 @@ def load_securities(
             # Keep the snapshot current so a symbol repeated within one run (the
             # bulk-list universes can repeat; the screener path dedups upstream)
             # is a refresh, not a second arrival.
-            listed[symbol] = {"security_id": sec_id, "company_name": company_name}
+            listed[symbol] = {
+                "security_id": sec_id,
+                "company_name": company_name,
+                "is_actively_trading": active,
+                "venue_override": (previous or {}).get("venue_override"),
+            }
             count += 1
             run.rows_inserted = count
             # Batched, unlike the price and action loaders: there is no network
@@ -567,7 +735,7 @@ def load_securities(
                     else f"{len(skipped_retired)} vendor entries were"
                 ),
                 "an already-retired listing" if one else "already-retired listings",
-                ", ".join(skipped_retired[:20]),
+                ", ".join(skipped_labels[:20]),
                 "..." if len(skipped_retired) > 20 else "",
             )
         if len(new_symbols) >= LARGE_NEW_LISTING_BATCH:
@@ -585,8 +753,20 @@ def load_securities(
                 len(skipped_test_issues),
                 ", ".join(skipped_test_issues[:20]),
             )
+        if skipped_out_of_scope:
+            logger.info(
+                "%d out-of-scope instrument(s) skipped (%s): %s%s",
+                len(skipped_out_of_scope),
+                "/".join(excluded),
+                ", ".join(skipped_out_of_scope[:20]),
+                "..." if len(skipped_out_of_scope) > 20 else "",
+            )
         return SecurityLoadResult(
-            count, new_symbols, skipped_retired, skipped_test_issues
+            count,
+            new_symbols,
+            skipped_retired,
+            skipped_test_issues,
+            skipped_out_of_scope,
         )
 
 
@@ -627,12 +807,14 @@ def enrich_profiles(db: Database, fmp: FMPClient, symbols: Iterable[str]) -> int
             nums = _bounded_security_numerics(
                 db, row=prof, symbol=symbol, run=run, sec_id=sec_id
             )
+            exchange = _norm_exchange(prof)
+            ensure_venue(db, exchange)
             repo.upsert_security(
                 db,
                 primary_symbol=symbol,
                 company_name=prof.get("companyName"),
                 asset_type="etf" if prof.get("isEtf") else "equity",
-                exchange_code=_norm_exchange(prof),
+                exchange_code=exchange,
                 sector_id=sector_id,
                 industry_id=industry_id,
                 currency=prof.get("currency") or "USD",

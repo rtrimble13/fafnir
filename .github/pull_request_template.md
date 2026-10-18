@@ -18,7 +18,7 @@ Closes #
 - [ ] duk / agent (`doc/duk.md`, `doc/agent.md`)
 - [ ] fafnir-dba skill references (`.claude/skills/fafnir-dba/`)
 - [ ] `etc/` templates (`etc/fafnirrc`, `etc/crontab.example`, `etc/systemd/`)
-- [ ] Living-plan row (`doc/plans/sharadar-adoption.md`: status and PR number)
+- [ ] Living plan (`doc/plans/sharadar-adoption.md`: phase note or decision log)
 
 ## Migrations
 

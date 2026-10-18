@@ -7,5 +7,6 @@ INSERT INTO ref.exchange (exchange_code, exchange_name, country, timezone) VALUE
     ('NYSE',   'New York Stock Exchange',  'US', 'America/New_York'),
     ('AMEX',   'NYSE American',            'US', 'America/New_York'),
     ('BATS',   'Cboe BZX Exchange',        'US', 'America/New_York'),
+    ('TXSE',   'Texas Stock Exchange',     'US', 'America/Chicago'),
     ('OTC',    'Over-the-Counter',         'US', 'America/New_York')
 ON CONFLICT (exchange_code) DO NOTHING;

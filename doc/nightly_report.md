@@ -176,6 +176,11 @@ result. It is not sent to go and look. That keeps the nightly cost flat, makes
 two nights comparable, and means a bad report can be reproduced from the
 evidence file rather than re-run against a warehouse that has since moved.
 
+**It names the symbols the vendor stopped serving.** A `VENDOR GAPS` section runs
+`fafnir source vendor-gaps` (v1.5.0): live securities whose newest payload came back
+empty while their venue moved on. The email lists them, new ones first, as the
+evidence for an FMP ticket; their `stale` flags are not for closing.
+
 **It reports movement, not totals.** `nightly_report.sh` copies the previous
 run's evidence aside before collecting tonight's, and feeds both in, fenced.
 An open-flag count that is identical every morning is not news; a count that

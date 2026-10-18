@@ -1,24 +1,63 @@
 # duk — the data-access CLI
 
 `duk` is fafnir's primary read client. It keeps its original command surface and
-adds a global `--source/-S` to choose between the warehouse and the live API.
+adds a global `--source/-S` to choose between the warehouse and a vendor's API.
 
 ## Sources
 
 | Source | Reads from | When to use |
 |---|---|---|
-| `db` (default when a DSN is set) | fafnir PostgreSQL `mart`/`core` | normal use; fast, offline, point-in-time stable |
-| `live` | FMP API directly | ad-hoc symbols not yet in the warehouse, reconciliation, no-DB use |
+| `db` (**default**) | fafnir PostgreSQL `mart` | normal use; fast, offline, point-in-time stable, every security the warehouse holds |
+| `fmp` | FMP API directly | a symbol not yet in the warehouse; checking a series against FMP; no-DB use. `live` is the older name and still works |
+| `sharadar` | Sharadar's SEP/SFP price tables directly | checking a series against Sharadar; reading a security before it is loaded. `ph` only |
 
 The source is a **group-level** option, so it comes before the subcommand:
 
 ```bash
-duk -S db   ph AAPL --adj
-duk -S live ph AAPL --adj
+duk ph AAPL --adj                 # the warehouse
+duk -S fmp ph AAPL --adj          # FMP
+duk -S sharadar ph AAPL --adj     # Sharadar
 ```
 
-The default is `[general].default_source` in `~/.dukrc` / `~/.fafnirrc` (which
-defaults to `db` when a database DSN is configured, else `live`).
+**The warehouse is the default** whether or not a DSN is configured. Without one,
+`duk` stops with *no fafnir DSN configured* and names the vendor flags; it never
+silently answers from a vendor when the warehouse was meant (before 1.6 it fell
+back to FMP). Set `[general].default_source` to `fmp` or `sharadar` for a machine
+that has no warehouse.
+
+Each vendor source needs that vendor's key, and nothing else: `-S fmp` reads
+`FMP_API_KEY` / `[api].fmp_key`, `-S sharadar` reads `SHARADAR_API_KEY` /
+`[api].sharadar_key`. A missing key is refused before any request is made.
+
+### What each source can serve
+
+| Command | `db` | `fmp` | `sharadar` |
+|---|---|---|---|
+| `ph` | ✅ | ✅ | ✅ |
+| `ph cik:` / `isin:` / `cusip:` | ✅ warehouse identifiers | ✅ FMP search | ✖ pass a ticker, or resolve with `-S db` / `-S fmp` |
+| `ls` (list, screen) | ✅ | ✅ | ✖ |
+| `ls SYMBOL` (company summary) | ✅ | ✖ | ✖ |
+| `yc` | ⤳ falls back to FMP until the FRED series land | ✅ | ✖ no treasury data |
+| `rc`, `ti` | source-agnostic | source-agnostic | source-agnostic |
+
+### The Sharadar source
+
+Sharadar's price tables carry split-adjusted `open`/`high`/`low`/`close`/`volume`,
+a fully adjusted `closeadj`, and one as-traded field, `closeunadj`. `duk ph`
+without `--adj` means **raw**, so the raw series is recovered with the vendor's own
+identities (`OpenUnadj = Open × CloseUnadj / Close`, `VolumeUnadj = Volume × Close /
+CloseUnadj`): exact on bars with no later split, the vendor's rounding on bars
+with one. With `--adj`, every price is scaled by `closeadj / close`. SEP (stocks)
+is read first and SFP (ETFs, closed-end funds) when SEP has no rows, so one
+spelling of a ticker works for both. Sharadar has no mutual funds.
+
+> **The endpoint shape is unverified against a paid key.** `duk.sharadar_api`
+> follows Sharadar's documentation pages (a table API keyed by `api_key`, filtered by
+> `ticker` and `date.gte`/`date.lte`, `format=json`) and accepts both payload shapes
+> the vendor has used. If a request fails, the error names
+> `[api].sharadar_base_url` / `SHARADAR_BASE_URL`, which override the base URL. The
+> warehouse-side probe, `fafnir source probe-sharadar`, is where the shape is
+> measured and this module corrected ([plan](plans/sharadar-adoption.md)).
 
 ## Configuration
 
@@ -26,13 +65,15 @@ defaults to `db` when a database DSN is configured, else `live`).
 
 ```toml
 [api]
-fmp_key = ""              # or FMP_API_KEY env (live mode)
+fmp_key = ""              # or FMP_API_KEY env (-S fmp)
+sharadar_key = ""         # or SHARADAR_API_KEY env (-S sharadar)
+# sharadar_base_url = "https://api.sharadar.com/v1.0/data"   # override if the probe says so
 
 [database]
-dsn = "host=localhost dbname=fafnir user=fafnir_app"   # or FAFNIR_DSN env (db mode)
+dsn = "host=localhost dbname=fafnir user=fafnir_app"   # or FAFNIR_DSN env (-S db)
 
 [general]
-default_source = "db"     # "db" or "live"
+default_source = "db"     # "db" (default), "fmp" or "sharadar"
 log_level = "info"
 ```
 
@@ -43,26 +84,27 @@ when symbol resolution still read `core`.
 
 ## Commands
 
-| Command | Description | db mode | live mode |
+| Command | Description | `db` | `fmp` |
 |---|---|---|---|
-| `ph SYMBOL` | price history (OHLCV, raw or `--adj`) | ✅ warehouse | ✅ FMP |
-
-`ph` without `--adj` means **raw** — prices as they actually traded, so a split shows
-up as a real jump. Both sources honour that: `db` reads `mart.v_daily_price_raw`, and
-`live` reads FMP's `historical-price-eod/non-split-adjusted` (not `.../full`, which
-is already split-adjusted). That is what makes the two sources comparable, and what
-`scripts/reconcile.sh` relies on. With `--adj`, `db` reads
-`mart.v_daily_price_adjusted` (split + dividend, point-in-time stable) while `live`
-reads FMP's `dividend-adjusted` endpoint — close, but a moving vendor snapshot
-rather than a reproducible series, so small differences on old dates are expected.
+| `ph SYMBOL` | price history (OHLCV, raw or `--adj`) | ✅ warehouse | ✅ FMP (and ✅ `sharadar`) |
 | `ls` | list/screen securities, sectors, industries | ✅ `mart.security_latest` / `ref.*` | ✅ FMP |
 | `ls SYMBOL\|NAME` | everything the warehouse holds on one company | ✅ `mart.v_security_*` | ✖ db only |
-| `yc` | treasury yield curve | ⤳ falls back to live | ✅ FMP |
+| `yc` | treasury yield curve | ⤳ falls back to FMP | ✅ FMP |
 | `rc` | return calculations from an input file | source-agnostic | source-agnostic |
 | `ti` | technical indicators (sma/ema/rsi/macd) from a file | source-agnostic | source-agnostic |
 
-> `yc` is **live-only** until the economic-series fast-follow adds treasury data to
-> the warehouse; in db mode it logs a warning and reads live (requires an FMP key).
+`ph` without `--adj` means **raw** — prices as they actually traded, so a split shows
+up as a real jump. Every source honours that: `db` reads `mart.v_daily_price_raw`,
+`fmp` reads FMP's `historical-price-eod/non-split-adjusted` (not `.../full`, which
+is already split-adjusted), and `sharadar` recovers the as-traded series from
+`closeunadj`. That is what makes the sources comparable, and what
+`scripts/reconcile.sh` relies on. With `--adj`, `db` reads
+`mart.v_daily_price_adjusted` (split + dividend, point-in-time stable) while the
+vendors return their own adjusted series — close, but a moving vendor snapshot
+rather than a reproducible one, so small differences on old dates are expected.
+
+> `yc` reads FMP until the economic-series fast-follow adds treasury data to the
+> warehouse; in db mode it logs a warning and reads FMP (requires an FMP key).
 
 ## Examples
 
@@ -73,27 +115,28 @@ with `--start-date` (the first N bars from that date) or `--end-date` (the last 
 to it); all three together is an error.
 
 ```bash
-# Adjusted daily closes from the warehouse
-duk -S db ph AAPL --adj --close
+# Adjusted daily closes from the warehouse (the default source)
+duk ph AAPL --adj --close
 
 # Weekly OHLC, last 52 weeks
-duk -S db ph AAPL -f week -n 52 --ohlc
+duk ph AAPL -f week -n 52 --ohlc
 
 # The first five trading days of 1990
-duk -S db ph AAPL --start-date 1990-01-01 -n 5
+duk ph AAPL --start-date 1990-01-01 -n 5
 
 # Prices print at 2dp by default; -p widens it
-duk -S db ph AAPL --adj -p 4
+duk ph AAPL --adj -p 4
 
 # Screen tech names by market cap (warehouse snapshot)
-duk -S db ls --sector Technology --market-cap ">1000000000"
+duk ls --sector Technology --market-cap ">1000000000"
 
 # Export to CSV, then compute a 20-day SMA (pure compute, no source needed)
-duk -S db ph AAPL --close -o prices.csv
+duk ph AAPL --close -o prices.csv
 duk ti sma -i prices.csv -c close -w 20
 
-# Reconcile a symbol: same series from both sources should match
-diff <(duk -S db ph AAPL --close --csv) <(duk -S live ph AAPL --close --csv)
+# Reconcile a symbol: the same raw series from the warehouse and a vendor should match
+diff <(duk ph AAPL --close --csv) <(duk -S fmp ph AAPL --close --csv)
+diff <(duk ph AAPL --close --csv) <(duk -S sharadar ph AAPL --close --csv)
 ```
 
 ### Price formatting
@@ -163,9 +206,11 @@ filled in, and vice versa. The resolved `security_id` — not the ticker it maps
 is what the price query then uses, so a **reused ticker** cannot redirect the
 answer to its current owner.
 
-In **live mode** there is no security master, so the identifier is handed to FMP's
+With **`-S fmp`** there is no security master, so the identifier is handed to FMP's
 own `search-cik` / `search-isin` / `search-cusip` and the ticker that comes back is
-used from there. `ls QUERY` is db-only in either case.
+used from there. **`-S sharadar`** refuses an identifier: Sharadar's TICKERS table
+carries CUSIPs and the CIK, but `duk` does not read it yet, and guessing a ticker
+would be worse than stopping. `ls QUERY` is db-only in every case.
 
 Identifiers work on the MCP surface too: every tool taking a `symbol` accepts
 `cik:`/`isin:`/`cusip:` (see [agent.md](agent.md)).
@@ -233,7 +278,7 @@ that cannot be spotted from the output.
 | several name matches | candidate table on stderr, exit 1 |
 | malformed identifier | error naming the scheme, exit 1 |
 | identifier matching several securities | candidate table on stderr, exit 1 |
-| `-S live` | error, exit 1 — three of the four sections describe the warehouse, so falling back would answer a different question |
+| `-S fmp` / `-S sharadar` | error, exit 1 — three of the four sections describe the warehouse, so falling back would answer a different question |
 | `-n/--limit` | ignored |
 
 `--json` in profile mode is a **nested object**, where list mode emits an array of
@@ -244,8 +289,9 @@ the DQ table collapses to an `open_dq_flags` count.
 ## Library use
 
 The DataFrame contracts are identical across sources, so downstream code is
-source-agnostic. `duk.datasource.db` and `duk.datasource.live` expose
-`price_history(...)` and `screen(...)` returning the same shapes; the pure compute
+source-agnostic. `duk.datasource.db`, `duk.datasource.live` (FMP) and
+`duk.datasource.sharadar` expose `price_history(...)` returning the same shape (the
+first two also `screen(...)`); the pure compute
 modules (`duk.indicators`, `duk.return_utils`, `duk.rates_utils`, `duk.stats`)
 operate on those frames unchanged.
 
@@ -254,3 +300,172 @@ and `.company_summary()` do the I/O and return plain dicts; `duk.company_summary
 is pure functions over those dicts (`build_summary`, `render_text`, `render_flat`,
 `render_candidates`) with no SQL and no click, so the whole report can be built and
 asserted without a database. `build_summary`'s output is the `--json` contract.
+
+## From Claude Code on a laptop
+
+A Claude Code session on your laptop reads the warehouse the way you do: its Bash
+tool runs `duk` as your OS user, with your `~/.dukrc` and your SSH tunnel. Three
+things need settling first: the shape of the tunnel, the role Claude's queries run
+as, and Claude Code's Bash sandbox. What follows was measured on Ubuntu 24.04
+(OpenSSH 9.6p1, PostgreSQL 16, every migration applied), running `duk` directly and
+inside `@anthropic-ai/sandbox-runtime` 0.0.79, the package Claude Code builds its
+sandbox on. Where a line rests on Claude Code's documentation instead, it says so.
+
+### The server: two roles and one `pg_hba` line
+
+Add yourself as a reader with **both** of a person's roles, `rob` for you and
+`rob_mcp` for your agents, as
+[operations.md](operations.md#adding-a-reader-a-person-or-an-agent) describes. That
+includes the `+fafnir_app` rule in `pg_hba.conf`: it is what lets the OS user `rob`
+become `rob_mcp`. Without it the generic `local all all peer` line admits only a role
+named exactly like the OS user, and every Claude connection fails with
+`Peer authentication failed for user "rob_mcp"`.
+
+### The tunnel: a socket, kept up by a service
+
+Forward the server's Postgres socket to a **local socket file**, not a local port,
+and run it as a service outside Claude:
+
+```
+# ~/.ssh/config                      (once: mkdir -m 700 ~/.fafnir)
+Host fafnir-tunnel
+    HostName <SERVER_IP>
+    User rob
+    IdentityFile ~/.ssh/id_ed25519_fafnir
+    IdentitiesOnly yes
+    LocalForward %d/.fafnir/.s.PGSQL.15432 /var/run/postgresql/.s.PGSQL.5432
+    StreamLocalBindUnlink yes
+    ExitOnForwardFailure yes
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    ControlMaster no
+    BatchMode yes
+```
+
+```ini
+# ~/.config/systemd/user/fafnir-tunnel.service     (Linux)
+[Unit]
+Description=SSH tunnel to the fafnir warehouse
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N fafnir-tunnel
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+`systemctl --user enable --now fafnir-tunnel`. On macOS, run the same
+`/usr/bin/ssh -N fafnir-tunnel` as a launchd agent in `~/Library/LaunchAgents` with
+`RunAtLoad` and `KeepAlive`.
+
+- **A socket, not `127.0.0.1:15432`.** On Linux a sandboxed command's `localhost` is
+  its own, so a port forward cannot be reached from inside the sandbox under any
+  setting, while a socket can be let through. A port forward also authenticates
+  *anyone* on the laptop who can reach it as you: a second local user connected
+  through one as `rob`. The socket is created mode `0600`, OpenSSH's default
+  `StreamLocalBindMask`, and the same user got `Permission denied`.
+- **A supervised `ssh -N`, not `ssh -fN` with `ControlPersist`.** ADR 0008's
+  `ControlPersist 30m` closes the tunnel 30 minutes after its last forwarded
+  connection, and `duk` holds one only while a command runs, so the tunnel is gone
+  half an hour after the last query. Here a dead link makes ssh exit and the service
+  restarts it: the tunnel was back seconds after the server dropped the session,
+  the restart delay plus one SSH handshake.
+- **Outside Claude.** Plain `ssh` cannot connect from inside the sandbox, and
+  Claude has no need to hold the tunnel. `BatchMode yes` makes ssh fail rather than
+  prompt, so the key comes from your ssh-agent. Give it a passphrase: commands
+  Claude runs can read `~/.ssh`.
+
+Your own `~/.dukrc` then names the socket's **directory**, as an absolute path
+(libpq does not expand `~`, and appends `.s.PGSQL.<port>` itself):
+
+```toml
+[database]
+dsn = "host=/home/rob/.fafnir port=15432 dbname=fafnir user=rob application_name=duk"
+```
+
+### Claude Code settings
+
+Merge
+[`etc/agent/claude-code-laptop.settings.json.example`](../etc/agent/claude-code-laptop.settings.json.example)
+into `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "FAFNIR_DSN": "host=/home/rob/.fafnir port=15432 dbname=fafnir user=rob_mcp application_name=duk-claude"
+  },
+  "permissions": { "allow": ["Bash(duk *)"] },
+  "sandbox": { "excludedCommands": ["duk *"] }
+}
+```
+
+- **`env.FAFNIR_DSN`** runs Claude's `duk` as `rob_mcp`. Its queries are then told
+  apart from yours in `pg_stat_activity` and the server log, get the agent budget
+  (20 s statement timeout, 4 connections), and `ALTER ROLE rob_mcp NOLOGIN` stops
+  them while you keep working. The variable wins over `~/.dukrc`. This is
+  attribution, not enforcement: your OS account maps to both roles, and both read
+  `mart` and `ref` only, read-only, so nothing Claude can reach changes.
+- **`permissions.allow`** spares a prompt on every `duk` call.
+- **`sandbox.excludedCommands`** is for when the sandbox is on (below), and inert
+  while it is off.
+
+User-level, not a project's `.claude/settings.json`: the DSN names you, and where an
+administrator makes the sandbox admin-required, Claude Code ignores
+`excludedCommands` entries in a project's `.claude/` files.
+
+### The Bash sandbox
+
+Claude Code's Bash sandbox is **off by default**, and then nothing more is needed.
+Turned on (`/sandbox`, or `sandbox.enabled`), it stops a sandboxed `duk` reaching
+the tunnel's socket:
+
+| Sandbox setting | Linux (measured) | macOS (Claude Code docs; not measured) |
+|---|---|---|
+| none | ✖ `connection is bad: no error details available`. Only with Claude Code's optional seccomp filter installed; without it Unix sockets are not blocked at all | ✖ |
+| `network.allowUnixSockets: ["<socket path>"]` | ✖ ignored: seccomp cannot filter by path | ✅ |
+| `network.allowAllUnixSockets: true` | ✅ but opens *every* socket to every sandboxed command, `docker.sock` included | ✅ same caveat |
+| `excludedCommands: ["duk *"]` | ✅ `duk` runs unsandboxed, as `duk` run directly did | ✅ |
+| a `127.0.0.1` port forward | ✖ under every setting | needs `allowLocalBinding`, which opens every localhost port |
+
+The example uses `excludedCommands`, which works on both. An excluded command runs
+with your full access, `-o` to any path included; that is the trade. On macOS,
+`allowUnixSockets` with the socket's absolute path is narrower, since `duk` stays
+sandboxed, if you would rather.
+
+`excludedCommands` matches the text of the whole call, and every command in the call
+has to match. `duk ph AAPL --adj -n 20` leaves the sandbox; `duk ph AAPL | head`,
+`cd x && duk …` and `duk … > out.csv` stay in it and fail as above. Limit with `-n`,
+save with `-o`. `rc` and `ti` read local files and need no exception at all.
+
+### Tell Claude what the failures look like
+
+`duk` reports psycopg's connection errors, which name neither the tunnel nor the
+sandbox. A few lines in the `CLAUDE.md` of the project where Claude uses `duk`:
+
+```markdown
+## fafnir data
+- Read with `duk …` (the warehouse is the default source), one plain `duk`
+  command per call: no pipes, redirects, `cd` or `&&`. Limit rows with `-n`; save
+  with `-o file.csv`.
+- "Connection refused" or "No such file or directory" on ~/.fafnir/.s.PGSQL.15432:
+  the SSH tunnel is down. Tell me; never start ssh yourself.
+- "connection is bad: no error details available": the Bash sandbox blocked the
+  socket (doc/duk.md, "The Bash sandbox").
+```
+
+### Or the MCP server
+
+`fafnir-mcp --profile read` serves the same reads as MCP tools, with result sizes
+capped. MCP servers run outside the Bash sandbox, so the section above does not
+apply to it. Register it from
+[`etc/agent/mcp-laptop.json.example`](../etc/agent/mcp-laptop.json.example) with
+`FAFNIR_DSN` pointed at the socket (`host=/home/rob/.fafnir port=15432 dbname=fafnir
+user=rob_mcp application_name=fafnir-mcp`); through the tunnel,
+`fafnir-mcp --profile read --check` reports `rob_mcp`, read-only, with `mart` and
+`ref` only. One caveat: on a socket DSN, its connection error says PostgreSQL is not
+running, because a socket DSN means "on the host" to it. On a laptop it means the
+tunnel is down. Reach for `duk` when Claude should write files (`-o`) or run `rc` and
+`ti` on them.

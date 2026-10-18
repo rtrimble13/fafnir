@@ -141,8 +141,9 @@ not for funds. The probe measures NAV across the *largest* distribution on recor
 The command exits non-zero on anything but a pass or `inconclusive`, so it can gate a
 script. It costs 3 requests and writes nothing.
 
-**Retiring a fund.** The delisted feed does not carry funds (and `MUTF` is outside
-`SCREENER_EXCHANGES`, so the sweep cannot reach them). `fafnir track rm VFIAX` stops
+**Retiring a fund.** The delisted feed's rows for funds carry a venue the sweep
+does not read, so it cannot reach them. (The recorded `MUTF` venue is not what keeps
+them out: the sweep filters on the feed's venue, not the security's.) `fafnir track rm VFIAX` stops
 the pulls; `fafnir track rm VFIAX --closed 2027-03-31` also retires the security the
 ordinary way — `delisted_date` stamped, ticker period closed, every bar retained. Use
 `--closed` when the fund actually closed or merged: an untracked-but-active security
@@ -184,6 +185,80 @@ Two details follow from the endpoint choice:
   cannot decide on their own.
 
 Full rationale and the migration consequences: [adr/0004](adr/0004-unadjusted-price-feed.md).
+
+## What FMP restates, and the guard
+
+The nightly price load re-reads the last `overlap_days` (5) sessions of every
+symbol, to pick up late corrections. FMP's first print of a bar is usually right;
+what it serves on a later read of the same date often is not. Between 2026-09-16 and
+10-14, the re-read replaced first prints with:
+
+- **another instrument's prices**: one fund's history became another's level from
+  one night to the next (a ~11 first print re-served at ~58; a ~26 one at 0.07), every
+  night, in both directions;
+- **a split's scale, before the split**: four sessions re-served at x6 the day after
+  a 1:6 reverse split went ex, and five at x50 the week before a 1:50 -- prices only,
+  the volumes within 8% of the first prints;
+- **a phantom split's scale**: two sessions at a 2:1 scale FMP took from a warrant
+  dividend it had recorded as a split.
+
+An operator re-fetch (`ingest prices --symbols S --from D --to D`) repaired those --
+and one of them returned the prices right and the volume x50, at the same time.
+
+So a **nightly** load (no `--from`) never overwrites a stored bar by more than
+`[prices] restatement_max_ratio` (close, default 1.25) or
+`restatement_max_volume_ratio` (volume, default 3), either direction. It keeps the
+stored bar and writes `price_restatement_conflict` -- once per open `(symbol,
+date)`, with the stored OHLCV and the run that stored it, the incoming OHLCV, both
+ratios and any split on file within 30 days. The date still counts as loaded, so the
+watermark moves past it. A zero volume on either side is no ratio and restates
+nothing.
+
+An **explicit** re-fetch (`--from`) overwrites, as before, and:
+- prints every bar it restated beyond the thresholds, close and volume, old -> new
+  (the table that would have shown the x50 volume on the spot);
+- records them in its run's `params.restated` (the first 500) and
+  `params.restated_count`;
+- resolves the open `price_restatement_conflict` on every date it wrote, with
+  `operator re-fetch, run N` and the old and new values.
+
+The guard's cost is deliberate. Sometimes the first print is the wrong one (the
+phantom-scale bars above; a 0.07 first print later served as 25.52): the guard keeps
+it and raises a conflict rather than accept the vendor's correction. A blocked
+correction is visible and costs one re-fetch; a silently stored wrong-instrument
+restatement cost weeks. There is no "consistent with the neighbours" tie-break: on a
+series whose stored history is already the wrong instrument it would accept the
+wrong re-read and refuse the right first print. The playbook probes the vendor and
+re-fetches the side that is right.
+
+**A new bar at a split's scale.** A bar with no stored copy has nothing to protect,
+so the guard above cannot apply. When it is dated within 30 days before a split on
+file, its close is the last stored close times the split's price factor (x50 for a
+1:50, x0.5 for a 2:1) within 10%, and its volume is within 25% of the 20-session
+median times the inverse factor or times one (FMP has served both shapes), it is
+quarantined as `price_split_scale_mismatch`: not stored, and holding the watermark
+like any quarantine. Splits nearer 1:1 than 3:2 are not judged: a 5:4 split's
+factor is inside an ordinary day's range.
+
+**One split on file twice.** `fafnir adjust` flags two splits of one ratio within ten
+sessions as `split_duplicate_suspect`, naming the one the raw closes move across
+(GLE's 1:10 sat on 10-07 and 10-08, and adjusted prices were x100 before the earlier
+date; NXGL's 1:20 on 10-09 and 10-12). Delete the other with `actions delete`, after
+`source probe-prices` on the bar before each ex-date shows which one the
+split-adjusted feed applies.
+
+**Symbols FMP stopped serving.** `fafnir source vendor-gaps` lists live securities
+whose newest payload was an open-ended request that returned nothing after their
+last bar, while 95% of their venue moved on and the delisted feed does not name
+them. On 2026-10-14 that was ten securities that traded every day (last bars 09-29
+to 10-08). The list is for an FMP ticket; their `stale` flags stay open. The
+delisting sweep lands its payload (from v1.5.0) so the report can check it.
+
+**A declared ticker over a delisted row.** `ingest tracked` mints nothing for a
+declared ticker whose vendor profile names a delisted security (same CUSIP, or the
+same normalised name): it flags `tracked_symbol_delisted` instead. BURU was declared
+while its only row was delisted, and every night a new row was minted and stamped
+delisted by the sweep. `track add` refuses such a ticker unless `--allow-delisted`.
 
 ## Corporate actions
 
@@ -391,19 +466,73 @@ dismissed and ignored rows are left exactly as they are. The count is reported a
 A rename for a ticker fafnir does not track is counted and dropped, not recorded:
 the feed is global across every venue, and the audit table is not a copy of it.
 
+The vendor keeps listing the *old* ticker on the screener for weeks after a rename,
+and nothing in `core.security` holds it any more: the security moved, and nothing
+was delisted. So an applied rename also retires its old ticker for the
+security-master load. `repo.renamed_away_securities` offers every name the echo is
+known to carry: the security's name before the rename (`detail.old_company_name`,
+recorded by the sweep and by `merge-rename`), any name a `security merge` recorded
+from a re-minted echo (`detail.echo_names`), the security's current name and the
+feed's. `is_retired_listing` weighs the screener entry against them with the same
+strict normalised-name test it uses for delisted rows. A matching entry is skipped
+and logged as `<OLD> (renamed <NEW>)`. A different issuer taking the freed ticker
+still lists.
+
 If the security master ran before the rename was known and minted the new ticker as
 its own row, the sweep folds that duplicate back in — but only when it is still
-empty (no bars, no actions, no factors). That fold is the one place fafnir deletes
-a security; retention exists so history is never lost, and a stub has none. A
+empty (no bars, no actions, no factors). That fold is the one place a loader deletes
+a security; retention exists so history is never lost, and a stub has none. (An
+operator can too: `security merge` folds a duplicate by hand, and `security
+descope` removes an instrument kind taken out of scope.) A
 duplicate that *has* accumulated history is a `conflict` instead: merging two price
 histories is not a decision a loader should make silently.
+
+### Instruments out of scope: warrants, rights and units (ADR 0012)
+
+`ingest securities` does not mint warrants, rights or units. It classifies each
+screener entry by ticker with `fafnir.instruments.instrument_kind`:
+
+- Nasdaq's reserved fifth letters W, R and U decide on their own.
+- So do the NYSE `-WT` / `-WS` / `-RT` / `-UN` suffixes.
+- A three-letter base plus W/R/U, or a fifth-letter Z, counts only when the
+  vendor's name names the same kind.
+
+A matching entry is skipped before anything is written, and the run reports it:
+`Skipped 12 out-of-scope instruments (warrant/right/unit)`. A few a night is normal
+SPAC issuance.
+
+- `[general] exclude_instruments` chooses the kinds. All three are excluded by
+  default; `[]` admits everything.
+- To keep a single ticker that still lists, declare it with `fafnir track add`.
+  Never declare a delisted one: `ingest tracked` would mint it again as a new,
+  active security. A delisted security of an excluded kind is kept by naming it
+  with `security descope --keep`, as Granite REIT's `GRP-UN` is.
+- Rows minted before the filter existed are not refreshed. Remove them with
+  `fafnir security descope` (see [operations.md](operations.md#descoping-an-instrument-kind)).
+
+**A rename never changes the instrument.** The vendor's rename feed shuffles one
+SPAC's tickers among themselves before launch (`ABCD -> ABCDU`, and back). With the
+unit never minted, nothing holds the target ticker, and the sweep would move the
+class A share onto it. From there the screener load would skip it as out of scope,
+the price step would feed it the unit's bars, and the next descope would delete it.
+So `apply_symbol_change` refuses, before the fold and before the free-ticker path,
+any rename `fafnir.instruments.rename_changes_instrument` objects to. That covers
+a rename between kinds (`ABCD -> ABCDU`, `AAC -> AAC-WT`, `ABCDU -> ABCDW`), and one
+ticker being the other plus a designator letter (`ZKP -> ZKPU`). The row is
+recorded as a `conflict` with `detail.reason`, flagged once, and retried and
+refused nightly until `fafnir security dismiss-rename` closes it.
+`security merge-rename` refuses the same renames unless forced. A de-SPAC rename
+keeps the kind (`ABCDW -> NEWCW`) and applies as before; funds and ETFs are never
+refused.
 
 ## Order of operations (daily)
 
 ```
 ensure-partitions → symbol-changes → securities → delisted →
-prices → actions → adjust --changed → refresh-marts → dq run
+prices → actions → adjust --changed → refresh-marts
 ```
+
+then, as its own job after the load, `dq run` (`fafnir-dq`).
 
 The universe is reconciled before any data is pulled, so prices run against what is
 actually trading today. `ingest delisted` keeps its place and its behaviour, with
@@ -423,11 +552,38 @@ which any command could fold. `mark_delisted` is one-way, so before it runs the
 loader reads the security's own bar span and **declines** a delisting that precedes
 the first bar (it describes an earlier holder) or that the security kept printing
 bars more than `TRADED_AFTER_GRACE_DAYS` (30) past. The grace covers the normal lag
-between a delisting and the feed reporting it. A name that left the exchange and
-kept trading under the same ticker elsewhere is declined too, and goes on loading —
-the cheaper error, and the per-row warning names it for a human. A security with no
-bars contradicts nothing and is marked as before. Declined rows are counted in the
-run's `rows_quarantined`.
+between a delisting and the feed reporting it. A security with no bars contradicts
+nothing and is marked as before.
+
+That bar test cannot catch a **venue transfer**: once a security is marked, the
+price step stops loading it, so the bars after the delisting never arrive. ET and
+five others moved from the NYSE to the Texas Stock Exchange (TXSE) on 2026-10-05,
+and the sweep stamped all six from FMP's delisted feed. FMP's profile was no help:
+it went on calling ET inactive on the NYSE. Its price feed was, so the sweep now
+asks it ([ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)):
+
+- **A recent delisting** is checked first: one within 60 days, with the last
+  stored bar within 10 sessions of the date. The sweep fetches the security's bars
+  from about 10 sessions before the date, one request. A bar strictly after the
+  date declines the record and flags it `security_delisting_contradicted` for an
+  operator to decide: `security venue-transfer` if it moved, `security delist` if
+  it left scope (a move to OTC keeps printing bars too). A bar *on* the date is
+  not enough, because FMP's `delistedDate` is often the last trading day.
+- **A record that flag already names** is declined without asking. That covers an
+  accepted flag (an operator recorded the move) and an open one (still undecided),
+  so an undecided record is never stamped by default.
+
+The run's `params` record `declined` per reason and `prices_requested`.
+`rows_quarantined`, which marks the run `partial`, counts every decline that wants
+a look, but not `known_transfer`, the expected echo of a move already recorded.
+
+The same move froze these securities a second way: the nightly `ingest securities`
+copies the vendor's `isActivelyTrading` onto every listed row, and FMP called them
+inactive. So the nightly price and corporate-action universes are "listed, and
+either actively trading or with a bar in the last 30 days", not
+`is_actively_trading` alone. A venue recorded by `security venue-transfer` is an
+override (migration 0027) that the upsert keeps, with the row's activity, until FMP
+names a venue other than the one the security left.
 
 Prices precede actions so dividend adjustment can value against fresh closes.
 `scripts/daily_update.sh` encodes this order.

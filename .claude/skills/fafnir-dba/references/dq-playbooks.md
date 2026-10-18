@@ -26,8 +26,9 @@ and they are not interchangeable:
 
 - **`dq recheck`** re-evaluates a check against its own open flags and closes the
   ones whose condition is no longer true. It is the negation of the check, run by
-  the same constants, so what it closes cannot come back. Only six checks support
-  it; a check that is not listed cannot be rechecked at all.
+  the same constants, so what it closes cannot come back. Only six SQL checks
+  support it, plus the `dorq_*` checks by re-running dorq (below); a check that is
+  not listed cannot be rechecked at all.
 - **`dq accept`** is a terminal disposition for a condition that is real,
   understood, and has no repair. It sets `accepted_at`, and `add_dq_flag_once`
   skips a condition already accepted — so the writer stops re-detecting it. It
@@ -43,12 +44,19 @@ and they are not interchangeable:
 | `gap`, `sparse_coverage`, `outlier`, `stale`, `security_duplicate_identity`, `security_missing_classification` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes — except `security_duplicate_identity` |
 | `dividend_no_prior_close`, `dividend_exceeds_price`, `adjustment_factor_extreme`, `adjustment_failed` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security | yes | `dividend_no_prior_close` only |
 | `price_scale_collapse` | price loader | `add_dq_flag_once` | a re-read of that bar | yes | no |
+| `price_restatement_conflict` | nightly price load (not `--from`) | `add_dq_flag_once` | a nightly re-read of that date while the vendor still restates it beyond the guard. An explicit `ingest prices --from` re-fetch of the date **resolves it itself** | yes | no |
+| `price_split_scale_mismatch` | price loader | `add_dq_flag` (**no dedupe**: a quarantine) | every re-read of that bar | **no** | no |
+| `split_duplicate_suspect` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security, while both splits are on file | yes | no |
+| `tracked_symbol_delisted` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, while the declaration names a delisted identity | yes | no |
 | `price_cross_field_violation`, `price_non_positive_price`, `price_subresolution_price`, `price_price_out_of_range`, `price_missing_or_nonnumeric_ohlc` | price loader | `add_dq_flag` (**no dedupe**) | *every* re-read of that bar — overlap window, watermark holds, backfills | **no** | no |
 | `security_company_name_drift` | security master | `add_dq_flag_once` | not re-written: the upsert stores the new name | yes — **for the whole ticker** | no |
 | `corporate_action_drift` | action reconciliation | `add_dq_flag_once` | the next reconciliation of that symbol, if the drift persists | yes — **for the whole symbol** | no |
 | `symbol_change_conflict` | symbol-change sweep | `add_dq_flag_once` | no longer re-detected once the row is terminal; the sweep closes it itself when a retry applies the rename | yes | no |
 | `split_invalid`, `dividend_invalid` | action loader | `add_dq_flag_once` | the next load of that action | yes | no |
 | `tracked_symbol_unknown_to_source` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, if the vendor still won't serve it | yes | no |
+| `security_delisting_contradicted` | `ingest delisted` | `add_dq_flag_once` | the next sweep, while the vendor has bars after the date and the record is within 60 days. **Never a bare resolve**: `security venue-transfer` accepts it, `security delist` resolves it | yes — and an acceptance is how the sweep knows the record is a move | no |
+| `security_inactive_but_trading` (info) | `ingest securities` | `add_dq_flag_once` | the next load that turns the row inactive again within 5 sessions of a bar | yes | no |
+| `dorq_*` | `dq run --engine dorq\|both` with `--no-shadow` | `dq.dorq.ingest` (the same two guards as `dq.checks`) | the next dorq run whose window still reports it — nightly, only dates within its `--since`, plus any date of a security whose history was new or rewritten since the night before (the backfill); a `--full` run, any date | yes | yes, by re-running dorq — except the Never three and the cross-sectional `dorq_cohort_gap`, `dorq_cohort_move` |
 
 **The two acceptance traps.** `corporate_action_drift` and
 `security_company_name_drift` are both keyed on `record_key = {"symbol": …}`. An
@@ -215,6 +223,12 @@ explanation. The queries and thresholds for each are in
 - **A near-miss split** — one jump of the split's ratio on a session 1–5 days off
   the ex-date, and the price holds — is a *misdated* split, not a market move.
   Correct the ex-date with `fafnir actions redate <id> --ex-date <d>`; do not accept.
+  **Before redating, compare the bar you are dating from across every run's
+  payload** in `landing.fmp_raw`, not only the latest. FMP restates a new ticker's
+  first bars on the post-split scale (×k the price, ÷k the volume), and a restated
+  bar looks exactly like an earlier ex-date. On 2026-10-04 OPNW was redated
+  09-29 → 09-25 off such a bar and had to be undone, though the as-traded 09-25 bar
+  was in the payloads of earlier runs.
   **Two** jumps of the split's size a few days apart are not a misdate: the pre-split
   history is mis-adjusted, and moving the date fixes neither.
 - **A split the feed never reported** — a clean ×k or ÷k jump (within 3%) that holds
@@ -275,6 +289,17 @@ the operator's bars and writes the vendor's back exactly as they stood, because 
 edit replaced them rather than judging them worthless. Deletes need migration 0025
 on the host and bar edits need 0026 — check `schema_state` before planning with them.
 
+**Corporate actions behave the same way.** Revoking an `actions delete` override,
+or the pair of overrides `actions redate` leaves, lifts the suppression and removes
+the operator's row. It **does not bring the vendor's row back**. That happens only
+if a later actions load re-reads the date: the calendar sweep's overlap window is
+about a week, and the per-symbol rotation reaches each security once a month.
+
+After a revoke, read `core.corporate_action` for the security. If the vendor's event
+is missing and its date is confirmed, add it with `actions add`, as an operator
+row that no feed overwrites. On 2026-10-06, undoing OPNW's redate left it with no
+split at all.
+
 **Close with:** `repair-then-recheck` for a missing or misdated action, a duplicate,
 a re-fetchable or deleted bar (`dq recheck --check outlier` — a deleted bar, a
 deleted previous bar, or a split on the flag's date closes it; run `db refresh-marts`
@@ -307,11 +332,15 @@ SELECT s.primary_symbol, s.is_actively_trading, s.delisted_date, s.is_fund,
 
 - **Delisted but unmarked** → `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest delisted`, then
   resolve. The security stopped trading; the flag was right and is now explained.
-- **A tracked fund** → NAV publication lags, and the `MUTF` pseudo-venue is
-  outside `SCREENER_EXCHANGES` so the delisted sweep cannot reach it. If the fund
+- **A tracked fund** → NAV publication lags, and the delisted sweep will not
+  retire it: the feed's own rows for funds carry a venue the sweep does not read
+  (its recorded `MUTF` pseudo-venue is not what keeps it out). If the fund
   has actually closed: `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir track rm <SYM> --closed <date>` —
   not a `dq resolve`, because `track rm` alone leaves it active and it will be
   flagged stale again every night.
+- **A name stamped delisted, or turned inactive, that kept trading** → a venue
+  transfer (ADR 0014). Not a `stale` flag (the check reads active securities only),
+  but the same question; see `security_delisting_contradicted` below.
 - **A live, liquid name** → **never resolve.** The loader is failing for it. Look
   at `ingestion_runs` and the watermark; a watermark stuck behind a quarantined
   bar is the usual cause, and the fix is the `price_*` playbook below.
@@ -333,6 +362,26 @@ enough behind, or is no longer actively trading. Where the security really has
 stopped (a closed fund) retire it properly first — `track rm <SYM> --closed <date>`
 — and the recheck closes the flag on its own. **Accept** only a security that will
 never take another bar and cannot be retired.
+
+### A live name the vendor stopped serving
+
+`fafnir source vendor-gaps` lists them: in the nightly universe, behind by two or
+more sessions, the newest payload an open-ended request that returned nothing after
+the last bar, 95% of the venue ahead, and not on the delisted feed. On 2026-10-14
+that was ten names that traded every day (FPAS, XJUL, XAPR, XFEB, CMCI, VAIC, CHIP,
+MYCP, VMSD, VAI). The nightly report has the section.
+
+- **Report, don't close.** The security trades; the vendor does not serve it. Its
+  `stale` flag is right and stays open. Never resolve or accept it, and never
+  `track rm` or delist it on the strength of the vendor's silence.
+- Confirm once with `source probe-prices --symbol <SYM> --date <latest>`: no bar in
+  either feed is the vendor, not the load. A bar there is the loader's problem: see
+  the watermark, above.
+- The list is the evidence for an FMP ticket (an operator task). If the vendor
+  catches up, the next load fills the bars and `dq recheck --check stale` closes the
+  flags; if a label is wanted meanwhile, state it:
+  `dq label add --security-id <id> --first <first missing> --kind feed_gap
+  --verified -m "<the outside source that shows it trading>"`.
 
 ---
 
@@ -423,6 +472,117 @@ bar; it deletes the only record of what was lost.
 
 ---
 
+## `price_restatement_conflict` — the vendor restates a stored bar
+
+Warn, **repair-first**. The nightly re-read of the last five sessions served a bar
+that differs from the stored one by more than `[prices] restatement_max_ratio`
+(close, 1.25) or `restatement_max_volume_ratio` (volume, 3), either way. The loader
+kept the stored bar and wrote this, once per open `(symbol, date)`. It is not a
+quarantine: it spends no watermark budget, and the watermark moved past the date.
+
+`detail` has `stored` (OHLCV and the `ingestion_run_id` that stored it), `incoming`,
+`close_ratio`, `volume_ratio`, `over` (which tripped) and `splits_near` (any split
+on file within 30 days).
+
+**Which side is right?** FMP's first print usually is. What it restated from
+2026-09-16 to 10-14:
+- **another instrument's level** (OUSL ~11 -> ~58, QCJL ~26 -> 0.07, KEO, MILK,
+  XNDX): keep the stored bar. Probe; the series' outside history (issuer page)
+  settles it;
+- **a split's scale before the split** (GCDT x6, ZBAO x50, `splits_near` names it):
+  keep the stored bar;
+- **a correction of a wrong first print** (SKYD 10-02: a phantom 2:1 first print,
+  correctly re-served at 9.5): the incoming side is right, and the guard blocked it.
+  That is its documented cost.
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices --symbol <SYM> --date <d>
+```
+
+**Repair.** Stored side right: nothing to change; the vendor's wrong re-read is held
+off every night. Incoming side right: re-fetch the date explicitly, which overwrites,
+prints what it restated, and resolves this flag itself:
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --symbols <SYM> --from <d> --to <d>
+```
+
+Read the restated table it prints: ZBAO's re-fetch put the prices right and returned
+volume x50 in the same breath. If neither side is right, `prices delete` the bar.
+
+**Close with:** the explicit re-fetch (it resolves the conflict on every date it
+wrote). Stored side right and the vendor still restates nightly: **accept**, with the
+evidence (`--per-flag --label data_error --kind wrong_instrument` when it is another
+instrument), so the nightly stops re-asking; the stored bar stays protected either
+way. If the vendor has since gone back to serving the stored value (probe), resolve
+with that in the note. Never resolve on the count.
+
+---
+
+## `price_split_scale_mismatch` — a new bar at a coming split's scale
+
+Warn, a **quarantine** (repeats per re-read, holds the watermark). A bar with no
+stored copy, dated within 30 days before a split on file, whose close is the last
+stored close times the split's price factor (x50 for a 1:50) within 10%, on a
+volume consistent with the vendor's adjusted bar. It was not stored. `detail` names
+the split, the factor and which volume shape it matched.
+
+**Repair-first.** Probe the date (`source probe-prices`): the split-adjusted feed
+should equal the incoming bar. Then re-fetch once the vendor serves the raw bar, or
+let the watermark budget release it and fill the gap by hand-checked re-fetch. If
+the split on file is itself wrong (misdated, a phantom), fix the action (`actions
+delete|redate`) and re-fetch. **Close with:** the re-fetch that stores the raw bar,
+then resolve with the evidence. Never accept: it is a bar the warehouse does not hold.
+
+---
+
+## `split_duplicate_suspect` — one split on file twice
+
+Warn, **repair-first**, written by `adjust`. Two split rows on one security with the
+same ratio, no more than ten sessions apart (GLE 1:10 on 10-07 and 10-08; NXGL 1:20
+on 10-09 and 10-12). The bars move once, and the adjusted series moves twice:
+adjusted prices before the earlier date were x100 and x400. No SQL check saw them;
+dorq's DQ701 did. `detail.splits` gives the close ratio across each ex-date against
+the split factor, and `moves_on` the date the raw closes actually move.
+
+**Repair.** Probe the split-adjusted feed on the bar before each ex-date: the
+cumulative split it applies shows which one it knows.
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices --symbol <SYM> --date <bar before each ex-date>
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir actions list --symbol <SYM> --type split
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir actions delete <the other id> --dry-run \
+    --by claude -m "duplicate of the <ratio> on <moves_on>: closes move once, on <d>; probe: ..."
+```
+
+**Close with:** the `actions delete` (factors recompute in the same transaction; the
+next `adjust` writes no flag), then resolve with the delete's override id. Never
+resolved by a run. The delete becomes a `split_deleted` label at the next export.
+
+---
+
+## `tracked_symbol_delisted` — a declared ticker over a delisted row
+
+Warn. `ingest tracked` found a declaration whose vendor profile describes a
+security fafnir holds as delisted (same CUSIP, or the same normalised name), and
+minted nothing. Before v1.5.0 it minted a new row every night, which the delisting
+sweep then stamped (BURU: 815532 on 10-13, 833074 on 10-14, beside 286436).
+`detail.delisted_security_id` names the row.
+
+**A repair either way:**
+- **It relisted** (a real move back to a venue: the vendor's bars continue, an
+  exchange notice says so) — `security venue-transfer <id>` reverses the delisting,
+  after which the declaration finds a listed row and loads into it.
+- **It is gone** (OTC, wound up, the declaration was a mistake) —
+  `track rm <SYM>`.
+
+**Close with:** the venue transfer or the `track rm`, then resolve with which and
+why. `track add --allow-delisted` is not a fix: it declares a ticker that now
+belongs to a different issuer, and `ingest tracked` still mints nothing over a
+delisted row of the same identity.
+
+---
+
 ## `split_invalid` / `dividend_invalid` — unusable action values
 
 **Diagnose** against `landing_payload` for the actions endpoint. **Resolve** for
@@ -465,6 +625,14 @@ truncated before that deploy still need the re-backfill.)
 **Repair when** it is mid-history: the real defect is a **price gap**, not the
 dividend. Fix the gap first, then `fafnir adjust --symbol <SYM>`, then
 `dq recheck`.
+
+**A security with no bars at all can never be closed by the recheck**, because its
+rule is "a prior raw close now exists". The usual case is a stray dividend on an
+empty echo row: the calendar sweep attaching a renamed company's distribution to
+the shell its old ticker left (GBF → AGGM, 2026-10-06). Delete the stray row with
+`actions delete <id>`; its override keeps it out. Then **resolve the flag by id**:
+with no dividend left, `adjust` has nothing to re-detect. Confirm first that the
+renamed company still holds its own copy of the distribution.
 
 ---
 
@@ -581,7 +749,14 @@ SELECT security_id, primary_symbol, company_name, delisted_date, first_seen_at,
   Keep the row with bars, delete the shells, re-point the xref period. The
   loader-side cause is fixed by `is_retired_listing` in
   `fafnir/ingest/security_master.py`; a warehouse still accumulating these is
-  running code that predates it.
+  running code that predates it. A ticker a *rename* moved away from is covered
+  too, by `repo.renamed_away_securities`, which weighs the echo against the
+  renamed security's former name (`core.symbol_change.detail.old_company_name`),
+  its current name and the rename feed's name. A rename applied before that was
+  recorded has no former name on file, and a vendor spelling variant ("Mattr
+  Corp. (MAPP)") matches none of them, so those echoes still re-mint -- until a
+  `security merge` folds one back in, which records its name on the rename
+  (`detail.echo_names`) and stops the next one.
 
 - **Names differ → genuine ticker reuse.** A new issuer took a dead ticker, and
   two rows is *correct* (0009). Nothing to repair. Say so and leave it open, or
@@ -595,10 +770,40 @@ that decide whether the merge is right:
 
 - **Keep the oldest row.** It holds the ticker history back to 1900 and the
   identifiers; the re-minted row holds neither.
-- **Check every victim's company name against the rows you keep.**
-  `is_retired_listing` matches echoes against **delisted rows by normalised name**,
-  so folding every echo into a live *renamed* security invites the next load to
-  re-mint it. Keep one retired row per ticker.
+- **Read the `Would record ...` line before merging into a live renamed
+  security.** When the victim holds a ticker the survivor was renamed away from,
+  the dry run says the merge will record the victim's name on that rename, and the
+  next load then declines the vendor's entry. No such line, and the tickers
+  differ, means no applied rename links them: `is_retired_listing` would only see
+  **delisted rows by normalised name** for the victim's ticker, so unless one
+  remains under the victim's name, the next load re-mints it. Keep one retired row
+  per ticker in that case.
+
+Three shapes need more than the merge itself:
+
+- **A SPAC merger the feed never sent as a ticker change** (COLA → SAIQ,
+  2026-10-06). The old ticker is delisted, so `merge-rename` refuses ("not a listed
+  security") and nothing retargets a delisted row. Merge the **old row into the live
+  new one** (`security merge <old_id> <new_id>`; it takes security ids, victim
+  first). Keeping the old row instead just gets the new ticker minted again.
+  - The old row's ticker period and identifiers (the SPAC's CUSIP, ISIN and CIK)
+    are deleted with it.
+  - `--note` is stored only on the duplicate-identity flags the merge closes, and a
+    two-ticker pair has none.
+  - So write the lineage and identifiers into a note that persists, such as the
+    overrides of the clearing step below.
+- **The OHLC guard tripped by vendor restatement**: one-cent or sub-cent
+  differences, with closes otherwise equal. Never `--force`. Instead:
+  1. Confirm the survivor holds every one of those dates.
+  2. Delete the disagreeing bars **on the victim** with `prices delete`.
+  3. Re-run the dry run until it shows 0 disagreeing, then merge.
+  4. `override revoke` the delete overrides the merge re-points onto the survivor.
+     There they sit over the survivor's own stored bars, and would only stop the
+     loader updating those sessions.
+- **Victim flags whose twin on the survivor is already closed** move across
+  **open**, because the merge drops a victim flag only against an *open* twin.
+  Resolve each one by id afterwards, citing the twin's id and how it was closed
+  (WKEY → WQEY, 2026-10-07: six copies of accepted outliers).
 
 `security dedupe` cannot fold a ticker whose rows name two different companies,
 which rules it out for most real cases; reach for `merge` by id instead.
@@ -642,11 +847,23 @@ conflict and re-flags it, so a resolve changes nothing. The terminal state lives
 in `core.symbol_change` (0018), and two commands write it — both of which close
 the flag for you.
 
+**Read `detail.reason` first.** Two different refusals raise this flag:
+
+- **"... a rename does not change what an instrument is"** or **"... plus the
+  designator letter ..."**: the sweep's instrument guard (ADR 0012) refused a
+  rename that would move a share onto its own warrant, right or unit ticker, or
+  back (`ABCD -> ABCDU`, `ZKP -> ZKPU`). That is the vendor shuffling one SPAC's
+  tickers, never a rename. It cannot clear itself, and `merge-rename` refuses it
+  too. Close it with `fafnir security dismiss-rename <OLD> <NEW> -m "<why>"`.
+- **"new ticker already belongs to another listed security ..."**: two live
+  claims on one ticker. Diagnose below.
+
 **Diagnose** — the two cases look identical in `fafnir status` and need opposite
 treatment:
 
 ```sql
-SELECT f.record_key->>'old_symbol' AS old_sym, f.record_key->>'new_symbol' AS new_sym,
+SELECT f.detail->>'reason' AS reason,
+       f.record_key->>'old_symbol' AS old_sym, f.record_key->>'new_symbol' AS new_sym,
        o.cusip AS old_cusip, n.cusip AS new_cusip, o.cik AS old_cik, n.cik AS new_cik,
        (SELECT max(trade_date) FROM core.daily_price WHERE security_id = o.security_id)
          AS old_last_bar
@@ -684,3 +901,226 @@ succeeded and no command could reach it. Dismissed and ignored rows are untouche
 `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir track rm <SYM> --closed <date>`. **Escalate** a typo in
 `track add`; the operator added a symbol that does not exist, and only they can
 say what they meant.
+
+---
+
+## `security_delisting_contradicted` — the vendor has bars after a delisting
+
+Warn. FMP's delisted feed reported a delisting, and its price feed has bars
+**after** the date, so the sweep did not stamp it (ADR 0014). The security is still
+listed and loading. `detail` holds:
+
+- `feed_venue`, the venue the feed says it left;
+- `bars_after`, `first_after` and `last_after`;
+- `median_volume_before_20` and `median_volume_after`.
+
+The record key is `{"symbol", "delisted_date"}`: one feed record.
+
+**Diagnose.** The bars cannot tell a move between listed venues from a move to OTC:
+GRP-UN kept printing after it left the NYSE for OTCQX. Volume will not tell them
+apart either: USAC traded 18% of its median on its first TXSE day. Look for a public
+notice: the issuer's investor relations or press releases, or the new exchange's
+listing alerts.
+
+**Decide**, after showing the dry run and getting an explicit yes (standing rules 2
+and 6):
+
+```bash
+# It moved to another listed venue (ET: NYSE -> TXSE on 2026-10-05):
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir security venue-transfer <id> --venue TXSE \
+    --date <first session on the new venue> -m "<from>->TXSE <date> (<source>)" \
+    --by claude --dry-run
+# It left for OTC, or stopped trading:
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir security delist <id> --date <date> \
+    -m "<why> (<source>)" --by claude --dry-run
+```
+
+Then `fafnir db refresh-marts`.
+
+- **`venue-transfer`** accepts this flag, which is how the sweep declines the
+  record from then on (`known_transfer`). It also reverses a stamped delisting,
+  and records the venue as an override the nightly load keeps.
+- **`delist`** stamps the delisting and resolves this flag.
+- **Refused because another security holds the ticker**: fold that duplicate in
+  with `security merge` first.
+- **Neither is clear**: leave it open. The sweep declines the record every night
+  while the flag is open (`pending_decision`), so the security keeps loading.
+
+**Never a bare `dq resolve`.** It frees the slot, the sweep asks the vendor again,
+and once the record is past its 60 days it is stamped by default.
+
+**Close with:** `security venue-transfer` (accepts it) or `security delist`
+(resolves it).
+
+---
+
+## `security_inactive_but_trading` — the vendor turned a still-trading row inactive
+
+Info. The universe load copied the vendor's `isActivelyTrading: false` onto a row
+whose last bar is within 5 sessions. FMP did this to ET, and five others, the week
+they moved to TXSE, while quoting their prices. The security stays in the nightly
+price universe while it has a bar in the last 30 days, so nothing is frozen. This
+flag is the early warning, often before the delisted feed reports a move.
+
+**Diagnose.** Bars after the flag's `last_bar` mean it is still trading: look for a
+public notice of a move. No bars for weeks means a wind-down the vendor reported
+promptly.
+
+**Close with:**
+
+- a move: `security venue-transfer`, which resolves it and holds the row active
+  against the next load;
+- a wind-down: `dq resolve` with the evidence once the bars have stopped. The
+  security drops out of the price universe 30 days after its last bar.
+
+---
+
+## The `dorq_*` family — dorq's judgement of a bar
+
+Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**
+(`[dq] dorq_shadow = false`). Until the shadow period meets the cutover criteria
+(dorq plan §8), dorq writes to `<dorq_shadow_dir>/<as-of>.jsonl` instead
+(`/var/lib/fafnir/dorq-shadow` on the host) and the queue carries none of these.
+`doc/dorq.md` covers the engine.
+
+A `dorq_*` flag is not a threshold crossing. dorq weighed the explanations of a
+bar — a bad print, a scale error, an unreported split, a feed outage, a real move —
+and `detail.p_error` is the probability that the bar is a **data error**. Read
+`detail` before anything else:
+
+| Field | What it tells you |
+|---|---|
+| `code`, `check` | dorq's check (`DQ201` bad-print …); `dorq explain <code>` prints its page |
+| `p_error` | P(data error). `error` severity is ≥ 0.9, `warn` ≥ 0.6 |
+| `hypotheses` | each explanation's posterior: the runner-up says what else it could be |
+| `evidence` | the terms behind it (jump size, reversion, volume ratio, tick grid, peers) |
+| `suggested_action` | the repair dorq proposes: a `kind` (`delete_bars`, `add_split`, `rescale`, `redate_split`, `split_history` …) and its fields. The table below maps each to a fafnir command |
+| `provisional` | the newest bars: no "after" yet. The next night judges them again |
+| `dorq.version`, `dorq.config_hash` | which binary and settings wrote it |
+
+**Diagnose with the evidence, not the price chart alone.** Compare `p_error` with
+the runner-up hypothesis. A `dorq_bad_print` at 0.62 whose runner-up is
+`market_move` at 0.38 is a coin with a bias, not a verdict. Read the bars around it
+with `price_history`.
+
+**The map to repairs.** Each code has the repair the outlier classification found
+by hand (`references/outlier-classification.md`, sections in brackets):
+
+| Check | Repair | Close with |
+|---|---|---|
+| `dorq_bad_print`, `dorq_ohlc_close_mismatch` | `prices delete` after probing the vendor (§2f, §3) | the repair, then `dq recheck` |
+| `dorq_unreported_split`, `dorq_cohort_move` | `actions add --split N:D` (§2d) | the repair, then `dq recheck` |
+| `dorq_scale_shift` | `prices rescale` over the era (§2i) | **Never** — see below |
+| `dorq_date_shift` | `prices shift` (§2i) | the repair, then `dq recheck` |
+| `dorq_history_segment` | `security split` (§2h) | the repair, then `dq recheck` |
+| `dorq_split_misdated` | `actions redate` (§2c) | the repair, then `dq recheck` |
+| `dorq_split_without_jump`, `dorq_split_double_applied` | an action or bar repair | **Never** — see below |
+| `dorq_split_ratio_mismatch`, `dorq_dividend_implausible` | correct the action on file | the repair, then `dq recheck` |
+| `dorq_bad_context_row` | correct or delete the action on file (`actions delete`, then `actions add`). A skipped split can also surface as `dorq_unreported_split`: fix the row first | the repair, then `dq recheck` |
+| `dorq_missing_run`, `dorq_cohort_gap` | `ingest prices --symbols … --from … --to …` | the repair, then `dq recheck` |
+| `dorq_frequency_gap` | a thin series dorq reads as weekly or monthly, missing whole periods: re-fetch them with `ingest prices`. If the vendor has no bar, the security did not trade | the repair, then `dq recheck`; **accept** a period with no trading |
+| `dorq_stale_feed` | as `stale`. fafnir leaves out stale-feed reports on securities not actively trading, by `stale`'s own rule, so every one here is on a security still trading | as `stale`. `dq recheck` closes it once the security stops trading |
+| `dorq_repeated_price` | as `stale` | as `stale` |
+| `dorq_zero_range_with_volume` | re-fetch the bar. Check first for a cash takeover pinning the price (below) | the repair, then `dq recheck`; **accept** a deal-price pin |
+| `dorq_move_on_zero_volume` | probe the vendor (§3), then re-fetch the bar; `prices delete` if it re-serves an indicative quote | the repair, then `dq recheck` |
+| `dorq_volume_scale_shift` | `prices rescale --factor 1 --volume-factor V` over the era (§2i), or re-fetch it | the repair, then `dq recheck` |
+| `dorq_non_session_bar` | `prices delete --non-session`, after the weekday check under `outlier`: a history dated a day early wants `prices shift` (§2i) | the repair, then `dq recheck` |
+| `dorq_precision_shift` | an era of computed, back-adjusted prices in the raw feed (WZRD, SMUP): `prices rescale` it to as-traded once an outside source confirms the scale (§2i) | the repair, then `dq recheck` |
+
+NAV-priced funds never carry `dorq_zero_range_with_volume` or the volume checks:
+the `nav_funds` profile in dorq's `priors/fafnir.toml` ignores them for those
+series, because a fund strikes one price a day on no volume.
+
+**Accept when** the evidence shows a real event dorq could not know about — a
+halt, a tender at a fixed price — and say what it was. **Resolve** only a report
+you judged wrong: the next run writes it again if its window still holds the bar,
+and your note becomes a label for the next calibration (`dq export-labels`), so say
+*why* it is not an error.
+
+**Recheck** re-runs dorq over the full history of the securities with open flags
+and closes each flag dorq no longer emits. When the binary has changed since the
+flag was written, the note says so — a newer model, not a repair, may be what
+closed it.
+
+## `dorq_bad_print`, `dorq_unreported_split` — check for a cash dividend first
+
+**On dorq ≤ 0.8.1** (`detail.dorq.version`), before any repair: is there a cash
+dividend on file at the report's date (`fafnir actions list --symbol <SYM>`) that
+explains the drop, `prev_close − dividend ≈ close`? dorq up to 0.8.1 ignores the
+dividends on file, so a large distribution's ex-date drop reads as a bad print
+(DQ201) or an unreported split (DQ203). That is about 140 a year, mostly December
+fund distributions.
+
+That is a known false positive. **Resolve** it, and put the dividend in the note:
+`cash dividend 2.41 on file at the ex-date; prev_close 48.10 − 2.41 = close 45.69;
+dorq ≤ 0.8.1 ignores dividends`. The note becomes a `market_fact` label for the
+code (`dq export-labels`), which is what it is. Do not accept it: an accepted
+`dorq_*` flag exports as a `data_error`. Do not delete the bar or add a split.
+dorq's next release reads the dividend (doc/dorq.md, "Known false positives").
+
+## `dorq_scale_shift` — an era stored at the wrong scale
+
+**On dorq ≤ 0.8.1, check first for a split on file at that date whose ratio
+matches the move**: `detail.hypotheses.explained_split` is present. dorq up to
+0.8.1 reports such a split anyway when share volume does not shift with it,
+about 100 a year. That is the known false positive, not an era at the wrong scale.
+Report it with the split row (`fafnir actions list --symbol <SYM>`). **Don't
+rescale**: the bars are right, and the split on file already explains them. It
+stays Never-tier: the operator closes it.
+
+Otherwise: never auto-resolve. A run of bars ×100, ×0.01 or ×1000 the level
+either side, with no volume change to make it a split. The repair is `prices
+rescale` over the **whole era** (outlier classification §2i). Resolving one flag
+leaves every other bar of the era wrong, and the adjusted series built on it.
+Report the era's bounds from `detail`, propose the rescale, and leave the flag to
+`dq recheck` once the operator has run it.
+
+## `dorq_split_without_jump` — a split on file the bars never show
+
+Never auto-resolve. Either the split is not real (the vendor fabricated or
+duplicated it; `actions delete`), or the bars already carry it (the history was
+stored adjusted, and the factor applies it a second time). Both corrupt every
+adjusted price before the ex-date, and telling them apart needs the pre-split
+levels (§2b, the AKR/HUN pattern). Report both readings with the numbers; the
+operator decides.
+
+## `dorq_split_double_applied` — the bars apply one split twice
+
+Never auto-resolve. The level moves by the split's ratio at the ex-date and again
+a few sessions later. One of the two moves is a vendor restatement, and every
+adjusted price before it is off by the ratio. The repair is a rescale of the bars
+between the two moves, after probing the vendor's payloads for which one is the
+restatement (§3). Report; do not close.
+
+## `dorq_zero_range_with_volume` — a flat bar on ordinary volume
+
+Open, high, low and close are one price, on at least the series' median traded
+volume, among nearby bars that do have a range. dorq reads it as a lost range: a
+close copied into the other three fields, or a price at a scale that rounds the
+range away (`price_scale_collapse`'s pattern).
+
+**Check for a cash takeover first.** In a security's final sessions, a flat bar
+on heavy volume is usually the deal price pinning the stock, which is a market
+fact. On the first shadow night (2026-10-09), 640 reports had ranged bars nearby.
+27 of them fell within 7 days of the series' last bar, including 20 of the 117 on
+securities trading 10,000 shares a day or more. The largest:
+
+| Symbol | Session | Flat at | Volume | Delisted |
+|---|---|---:|---:|---|
+| HOLX (Hologic) | 2026-04-07 | 76.01 | 101,956,189 | 2026-04-08 |
+| EXAS (Exact Sciences) | 2026-03-23 | 104.91 | 21,562,141 | 2026-03-24 |
+| RNAM (Avidity) | 2026-02-26 | 71.34 | 16,835,884 | 2026-03-02 |
+
+Check `delisted_date` and the last sessions' closes. A delisting within days of
+the bar, with the closes before it at or near one price, is the pin. **Accept**
+it, and name the deal in the note.
+
+Otherwise re-fetch the bar (`ingest prices --symbols <SYM> --from <d> --to <d>`).
+If the vendor serves the same flat bar on a price small enough for its range to
+round away, it is `price_scale_collapse`'s case: report it, and do not resolve.
+
+**Under dorq 0.8.0, most of these reports are something else.** 15,632 of the
+first night's 16,272 were thin ETFs printing one 100-share lot a day, where a
+single trade makes a flat bar. That is a dorq defect, to be fixed in dorq. Do not
+work those one by one, and do not filter them in fafnir.
+

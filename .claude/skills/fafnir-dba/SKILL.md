@@ -29,10 +29,11 @@ These are not style guidance. Each one is a way this system gets damaged.
 4. **Never `--force`.** `fafnir security merge-rename --force` overrides guards
    comparing CUSIP/ISIN and overlapping OHLC. If they trip, report the blockers
    and stop.
-5. **Six checks are never yours to auto-resolve**: `price_scale_collapse`,
+5. **Nine checks are never yours to auto-resolve**: `price_scale_collapse`,
    `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`,
-   `price_subresolution_price`, `security_duplicate_identity`. Each is a
-   measurement, an unrepresentable value, or needs a different command
+   `price_subresolution_price`, `security_duplicate_identity`, and dorq's
+   `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied`.
+   Each is a measurement, an unrepresentable value, or needs a different command
    entirely — see the playbooks. This list is also
    `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and `dq_triage` returns
    `never_auto_resolve` per row; a test asserts the two agree.
@@ -43,8 +44,14 @@ These are not style guidance. Each one is a way this system gets damaged.
    that is real and permanent while **keeping** the record — which a resolve does
    not. Under an operator's explicit direction to clear a check, accept is the
    disposition to reach for; see `references/sweep-policy.md`.
-6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` are
-   operator commands.** Propose; never run.
+6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` and
+   `fafnir security descope` are operator commands.** Propose; never run. A
+   descope deletes every security of a kind with all its history (ADR 0012), and
+   only a backup brings it back. **`fafnir security venue-transfer` and
+   `fafnir security delist` are not among them.** They record the decision on a
+   `security_delisting_contradicted` flag (ADR 0014), delete nothing, and each is
+   undone by the other. Like `security merge`, they are yours to run after showing
+   the dry run and getting an explicit yes.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
    checkout the venv installs from. Editing it to fix tonight's problem is
    invisible to the repo, destroyed by the next `git pull`, and leaves the
@@ -111,6 +118,26 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
 - **`journalctl` needs the `adm` or `systemd-journal` group**, which `claude` is
   not in. Use `ops.ingestion_run` for what ran and how it ended.
 
+### Resuming a plan an earlier session made
+
+Notes and memory record what was *planned* or *approved*; only the warehouse records
+what *ran*. A session can end between a real run and the note that would have
+recorded it. On 2026-10-06 the notes said "dry runs only, awaiting a yes" while
+most of the approved batches had already run, minutes after the notes were written.
+Before acting on an earlier plan:
+
+- Read that session's run output if it exists: real-run files sit next to its dry
+  runs.
+- Ask the warehouse what changed since the plan was written: `max(resolved_at)` on
+  `ops.data_quality_flag`; `max(override_id)`, `max(created_at)` and
+  `max(revoked_at)` on `ops.operator_override`; every `ops.ingestion_run` since.
+- Check each planned effect before proposing it again: the action row, the flag's
+  state, the bars a re-fetch was meant to land.
+
+Most commands refuse a literal repeat. The real damage is a plan built on a stale
+picture: a recheck prediction computed before a re-fetch, or a split "restored" by
+a revoke that in fact left the security with none.
+
 ## Which tool for what
 
 | Need | Use |
@@ -124,6 +151,8 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
 | Whether a symbol has stopped advancing | `watermarks` |
 | One security, end to end | `security_profile` |
 | A price series | `price_history` (say raw or adjusted) |
+| Live names the vendor stopped serving | `fafnir source vendor-gaps` (reads only) |
+| dorq against the SQL checks and the labels | `fafnir dq compare --labels-from-db` (reads only) |
 | Timers, journal, disk, backups | `scripts/monitor.sh` (changes nothing) |
 | To change something | the `fafnir` CLI, under `sudo -u fafnir` |
 
@@ -139,12 +168,15 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
      data defect  → repair (ingest / adjust / refresh-marts), THEN dq recheck
      market fact  → dq accept, with the evidence in --note (a resolve returns)
      wrong shape  → the command that fixes it (security merge, track rm --closed,
-                    security split-history for two issuers on one row)
+                    security split-history for two issuers on one row,
+                    security venue-transfer | delist for a delisting the
+                    vendor's bars contradict)
      vendor wrong → the correction (actions add|delete|redate, prices delete, or
                     prices shift|rescale for a real price at the wrong date/scale),
                     then dq recheck -- a SQL DELETE comes back on the next load
      neither      → escalate; leave it open
-6. sudo -u fafnir $F <disposition> <ids> --by claude --note "<evidence>"
+6. sudo -u fafnir $F <disposition> <ids> --by claude --note "<evidence>" \
+       [--per-flag | --by-rule] [--label CLASS --kind K]
 7. verify in SQL that it committed (rule 10)
 ```
 
@@ -164,6 +196,35 @@ SELECT (record_key->>'trade_date')::date AS d, count(*) AS securities
 
 A date with a large count is not two hundred problems. It is one, and resolving
 the flags individually is the wrong answer to it.
+
+## Labels: record what you judged
+
+dorq is measured against labels (`fafnir dq compare --labels-from-db`; doc/dorq.md),
+and the labels are the decisions this queue records. A label is derived on its own
+only where the disposition is unambiguous: a repair (`reason` data_error), an
+outlier or `dorq_*` flag accepted or resolved. Everything else is stated, and the
+moment to state it is when you judge:
+
+- **`--per-flag` when the note carries per-security evidence**, `--by-rule` when the
+  batch was closed by a rule. That is the label's `verified`.
+- **`--label CLASS --kind K` on the accept or resolve** writes the label with the
+  closure, in one transaction, keyed to each flag's security and date: a feed gap
+  (`data_error --kind feed_gap`), a stale feed on odd lots
+  (`market_fact --kind odd_lots_only`), a real distribution
+  (`market_fact --kind distribution`, two labels), another instrument's prices
+  (`data_error --kind wrong_instrument`).
+- **`dq label add`** for one that goes with no flag (`--cohort --members ...
+  --kind cohort_fact` for a cohort of real moves). `dq label import` for a file.
+  Like `dq accept`: show the dry run, act on a yes.
+- **`override set-reason`** when an edit was not a data error: a scope removal is
+  `out_of_scope`, a merge's leftovers `cleanup`.
+
+What makes a good label:
+- **verified** on the bars or an outside source, and the note says which;
+- **one decision**, never a bulk class (a batch closed by rule is never labelled);
+- **a repair's label expires at the repair** (`applies_until`): don't restate a
+  repaired fault as a timeless one;
+- **a scope removal is not an error**.
 
 ## The proactive sweep
 
@@ -274,6 +335,20 @@ the full sort order, with the queries.
 - **A `prices delete` dry run prints every bar.** Count the `requested` rows in the
   output file against the dates you passed; a date with no stored bar is skipped
   with only a one-line `No stored bar on …` notice.
+- **A dry run that rolls back still uses up ids.** `prices delete` and
+  `actions add|delete` dry runs make the change and roll it back, which consumes
+  sequence values. The real run's override or action id is therefore not the next
+  number after the last one; read ids from the output, never predict them.
+- **`mart.v_security_price_coverage` is a live view.** It is right for a handful of
+  securities, but joined to hundreds it exceeds the read role's `statement_timeout`.
+  Count bars from `core.daily_price` with `security_id = ANY(ARRAY(SELECT …))` and a
+  `trade_date` bound instead: 493 securities and 77,804 bars came back at once that
+  way.
+- **A step whose dry run exists only after the previous step ran.** Examples: a
+  split re-added once a revoke has run, or a merge re-checked once its noise bars
+  are deleted. State the expected dry-run output in the plan, before the first step
+  runs. Then run each dry run between steps and stop on any mismatch rather than
+  reasoning past it.
 
 ## Reference
 

@@ -43,6 +43,7 @@ corporate actions.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from decimal import Context, Decimal, localcontext
 from typing import Iterable, Optional
@@ -90,6 +91,13 @@ SYSTEMIC_FAILURE_FLOOR = 20
 # the open-flag count `fafnir status` reports, permanently.
 EARLY_ABORT_FAILURES = 50
 
+# Two splits of one ratio this close are one split recorded twice (G3). GLE's 1:10 sat
+# on 2026-10-07 and 10-08, NXGL's 1:20 on 10-09 and 10-12: the bars moved once, and
+# the adjusted series moved twice -- x100 and x400 before the earlier date. No SQL
+# check saw either. Counted in open sessions on the security's venue.
+DUPLICATE_SPLIT_SESSIONS = 10
+DUPLICATE_SPLIT_CHECK = "split_duplicate_suspect"
+
 
 def compute_for_security(db: Database, security_id: int) -> list[dict]:
     """Compute (and persist) adjustment factors for one security. Returns the rows."""
@@ -97,6 +105,7 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
     if not actions:
         repo.replace_adjustment_factors(db, security_id, [])
         return []
+    _flag_duplicate_splits(db, security_id, actions)
 
     # Group per-event factors by ex_date (a split and dividend can share a date).
     # Exact Decimal math throughout -> the derived factor ties out to the penny
@@ -170,6 +179,125 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
     _flag_if_extreme(db, security_id, factors)
     repo.replace_adjustment_factors(db, security_id, factors)
     return factors
+
+
+def _split_ratio(action: dict) -> Optional[Decimal]:
+    try:
+        return Decimal(action["split_numerator"]) / Decimal(action["split_denominator"])
+    except (TypeError, ArithmeticError):
+        return None
+
+
+def _same_ratio_pairs(actions: list[dict]) -> list[tuple[dict, dict]]:
+    """Same-ratio split pairs within a calendar window wide enough to hold
+    :data:`DUPLICATE_SPLIT_SESSIONS` sessions: the candidates, found without a
+    query, because this runs for every security `fafnir adjust` recomputes."""
+    splits = sorted(
+        (a for a in actions if a["action_type"] == "split" and _split_ratio(a)),
+        key=lambda a: a["ex_date"],
+    )
+    pairs = []
+    for i, a in enumerate(splits):
+        for b in splits[i + 1 :]:
+            if (b["ex_date"] - a["ex_date"]).days > 3 * DUPLICATE_SPLIT_SESSIONS:
+                break
+            if _split_ratio(a) == _split_ratio(b):
+                pairs.append((a, b))
+    return pairs
+
+
+def duplicate_split_pairs(
+    db: Database, security_id: int, actions: list[dict], exchange_code: str
+) -> list[tuple[dict, dict]]:
+    """Pairs of splits of one ratio no more than :data:`DUPLICATE_SPLIT_SESSIONS`
+    open sessions apart, earlier first."""
+    return [
+        (a, b)
+        for a, b in _same_ratio_pairs(actions)
+        if repo.sessions_apart(db, a["ex_date"], b["ex_date"], exchange_code)
+        <= DUPLICATE_SPLIT_SESSIONS
+    ]
+
+
+def _split_moves(db: Database, security_id: int, action: dict) -> dict:
+    """How the raw closes move across one split's ex-date, against its factor."""
+    ex = action["ex_date"]
+    before = repo.close_before(db, security_id, ex)
+    after = db.fetchval(
+        "SELECT close FROM core.daily_price WHERE security_id = %s AND trade_date >= %s"
+        " ORDER BY trade_date LIMIT 1",
+        (security_id, ex),
+    )
+    # A 1:10 reverse split multiplies the price by 10 on its ex-date: num/den inverted.
+    factor = 1 / _split_ratio(action)
+    move = (
+        Decimal(after) / Decimal(before)
+        if before is not None and after is not None and Decimal(before) > 0
+        else None
+    )
+    return {
+        "ex_date": str(ex),
+        "split": f"{_num(action['split_numerator'])}:"
+        f"{_num(action['split_denominator'])}",
+        "close_before": str(before) if before is not None else None,
+        "close_on_or_after": str(after) if after is not None else None,
+        "close_ratio": float(round(move, 6)) if move is not None else None,
+        "split_factor": float(round(factor, 6)),
+        # Moves "by the split" when the close ratio is nearer the factor than 1:1,
+        # on a log scale.
+        "moves": (
+            move is not None
+            and move > 0
+            and abs(math.log(float(move) / float(factor))) < abs(math.log(float(move)))
+        ),
+    }
+
+
+def _num(v) -> str:
+    return format(Decimal(v).normalize(), "f")
+
+
+def _flag_duplicate_splits(db: Database, security_id: int, actions: list[dict]) -> None:
+    """Flag two same-ratio splits close together (``split_duplicate_suspect``).
+
+    The detail says which of them the raw closes move on: the close ratio across
+    each ex-date against the split's factor. The other is the one to delete, after
+    probing the vendor's split-adjusted feed (`source probe-prices` on the bar
+    before each ex-date shows which one it applies). Never resolved by a run: the
+    repair is `actions delete`, and with one of the pair gone the condition is too.
+    """
+    if not _same_ratio_pairs(actions):
+        return
+    exchange = (repo.security_price_profile(db, security_id) or {}).get(
+        "exchange_code"
+    ) or "NYSE"
+    for a, b in duplicate_split_pairs(db, security_id, actions, exchange):
+        rows = [_split_moves(db, security_id, x) for x in (a, b)]
+        moving = [r["ex_date"] for r in rows if r["moves"]]
+        logger.warning(
+            "security %d: the same %s split on %s and %s -- one is a duplicate "
+            "(the closes move on %s)",
+            security_id,
+            rows[0]["split"],
+            a["ex_date"],
+            b["ex_date"],
+            ", ".join(moving) or "neither",
+        )
+        repo.add_dq_flag_once(
+            db,
+            check_name=DUPLICATE_SPLIT_CHECK,
+            severity="warn",
+            security_id=security_id,
+            table_name="core.corporate_action",
+            record_key={"ex_dates": [str(a["ex_date"]), str(b["ex_date"])]},
+            detail={
+                "splits": rows,
+                "moves_on": moving,
+                "sessions_apart": repo.sessions_apart(
+                    db, a["ex_date"], b["ex_date"], exchange
+                ),
+            },
+        )
 
 
 def _flag_if_extreme(db: Database, security_id: int, factors: list[dict]) -> None:

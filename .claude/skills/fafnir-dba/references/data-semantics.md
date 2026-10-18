@@ -101,7 +101,10 @@ hold logic). Everything else is one row per *open condition*.
 > re-quarantining the same bar nightly.
 
 `dq_totals` separates them: read `distinct_condition_flags` for the count of
-problems.
+problems. Two `price_*` checks are not quarantines and do not repeat:
+`price_scale_collapse` and `price_restatement_conflict` (the bar was stored, or kept)
+are one row per open condition. `price_split_scale_mismatch` is a quarantine and
+repeats like the rest.
 
 ## 9. Open DQ is a count of problems, not of runs
 
@@ -182,3 +185,99 @@ the bad one).
 
 > **Wrong answer:** an outlier on the newest bar read as a market move, or deleted
 > as a bad bar, on its first night. Recheck it after the next load.
+
+## 18. Warrants, rights and units are not in the universe (ADR 0012)
+
+From the release that carries ADR 0012, `ingest securities` skips them. The ones
+minted before it stay until an operator runs `fafnir security descope`, once. Until
+then the load no longer refreshes them, though their prices still load. Whether it
+has run is an `ops.ingestion_run` row with endpoint `security-descope`. After it, a
+warrant, right or unit that *is* present was kept on purpose. Either it was
+declared (`fafnir track list`), which is for tickers that still list, or it was
+named with `--keep` on that run (the audit row's `kept_by_option`), as Granite
+REIT's delisted `GRP-UN` was. SPAC class A shares are still held either way.
+
+**Never propose `track add` for a delisted ticker.** `ingest tracked` looks only for
+a *listed* security under a declared ticker. It finds none, and mints a new, active
+one that the price step backfills with a duplicate of the history. If FMP has no
+profile for the ticker, it raises `tracked_symbol_unknown_to_source` every night
+instead.
+
+> **Wrong answer:** "fafnir has no data for ABCDW" read as a load failure, or a
+> SPAC's unit or warrant history expected next to its class A shares. Equally, a
+> warrant still held before the descope has run is not a filter failure.
+
+## 19. A dividend can be stored twice across a ticker change
+
+After a rename, FMP files a distribution again under the new ticker. When a split
+takes effect on the record date, it also restates the amount on the new share
+basis and dates it at the ticker change.
+
+OPNW (VerifyMe → OpenWorld, 2026-09/10) carried two rows with the same record and
+payment dates: $0.15 ex 09-29 under VRME, and $1.50 "ex 10-01" under OPNW. That was
+one dividend counted twice, and it put the adjusted prices about 17% low.
+
+When a split and a dividend share an ex-date, the stored dividend must be in
+**pre-split** terms. The factor is valued against the prior raw close, which is the
+pre-split close. A post-split amount there is wrong either way. After a large
+enough reverse split, like OPNW's 1-for-10, it exceeds that close: the factor goes
+negative (`dividend_exceeds_price`) and the dividend is skipped. After a forward
+split it is silently too small, and nothing flags it.
+
+> **Wrong answer:** two dividends with the same record and payment dates read as two
+> distributions, or the post-split amount "corrected" onto the split's ex-date.
+
+## 20. A venue transfer can arrive as a delisting
+
+FMP's delisted feed has reported a move between exchanges as a delisting. ET, SUN,
+SUNC, USAC, DDS and DDT moved from the NYSE to the Texas Stock Exchange (**TXSE**;
+TSX is Toronto) after the 2026-10-02 close and kept their tickers. The nightly
+sweep stamped them delisted 2026-10-05, and they stopped receiving bars.
+
+FMP's profile and screener are no better guide. A week after the move they still
+named ET's venue as the NYSE and called it `isActivelyTrading: false`, while
+quoting its price and that day's volume. FMP had no code for TXSE. **Its price feed
+is the evidence:** a security that delisted has no bar after its delisting date.
+
+Since ADR 0014:
+
+- **Caught.** The delisting sweep declines a recent delisting the vendor has bars
+  after, and flags `security_delisting_contradicted`. The nightly price universe
+  keeps a listed security with a bar in the last 30 days even when FMP calls it
+  inactive, and the universe load raises `security_inactive_but_trading` when it
+  turns such a row inactive.
+- **Decided** by an operator, or by you after a dry run and an explicit yes:
+  `security venue-transfer` for a move between listed venues, `security delist`
+  for a delisting, such as a move to OTC (`references/dq-playbooks.md`).
+- **The venue is fafnir's own.** `exchange_code = 'TXSE'` with a non-null
+  `venue_override` means the move was recorded by hand. The nightly load keeps it
+  until FMP names a venue other than `venue_override_left`.
+
+Before reporting a large, liquid name as delisted, check for bars after its
+`delisted_date` and for these flags, then look for a public notice of a move.
+
+> **Wrong answer:** "ET was delisted on 2026-10-05". It changed venue.
+
+## 21. FMP restates bars, and the warehouse keeps the first print
+
+FMP's first print of a bar is usually right; what it serves on a later read of the
+same date often is not. From 2026-09-16 the nightly re-read of the last five
+sessions stored another fund's prices over first prints (OUSL ~11 -> ~58, QCJL ~26
+-> 0.07), prices at the scale of a split not yet gone ex (GCDT x6, ZBAO x50, volumes
+unchanged), and a phantom split's scale (SKYD x2). An operator re-fetch once
+returned prices right and volume x50.
+
+Since v1.5.0 the nightly load keeps the stored bar when the re-read moves the close
+by more than 1.25x or the volume by more than 3x, either way, and flags
+`price_restatement_conflict` with both sides. Only an explicit `ingest prices --from`
+overwrites, and it prints what it restated.
+
+> **Wrong answer:** "the vendor corrected it, so the stored bar is stale." Read the
+> conflict's `detail`: the first print is usually the right one, and when it is not
+> (SKYD 10-02), a probe and a re-fetch put it right in one step.
+
+> **Wrong answer:** "core.daily_price.loaded_at says the bar was loaded last night,
+> so that is what dorq read." The 5-session re-read rewrites `loaded_at` and
+> `ingestion_run_id` on every overlap; `dq compare` reads the run's own holding
+> snapshot instead.
+

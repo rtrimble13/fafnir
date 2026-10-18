@@ -18,9 +18,12 @@ preconditions.
 
 | Tier | Checks | What a sweep may do |
 |---|---|---|
-| **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price`, `security_duplicate_identity` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
-| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
-| **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `tracked_symbol_unknown_to_source` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
+| **Never** | `price_scale_collapse`, `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`, `price_subresolution_price`, `security_duplicate_identity`, `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied` | Report only. Never propose a `dq resolve`, whatever the evidence looks like. |
+| **Repair-first** | `adjustment_failed`, `dividend_no_prior_close`, `stale` (live name), `price_missing_or_nonnumeric_ohlc` (systematic), `security_missing_classification`, `security_delisting_contradicted` (the repair is `security venue-transfer` or `security delist`, which close it; never a resolve), `price_restatement_conflict` (probe, then the explicit re-fetch of the side that is right, which resolves it; or accept a vendor that keeps restating), `price_split_scale_mismatch` (a quarantine: re-fetch once the vendor serves the raw bar), `split_duplicate_suspect` (`actions delete` the row the closes do not move on), `tracked_symbol_delisted` (the repair is `security venue-transfer` or `track rm`), and every other `dorq_*` check at `error` | Propose the *repair*. Resolve only after the repair ran and the condition is verifiably gone. |
+| **Judgement** | `gap`, `outlier`, `stale` (delisted/fund), `dividend_exceeds_price`, `split_invalid`, `dividend_invalid`, `adjustment_factor_extreme`, `security_company_name_drift`, `security_inactive_but_trading`, `tracked_symbol_unknown_to_source`, `dorq_*` at `warn` | May be proposed for resolve, **only** when its precondition below is met and the evidence is in the note. |
+
+A `stale` flag on a name `fafnir source vendor-gaps` lists is **report only**: the
+security trades and the vendor stopped serving it (see the `stale` playbook).
 
 `sparse_coverage` is not yet placed in a tier. Until it is, treat it as **report
 only**: nothing about it has been repaired, so closing one frees its slot and the
@@ -30,6 +33,16 @@ The **Never** tier is also `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, an
 `dq_triage` returns `never_auto_resolve` per row so it is in front of you at the
 moment you decide. `test_never_auto_matches_the_skill` asserts the two lists
 agree — if you are editing one, edit both.
+
+**Warrants, rights and units awaiting the descope** (ADR 0012). Until an
+`ops.ingestion_run` row with endpoint `security-descope` exists, every flag on one
+of these sits on a row the descope will delete, flags and all. Leave their `stale`,
+`gap`, `sparse_coverage` and `outlier` flags open rather than re-fetching,
+rechecking or accepting them, and say so in the report.
+
+Classify with `fafnir.instruments.instrument_kind`, not by eye: most SPAC warrants
+carry the sponsor's plain name. The descope itself is an operator command, so
+propose it; never run it.
 
 ---
 
@@ -64,6 +77,30 @@ leave it open. "I could not check" is not "it is fine".
   bar's exact date, so a resolved flag on a split between two bars is re-written.
   `references/outlier-classification.md` is the sort order for the rest.
 
+### `dorq_*` at `warn`
+- `detail.provisional` is false. A provisional report is about the newest bars and
+  is judged again tomorrow with more evidence; leave it.
+- The runner-up hypothesis in `detail.hypotheses` is a market explanation
+  (`market_move`, `tick_move`, `explained_split`), and the bars around the date,
+  read with `price_history`, show why: the move held, peers moved, or the tick grid
+  explains it.
+- The note names the hypothesis you agreed with. A resolved `dorq_*` flag becomes a
+  market-fact label at the next `dq export-labels`, so the note is training data.
+- Never batch across codes: one batch, one `code`.
+
+### `dorq_bad_print`, `dorq_unreported_split` written by dorq ≤ 0.8.1 — a dividend
+The one `dorq_*` report a sweep may propose to resolve **at `error`** without a
+repair: there is nothing to repair. dorq up to 0.8.1 ignores the cash dividends
+on file (doc/dorq.md, "Known false positives").
+- `detail.dorq.version` is 0.8.1 or older.
+- A cash dividend on file at the flag's date explains the drop: `prev_close −
+  dividend ≈ close`, within a cent or two.
+- The note names the dividend and the arithmetic. It becomes a market-fact label.
+- Resolve, never accept: an accepted `dorq_*` flag exports as a `data_error`.
+
+The other known false positive, a `dorq_scale_shift` on a split on file whose
+ratio matches the move, stays **Never**: report it with the split row.
+
 ### `stale`
 Only the two determinate branches:
 - `delisted_date IS NOT NULL` or `is_actively_trading = false` — the security
@@ -90,6 +127,11 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 - The price history continues sensibly across the change, and the note names
   which it was: a rebrand, or a vendor abbreviation.
 
+### `security_inactive_but_trading`
+- The security's bars have stopped (a wind-down the vendor reported promptly), and
+  the note says when. A security still printing bars is a move:
+  `security venue-transfer` closes it instead.
+
 ### `security_missing_classification`
 - The universe load has run **since** the fix that carries the screener's
   `sector`/`industry` through `upsert_security`, and the security still has no
@@ -115,6 +157,10 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 4. **One note per batch, naming the evidence and the cohort size.** For example:
    `--note "cohort_size=1; NASDAQ peers traded 2026-07-14; halt confirmed for
    this security only"`. Never `--note "reviewed"`.
+   **Say how it was judged:** `--per-flag` when the note carries each flag's own
+   evidence, `--by-rule` when the batch is a class closed by a rule. A batch closed
+   by rule is never labelled; a per-flag decision about a fault, a feed gap or a
+   real move may carry `--label` (see SKILL.md, "Labels").
 5. **Always `--by claude`.** It is what makes
    `WHERE resolved_by LIKE 'claude%'` the complete record, and `dq reopen` the
    undo.

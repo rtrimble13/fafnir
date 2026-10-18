@@ -133,7 +133,12 @@ class TestPhOutput:
         monkeypatch.setattr(cli.ds_db, "price_history", lambda **kwargs: indexed.copy())
 
         dukrc = tmp_path / "dukrc"
-        dukrc.write_text(f'[general]\nlog_dir = "{tmp_path / "log"}"\n')
+        # A DSN, because `ph` now checks one is configured before dispatching to
+        # the (stubbed) warehouse backend; the value is never connected to.
+        dukrc.write_text(
+            f'[database]\ndsn = "host=/nonexistent dbname=fafnir"\n'
+            f'[general]\nlog_dir = "{tmp_path / "log"}"\n'
+        )
         return CliRunner().invoke(
             cli.main,
             ["--config", str(dukrc), "-S", "db", "ph", "AAPL"] + list(args),

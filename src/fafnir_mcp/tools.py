@@ -568,8 +568,20 @@ def dq_queue(
 #: * ``price_price_out_of_range`` -- a real quote NUMERIC(20,6) cannot hold.
 #: * ``price_subresolution_price``-- below the 5e-7 quantize cliff. Same verdict.
 #:
-#: The first three are the skill's standing rule 5 verbatim; the last two are the
-#: playbooks' "report, do not resolve". ``test_never_auto_matches_the_skill``
+#: * ``dorq_scale_shift``         -- an era at the wrong scale. The repair is
+#:                                   `prices rescale` over the whole era; closing
+#:                                   one flag leaves the rest of it wrong.
+#: * ``dorq_split_without_jump``  -- a split on file the bars never show: either
+#:                                   the split is not real (delete it) or it is
+#:                                   already in the bars (the adjusted series is
+#:                                   then wrong). Both are repairs; neither is a
+#:                                   resolve.
+#: * ``dorq_split_double_applied``-- the bars apply a split twice. Every adjusted
+#:                                   price before it is off by the ratio.
+#:
+#: The first three are the skill's standing rule 5 verbatim; the price_ pair are
+#: the playbooks' "report, do not resolve"; the dorq_ three are dorq plan §7.6.
+#: ``test_never_auto_matches_the_skill``
 #: parses SKILL.md and asserts the two lists agree, so this cannot drift into
 #: being a second, quieter policy.
 NEVER_AUTO_RESOLVE = frozenset(
@@ -580,6 +592,9 @@ NEVER_AUTO_RESOLVE = frozenset(
         "price_price_out_of_range",
         "price_subresolution_price",
         "security_duplicate_identity",
+        "dorq_scale_shift",
+        "dorq_split_without_jump",
+        "dorq_split_double_applied",
     }
 )
 

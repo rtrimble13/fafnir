@@ -32,6 +32,7 @@ import click
 from fafnir import __version__
 from fafnir.config import get_config
 from fafnir.db.connection import Database, DatabaseConnectionError
+from fafnir.instruments import INSTRUMENT_KINDS, select_descope_candidates
 from fafnir.logging_config import LogDirectoryError, setup_logging
 
 
@@ -53,6 +54,17 @@ def _os_user() -> str:
         return getpass.getuser()
     except (OSError, KeyError):
         return "unknown"
+
+
+def _excluded_instruments(cfg) -> tuple[str, ...]:
+    """``[general] exclude_instruments``, with a misspelt kind as one line, not a
+    traceback. The setting is read by the nightly load, so its error is the first
+    thing an operator sees in the journal after a typo.
+    """
+    try:
+        return tuple(cfg.excluded_instruments)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _split_symbols(value: Optional[str]) -> list[str]:
@@ -267,9 +279,15 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
     universe = universe or cfg.universe
+    excluded = _excluded_instruments(cfg)
     with Database(cfg.dsn) as database:
         result = security_master.load_securities(
-            database, fmp, universe=universe, include_etfs=not no_etfs, limit=limit
+            database,
+            fmp,
+            universe=universe,
+            include_etfs=not no_etfs,
+            limit=limit,
+            excluded_kinds=excluded,
         )
         if enrich:
             syms = [
@@ -289,6 +307,11 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
         f"Loaded {result.total} securities ({len(result.new_symbols)} new). "
         f"FMP requests: {fmp.request_count}, bytes: {fmp.bytes_downloaded}"
     )
+    if result.skipped_out_of_scope:
+        click.echo(
+            f"Skipped {len(result.skipped_out_of_scope)} out-of-scope instruments "
+            f"({'/'.join(excluded)}); see [general] exclude_instruments."
+        )
     if result.new_symbols:
         shown = ", ".join(result.new_symbols[:25])
         more = (
@@ -338,6 +361,12 @@ def ingest_tracked(ctx):
             f"Unknown to FMP: {', '.join(result.missing)} -- check the ticker; "
             "flagged in the DQ queue as tracked_symbol_unknown_to_source."
         )
+    for symbol, sid in result.delisted:
+        click.echo(
+            f"Not minted: {symbol} is security {sid}, which is delisted. If it "
+            f"relisted, `fafnir security venue-transfer {sid}`; if not, `fafnir "
+            f"track rm {symbol}`. Flagged as tracked_symbol_delisted."
+        )
 
 
 @ingest.command("prices")
@@ -352,17 +381,35 @@ def ingest_tracked(ctx):
 )
 @click.pass_context
 def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
-    """Load daily OHLCV (incremental by default)."""
+    """Load daily OHLCV (incremental by default).
+
+    The incremental load never overwrites a stored bar by more than [prices]
+    restatement_max_ratio (close) or restatement_max_volume_ratio (volume): it
+    keeps the stored bar and flags price_restatement_conflict. With --from it is an
+    explicit re-fetch: it overwrites, prints every bar it restated beyond those
+    ratios, and resolves the conflicts on the dates it covered.
+    """
+    from fafnir.db import repository as repo
     from fafnir.ingest import daily_price
 
     cfg = ctx.obj["config"]
+    try:
+        guard = daily_price.RestatementGuard(
+            max_ratio=cfg.restatement_max_ratio,
+            max_volume_ratio=cfg.restatement_max_volume_ratio,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    restated: list = []
     fmp = _fmp_client(cfg)
     with Database(cfg.dsn) as database:
-        # The nightly run wants active names only -- a delisted security will
-        # never have another bar, so re-polling it burns requests forever. A
+        # The nightly run wants the trading names only -- a delisted security will
+        # never have another bar, so re-polling it burns requests forever. Trading
+        # is not the vendor's isActivelyTrading alone: a listed security with a bar
+        # in the last 30 days stays in (repo.nightly_universe, ADR 0014). A
         # historical backfill wants everything, or the resulting history only
         # contains companies that happened to survive to today.
-        where = "" if include_inactive else "AND is_actively_trading "
+        where = "" if include_inactive else f"AND {repo.nightly_universe()} "
         syms = _split_symbols(symbols) or [
             r["primary_symbol"]
             for r in database.fetchall(
@@ -384,11 +431,43 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
             # A symbol with no watermark is new to the warehouse and gets its whole
             # history, not FMP's default ~5-year window.
             backfill_start=dt.date(cfg.calendar_start_year, 1, 1),
+            guard=guard,
+            restated=restated,
         )
     click.echo(
         f"Loaded {n} price rows for {len(syms)} symbols. "
         f"FMP bytes: {fmp.bytes_downloaded}"
     )
+    if restated:
+        _echo_restated(restated, guard)
+
+
+def _echo_restated(restated, guard, *, limit: int = 50) -> None:
+    """The bars an explicit re-fetch restated beyond the guard: the operator reads
+    this to see that the re-fetch put right what it was meant to -- and nothing
+    else (ZBAO's re-fetch restored its prices and returned volume x50)."""
+    click.echo(
+        f"Restated {_plural(len(restated), 'stored bar')} by more than "
+        f"x{guard.max_ratio:g} (close) or x{guard.max_volume_ratio:g} (volume):"
+    )
+
+    def change(pair) -> str:
+        old, new = pair
+        try:
+            ratio = float(new) / float(old)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return f"{old} -> {new}"
+        return f"{old} -> {new} (x{ratio:.3g})"
+
+    _echo_table(
+        ["SYMBOL", "DATE", "CLOSE", "VOLUME"],
+        [
+            [r["symbol"], r["date"], change(r["close"]), change(r["volume"])]
+            for r in restated[:limit]
+        ],
+    )
+    if len(restated) > limit:
+        click.echo(f"... and {len(restated) - limit} more (the run's params.restated).")
 
 
 @ingest.command("symbol-changes")
@@ -567,9 +646,23 @@ def track():
     help="Venue to record [default: MUTF for a fund, none otherwise]",
 )
 @click.option("--note", default=None, help="Why this symbol is tracked")
+@click.option(
+    "--allow-delisted",
+    is_flag=True,
+    help="Declare it although its only security is delisted: the ticker now "
+    "belongs to another issuer. (Not a merge --force.)",
+)
 @click.pass_context
-def track_add(ctx, symbol, asset_type, exchange, note):
-    """Declare SYMBOL. Loads on the next `fafnir ingest tracked`."""
+def track_add(ctx, symbol, asset_type, exchange, note, allow_delisted):
+    """Declare SYMBOL. Loads on the next `fafnir ingest tracked`.
+
+    A ticker whose only security is delisted is refused: the nightly would mint a
+    new row for it every night, and the delisting sweep stamp each one (BURU,
+    2026-10-13/14). If the security relisted, `fafnir security venue-transfer`
+    reverses the delisting and the declaration finds it; if the ticker now belongs
+    to a different issuer, pass --allow-delisted -- `ingest tracked` still mints
+    nothing over a delisted row of the same CUSIP or name.
+    """
     from fafnir.db import repository as repo
     from fafnir.ingest.tracked import FUND_EXCHANGE
 
@@ -577,6 +670,19 @@ def track_add(ctx, symbol, asset_type, exchange, note):
     if exchange is None and asset_type == "fund":
         exchange = FUND_EXCHANGE
     with Database(ctx.obj["config"].dsn) as database:
+        retired = repo.delisted_rows_for_symbol(database, symbol)
+        listed = repo.listed_security_for_declaration(database, symbol=symbol)
+        if retired and listed is None and not allow_delisted:
+            row = retired[0]
+            raise click.ClickException(
+                f"{symbol}'s only security, {row['security_id']} "
+                f"({row['company_name'] or 'no name'}), was delisted on "
+                f"{row['delisted_date']}. Declaring it would mint a new row every "
+                "night, each stamped delisted by the sweep. If it relisted: "
+                f"`fafnir security venue-transfer {row['security_id']}`, then "
+                "declare it. If the ticker now belongs to another issuer: "
+                "--allow-delisted."
+            )
         added = repo.upsert_tracked_symbol(
             database,
             symbol=symbol,
@@ -858,6 +964,13 @@ def _echo_merge_plan(plan) -> None:
         f"({plan.colliding_actions} already held), and delete security "
         f"{plan.victim_id}."
     )
+    if plan.echo_of and plan.victim_name:
+        renames = ", ".join(f"{old} -> {new}" for old, new in plan.echo_of)
+        click.echo(
+            f"Would record {plan.victim_name!r} on the rename {renames}, so the "
+            f"security-master load stops minting the vendor's lingering "
+            f"{plan.victim_symbol} entry."
+        )
     if plan.volume_only_disagreements:
         # Reported, never blocking: a restated volume across a rename is common and
         # costs no price accuracy. Silence here would be worse than a line of noise.
@@ -918,8 +1031,10 @@ def security_merge_rename(
     is absorbed and deleted.
 
     Refuses unless the vendor's own identifiers agree (CUSIP/ISIN/CIK, where both
-    sides have them) and the overlapping sessions agree on OHLC. Run it with
-    --dry-run first: the preview is the same comparison the guard runs.
+    sides have them) and the overlapping sessions agree on OHLC, and refuses a
+    rename that would change what the instrument is (a share onto its unit's or
+    warrant's ticker, ADR 0012). Run it with --dry-run first: the preview is the
+    same comparison the guard runs.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
@@ -960,11 +1075,22 @@ def security_merge_rename(
         )
         click.echo(f"{old_symbol} -> {new_symbol}, effective {effective}")
         _echo_merge_plan(plan)
+        # Not in the plan's blockers: merge_security re-checks those for any merge,
+        # and this one is about the rename, which only this command carries out.
+        refusal = repo.rename_instrument_refusal(
+            database,
+            security_id=survivor_id,
+            old_symbol=old_symbol,
+            new_symbol=new_symbol,
+            new_name=plan.victim_name,
+        )
+        if refusal:
+            click.echo(f"BLOCKER: {refusal}", err=True)
 
         if dry_run:
             click.echo("Dry run: nothing changed.")
             return
-        if plan.blockers and not force:
+        if (plan.blockers or refusal) and not force:
             raise click.ClickException(
                 "Refusing to merge -- see the blockers above. If you have read them "
                 "and this is still one instrument, re-run with --force."
@@ -990,6 +1116,14 @@ def security_merge_rename(
                 f"{exc} -- the rows changed since the comparison above. Re-run to "
                 "see the current one."
             ) from exc
+        # The name the vendor will keep serving the old ticker under, kept on the
+        # audit row as apply_symbol_change does: the next security-master load
+        # overwrites it on the survivor, and repo.renamed_away_securities needs it
+        # to decline that echo instead of minting a copy of the company.
+        old_company_name = database.fetchval(
+            "SELECT company_name FROM core.security WHERE security_id = %s",
+            (survivor_id,),
+        )
         # Only now does the ticker move: the merge is about identity, the retarget
         # is about the rename, and they carry different dates.
         repo.retarget_symbol(
@@ -999,6 +1133,14 @@ def security_merge_rename(
             new_symbol=new_symbol,
             change_date=effective,
         )
+        detail = {
+            "old_symbol": old_symbol,
+            "new_symbol": new_symbol,
+            "merged_security_id": victim_id,
+            "merged_by": resolved_by,
+        }
+        if old_company_name:
+            detail["old_company_name"] = old_company_name
         repo.record_symbol_change(
             database,
             old_symbol=old_symbol,
@@ -1006,12 +1148,7 @@ def security_merge_rename(
             change_date=effective,
             status=repo.CHANGE_APPLIED,
             security_id=survivor_id,
-            detail={
-                "old_symbol": old_symbol,
-                "new_symbol": new_symbol,
-                "merged_security_id": victim_id,
-                "merged_by": resolved_by,
-            },
+            detail=detail,
         )
         # The survivor's corporate actions just changed, so its factors are stale by
         # construction. Recomputing here rather than telling the operator to is the
@@ -1274,6 +1411,10 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
     when it matters, on the pair where the newer row has been fed by the daily load
     and the older one holds the history.
 
+    When the victim holds a ticker the survivor was renamed away from, the merge
+    also records the victim's name on that rename, so the next security-master load
+    declines the vendor's lingering entry instead of minting it again.
+
     Refuses on a populated identity mismatch (CUSIP/ISIN/CIK) or disagreeing OHLC.
     Run --dry-run first: the preview is the same comparison the guard reads.
     """
@@ -1407,8 +1548,587 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         f"{report.flags_moved} flags ({report.flags_dropped} duplicated)."
     )
     click.echo(f"Security {victim_id} is gone. Adjustment factors recomputed.")
+    if report.plan.echo_of and report.plan.victim_name:
+        click.echo(
+            f"Recorded {report.plan.victim_name!r} as a name the vendor still lists "
+            f"{report.plan.victim_symbol} under; the next security-master load "
+            "declines it."
+        )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("venue-transfer")
+@click.argument("security_id", type=int)
+@click.option(
+    "--venue",
+    required=True,
+    help="The listed US venue it trades on now, e.g. TXSE (Texas; never TSX, "
+    "which is Toronto).",
+)
+@click.option(
+    "--date",
+    "moved_on",
+    required=True,
+    metavar="YYYY-MM-DD",
+    help="Its first session on that venue.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence for the move. Required -- it is the whole record.",
+)
+@click.option("--by", "recorded_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_venue_transfer(
+    ctx, security_id, venue, moved_on, note, recorded_by, dry_run, yes
+):
+    """Record that a security moved to another listed venue (ADR 0014).
+
+    \b
+      fafnir security venue-transfer 12441 --venue TXSE --date 2026-10-05 \\
+          -m "NYSE->TXSE 2026-10-05 (Energy Transfer press release)" --dry-run
+
+    For a security that moved and kept its ticker: ET and five others moved from
+    the NYSE to the Texas Stock Exchange on 2026-10-05, FMP's delisted feed reported
+    each as a delisting, and the sweep stamped them. Whether or not the sweep has
+    stamped it:
+
+    \b
+      * a stamped delisting is reversed: listed again, and the ticker period it
+        closed re-opened (the ticker never changed hands);
+      * the venue is recorded as an override the nightly load keeps, with the
+        security active, until FMP names a venue other than the one it left;
+      * the delisting sweep's security_delisting_contradicted flag is accepted for
+        each feed record the move settles, so the sweep declines it without
+        asking; any security_inactive_but_trading flag is resolved;
+      * an ops.ingestion_run row (source 'operator', endpoint
+        'security-venue-transfer') holds the row before and after.
+
+    Refuses a ticker another security now holds, and one the vendor has no bar for
+    after --date: the dry run shows those bars (1 request). Never for a move to OTC,
+    which is a delisting here: use `security delist`. The next nightly
+    `ingest prices` resumes from the watermark, so the bars since load on their own.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import venue_transfer as vt
+    from fafnir.ingest.delisted import CONTRADICTED_CHECK
+    from fafnir.ingest.runlog import RunLog
+    from fafnir.ingest.security_master import INACTIVE_BUT_TRADING_CHECK, ensure_venue
+
+    cfg = ctx.obj["config"]
+    if recorded_by is None:
+        recorded_by = _os_user()
+    moved = _parse_date(moved_on)
+
+    with Database(cfg.dsn) as database:
+        plan = vt.plan_venue_transfer(
+            database, security_id=security_id, venue_code=venue, moved_on=moved
+        )
+        if plan.symbol is not None:
+            click.echo(
+                f"Security {security_id} {plan.symbol} ({plan.company_name or ''})"
+            )
+        if plan.refusals:
+            for refusal in plan.refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        evidence = vt.vendor_bars_after(
+            _fmp_client(cfg), plan.symbol, after=moved, today=dt.date.today()
+        )
+
+        stamped = plan.delisted_date is not None
+        click.echo(f"  {'':<10} {'before':<12} after")
+        click.echo(f"  {'listed':<10} {'no' if stamped else 'yes':<12} yes")
+        click.echo(f"  {'active':<10} {'yes' if plan.active_before else 'no':<12} yes")
+        click.echo(f"  {'delisted':<10} {str(plan.delisted_date or '-'):<12} -")
+        click.echo(
+            f"  {'venue':<10} {str(plan.exchange_before):<12} {plan.venue}, held "
+            f"until the vendor names a venue other than {plan.left}"
+        )
+        for p in plan.periods:
+            click.echo(
+                f"Ticker period re-opened: {p['symbol']} {p['valid_from']}.."
+                f"{p['valid_to']} -> {p['valid_from']}..open"
+            )
+        if evidence.bars:
+            first, last = evidence.bars[0], evidence.bars[-1]
+            volume = last.get("volume")
+            click.echo(
+                f"Vendor bars after {moved}: {len(evidence.bars)}, "
+                f"{str(first.get('date'))[:10]}..{str(last.get('date'))[:10]}; the "
+                f"latest close {last.get('close')} volume "
+                + (
+                    f"{volume:,.0f}"
+                    if isinstance(volume, (int, float))
+                    else str(volume)
+                )
+            )
+        if plan.watermark is not None:
+            resume = plan.watermark - dt.timedelta(days=cfg.overlap_days)
+            click.echo(
+                f"Prices: watermark {plan.watermark}. The next nightly `ingest prices` "
+                f"resumes from {resume} and loads the bars since."
+            )
+        else:
+            click.echo(
+                "Prices: no watermark. The next nightly `ingest prices` loads its "
+                f"full history from {cfg.calendar_start_year}."
+            )
+        click.echo(
+            "Feed records settled, which the sweep then declines without asking: "
+            + ", ".join(f"{k['symbol']} {k['delisted_date']}" for k in plan.arm_keys)
+        )
+        if plan.open_contradictions or plan.open_inactive:
+            click.echo(
+                "Flags: "
+                + ", ".join(
+                    [f"accept {i}" for i in plan.open_contradictions]
+                    + [f"resolve {i}" for i in plan.open_inactive]
+                )
+            )
+        refusals = vt.evidence_refusals(evidence, symbol=plan.symbol, moved_on=moved)
+        if refusals:
+            for refusal in refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Record {plan.symbol} ({security_id}) as moved to {plan.venue} on "
+                f"{moved}?",
+                abort=True,
+            )
+
+        flag_note = f"Moved to {plan.venue} on {moved}: {note}"
+        # The RunLog row commits first, and its exit commits the change with the
+        # outcome; nothing is printed in between (see security descope).
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-venue-transfer",
+            params={
+                "security_id": security_id,
+                "symbol": plan.symbol,
+                "note": note,
+                "by": recorded_by,
+                "date": moved,
+                "before": {
+                    "is_actively_trading": plan.active_before,
+                    "delisted_date": plan.delisted_date,
+                    "exchange_code": plan.exchange_before,
+                },
+                "after": {
+                    "is_actively_trading": True,
+                    "delisted_date": None,
+                    "exchange_code": plan.venue,
+                    "venue_override_left": plan.left,
+                },
+                "periods_reopened": [
+                    f"{p['symbol']} {p['valid_from']}..{p['valid_to']}"
+                    for p in plan.periods
+                ],
+                "vendor_bars_after": len(evidence.bars),
+                "feed_records_settled": plan.arm_keys,
+            },
+        ) as run:
+            if stamped:
+                try:
+                    repo.reverse_delisting(
+                        database,
+                        security_id=security_id,
+                        delisted_date=plan.delisted_date,
+                        periods=plan.periods,
+                    )
+                except repo.VenueTransferRefused as exc:
+                    raise click.ClickException(
+                        f"{exc} -- it changed since the plan above. Re-run to see "
+                        "the current one."
+                    ) from exc
+            ensure_venue(database, plan.venue)
+            repo.record_venue_override(
+                database, security_id=security_id, venue=plan.venue, left=plan.left
+            )
+            for key in plan.arm_keys:
+                repo.add_dq_flag_once(
+                    database,
+                    check_name=CONTRADICTED_CHECK,
+                    security_id=security_id,
+                    table_name="core.security",
+                    record_key=key,
+                    detail={"recorded_by": "security venue-transfer"},
+                    ingestion_run_id=run.run_id,
+                )
+            accepted = repo.accept_dq_flags(
+                database,
+                repo.DqFilter(
+                    state="open",
+                    checks=(CONTRADICTED_CHECK,),
+                    security_ids=(security_id,),
+                ),
+                note=flag_note,
+                accepted_by=recorded_by,
+            )
+            resolved = []
+            if plan.open_inactive:
+                resolved = repo.resolve_dq_flags(
+                    database,
+                    repo.DqFilter(
+                        state="open",
+                        checks=(INACTIVE_BUT_TRADING_CHECK,),
+                        security_ids=(security_id,),
+                    ),
+                    note=flag_note,
+                    resolved_by=recorded_by,
+                )
+            run.symbols_requested = 1
+            run.params.update(flags_accepted=accepted, flags_resolved=resolved)
+            run_id = run.run_id
+
+    click.echo(
+        f"Recorded {plan.symbol} ({security_id}) as moved to {plan.venue} on {moved}, "
+        f"as {recorded_by} (ops.ingestion_run {run_id})."
+    )
+    click.echo(
+        f"Accepted {_plural(len(accepted), 'feed record')} as this move"
+        + (f"; resolved {_plural(len(resolved), 'DQ flag')}." if resolved else ".")
+    )
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("delist")
+@click.argument("security_id", type=int)
+@click.option(
+    "--date",
+    "delisted_on",
+    required=True,
+    metavar="YYYY-MM-DD",
+    help="The delisting date to record.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why it is a delisting. Required -- it is the whole record.",
+)
+@click.option("--by", "delisted_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_delist(ctx, security_id, delisted_on, note, delisted_by, dry_run, yes):
+    """Confirm a delisting the sweep declined (ADR 0014).
+
+    \b
+      fafnir security delist 4321 --date 2025-12-31 \\
+          -m "Left the NYSE for OTCQX (issuer notice)" --dry-run
+
+    The delisting sweep will not stamp a recent delisting the vendor still has
+    bars after: it flags security_delisting_contradicted instead. That is right
+    for a venue transfer (`security venue-transfer`) and wrong for a security that
+    left this warehouse's scope while still trading, such as a move to OTC (GRP-UN,
+    2025-12-31). This stamps it the way the sweep would: delisted on --date, the
+    ticker's open period closed, every bar kept. Any operator venue override is
+    cleared, and the contradiction and inactive-but-trading flags are resolved
+    with the note. An ops.ingestion_run row (source 'operator', endpoint
+    'security-delist') records it. Reversible with `security venue-transfer`.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import venue_transfer as vt
+    from fafnir.ingest.delisted import CONTRADICTED_CHECK
+    from fafnir.ingest.runlog import RunLog
+    from fafnir.ingest.security_master import INACTIVE_BUT_TRADING_CHECK
+
+    cfg = ctx.obj["config"]
+    if delisted_by is None:
+        delisted_by = _os_user()
+    when = _parse_date(delisted_on)
+
+    with Database(cfg.dsn) as database:
+        plan = vt.plan_delist(database, security_id=security_id, delisted_on=when)
+        if plan.symbol is not None:
+            click.echo(
+                f"Security {security_id} {plan.symbol} ({plan.company_name or ''}) on "
+                f"{plan.exchange}"
+            )
+        if plan.refusals:
+            for refusal in plan.refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        click.echo(f"Delisted on {when}; last stored bar {plan.last_bar or 'none'}.")
+        for p in plan.periods:
+            click.echo(f"Ticker period closed: {p['symbol']} {p['valid_from']}..")
+        click.echo(
+            "Flags resolved: " + (", ".join(map(str, plan.open_flags)) or "none open")
+        )
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Stamp {plan.symbol} ({security_id}) delisted on {when}?", abort=True
+            )
+
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-delist",
+            params={
+                "security_id": security_id,
+                "symbol": plan.symbol,
+                "note": note,
+                "by": delisted_by,
+                "delisted_date": when,
+                "exchange_code": plan.exchange,
+                "last_bar": plan.last_bar,
+            },
+        ) as run:
+            if not repo.mark_delisted(
+                database, security_id=security_id, delisted_date=when
+            ):
+                raise click.ClickException(
+                    f"{plan.symbol} ({security_id}) was delisted since the plan above. "
+                    "Nothing was changed."
+                )
+            repo.clear_venue_override(database, security_id)
+            resolved = []
+            if plan.open_flags:
+                resolved = repo.resolve_dq_flags(
+                    database,
+                    repo.DqFilter(
+                        state="open",
+                        checks=(CONTRADICTED_CHECK, INACTIVE_BUT_TRADING_CHECK),
+                        security_ids=(security_id,),
+                    ),
+                    note=f"Delisted on {when}: {note}",
+                    resolved_by=delisted_by,
+                )
+            run.symbols_requested = 1
+            run.params["flags_resolved"] = resolved
+            run_id = run.run_id
+
+    click.echo(
+        f"Delisted {plan.symbol} ({security_id}) on {when} as {delisted_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
+    if resolved:
+        click.echo(f"Resolved {_plural(len(resolved), 'DQ flag')}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+def _descope_verb(table: str, *, done: bool = False) -> str:
+    """What a descope does to one footprint entry: an unresolved rename is
+    dismissed, a rename record detached, every other row deleted.
+    """
+    from fafnir.db import repository as repo
+
+    if table == repo.UNRESOLVED_RENAMES:
+        return "dismissed" if done else "dismiss"
+    if table == "core.symbol_change":
+        return "detached" if done else "detach"
+    return "deleted" if done else "delete"
+
+
+@security.command("descope")
+@click.option(
+    "--kind",
+    "kinds",
+    multiple=True,
+    type=click.Choice(INSTRUMENT_KINDS),
+    help="Only this kind; repeatable. It must be one [general] exclude_instruments "
+    "excludes  [default: every kind it excludes]",
+)
+@click.option(
+    "--note",
+    "-m",
+    help="Why. Kept on the ops.ingestion_run row that audits the run, and on any "
+    "rename it dismisses.",
+)
+@click.option(
+    "--keep",
+    "keep_symbols",
+    multiple=True,
+    metavar="SYMBOL",
+    help="Keep this security although its kind is excluded; repeatable. For one "
+    "that no longer lists -- a listed one is declared with `track add` instead. "
+    "A SYMBOL matching nothing this run would remove is refused, so a typo cannot "
+    "delete the security it meant to keep.",
+)
+@click.option("--by", "removed_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="List what would be removed; change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_descope(ctx, kinds, note, keep_symbols, removed_by, dry_run, yes):
+    """Delete every security of an excluded instrument kind, with all its rows.
+
+    \b
+      fafnir security descope --dry-run
+      fafnir security descope -m "ADR 0012: no warrants, rights or units" --yes
+
+    For a scope decision (ADR 0012), never for a delisting: a security that stopped
+    trading keeps its history. Deploy the release that stops `ingest securities`
+    minting these first, or the next nightly load mints them straight back. For
+    the same reason a --kind that [general] exclude_instruments does not exclude is
+    refused.
+
+    Candidates are classified by their ticker (and, for two ambiguous shapes, their
+    name); see `fafnir.instruments.instrument_kind`. There are two ways to keep one:
+
+    \b
+      * a symbol in the declared universe (`fafnir track add`), for a ticker that
+        still lists -- every future descope skips it too;
+      * --keep SYMBOL, for this run, for one that no longer lists. Declaring a
+        delisted ticker makes `ingest tracked` mint it again as a new security.
+
+    Every --keep must name a security this run would otherwise remove; one that
+    names nothing is refused before anything is read out or changed.
+
+    IRREVERSIBLE. Bars, corporate actions, factors, profiles, ticker periods,
+    watermarks, operator overrides and DQ flags go with each security, in one
+    transaction. Rename records are kept, detached; a rename still in conflict that
+    names one of them is dismissed, because removing either side changes what the
+    nightly sweep would do with it. Take a backup first. The audit trail is a single
+    ops.ingestion_run row (source 'operator', endpoint 'security-descope') naming
+    every symbol removed.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest.runlog import RunLog
+
+    cfg = ctx.obj["config"]
+    excluded = _excluded_instruments(cfg)
+    wanted = tuple(kinds) or excluded
+    if not wanted:
+        raise click.ClickException(
+            "No instrument kind is excluded ([general] exclude_instruments is empty) "
+            "and no --kind was given, so there is nothing to descope."
+        )
+    admitted = [k for k in wanted if k not in excluded]
+    if admitted:
+        raise click.ClickException(
+            f"[general] exclude_instruments does not exclude {'/'.join(admitted)}, so "
+            "`ingest securities` still mints them: the next nightly load would mint "
+            "every one back under a new id and pull its full price history. Exclude "
+            "the kind first."
+        )
+    if removed_by is None:
+        removed_by = _os_user()
+
+    with Database(cfg.dsn) as database:
+        declared = {r["symbol"] for r in repo.list_tracked_symbols(database)}
+        securities = database.fetchall(
+            "SELECT security_id, primary_symbol, company_name, is_etf, is_fund,"
+            " is_actively_trading, delisted_date FROM core.security"
+            " ORDER BY primary_symbol, security_id"
+        )
+        selection = select_descope_candidates(
+            securities, excluded=wanted, declared=declared, keep=keep_symbols
+        )
+        if selection.unmatched_keeps:
+            raise click.ClickException(
+                f"--keep {', '.join(selection.unmatched_keeps)} matches no "
+                f"{'/'.join(wanted)} security this run would remove. Nothing was "
+                "changed. Check the ticker: a misspelt --keep would have deleted the "
+                "security it was meant to keep."
+            )
+        candidates = selection.candidates
+
+        if selection.kept_declared:
+            click.echo(
+                "Kept, declared in ref.tracked_symbol: "
+                + ", ".join(k["primary_symbol"] for k in selection.kept_declared)
+            )
+        if selection.kept_by_request:
+            click.echo(
+                "Kept, --keep: "
+                + ", ".join(
+                    f"{k['primary_symbol']} ({k['security_id']}, "
+                    + (
+                        f"delisted {k['delisted_date']}"
+                        if k["delisted_date"]
+                        else "listed"
+                    )
+                    + ")"
+                    for k in selection.kept_by_request
+                )
+            )
+        if not candidates:
+            click.echo(f"No {'/'.join(wanted)} securities to descope.")
+            return
+
+        ids = [int(c["security_id"]) for c in candidates]
+        footprint = repo.security_footprint(database, ids)
+        renames = repo.unresolved_renames(database, ids)
+        for c in candidates:
+            click.echo(
+                f"{c['security_id']:>8}  {c['primary_symbol']:<9} {c['kind']:<8} "
+                f"{'active' if c['is_actively_trading'] else 'inactive':<8} "
+                f"{c['company_name'] or ''}"
+            )
+        for r in renames:
+            click.echo(
+                f"Unresolved rename, dismissed with them: {r['old_symbol']} -> "
+                f"{r['new_symbol']} ({r['change_date']})"
+            )
+        for kind in wanted:
+            of_kind = [c for c in candidates if c["kind"] == kind]
+            active = sum(1 for c in of_kind if c["is_actively_trading"])
+            click.echo(f"{kind:<8} {len(of_kind):>6} securities ({active} active)")
+        for table, count in footprint.items():
+            click.echo(f"  {_descope_verb(table):<9} {count:>9} rows  {table}")
+
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Delete these {len(ids)} securities and every row keyed to them? "
+                "This cannot be undone.",
+                abort=True,
+            )
+        # The RunLog row commits first (it is the record that the run happened, even
+        # if the purge then fails), and its exit commits the purge with the outcome.
+        # Nothing is printed between the deletes and that commit: a closed pipe there
+        # would roll the purge back after the screen said it was done.
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-descope",
+            params={
+                "kinds": list(wanted),
+                "note": note,
+                "by": removed_by,
+                "securities": len(ids),
+                "symbols": [c["primary_symbol"] for c in candidates],
+                "security_ids": ids,
+                "kept_declared": [k["primary_symbol"] for k in selection.kept_declared],
+                "kept_by_option": [
+                    k["primary_symbol"] for k in selection.kept_by_request
+                ],
+                "renames_dismissed": [
+                    f"{r['old_symbol']}->{r['new_symbol']}@{r['change_date']}"
+                    for r in renames
+                ],
+            },
+        ) as run:
+            removed = repo.purge_securities(
+                database, ids, removed_by=removed_by, note=note
+            )
+            run.symbols_requested = len(ids)
+            run_id = run.run_id
+
+    for table, count in removed.items():
+        click.echo(f"  {_descope_verb(table, done=True):<9} {count:>9} rows  {table}")
+    click.echo(
+        f"Descoped {len(ids)} securit{'y' if len(ids) == 1 else 'ies'} as {removed_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
@@ -1963,6 +2683,18 @@ _OVERRIDE_HINT = (
     "`fafnir db refresh-marts`."
 )
 
+# Why an edit is made (ops.operator_override.reason, migration 0028). Only a
+# data_error is exported as a label: a scope removal (CELG-RI) or bookkeeping is
+# not a statement that the vendor's row was wrong.
+_reason_option = click.option(
+    "--reason",
+    type=click.Choice(["data_error", "out_of_scope", "cleanup"]),
+    default="data_error",
+    show_default=True,
+    help="Why: the row was wrong (data_error), the security does not belong "
+    "(out_of_scope), or bookkeeping (cleanup). Only data_error becomes a label.",
+)
+
 
 @main.group()
 def actions():
@@ -2044,6 +2776,7 @@ def actions_list(ctx, symbol, security_id, action_type, from_date, to_date):
     help="The evidence the feed is wrong. Required -- it is the whole record.",
 )
 @click.option("--by", "created_by", help="Who  [default: the OS user]")
+@_reason_option
 @click.option(
     "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
 )
@@ -2058,6 +2791,7 @@ def actions_add(
     dividend,
     note,
     created_by,
+    reason,
     dry_run,
     yes,
 ):
@@ -2114,6 +2848,7 @@ def actions_add(
                 dividend_amount=amount,
                 note=note,
                 created_by=created_by,
+                reason=reason,
             )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2142,12 +2877,13 @@ def actions_add(
     help="Why the feed's row is wrong. Required -- it is the whole record.",
 )
 @click.option("--by", "created_by", help="Who  [default: the OS user]")
+@_reason_option
 @click.option(
     "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
 @click.pass_context
-def actions_delete(ctx, action_ids, note, created_by, dry_run, yes):
+def actions_delete(ctx, action_ids, note, created_by, reason, dry_run, yes):
     """Delete corporate actions by id, and keep the feed from putting them back.
 
     \b
@@ -2207,6 +2943,7 @@ def actions_delete(ctx, action_ids, note, created_by, dry_run, yes):
                         corporate_action_id=int(r["corporate_action_id"]),
                         note=note,
                         created_by=created_by,
+                        reason=reason,
                     )
                 )
         except repo.OverrideRefused as exc:
@@ -2246,12 +2983,13 @@ def actions_delete(ctx, action_ids, note, created_by, dry_run, yes):
     help="The evidence for the correct date. Required -- it is the whole record.",
 )
 @click.option("--by", "created_by", help="Who  [default: the OS user]")
+@_reason_option
 @click.option(
     "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
 @click.pass_context
-def actions_redate(ctx, action_id, ex_date, note, created_by, dry_run, yes):
+def actions_redate(ctx, action_id, ex_date, note, created_by, reason, dry_run, yes):
     """Move a misdated corporate action to its real ex-date.
 
     \b
@@ -2296,6 +3034,7 @@ def actions_redate(ctx, action_id, ex_date, note, created_by, dry_run, yes):
                 new_ex_date=new_date,
                 note=note,
                 created_by=created_by,
+                reason=reason,
             )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2345,6 +3084,7 @@ def prices():
     help="Why the bars are wrong. Required -- it is the whole record.",
 )
 @click.option("--by", "created_by", help="Who  [default: the OS user]")
+@_reason_option
 @click.option(
     "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
 )
@@ -2360,6 +3100,7 @@ def prices_delete(
     to_date,
     note,
     created_by,
+    reason,
     dry_run,
     yes,
 ):
@@ -2481,6 +3222,7 @@ def prices_delete(
                 trade_dates=list(bars),
                 note=note,
                 created_by=created_by,
+                reason=reason,
             )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2573,6 +3315,7 @@ def _has_actions(database, security_id: int) -> bool:
     help="The evidence for the factor. Required -- it is the whole record.",
 )
 @click.option("--by", "created_by", help="Who  [default: the OS user]")
+@_reason_option
 @click.option(
     "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
 )
@@ -2588,6 +3331,7 @@ def prices_rescale(
     volume_factor,
     note,
     created_by,
+    reason,
     dry_run,
     yes,
 ):
@@ -2642,7 +3386,7 @@ def prices_rescale(
             click.confirm(f"Rescale {_plural(n, 'bar')}?", abort=True)
         try:
             edit_id, override_ids, _ = price_edits.apply_plan(
-                database, plan, note=note, created_by=created_by
+                database, plan, note=note, created_by=created_by, reason=reason
             )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2698,6 +3442,7 @@ def prices_rescale(
     help="The evidence for the new dates. Required -- it is the whole record.",
 )
 @click.option("--by", "created_by", help="Who  [default: the OS user]")
+@_reason_option
 @click.option(
     "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
 )
@@ -2714,6 +3459,7 @@ def prices_shift(
     with_actions,
     note,
     created_by,
+    reason,
     dry_run,
     yes,
 ):
@@ -2814,6 +3560,7 @@ def prices_shift(
                 note=note,
                 created_by=created_by,
                 with_actions=with_actions,
+                reason=reason,
             )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
@@ -2899,6 +3646,11 @@ def override_list(ctx, symbol, security_id, include_revoked, as_json):
                 + (
                     f" ({r['detail']['transform'].get('kind')})"
                     if isinstance(r["detail"], dict) and r["detail"].get("transform")
+                    else ""
+                )
+                + (
+                    f" [{r['reason']}]"
+                    if r.get("reason") not in (None, "data_error")
                     else ""
                 ),
                 r["created_by"],
@@ -3066,6 +3818,139 @@ def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
         click.echo(_BAR_EDIT_HINT)
 
 
+@override.command("set-reason")
+@click.argument("override_ids", nargs=-1, type=int, metavar="[ID]...")
+@click.option("--security-id", type=int, help="Every active override on a security.")
+@click.option(
+    "--target",
+    type=click.Choice(["daily_price", "corporate_action"]),
+    help="With --security-id: bars or corporate actions only.",
+)
+@click.option(
+    "--created-on",
+    metavar="YYYY-MM-DD",
+    help="With --security-id: only overrides made on this day.",
+)
+@click.option(
+    "--reason",
+    required=True,
+    type=click.Choice(["data_error", "out_of_scope", "cleanup"]),
+    help="What the edits were: the row was wrong, the security does not belong, "
+    "or bookkeeping.",
+)
+@click.option(
+    "--note", "-m", required=True, help="Why the reason changes. Kept in the record."
+)
+@click.option("--by", "set_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def override_set_reason(
+    ctx,
+    override_ids,
+    security_id,
+    target,
+    created_on,
+    reason,
+    note,
+    set_by,
+    dry_run,
+    yes,
+):
+    """Say why overrides were made, after the fact.
+
+    \b
+      fafnir override set-reason --security-id 809739 --target daily_price \\
+          --reason out_of_scope -m "CELG-RI removed for scope, not error" --dry-run
+      fafnir override set-reason 574799 574800 --reason data_error -m "..."
+
+    Only `data_error` overrides are exported as labels (`fafnir dq export-labels`):
+    a scope removal or a merge's leftovers say nothing about whether the vendor's
+    row was right. This changes the reason and nothing else -- no row, no
+    suppression, no factor -- and keeps the original note, appending the change to
+    the override's `detail.reason_history`.
+    """
+    from fafnir.db import repository as repo
+
+    if override_ids and (security_id or target or created_on):
+        raise click.ClickException(
+            "Give override ids or --security-id (with --target / --created-on), not "
+            "both."
+        )
+    if not override_ids and security_id is None:
+        raise click.ClickException(
+            "Nothing selected. Pass override ids, or --security-id."
+        )
+    if (target or created_on) and security_id is None:
+        raise click.ClickException("--target and --created-on narrow --security-id.")
+    set_by = set_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = repo.overrides_for_reason(
+            database,
+            override_ids=override_ids,
+            security_id=security_id,
+            target=target,
+            created_on=_parse_date(created_on),
+        )
+        found = {int(r["override_id"]) for r in rows}
+        for oid in override_ids:
+            if oid not in found:
+                click.echo(f"  {oid}: no such override.", err=True)
+        changing = [r for r in rows if r["reason"] != reason]
+        groups: dict = {}
+        for r in changing:
+            key = (r["security_id"], r["target"], r["operation"], r["reason"])
+            groups.setdefault(key, []).append(r)
+        if groups:
+            _echo_table(
+                ["SECURITY", "TARGET", "OP", "FROM", "TO", "N", "KEYS"],
+                [
+                    [
+                        str(sid),
+                        "action" if tgt == "corporate_action" else "bar",
+                        op,
+                        old,
+                        reason,
+                        str(len(rs)),
+                        f"{min(r['key_date'] for r in rs)}.."
+                        f"{max(r['key_date'] for r in rs)}",
+                    ]
+                    for (sid, tgt, op, old), rs in sorted(groups.items())
+                ],
+                right=(0, 5),
+            )
+        unchanged = len(rows) - len(changing)
+        if unchanged:
+            click.echo(f"{_plural(unchanged, 'override')} already {reason}.")
+        if not changing:
+            click.echo("Nothing to change.")
+            return
+        if dry_run:
+            click.echo(
+                f"Dry run: {_plural(len(changing), 'override')} would become "
+                f"{reason}. Nothing changed."
+            )
+            return
+        if not yes:
+            click.confirm(
+                f"Set {_plural(len(changing), 'override')} to {reason}?", abort=True
+            )
+        try:
+            changed = repo.set_override_reason(
+                database,
+                override_ids=[int(r["override_id"]) for r in changing],
+                reason=reason,
+                note=note,
+                set_by=set_by,
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        database.commit()
+    click.echo(f"Set {_plural(len(changed), 'override')} to {reason} as {set_by}.")
+    if reason != "data_error":
+        click.echo("They are no longer exported as labels (`fafnir dq export-labels`).")
+
+
 # ---------------------------------------------------------------------------
 # dq + status
 # ---------------------------------------------------------------------------
@@ -3200,24 +4085,767 @@ def source_probe_actions(ctx, symbols, days):
         )
 
 
+@source.command("vendor-gaps")
+@click.option(
+    "--min-sessions",
+    default=2,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Open sessions behind the market's latest before a security counts.",
+)
+@click.option("--exchange", default="NASDAQ", show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.pass_context
+def source_vendor_gaps(ctx, min_sessions, exchange, as_json):
+    """List live securities FMP has stopped serving: the list for a vendor ticket.
+
+    \b
+      fafnir source vendor-gaps
+      fafnir source vendor-gaps --min-sessions 3 --json
+
+    A security is listed when it is in the nightly universe and not delisted, its
+    last bar is --min-sessions behind the market, its newest payload was an
+    open-ended request made after the market's latest session that returned
+    nothing newer, at least 95% of its venue has a newer bar, and the newest
+    delisted-companies payload does not name it. Its `stale` flag is not to be
+    resolved: the security trades, the vendor does not serve it. Reads only.
+    """
+    from fafnir.sources import vendor_gaps as vg
+
+    with Database(ctx.obj["config"].dsn) as database:
+        report = vg.vendor_gaps(
+            database, exchange_code=exchange, min_sessions=min_sessions
+        )
+    if as_json:
+        _dq_json(report.as_dict())
+        return
+    if report.market_latest is None:
+        click.echo("No bars on an open session yet.")
+        return
+    n = len(report.gaps)
+    click.echo(
+        f"Market's latest session: {report.market_latest}. "
+        + (
+            f"{n} {'security' if n == 1 else 'securities'} the vendor stopped "
+            "serving:"
+            if n
+            else "No security the vendor stopped serving."
+        )
+    )
+    if not report.delisted_payload:
+        click.echo(
+            "  (No delisted-companies payload landed yet: the delisted test was "
+            "skipped. `fafnir ingest delisted` lands one.)"
+        )
+    if not report.gaps:
+        return
+    _echo_table(
+        [
+            "SYMBOL",
+            "ID",
+            "VENUE",
+            "LAST BAR",
+            "BEHIND",
+            "ASKED",
+            "SERVED TO",
+            "VENUE AHEAD",
+            "OPEN FLAGS",
+        ],
+        [
+            [
+                g.symbol,
+                str(g.security_id),
+                g.exchange_code or "-",
+                str(g.last_bar),
+                str(g.sessions_behind),
+                f"{g.request_from or '?'}..",
+                str(g.payload_max_date or "nothing"),
+                f"{g.venue_share:.0%}",
+                ", ".join(f"{c} {n}" for c, n in g.open_flags.items()) or "-",
+            ]
+            for g in report.gaps
+        ],
+        right=(1, 4),
+    )
+
+
 @main.group()
 def dq():
     """Data-quality checks."""
 
 
+def _dq_engine(cfg, engine: Optional[str]) -> str:
+    """``--engine``, else ``[dq] engine``, with a bad config value as one line."""
+    if engine:
+        return engine
+    try:
+        return cfg.dq_engine
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @dq.command("run")
 @click.option("--exchange", default="NASDAQ", show_default=True)
 @click.option("--outlier-threshold", default=0.5, show_default=True, type=float)
+@click.option(
+    "--engine",
+    type=click.Choice(["sql", "dorq", "both"]),
+    help="Which checks run  [default: [dq] engine, else sql]",
+)
+@click.option(
+    "--shadow/--no-shadow",
+    default=None,
+    help="dorq's flags to [dq] dorq_shadow_dir instead of the queue  "
+    "[default: [dq] dorq_shadow, else shadow]",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="dorq over every bar of every security, not the nightly lookback.",
+)
 @click.pass_context
-def dq_run(ctx, exchange, outlier_threshold):
-    """Run gap / outlier / freshness checks; write flags to ops.data_quality_flag."""
+def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full):
+    """Run the data-quality checks; write flags to ops.data_quality_flag.
+
+    \b
+      fafnir dq run                          # [dq] engine: sql by default
+      fafnir dq run --engine both            # SQL checks, and dorq in shadow
+      fafnir dq run --engine dorq --full     # dorq over the whole history
+
+    The SQL engine is the gap / outlier / freshness / identity / classification
+    checks. dorq (doc/dorq.md) judges every bar of the lookback for a data error
+    and writes `dorq_*` flags -- or, in shadow mode, the shadow file
+    `fafnir dq compare` reads, leaving the queue alone. Shadow is the default
+    until the cutover criteria are met (dorq plan §7.4, §8).
+    """
     from fafnir.dq import checks
+    from fafnir.dq import dorq as dorq_engine
+
+    cfg = ctx.obj["config"]
+    engine = _dq_engine(cfg, engine)
+    if shadow is None:
+        shadow = cfg.dorq_shadow
+    with Database(cfg.dsn) as database:
+        if engine in ("sql", "both"):
+            result = checks.run_all(
+                database, exchange_code=exchange, outlier_threshold=outlier_threshold
+            )
+            # Durable before dorq runs: a dorq failure must not cost the SQL flags.
+            database.commit()
+            click.echo(f"DQ flags written: {result}")
+        if engine in ("dorq", "both"):
+            settings = dorq_engine.settings_from(cfg)
+            try:
+                out = dorq_engine.run(
+                    database, settings, exchange, shadow=shadow, full=full
+                )
+            except dorq_engine.DorqError as exc:
+                raise click.ClickException(str(exc)) from exc
+            database.commit()
+            w = out.window
+            span = (
+                f"{w.bars_from or 'start'}..{w.as_of}"
+                + (f", reporting from {w.since}" if w.since else "")
+                if w.as_of
+                else "no bars"
+            )
+            detected = sum(out.detected.values())
+            if shadow:
+                click.echo(
+                    f"dorq {out.version} ({span}): {_plural(detected, 'violation')}"
+                    f" written to the shadow file {out.shadow_file}"
+                )
+            else:
+                click.echo(
+                    f"dorq {out.version} ({span}): {_plural(detected, 'violation')},"
+                    f" DQ flags written: {out.flagged}"
+                )
+            b = out.backfill
+            if b and b["securities"]:
+                n = b["securities"]
+                whose = f"{n} {'security' if n == 1 else 'securities'}"
+                click.echo(
+                    f"  backfill: {whose} with history before {b['before']} new or"
+                    " rewritten -- "
+                    + (
+                        f"not judged, {b['skipped']}; use --full"
+                        if b.get("skipped")
+                        else f"{_plural(b['reports'], 'violation')}, included above"
+                    )
+                )
+
+
+@dq.command("compare")
+@click.argument(
+    "shadow_files", nargs=-1, type=click.Path(dir_okay=False), metavar="[FILE]..."
+)
+@click.option(
+    "--labels",
+    type=click.Path(exists=True, dir_okay=False, allow_dash=True),
+    help="Labels (`dq export-labels`) to measure precision against; `-` is stdin.",
+)
+@click.option(
+    "--labels-from-db",
+    is_flag=True,
+    help="The warehouse's own labels, as `dq export-labels` would write them, with "
+    "no file. The normal way.",
+)
+@click.option(
+    "--labels-ignore-time",
+    is_flag=True,
+    help="Judge with every label, including repairs made after the night ran "
+    "(calibration-style).",
+)
+@click.option("--verified-only", is_flag=True, help="Only labels marked verified.")
+@click.option(
+    "--slack",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Calendar days a report may sit from a flag or label and still match.",
+)
+@click.option(
+    "--dorq-eval",
+    "dorq_eval",
+    type=click.Path(dir_okay=False),
+    help="Also run dorq-eval on the same night and labels, and say where it "
+    "disagrees  [default: dorq-eval beside [dq] dorq_path, when there is one]",
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.pass_context
+def dq_compare(
+    ctx,
+    shadow_files,
+    labels,
+    labels_from_db,
+    labels_ignore_time,
+    verified_only,
+    slack,
+    dorq_eval,
+    as_json,
+):
+    """Compare shadow nights of dorq with the SQL checks and the labels.
+
+    \b
+      fafnir dq compare                                # the newest shadow night
+      fafnir dq compare --labels-from-db               # with precision
+      fafnir dq compare var/dorq-shadow/2026-10-1{2,3,4}.jsonl --labels-from-db
+      fafnir dq export-labels --out - | fafnir dq compare --labels -
+
+    Overlap: of the outlier / gap / stale flags keyed in the night's window
+    (within the slack), how many dorq also reports, and how many of dorq's reports
+    no SQL check made. Recall is on the flags whose condition still held when
+    dorq ran, as the run's snapshot recorded them; stale flags keyed before the
+    window that still held get a line of their own. New flags: the conditions this
+    night holds that the previous night's file did not, against the SQL flags
+    written between the two runs (the bar is 70% fewer). Precision, with labels:
+    strict (right) and fault (right or another fault) per code, at warn and above
+    and at error, judged only by the labels that applied when the night's run
+    started. Several files add a summary over their distinct conditions. Reads
+    only.
+    """
+    import sys
+    from pathlib import Path
+
+    from fafnir.dq import compare as cmp
+
+    cfg = ctx.obj["config"]
+    if labels and labels_from_db:
+        raise click.ClickException("--labels or --labels-from-db, not both.")
+    if (labels_ignore_time or verified_only) and not (labels or labels_from_db):
+        raise click.ClickException(
+            "--labels-ignore-time and --verified-only qualify --labels / "
+            "--labels-from-db."
+        )
+    paths = [Path(p) for p in shadow_files]
+    if not paths:
+        newest = cmp.latest_shadow_file(cfg.dorq_shadow_dir)
+        paths = [newest] if newest is not None else []
+    if not paths or not all(p.is_file() for p in paths):
+        missing = [str(p) for p in paths if not p.is_file()]
+        raise click.ClickException(
+            (f"No such shadow file: {', '.join(missing)}." if missing else "")
+            or f"No shadow file in {cfg.dorq_shadow_dir}. Run "
+            "`fafnir dq run --engine both` (shadow is the default) first."
+        )
+    try:
+        if labels == "-":
+            label_rows = cmp.parse_labels(sys.stdin, "stdin")
+        else:
+            label_rows = cmp.read_labels(Path(labels)) if labels else None
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if dorq_eval is None:
+        beside = Path(cfg.dorq_path).with_name("dorq-eval")
+        dorq_eval = str(beside) if beside.is_file() else None
+    with Database(cfg.dsn) as database:
+        if labels_from_db:
+            label_rows = cmp.labels_from_db(database)
+        results = [
+            cmp.compare(
+                database,
+                path,
+                labels=label_rows,
+                slack_days=slack,
+                labels_ignore_time=labels_ignore_time,
+                verified_only=verified_only,
+            )
+            for path in paths
+        ]
+    if dorq_eval and label_rows is not None:
+        for c in results:
+            ev = cmp.run_dorq_eval(
+                dorq_eval,
+                Path(c.shadow_file),
+                label_rows,
+                c.state_at,
+                ignore_time=labels_ignore_time,
+                verified_only=verified_only,
+            )
+            ev["disagreements"] = cmp.eval_disagreements(c, ev)
+            c.dorq_eval = ev
+    summary = cmp.summarize(results) if len(results) > 1 else None
+    if as_json:
+        _dq_json(summary.as_dict() if summary else results[0].as_dict())
+        return
+    for i, c in enumerate(results):
+        if i:
+            click.echo("\n" + "=" * 78 + "\n")
+        click.echo(cmp.format_comparison(c))
+    if summary is not None:
+        click.echo("\n" + "=" * 78 + "\n")
+        click.echo(cmp.format_summary(summary))
+
+
+@dq.command("export-labels")
+@click.option(
+    "--out",
+    "out_path",
+    required=True,
+    type=click.Path(dir_okay=False, allow_dash=True),
+    help="The labels, as JSON Lines (dorq's doc/labels.md). `-` is stdout.",
+)
+@click.option(
+    "--restore",
+    "restore_path",
+    type=click.Path(dir_okay=False),
+    help="Also write the repaired bars as they stood, for dorq --restore.",
+)
+@click.option(
+    "--restore-actions",
+    "actions_path",
+    type=click.Path(dir_okay=False),
+    help="Also write the deleted and re-dated corporate actions as they stood, "
+    "in the shape of dorq's --actions file.",
+)
+@click.option(
+    "--verified-only",
+    is_flag=True,
+    help="Only labels marked verified: flags closed --per-flag, and stated labels "
+    "added --verified.",
+)
+@click.pass_context
+def dq_export_labels(ctx, out_path, restore_path, actions_path, verified_only):
+    """Write the warehouse's repairs, judged flags and stated labels for dorq.
+
+    \b
+      fafnir dq export-labels --out labels.jsonl --restore before.csv
+      fafnir dq export-labels --out - | fafnir dq compare --labels -
+      dorq calibrate bars.csv --labels labels.jsonl --restore before.csv ...
+
+    A repair (ops.operator_override, reason data_error) is a confirmed data error,
+    and the override keeps the row as it stood, so --restore and --restore-actions
+    put the evidence back. An outlier or dorq flag closed by judgement is a market
+    fact. Labels a person stated (`fafnir dq label`) are merged in, and win over a
+    derived label on the same security, dates and class. Every label carries
+    decided_at and applies_until: a repair's label stops applying when the repair
+    was made. See fafnir.dq.labels for what each becomes and what is left out.
+    Reads only.
+    """
+    from pathlib import Path
+
+    from fafnir.dq import labels as lb
 
     with Database(ctx.obj["config"].dsn) as database:
-        result = checks.run_all(
-            database, exchange_code=exchange, outlier_threshold=outlier_threshold
+        export = lb.build(database, verified_only=verified_only)
+    to_stdout = out_path == "-"
+    lb.write(
+        export,
+        Path(out_path) if not to_stdout else "-",
+        Path(restore_path) if restore_path else None,
+        Path(actions_path) if actions_path else None,
+    )
+    # With the labels on stdout, the summary goes to stderr so a pipe reads JSONL.
+    kinds = ", ".join(f"{k} {n}" for k, n in export.by_kind().items()) or "none"
+    where = "stdout" if to_stdout else out_path
+    click.echo(
+        f"Wrote {_plural(len(export.labels), 'label')} to {where} ({kinds}).",
+        err=to_stdout,
+    )
+    if restore_path:
+        click.echo(
+            f"Wrote {_plural(len(export.restore), 'bar')} as they stood to "
+            f"{restore_path}.",
+            err=to_stdout,
         )
-    click.echo(f"DQ flags written: {result}")
+    if actions_path:
+        click.echo(
+            f"Wrote {_plural(len(export.restore_actions), 'corporate action')} as "
+            f"they stood to {actions_path}.",
+            err=to_stdout,
+        )
+
+
+# ---------------------------------------------------------------------------
+# dq label: labels a person states (ops.dq_label)
+# ---------------------------------------------------------------------------
+
+
+@dq.group("label")
+def dq_label():
+    """State what was true about a series, for measuring dorq.
+
+    A label is derived automatically only where the disposition is unambiguous: a
+    repair, an outlier or dorq flag accepted or resolved. Everything else -- a feed
+    gap, a stale feed on odd lots, a real distribution, a vendor's wrong
+    instrument, a cohort of real moves -- is stated here, by someone who checked.
+    `fafnir dq export-labels` and `dq compare --labels-from-db` merge these in.
+    A label changes no data and no flag.
+    """
+
+
+def _label_members(value: Optional[str]) -> Optional[list[int]]:
+    if not value:
+        return None
+    try:
+        return sorted({int(v) for v in value.split(",") if v.strip()})
+    except ValueError as exc:
+        raise click.BadParameter(
+            "a comma-separated list of security ids", param_hint="--members"
+        ) from exc
+
+
+def _echo_labels(rows) -> None:
+    _echo_table(
+        ["ID", "SERIES", "FIRST", "LAST", "CLASS", "KIND", "CODES", "V", "SOURCE"],
+        [
+            [
+                str(r["label_id"]),
+                (
+                    (r.get("primary_symbol") or str(r["security_id"]))
+                    if r["security_id"] is not None
+                    else "*" + (f"({len(r['members'])})" if r.get("members") else "")
+                ),
+                str(r["first_date"]),
+                str(r["last_date"]),
+                r["class"],
+                r["kind"],
+                r["expect"] or r["codes"] or "",
+                "y" if r["verified"] else "",
+                r["source"],
+            ]
+            for r in rows
+        ],
+        right=(0,),
+    )
+
+
+@dq_label.command("add")
+@click.option("--security-id", type=int, help="The security the label is about.")
+@click.option("--cohort", is_flag=True, help="A cross-sectional label: give --members.")
+@click.option("--members", help="With --cohort: the security ids, comma-separated.")
+@click.option("--first", "first_date", required=True, metavar="YYYY-MM-DD")
+@click.option("--last", "last_date", metavar="YYYY-MM-DD", help="Default: --first.")
+@click.option(
+    "--class",
+    "label_class",
+    type=click.Choice(["data_error", "context_gap", "market_fact"]),
+    help="Implied by a known --kind.",
+)
+@click.option(
+    "--kind",
+    required=True,
+    help="feed_gap, odd_lots_only, distribution, dividend_units, wrong_instrument, "
+    "bad_print, cohort_fact -- or any other word, with --class.",
+)
+@click.option("--expect", help="A fault's expected codes, e.g. DQ202|DQ205.")
+@click.option("--codes", help="A market fact's code prefix, e.g. DQ705.")
+@click.option(
+    "--verified", is_flag=True, help="Checked on the bars or an outside source."
+)
+@click.option(
+    "--applies-until",
+    metavar="YYYY-MM-DDTHH:MM",
+    help="When a repair changed what dorq reads (default: always applies).",
+)
+@click.option("--source", default=None, help="Free text  [default: cli]")
+@click.option(
+    "--note", "-m", required=True, help="What was checked, and how. Required."
+)
+@click.option("--by", "decided_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show the label; write nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def dq_label_add(
+    ctx,
+    security_id,
+    cohort,
+    members,
+    first_date,
+    last_date,
+    label_class,
+    kind,
+    expect,
+    codes,
+    verified,
+    applies_until,
+    source,
+    note,
+    decided_by,
+    dry_run,
+    yes,
+):
+    """State one label.
+
+    \b
+      fafnir dq label add --security-id 601133 --first 2026-10-05 --last 2026-10-13 \\
+          --kind feed_gap --verified -m "trades 10-05..10-13 on stockanalysis; FMP none"
+      fafnir dq label add --cohort --members 3560,5286,19195 --first 2026-10-06 \\
+          --kind cohort_fact --verified -m "each checked: three real 2:1-sized moves"
+
+    A known kind fills in its class and codes: a `distribution` is two labels (a
+    false DQ705 and a false price report).
+    """
+    from fafnir.db import repository as repo
+    from fafnir.dq import labels as lb
+
+    if cohort == (security_id is not None):
+        raise click.ClickException("Give --security-id, or --cohort with --members.")
+    member_ids = _label_members(members)
+    if member_ids and not cohort:
+        raise click.ClickException("--members goes with --cohort.")
+    try:
+        until = _parse_stamp(applies_until)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--applies-until") from exc
+    decided_by = decided_by or _os_user()
+    try:
+        rows = lb.stated_rows(
+            security_id=security_id,
+            members=member_ids,
+            first=_parse_date(first_date),
+            last=_parse_date(last_date),
+            label_class=label_class,
+            kind=kind,
+            expect=expect,
+            codes=codes,
+            note=note,
+            verified=verified,
+            source=source or "cli",
+            decided_by=decided_by,
+            applies_until=until,
+        )
+    except lb.LabelRefused as exc:
+        raise click.ClickException(str(exc)) from exc
+    with Database(ctx.obj["config"].dsn) as database:
+        ids = [security_id] if security_id is not None else (member_ids or [])
+        _refuse_unknown_securities(database, ids)
+        _echo_labels([{**r, "label_id": "-", "primary_symbol": None} for r in rows])
+        if dry_run:
+            click.echo(f"Dry run: {_plural(len(rows), 'label')} would be added.")
+            return
+        if not yes:
+            click.confirm(f"Add {_plural(len(rows), 'label')}?", abort=True)
+        new_ids = repo.insert_dq_labels(database, rows)
+        database.commit()
+    click.echo(
+        f"Added {_plural(len(new_ids), 'label')} ({', '.join(map(str, new_ids))}) "
+        f"as {decided_by}."
+    )
+
+
+def _parse_stamp(value: Optional[str]) -> Optional[dt.datetime]:
+    """An ISO timestamp; one without a zone is UTC, as the warehouse's are."""
+    if not value:
+        return None
+    stamp = dt.datetime.fromisoformat(value)
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.timezone.utc)
+
+
+def _refuse_unknown_securities(database, security_ids) -> None:
+    if not security_ids:
+        return
+    known = {
+        int(r["security_id"])
+        for r in database.fetchall(
+            "SELECT security_id FROM core.security WHERE security_id = ANY(%s)",
+            (list(security_ids),),
+        )
+    }
+    unknown = sorted(set(security_ids) - known)
+    if unknown:
+        raise click.ClickException(
+            f"Unknown security id(s): {', '.join(map(str, unknown[:10]))}"
+            + (f" and {len(unknown) - 10} more" if len(unknown) > 10 else "")
+            + "."
+        )
+
+
+@dq_label.command("list")
+@click.option("--security-id", type=int, help="Labels on this security (or naming it).")
+@click.option("--since", metavar="YYYY-MM-DD", help="Labels reaching this date.")
+@click.option("--kind", help="One kind.")
+@click.option("--all", "include_revoked", is_flag=True, help="Include revoked ones.")
+@click.option("--json", "as_json", is_flag=True, help="Every field, as JSON.")
+@click.pass_context
+def dq_label_list(ctx, security_id, since, kind, include_revoked, as_json):
+    """List stated labels."""
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = repo.list_dq_labels(
+            database,
+            security_id=security_id,
+            since=_parse_date(since),
+            kind=kind,
+            include_revoked=include_revoked,
+        )
+    if as_json:
+        _dq_json(rows)
+        return
+    if not rows:
+        click.echo("No labels.")
+        return
+    _echo_labels(rows)
+
+
+@dq_label.command("revoke")
+@click.argument("label_ids", nargs=-1, type=int, required=True, metavar="ID...")
+@click.option("--note", "-m", required=True, help="Why the label no longer stands.")
+@click.option("--by", "revoked_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would be revoked.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def dq_label_revoke(ctx, label_ids, note, revoked_by, dry_run, yes):
+    """Take stated labels back, keeping their record."""
+    from fafnir.db import repository as repo
+
+    revoked_by = revoked_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = repo.list_dq_labels(database, label_ids=label_ids)
+        if rows:
+            _echo_labels(rows)
+        missing = sorted(set(label_ids) - {int(r["label_id"]) for r in rows})
+        for i in missing:
+            click.echo(f"  {i}: no such active label.", err=True)
+        if not rows:
+            click.echo("Nothing to revoke.")
+            return
+        if dry_run:
+            click.echo(f"Dry run: {_plural(len(rows), 'label')} would be revoked.")
+            return
+        if not yes:
+            click.confirm(f"Revoke {_plural(len(rows), 'label')}?", abort=True)
+        done = repo.revoke_dq_labels(
+            database, [r["label_id"] for r in rows], note=note, revoked_by=revoked_by
+        )
+        database.commit()
+    click.echo(f"Revoked {_plural(len(done), 'label')} as {revoked_by}.")
+
+
+@dq_label.command("import")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, allow_dash=True))
+@click.option(
+    "--verified",
+    is_flag=True,
+    help="Mark every label verified, unless its line says verified: false.",
+)
+@click.option(
+    "--source",
+    default=None,
+    help="For lines with no source  [default: the file's name]",
+)
+@click.option("--by", "decided_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Count by class and kind; write nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def dq_label_import(ctx, path, verified, source, decided_by, dry_run, yes):
+    """Load labels from a dorq labels file (JSON Lines).
+
+    \b
+      fafnir dq label import hand-20261015.jsonl --verified --dry-run
+
+    Every line needs a series (a security id, or * with members), first (or date)
+    and class. A series that is not a security, a malformed line, or a line without
+    a note refuses the whole file, naming the line.
+    """
+    import sys
+    from pathlib import Path
+
+    from fafnir.db import repository as repo
+    from fafnir.dq import labels as lb
+
+    decided_by = decided_by or _os_user()
+    name = "stdin" if path == "-" else Path(path).name
+    try:
+        if path == "-":
+            parsed = lb.read_label_file(sys.stdin, name)
+        else:
+            with open(path, encoding="utf-8") as fh:
+                parsed = lb.read_label_file(fh, name)
+        rows = []
+        for p in parsed:
+            if not p["note"].strip():
+                raise lb.LabelRefused(
+                    f"{name} line {p['line']}: no note -- a label says what was checked"
+                )
+            until = p["applies_until"]
+            rows.append(
+                {
+                    "security_id": None if p["series"] == "*" else int(p["series"]),
+                    "members": p["members"],
+                    "first_date": p["first"],
+                    "last_date": p["last"],
+                    "class": p["class"],
+                    "kind": p["kind"],
+                    "expect": p["expect"] if p["class"] != "market_fact" else "",
+                    "codes": p["codes"] if p["class"] == "market_fact" else "",
+                    "note": p["note"],
+                    "verified": verified if p["verified"] is None else p["verified"],
+                    "source": p["source"] or source or name,
+                    "decided_by": decided_by,
+                    "applies_until": _parse_stamp(until),
+                }
+            )
+    except (lb.LabelRefused, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    counts: dict = {}
+    for r in rows:
+        counts[(r["class"], r["kind"])] = counts.get((r["class"], r["kind"]), 0) + 1
+    with Database(ctx.obj["config"].dsn) as database:
+        ids = {r["security_id"] for r in rows if r["security_id"] is not None}
+        ids |= {m for r in rows for m in (r["members"] or ())}
+        _refuse_unknown_securities(database, sorted(ids))
+        _echo_table(
+            ["CLASS", "KIND", "N"],
+            [[c, k, str(n)] for (c, k), n in sorted(counts.items())],
+            right=(2,),
+        )
+        click.echo(
+            f"{_plural(len(rows), 'label')} on {len(ids)} "
+            f"{'security' if len(ids) == 1 else 'securities'}, "
+            f"{sum(1 for r in rows if r['verified'])} verified."
+        )
+        if dry_run:
+            click.echo("Dry run: nothing written.")
+            return
+        if not rows:
+            return
+        if not yes:
+            click.confirm(f"Import {_plural(len(rows), 'label')}?", abort=True)
+        new_ids = repo.insert_dq_labels(database, rows)
+        database.commit()
+    click.echo(f"Imported {_plural(len(new_ids), 'label')} as {decided_by}.")
 
 
 # ---------------------------------------------------------------------------
@@ -3653,6 +5281,128 @@ def _echo_dq_detail(rows, totals, filt, *, limit, offset, hints=True) -> None:
         )
 
 
+def _judgement_options(func):
+    """How a closure was judged, and the label it states (migration 0028).
+
+    Shared by `dq accept` and `dq resolve`: a judgement and its label are made in
+    the same command, so neither is written without the other's context.
+    """
+    for option in reversed(
+        [
+            click.option(
+                "--per-flag",
+                is_flag=True,
+                help="Each flag's own evidence was looked at (recorded; exported as "
+                "verified).",
+            ),
+            click.option(
+                "--by-rule",
+                is_flag=True,
+                help="Closed as one of a class, by a rule (exported as unverified).",
+            ),
+            click.option(
+                "--label",
+                "label_class",
+                type=click.Choice(["market_fact", "data_error", "context_gap"]),
+                help="Also state a label per closed flag, on its security and date.",
+            ),
+            click.option(
+                "--kind", "label_kind", help="With --label: the label's kind."
+            ),
+            click.option(
+                "--expect", "label_expect", help="With --label: a fault's codes."
+            ),
+            click.option(
+                "--codes", "label_codes", help="With --label: a market fact's codes."
+            ),
+        ]
+    ):
+        func = option(func)
+    return func
+
+
+def _judgement_basis(per_flag: bool, by_rule: bool) -> Optional[str]:
+    if per_flag and by_rule:
+        raise click.ClickException("--per-flag and --by-rule: one or the other.")
+    return "per_flag" if per_flag else "by_rule" if by_rule else None
+
+
+def _check_label_options(label_class, label_kind, label_expect, label_codes) -> None:
+    """Refuse a --label that could not be written, before anything is closed."""
+    from fafnir.dq import labels as lb
+
+    if not label_class:
+        if label_kind or label_expect or label_codes:
+            raise click.ClickException("--kind / --expect / --codes go with --label.")
+        return
+    try:
+        lb.stated_rows(
+            security_id=0,
+            members=None,
+            first=dt.date.today(),
+            last=None,
+            label_class=label_class,
+            kind=label_kind or "check",
+            expect=label_expect,
+            codes=label_codes,
+            note="check",
+            verified=False,
+            source="check",
+            decided_by="check",
+        )
+    except lb.LabelRefused as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _state_flag_labels(
+    database,
+    closed_ids,
+    *,
+    label_class,
+    label_kind,
+    label_expect,
+    label_codes,
+    note,
+    basis,
+    decided_by,
+    accepted,
+) -> tuple[list[int], list[int]]:
+    """Write the labels `--label` asks for, for the flags just closed. Returns
+    ``(label_ids, skipped_flag_ids)``; the caller commits, then reports."""
+    from fafnir.db import repository as repo
+    from fafnir.dq import labels as lb
+
+    flags = repo.flags_for_labels(database, closed_ids)
+    try:
+        rows, skipped = lb.flag_label_rows(
+            flags,
+            label_class=label_class,
+            kind=label_kind,
+            expect=label_expect,
+            codes=label_codes,
+            note=note or "",
+            verified=basis == "per_flag",
+            decided_by=decided_by,
+            accepted=accepted,
+        )
+    except lb.LabelRefused as exc:
+        raise click.ClickException(str(exc)) from exc
+    return repo.insert_dq_labels(database, rows), skipped
+
+
+def _echo_stated(label_class, stated) -> None:
+    if not label_class:
+        return
+    ids, skipped = stated
+    click.echo(f"Stated {_plural(len(ids), 'label')} ({label_class}).")
+    if skipped:
+        click.echo(
+            f"  {_plural(len(skipped), 'flag')} could not be placed (no date, or a "
+            f"cohort with no members): {', '.join(map(str, skipped[:10]))}",
+            err=True,
+        )
+
+
 @dq.command("accept")
 @click.argument("flag_ids", nargs=-1, type=int, metavar="[ID]...")
 @_dq_filter_options
@@ -3667,6 +5417,7 @@ def _echo_dq_detail(rows, totals, filt, *, limit, offset, hints=True) -> None:
     "accepted_by",
     help="Who is accepting them  [default: the OS user running the command]",
 )
+@_judgement_options
 @click.option(
     "--dry-run", is_flag=True, help="Show what would be accepted and change nothing."
 )
@@ -3684,6 +5435,12 @@ def dq_accept(
     trade_dates,
     note,
     accepted_by,
+    per_flag,
+    by_rule,
+    label_class,
+    label_kind,
+    label_expect,
+    label_codes,
     dry_run,
     yes,
 ):
@@ -3716,9 +5473,17 @@ def dq_accept(
     Accepting is never automatic and no sweep may do it. `--note` is required, and
     `dq reopen` takes it back. Accepted flags stay visible under
     `dq list --state accepted`.
+
+    \b
+    --per-flag / --by-rule record how it was judged, and --label states what was
+    true as a label (`fafnir dq label`), keyed to each flag's security and date:
+      fafnir dq accept 893223 --per-flag --label data_error --kind feed_gap \\
+          -m "trades 10-05..10-13 on stockanalysis; FMP has no bar"
     """
     from fafnir.db import repository as repo
 
+    basis = _judgement_basis(per_flag, by_rule)
+    _check_label_options(label_class, label_kind, label_expect, label_codes)
     narrowed = bool(
         checks or severities or symbol or since or until or trade_dates or security_ids
     )
@@ -3758,8 +5523,9 @@ def dq_accept(
             preview = repo.list_dq_flags(database, filt, limit=20)
             _echo_dq_detail(preview, totals, filt, limit=20, offset=0, hints=False)
             click.echo(
-                f"Dry run: {_plural(matched, 'flag')} would be accepted. "
-                "Nothing changed."
+                f"Dry run: {_plural(matched, 'flag')} would be accepted"
+                + (f", each with a {label_class} label" if label_class else "")
+                + ". Nothing changed."
             )
             return
         if not matched:
@@ -3773,12 +5539,32 @@ def dq_accept(
             )
 
         accepted = repo.accept_dq_flags(
-            database, filt, note=note, accepted_by=accepted_by
+            database,
+            filt,
+            note=note,
+            accepted_by=accepted_by,
+            judgement_basis=basis,
         )
+        # One transaction: the judgement and its label stand or fall together.
+        stated = ([], [])
+        if label_class:
+            stated = _state_flag_labels(
+                database,
+                accepted,
+                label_class=label_class,
+                label_kind=label_kind,
+                label_expect=label_expect,
+                label_codes=label_codes,
+                note=note,
+                basis=basis,
+                decided_by=accepted_by,
+                accepted=True,
+            )
         database.commit()
 
     click.echo(f"Accepted {_plural(len(accepted), 'DQ flag')} as {accepted_by}.")
     click.echo(f'Note: "{note}"')
+    _echo_stated(label_class, stated)
     click.echo("`fafnir dq list --state accepted` lists them; `dq reopen` undoes it.")
 
 
@@ -3796,6 +5582,7 @@ def dq_accept(
     "resolved_by",
     help="Who is closing them  [default: the OS user running the command]",
 )
+@_judgement_options
 @click.option(
     "--dry-run", is_flag=True, help="Show what would be closed and change nothing."
 )
@@ -3815,6 +5602,12 @@ def dq_resolve(
     trade_dates,
     note,
     resolved_by,
+    per_flag,
+    by_rule,
+    label_class,
+    label_kind,
+    label_expect,
+    label_codes,
     dry_run,
     yes,
 ):
@@ -3832,9 +5625,18 @@ def dq_resolve(
 
     Resolving records a judgement, it does not fix the data. If the condition is
     still there the next `fafnir dq run` flags it again.
+
+    --per-flag / --by-rule record how it was judged; --label states a label per
+    closed flag (see `fafnir dq accept`).
     """
     from fafnir.db import repository as repo
 
+    basis = _judgement_basis(per_flag, by_rule)
+    _check_label_options(label_class, label_kind, label_expect, label_codes)
+    if label_class and not (note and note.strip()):
+        raise click.ClickException(
+            "--label needs --note: a label says what was checked."
+        )
     narrowed = bool(
         checks or severities or symbol or since or until or trade_dates or security_ids
     )
@@ -3874,8 +5676,9 @@ def dq_resolve(
             preview = repo.list_dq_flags(database, filt, limit=20)
             _echo_dq_detail(preview, totals, filt, limit=20, offset=0, hints=False)
             click.echo(
-                f"Dry run: {_plural(matched, 'flag')} would be closed. "
-                "Nothing changed."
+                f"Dry run: {_plural(matched, 'flag')} would be closed"
+                + (f", each with a {label_class} label" if label_class else "")
+                + ". Nothing changed."
             )
             return
 
@@ -3896,8 +5699,26 @@ def dq_resolve(
             )
 
         closed = repo.resolve_dq_flags(
-            database, filt, note=note, resolved_by=resolved_by
+            database,
+            filt,
+            note=note,
+            resolved_by=resolved_by,
+            judgement_basis=basis,
         )
+        stated = ([], [])
+        if label_class:
+            stated = _state_flag_labels(
+                database,
+                closed,
+                label_class=label_class,
+                label_kind=label_kind,
+                label_expect=label_expect,
+                label_codes=label_codes,
+                note=note,
+                basis=basis,
+                decided_by=resolved_by,
+                accepted=False,
+            )
         # Durable before a word of it is printed. The connection otherwise commits
         # only when this block exits cleanly, after the summary below -- so a
         # reader that stops early (`| head -2`) broke the pipe on the third line
@@ -3907,6 +5728,7 @@ def dq_resolve(
         click.echo(f"Resolved {_plural(len(closed), 'flag')} as {resolved_by}.")
         if note:
             click.echo(f'Note: "{note}"')
+        _echo_stated(label_class, stated)
         _warn_unclosed(database, flag_ids, closed=set(closed))
         remaining = repo.dq_flag_totals(database, repo.DqFilter())
         click.echo(f"Open DQ flags remaining: {remaining.get('flags') or 0}")
@@ -3981,16 +5803,38 @@ def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
     `price_*` and the NEVER_AUTO_RESOLVE checks are excluded and cannot be named:
     a quarantine describes a bar that was never stored, so there is nothing to
     re-evaluate, and a measurement's value is the record itself.
+
+    `dorq_*` flags are rechecked by re-running dorq over the full history of the
+    securities that carry them (dorq is deterministic), closing each flag it no
+    longer emits. Without --check, they are included whenever any are open.
     """
     from fafnir.db import repository as repo
+    from fafnir.dq import dorq as dorq_engine
     from fafnir.dq import recheck as rc
 
     if resolved_by is None:
         resolved_by = _os_user()
+    named = list(checks)
+    sql_checks = [c for c in named if not c.startswith(dorq_engine.DORQ_PREFIX)]
+    dorq_checks = [c for c in named if c.startswith(dorq_engine.DORQ_PREFIX)]
+    cfg = ctx.obj["config"]
     try:
         results = None
-        with Database(ctx.obj["config"].dsn) as database:
-            results = rc.recheck(database, checks=list(checks) or None)
+        with Database(cfg.dsn) as database:
+            results = []
+            if sql_checks or not named:
+                results += rc.recheck(database, checks=sql_checks or None)
+            if dorq_checks or (not named and rc.open_dorq_checks(database)):
+                try:
+                    results += rc.recheck_dorq(
+                        database,
+                        dorq_engine.settings_from(cfg),
+                        checks=dorq_checks or None,
+                    )
+                except dorq_engine.DorqError as exc:
+                    if dorq_checks:
+                        raise click.ClickException(str(exc)) from exc
+                    click.echo(f"  dorq_*: skipped -- {exc}", err=True)
 
             total = sum(r.stale for r in results)
             width = max(len(r.check_name) for r in results)
@@ -4049,7 +5893,9 @@ def dq_reopen(ctx, flag_ids):
     from fafnir.db import repository as repo
 
     with Database(ctx.obj["config"].dsn) as database:
-        reopened, conflicted = repo.reopen_dq_flags(database, flag_ids)
+        reopened, conflicted = repo.reopen_dq_flags(
+            database, flag_ids, reopened_by=_os_user()
+        )
         # Durable before it is reported -- see dq_resolve.
         database.commit()
         missing = [
@@ -4074,6 +5920,32 @@ def dq_reopen(ctx, flag_ids):
             for flag_id in missing:
                 reason = "already open" if flag_id in found else "no such flag"
                 click.echo(f"  {flag_id}: {reason}.", err=True)
+
+
+def _dorq_status(cfg) -> Optional[str]:
+    """The `status` line for dorq, or None on a host that does not use it.
+
+    Shown when the engine includes dorq or a binary sits at the configured path:
+    a host running the SQL checks alone, with no dorq installed, should not be
+    told about a component it never asked for.
+    """
+    import os
+
+    from fafnir.dq import dorq as dorq_engine
+
+    try:
+        engine = cfg.dq_engine
+    except ValueError as exc:
+        return f"dorq       : {exc}"
+    settings = dorq_engine.settings_from(cfg)
+    if engine == "sql" and not os.path.exists(settings.path):
+        return None
+    mode = f"engine {engine}" + (", shadow" if cfg.dorq_shadow else "")
+    try:
+        version = dorq_engine.dorq_version(settings)
+    except dorq_engine.DorqError:
+        return f"dorq       : NOT FOUND at {settings.path} ({mode})"
+    return f"dorq       : {version} ({mode})"
 
 
 @main.command("status")
@@ -4113,6 +5985,9 @@ def status(ctx):
     if open_flags:
         dq_line += "  -- fafnir dq list"
     click.echo(dq_line)
+    dorq_line = _dorq_status(ctx.obj["config"])
+    if dorq_line:
+        click.echo(dorq_line)
     if pending_renames:
         click.echo(f"Renames    : {pending_renames} unapplied (need review)")
         for row in rename_sample:

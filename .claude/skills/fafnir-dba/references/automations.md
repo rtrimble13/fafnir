@@ -2,14 +2,26 @@
 
 ## What runs, and why the order is load-bearing
 
-One scheduled job: `scripts/daily_update.sh`, after US settlement. Incremental and
-idempotent — a missed day is caught up on the next run.
+Two scheduled jobs, one after the other, after US settlement. Both are
+incremental and idempotent — a missed day is caught up on the next run.
 
-```
-ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
-  → ingest delisted → ingest prices → ingest actions → adjust --changed
-  → db refresh-marts → dq run → status
-```
+1. **The daily load**, `fafnir-daily` (`scripts/daily_update.sh`, `daily.log`):
+
+   ```
+   ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
+     → ingest delisted → ingest prices → ingest actions → adjust --changed
+     → db refresh-marts → status
+   ```
+
+2. **DQ**, `fafnir-dq` (`scripts/run_dq_checks.sh`, `dq.log`): `dq run` (the SQL
+   checks, then dorq per `[dq] engine`), then `dq list`. Its timer is 23:00 ET, but
+   the unit is `After=fafnir-daily.service`, so it starts when the load ends. A
+   DQ failure (dorq exiting) does not mark the load failed.
+
+   It is the night's **only** `dq run`. Up to v1.4.0 the daily ran one too, so
+   there were two `dq-shadow` runs a night and the second, narrower one replaced
+   the first's shadow file. One `dq-shadow` row in `ops.ingestion_run` a night,
+   started after `fafnir-daily` ended, is the healthy shape.
 
 The first four are **universe maintenance** and their order is not arbitrary:
 
@@ -61,6 +73,29 @@ fafnir status
 `monitor.sh` sections: `status dq disk timers journal backups runs bandwidth slow`.
 It changes nothing, by design — it exists because these checks are spread across
 the fafnir CLI, the OS and psql, which makes them easy to half-do at 8am.
+
+### Vendor gaps in the nightly report
+
+`scripts/collect_facts.sh` runs `fafnir source vendor-gaps` (reads only) into a
+`VENDOR GAPS` section, and the morning email lists them with what is new since the
+previous night. Each is a live security FMP stopped serving: in the nightly
+universe, its last bar two or more sessions behind, its newest payload an
+open-ended request that returned nothing newer, 95% of its venue ahead of it, and
+not on the delisted feed. They are for an FMP ticket (an operator task), not for the
+queue: their `stale` flags stay open (`references/dq-playbooks.md`, `stale`).
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source vendor-gaps --json
+```
+
+### What the price load holds back
+
+From v1.5.0 the nightly price load never overwrites a stored bar by more than
+`[prices] restatement_max_ratio` (1.25, close) or `restatement_max_volume_ratio` (3):
+it keeps the bar and flags `price_restatement_conflict`. A night with many is the
+vendor restating, not the load failing; `ops.ingestion_run` stays `success`. An
+explicit `ingest prices --from` re-fetch overwrites, records `params.restated` and
+`restated_count`, and resolves the conflicts on its dates.
 
 ## The two budgets
 
@@ -147,7 +182,9 @@ answered with its own ~5-year window. Always pass an explicit `--from` when
 re-backfilling a truncated history, whichever version is deployed.
 
 **Propose, never run** — `scripts/reset_data.sh`, `fafnir db rollback`,
-`fafnir db migrate`, edits to `~/.fafnirrc`, timer and unit changes,
+`fafnir db migrate`, `fafnir security descope` (ADR 0012: irreversible, and its dry
+run too, since the settings deny the command by prefix), edits to `~/.fafnirrc`,
+timer and unit changes,
 `systemctl restart/stop`, anything touching `/etc`.
 
 **Never** — edit the deployed checkout at `/opt/fafnir` (rule 7: it is deployed,

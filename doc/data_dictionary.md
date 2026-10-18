@@ -33,9 +33,10 @@ on enrichment.
 | `currency` | TEXT | Default `USD`. |
 | `country` | TEXT | |
 | `cik` / `isin` / `cusip` | TEXT | External identifiers (nullable). Populated from the vendor profile, so a security never profiled carries none. A lookup key for `duk ph cik:51143` / `duk ls cusip:459200101`, matched on a normalised form (zero-padding, case and grouping ignored) and indexed as such by migration 0023. Not unique: one CIK covers every share class of an issuer. |
-| `is_actively_trading` | BOOLEAN | False for delisted/inactive. |
+| `is_actively_trading` | BOOLEAN | False for delisted/inactive. The vendor's view, copied by the nightly load: it is not evidence that a listed security stopped trading (FMP called ET inactive the week it moved to TXSE), so the nightly universes also poll a listed row with a bar in the last 30 days (ADR 0014). |
 | `is_etf` / `is_fund` | BOOLEAN | |
 | `ipo_date` | DATE | |
+| `venue_override` / `venue_override_left` | TEXT | An operator-recorded venue (`fafnir security venue-transfer`, migration 0027), and the venue the security left. While set, the nightly upsert keeps `exchange_code` and `is_actively_trading` as they are, until the vendor reports a venue other than `venue_override_left`; then both clear. ADR 0014. |
 | `delisted_date` | DATE | NULL while listed; set (never deleted) on delist. |
 | `source` | TEXT | Origin feed (default `fmp`). `operator` for a security minted by `fafnir security split-history` to hold one issuer's history split off a reused ticker: delisted, carrying a closed `symbol_xref` period, and never fed by the vendor loaders (their universes filter `source <> 'operator'`, and a per-symbol pull that resolves to one is refused). |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. |
@@ -84,17 +85,21 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
 | `symbol_change_id` | BIGINT IDENTITY PK | |
 | `old_symbol` / `new_symbol` | TEXT NOT NULL | `CHECK (old_symbol <> new_symbol)`. |
 | `change_date` | DATE NOT NULL | Effective date; the xref period boundary. |
-| `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. |
+| `security_id` | BIGINT → core.security | The security the rename was applied to; NULL while unapplied. Also NULL once `fafnir security descope` has removed that security (ADR 0012): the row is kept, detached, so the sweep still knows the rename was recorded. |
 | `company_name` | TEXT | As reported with the rename. |
 | `status` | TEXT CHECK | `applied` / `conflict` / `ignored` / `dismissed` — see below. |
-| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. |
+| `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. A `conflict` refused because it would change the instrument carries that as `reason`. An applied rename records `old_company_name`, the security's name before the rename overwrote it: the security-master load declines a screener entry for the old ticker under that name (or the security's current name, or `company_name` above) as an echo instead of minting a copy of the company. `echo_names` lists further names it declines on that ticker: each one recorded by `security merge` from a re-minted echo it folded back in. |
 | `source` | TEXT | |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | |
 
 - `applied` — carried onto an existing `security_id` (terminal; never downgraded).
 - `conflict` — the new ticker already belongs to another **listed** security that
   carries history. Nothing was changed; retried on every sweep and raised as a
-  `symbol_change_conflict` DQ flag.
+  `symbol_change_conflict` DQ flag. Also the status, with `detail.reason`, of a
+  rename that would change what the instrument is: a share onto its own warrant,
+  right or unit ticker, or back (`ABCD -> ABCDU`, the vendor's pre-launch shuffle;
+  ADR 0012, `fafnir.instruments.rename_changes_instrument`). Such a rename is never
+  carried, so it waits for `fafnir security dismiss-rename`.
 - `ignored` — the old ticker belongs to a delisted issuer, so this is ticker
   *reuse*, not a rename.
 - `dismissed` (0018) — an operator judged the reported rename not to be a rename
@@ -102,6 +107,9 @@ FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
   `fafnir security dismiss-rename`, never by a loader, and the reasoning is kept in
   `detail`. It is **not** the way to close a rename that is real but blocked —
   that one is merged with `fafnir security merge-rename` and reaches `applied`.
+  `fafnir security descope` also sets it, on a `conflict` naming a security it
+  removes: the removal would otherwise leave the rename unresolvable, or let the
+  sweep carry it onto the security that remains.
 
 Renames of tickers fafnir does not track are counted but not stored — the feed is
 global across every venue.
@@ -353,9 +361,18 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 
 ### `ops.data_quality_flag` — quarantine/anomaly queue. **Grain:** `dq_flag_id`.
 `ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),
-`check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/...), `severity`
+`check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/`dorq_*`/...), `severity`
 (`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`,
-`resolved_by`, `resolution_note`.
+`resolved_by`, `resolution_note`, `accepted_at`/`accepted_by`/`accepted_note` (0024),
+`judgement_basis` (0028).
+
+`judgement_basis` says how a closure was judged: `per_flag` (`dq accept|resolve
+--per-flag`: this flag's own evidence was looked at), `by_rule` (`--by-rule`: closed as
+one of a class), or NULL (not said). Only a closed flag carries one, and `dq reopen`
+clears it with the rest of the resolution. 0028 marked `by_rule` the closures whose
+note says so ("without per-flag verification", "Classified by rule", "not individually
+verified": the 23,903 outlier acceptances of 2026-09-10/11). `dq export-labels` writes
+it as a label's `verified`.
 
 Read and worked with `fafnir dq list` / `fafnir dq resolve` (see
 [operations.md](operations.md#working-the-dq-queue)). Since migration 0017 a
@@ -388,8 +405,13 @@ stored, so it is written with `add_dq_flag_once` (one row per corrupted bar, not
 per nightly overlap) and `repository.count_price_quarantines` excludes it by name via
 `NON_QUARANTINE_PRICE_CHECKS`. Counting it would let a stored-but-corrupted bar spend
 the watermark budget of a *rejected* bar on the same date and release ingestion past
-one nobody had looked at. Anything added to that family later has to make the same
-choice explicitly.
+one nobody had looked at. `price_restatement_conflict` (v1.5.0) is the second such
+check: the nightly load kept the stored bar and the vendor's re-read disagrees with it
+beyond `[prices] restatement_max_ratio` / `restatement_max_volume_ratio`; it is
+written once per open `(symbol, date)` and listed in `NON_QUARANTINE_PRICE_CHECKS`.
+`price_split_scale_mismatch` is a real quarantine (a new bar at a split-adjusted scale
+was not stored) and repeats like the others. Anything added to that family later has
+to make the same choice explicitly.
 
 Since migration 0016 the schema holds the rule too — `ux_dq_flag_open_condition`,
 unique on `(check_name, security_id, record_key)` where `resolved_at IS NULL` and the
@@ -398,6 +420,20 @@ write path, because a constraint alone would turn a redundant flag (harmless noi
 into an exception that aborts whatever load raised it. 0016 also collapsed the
 duplicates a running warehouse had already accumulated, keeping the earliest row of
 each condition so `detected_at` still says when the problem was first seen.
+
+`dorq_*` flags are dorq's (doc/dorq.md): `detail` is dorq's whole report, with
+`p_error`, the hypotheses and evidence, the suggested repair and `dorq.version` /
+`dorq.config_hash`. The cross-sectional ones (`dorq_cohort_gap`, `dorq_cohort_move`)
+have a NULL `security_id`. They are written with the same open/accepted guards as
+the SQL checks, by a run recorded in `ops.ingestion_run` with `source = 'dorq'`. A
+cross-sectional row's `record_key` carries the cohort's split `ratio` beside its
+`trade_date` (v1.5.0; dorq 0.10 writes it itself): two cohorts on one date are two
+conditions.
+
+Other checks added in v1.5.0: `split_duplicate_suspect` (`fafnir adjust`: two splits
+of one ratio within ten sessions; keyed `{"ex_dates": [d1, d2]}`) and
+`tracked_symbol_delisted` (`ingest tracked`: a declared ticker whose identity is a
+delisted security; keyed `{"symbol": ...}`).
 
 ### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
 `last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
@@ -408,6 +444,7 @@ whole-endpoint (non per-symbol) mark.
 | `historical-price-eod/non-split-adjusted` | the security | bars are loaded through this date |
 | `corporate-actions` | the security | its full action history has been pulled, as of this date |
 | `corporate-actions-calendar` | `0` | the market-wide calendars have been read through this date |
+| `dq-run`, `dq-shadow` (source `dorq`) | `0` | dorq has judged bars through this as-of date, into the queue or the shadow file; the next nightly run reports from five sessions before it, and a re-run for the same date over the same span as that night's run |
 
 The `corporate-actions` row is a presence flag as much as a date: its *absence* is what
 puts a newly minted security on the full-history path, so it is stamped with the run
@@ -429,11 +466,35 @@ and `fafnir security split-history`; undone by `fafnir override revoke`
 | `operation` | TEXT CHECK | `delete`: the row was removed, and while active the loaders set aside a vendor row at this key. `add`: the operator wrote the row (`source = operator`). A bar is only ever added as a recorded transform of a vendor bar -- the table refuses a bar `add` without `detail.transform` -- and the price loader sets aside a vendor bar on the date of either operation. |
 | `detail` | JSONB | `delete`: the row as it stood. `add`: the values written. A re-date pair names the other half (`redated_to_override` / `redated_from_override`). A bar shift or rescale carries `transform`: `kind` (`shift` / `rescale`), its parameters (`days`, or `price_factor` and `volume_factor`), the other half (`to_override` / `from_override`, `to_date` / `from_date`), and `edit` -- the id of the edit's first override, shared by every override of one command. A key moved by `security split-history` carries `split` = `{source_security_id, destination_security_id, kind}`, where `kind` is `moved`, `duplicate` (the destination already held it identically), or `restored` (an earlier `prices delete`, now also materialised on the destination); `--undo` reads exactly these. |
 | `note` / `created_by` / `created_at` | TEXT / TEXT / TIMESTAMPTZ | The evidence and the owner. `note` may not be blank. |
+| `reason` | TEXT CHECK (0028) | Why: `data_error` (the row was wrong; the default, and every row before 0028), `out_of_scope` (the security does not belong -- its data was removed, not repaired), `cleanup` (bookkeeping). Set with `--reason` on every command above; changed after the fact with `fafnir override set-reason`, which appends `{from, to, note, by, at}` to `detail.reason_history`. Only `data_error` overrides are exported as labels. |
 | `revoked_at` / `revoked_by` / `revoked_note` | | Set by `override revoke`. Revoking a `delete` lifts the suppression only; revoking an `add` removes the operator's row. A bar shift or rescale is revoked whole: any of its overrides revokes every one of the `edit`, removes the operator bars and writes the vendor bars back from `detail.row`. A bar shift or rescale undone this way also puts back any corporate action a `--with-actions` shift re-dated. A key carrying a `split` marker is refused: revoking it alone would lift the suppression while the destination kept its copy, so a split is reversed whole by `security split-history --undo`. |
 
 At most one active override per `(security_id, target, action_type, key_date,
 operation)`: a `delete` and an `add` may share a key, which is how a wrong vendor row
 is replaced by a corrected one.
+
+### `ops.dq_label` — labels a person stated. **Grain:** `label_id`.
+What someone checked and found true about a stretch of one series, or a cohort, for
+measuring dorq (doc/dorq.md, "Labels"). Written by `fafnir dq label add|import` and
+`dq accept|resolve --label`; revoked by `dq label revoke` (and by `dq reopen`, for a
+label stated with that flag's closure). Merged into `dq export-labels`, where a row
+here wins over a derived label on the same security, overlapping dates and class.
+Changes no data and no flag (migration 0028). Active means `revoked_at IS NULL`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `label_id` | BIGINT IDENTITY PK | |
+| `security_id` | BIGINT | NULL for a cross-sectional label (dorq's series `*`). No FK, as `operator_override`. |
+| `members` | BIGINT[] | A cohort label's securities: it covers only the cross-sectional rows naming one of them. |
+| `first_date` / `last_date` | DATE | The span. |
+| `class` | TEXT CHECK | `data_error`, `context_gap` or `market_fact`. |
+| `kind` | TEXT | `feed_gap`, `odd_lots_only`, `distribution`, `dividend_units`, `wrong_instrument`, `bad_print`, `cohort_fact`, or free text. |
+| `expect` / `codes` | TEXT | A fault's expected codes (`DQ202\|DQ205`); a market fact's code prefix (default `DQ2`). |
+| `note`, `verified` | TEXT, BOOLEAN | What was checked; whether on the bars or an outside source. |
+| `source` | TEXT | Free text: `dq_flag:893223`, `hand-2026-10-15`, `cli`. |
+| `decided_by` / `decided_at` | TEXT / TIMESTAMPTZ | |
+| `applies_until` | TIMESTAMPTZ | When a repair changed what dorq reads; a shadow night that ran after it is not judged by the label. NULL: always applies. |
+| `revoked_at` / `revoked_by` / `revoked_note` | | |
 
 ---
 

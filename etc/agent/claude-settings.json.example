@@ -42,6 +42,7 @@
       "Bash(scripts/reset_data.sh:*)",
       "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db migrate:*)",
       "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db rollback:*)",
+      "Bash(sudo -u fafnir /opt/fafnir/.venv/bin/fafnir security descope:*)",
       "Bash(psql:*)",
       "Bash(pg_dump:*)",
       "Bash(pg_restore:*)",

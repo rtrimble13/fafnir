@@ -1,6 +1,6 @@
 # ADR 0008: Remote `duk` under per-person credentials, and a local stdio MCP server
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-02
 - Amended: 2026-09-02 — added [§4 The seam](#4-the-seam--mart-is-not-yet-complete-two-views-short).
   The identity model below makes every per-person and per-agent role a member of
@@ -8,7 +8,8 @@
   agent-visible world — but `duk.datasource.db` reads `core` for symbol resolution
   and raw prices, so as originally written the two most important MCP tools could
   not run. §4 names the two views that close it. Amended in place rather than
-  superseded because this ADR is still Proposed and nothing has been built on it.
+  superseded because this ADR was still Proposed then and nothing had been built
+  on it.
 - Depends on: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md)
 - Related: [install_hetzner.md §11](../install_hetzner.md), [extending.md](../extending.md),
   [duk.md](../duk.md),

@@ -35,6 +35,11 @@ bea_key = ""
 # Target universe for the security master.
 universe = "us-equity-etf"
 
+# Instrument kinds kept out of the universe (ADR 0012): never minted by
+# `fafnir ingest securities`, removed with `fafnir security descope`. Default is all
+# three; [] admits them again. Keep one ticker anyway with `fafnir track add`.
+# exclude_instruments = ["warrant", "right", "unit"]
+
 # Proactive FMP throttle (Professional plan ~300 req/min; stay just under).
 request_rate_per_min = 280
 
@@ -74,9 +79,38 @@ horizon_extra_years = 2
 log_level = "info"
 log_dir = "var/fafnir/log"
 
+# --- prices: the restatement guard (doc/ingestion.md) ------------------------
+[prices]
+# The nightly re-read of the last few sessions never overwrites a stored bar by more
+# than these ratios (either direction): it keeps the stored bar and flags
+# price_restatement_conflict. An explicit `ingest prices --from` re-fetch overwrites,
+# and prints what it restated.
+# restatement_max_ratio = 1.25
+# restatement_max_volume_ratio = 3
+
+# --- data quality: the dorq engine (doc/dorq.md, ADR 0013) -------------------
+[dq]
+# Which checks `fafnir dq run` runs: "sql" (default), "dorq" or "both".
+# engine = "both"
+# dorq_path = "/opt/dorq/bin/dorq"        # or FAFNIR_DORQ_PATH
+# dorq_config = "/etc/fafnir/dorq.toml"   # dorq's own settings; empty: its defaults
+# dorq's flags go to dorq_shadow_dir instead of the queue until the shadow period
+# meets the cutover criteria (doc/dorq.md#the-shadow-period).
+# dorq_shadow = true
+# The default, "var/dorq-shadow", is relative to the working directory. On a host,
+# make it absolute: the systemd units run from /opt/fafnir, the deployed checkout.
+# dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"
+# dorq_lookback_sessions = 260
+# dorq_threads = 0
+# A nightly run also judges the whole history of securities whose history before
+# its window is new (minted since the last run) or was rewritten by an operator
+# command. Above this many it skips that pass with a warning; use --full.
+# dorq_backfill_max = 500
+
 # --- duk (read CLI) settings -------------------------------------------------
-# duk reuses [api].fmp_key (live mode) and [database] (db mode).
-# default_source: "db" or "live". If unset, duk uses db when a DSN is configured.
+# duk reuses [api].fmp_key (-S fmp), [api].sharadar_key (-S sharadar) and
+# [database] (-S db). default_source: "db" (the default), "fmp" or "sharadar";
+# "live" is accepted as the older name for fmp.
 default_source = "db"
 default_output_dir = "var/duk"
 default_output_type = "csv"

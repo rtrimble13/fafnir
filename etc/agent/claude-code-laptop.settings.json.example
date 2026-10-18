@@ -1,0 +1,47 @@
+{
+  "//": [
+    "Claude Code settings for a session on a LAPTOP that reads the warehouse",
+    "with duk through the SSH tunnel. The whole setup, and what each choice",
+    "below was measured against, is doc/duk.md#from-claude-code-on-a-laptop.",
+    "",
+    "INSTALL AS ~/.claude/settings.json on the laptop, merged into what is",
+    "there. User-level, not a project's .claude/settings.json: the DSN names",
+    "you, and where an administrator makes the sandbox admin-required, Claude",
+    "Code ignores excludedCommands in a project's .claude/ files. Not this",
+    "repository's .claude/settings.json either -- every contributor inherits it.",
+    "",
+    "Replace rob and /home/rob with your role and home directory (/Users/rob",
+    "on macOS). The path is literal: settings do not expand ~ or $HOME.",
+    "",
+    "env.FAFNIR_DSN  Claude's duk runs as your AGENT role, rob_mcp, not as you:",
+    "                its queries are told apart from yours on the server, get",
+    "                the agent budget (20s statement timeout, 4 connections),",
+    "                and ALTER ROLE rob_mcp NOLOGIN stops them while you keep",
+    "                working. It wins over ~/.dukrc. Attribution, not",
+    "                enforcement: your OS account maps to both roles, and both",
+    "                read mart + ref only, read-only.",
+    "permissions     no prompt for each duk call.",
+    "sandbox         inert while the Bash sandbox is off, Claude Code's default.",
+    "                With it on, a sandboxed duk cannot open the tunnel's socket",
+    "                on Linux, so duk runs outside the sandbox. A call leaves it",
+    "                only when every command in it matches: one plain `duk ...`,",
+    "                no pipe, redirect, cd or &&. Save output with duk's own -o.",
+    "",
+    "No password and no key here: the SSH key, held by the tunnel service",
+    "outside Claude, is the only credential (ADR 0008)."
+  ],
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "FAFNIR_DSN": "host=/home/rob/.fafnir port=15432 dbname=fafnir user=rob_mcp application_name=duk-claude"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(duk *)"
+    ]
+  },
+  "sandbox": {
+    "excludedCommands": [
+      "duk *"
+    ]
+  }
+}

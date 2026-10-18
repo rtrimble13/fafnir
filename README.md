@@ -7,7 +7,10 @@ client.
 
 - **Runs on Linux** with PostgreSQL 16 (schema designed to adopt TimescaleDB later
   without a grain change).
-- **Primary source:** Financial Modeling Prep (FMP, Professional plan). Economic
+- **Sources:** Financial Modeling Prep (FMP) built the warehouse and still feeds it
+  nightly; **Sharadar** is being adopted as the system of record (identity, dead-issuer
+  history from 1998, corrections, fundamentals, then the nightly feed) under
+  [doc/plans/sharadar-adoption.md](doc/plans/sharadar-adoption.md). Economic
   sources (FRED, BLS, BEA) are fast-follows.
 - **Correct by construction:** money is exact `NUMERIC`; prices are ingested
   *unadjusted* (FMP's `historical-price-eod/non-split-adjusted`, so fafnir's own
@@ -77,11 +80,18 @@ fafnir ingest prices --symbols VFIAX             # no watermark yet -> full hist
 fafnir dq list                                   # open flags by check and severity
 fafnir dq list --detail --check gap --symbol AAPL
 fafnir dq resolve 12841 --note "exchange holiday, no bar expected"
+fafnir dq run --engine both                      # + dorq, in shadow (doc/dorq.md)
+fafnir dq compare --labels-from-db               # dorq vs the SQL checks and labels
+fafnir dq label add --security-id 601133 --first 2026-10-05 --kind feed_gap \
+    --verified -m "trades on the issuer page; FMP has no bar"   # state a label
+fafnir source vendor-gaps                        # live names FMP stopped serving
 
-# 7. Read with duk (db mode)
-duk ph AAPL --adj -S db
-duk ph cik:51143 -S db                    # or name a security by CIK/ISIN/CUSIP
-duk ls --sector Technology -S db
+# 7. Read with duk (the warehouse is the default source)
+duk ph AAPL --adj
+duk ph cik:51143                          # or name a security by CIK/ISIN/CUSIP
+duk ls --sector Technology
+duk -S fmp ph AAPL                        # the same series straight from a vendor
+duk -S sharadar ph AAPL
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
 ```
 
@@ -97,17 +107,22 @@ stopped trading — then loads
 prices, actions and factors. A newly listed security has no watermark, so it gets
 its full available history on the same run.
 
-## `duk` — dual-mode data access
+## `duk` — one CLI, three sources
 
 `duk` keeps its full command surface (`ph`, `yc`, `ls`, `rc`, `ti`) and adds a
 global `--source/-S`:
 
-- `-S db` (default when a DSN is configured): reads the fafnir warehouse.
-- `-S live`: reads the FMP API directly (the original standalone behaviour).
+- `-S db` (**the default**): reads the fafnir warehouse. Without a DSN configured,
+  `duk` says so and names the vendor flags rather than silently reading a vendor.
+- `-S fmp`: reads the FMP API directly (`-S live` is the older spelling and still
+  works).
+- `-S sharadar`: reads Sharadar's price tables directly (`ph` only; needs
+  `SHARADAR_API_KEY`).
 
 Return and indicator commands (`rc`, `ti`) operate on input files and are
-source-agnostic. `yc` (yield curve) is live-only until the economic-series
-fast-follow lands.
+source-agnostic. `yc` (yield curve) reads FMP until the FRED treasury series land.
+Reading the same symbol from two sources is how a series is checked:
+`diff <(duk ph AAPL --close --csv) <(duk -S sharadar ph AAPL --close --csv)`.
 
 Anywhere `duk` takes a ticker it also takes a **CIK, ISIN or CUSIP**, prefixed so
 the intent is explicit:
@@ -133,11 +148,11 @@ than guessing. See **[doc/duk.md](doc/duk.md)**.
 | [install_hetzner.md](doc/install_hetzner.md) | Fresh install on a Hetzner Cloud server: provision → Postgres → fafnir → cron |
 | [backfill.md](doc/backfill.md) | Initial setup & historical backfill (bandwidth, chunking, resumability) |
 | [operations.md](doc/operations.md) | Daily upkeep runbook, cron, backfill, recovery |
-| [duk.md](doc/duk.md) | CLI usage (live vs db) |
+| [duk.md](doc/duk.md) | CLI usage: the warehouse (`db`) vs a vendor (`fmp`, `sharadar`) |
 | [agent.md](doc/agent.md) | Run an operations agent on the host: DQ triage, automations, data questions |
 | [extending.md](doc/extending.md) | Add a source (FRED/BLS/BEA), a table, or an MCP tool |
 | [adr/](doc/adr/) | Architecture decision records |
-| [plans/sharadar-adoption.md](doc/plans/sharadar-adoption.md) | Living plan for adopting Sharadar (COA 2-M): sprints, status by issue, decision log |
+| [plans/sharadar-adoption.md](doc/plans/sharadar-adoption.md) | Living plan for adopting Sharadar: phases, working agreements, decision log |
 
 ## Development
 

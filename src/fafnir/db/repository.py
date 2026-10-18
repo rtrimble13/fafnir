@@ -8,13 +8,14 @@ them into the DataFrame contracts the CLI expects.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, NamedTuple, Optional, Sequence
 
 import psycopg
 
 from fafnir.db.connection import Database
+from fafnir.instruments import rename_changes_instrument
 
 # ---------------------------------------------------------------------------
 # Reference dimensions
@@ -22,17 +23,34 @@ from fafnir.db.connection import Database
 
 
 def ensure_exchange(
-    db: Database, code: str, name: str | None = None, country: str | None = None
+    db: Database,
+    code: str,
+    name: str | None = None,
+    country: str | None = None,
+    timezone: str | None = None,
 ) -> None:
+    """Create the venue's row if it is missing, and fill in any attribute it lacks.
+
+    Never overwrites a value already held: the seed's names are the record, and a
+    row created bare on first use (before its attributes were known) is completed
+    the next time a caller knows them.
+    """
     if not code:
         return
     db.execute(
         """
-        INSERT INTO ref.exchange (exchange_code, exchange_name, country)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (exchange_code) DO NOTHING
+        INSERT INTO ref.exchange (exchange_code, exchange_name, country, timezone)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (exchange_code) DO UPDATE SET
+            exchange_name = COALESCE(ref.exchange.exchange_name, EXCLUDED.exchange_name),
+            country       = COALESCE(ref.exchange.country, EXCLUDED.country),
+            timezone      = COALESCE(ref.exchange.timezone, EXCLUDED.timezone),
+            updated_at    = now()
+        WHERE (ref.exchange.exchange_name IS NULL AND EXCLUDED.exchange_name IS NOT NULL)
+           OR (ref.exchange.country IS NULL AND EXCLUDED.country IS NOT NULL)
+           OR (ref.exchange.timezone IS NULL AND EXCLUDED.timezone IS NOT NULL)
         """,
-        (code, name, country),
+        (code, name, country, timezone),
     )
 
 
@@ -64,6 +82,15 @@ def get_or_create_industry(db: Database, name: Optional[str]) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Security master
 # ---------------------------------------------------------------------------
+
+
+# Whether an operator's venue (0027) holds against what the vendor sent: it is set,
+# and the vendor names no venue, or still the one the security left (ADR 0014).
+_VENUE_OVERRIDE_HELD = (
+    "(core.security.venue_override IS NOT NULL"
+    " AND (EXCLUDED.exchange_code IS NULL"
+    " OR EXCLUDED.exchange_code = core.security.venue_override_left))"
+)
 
 
 def upsert_security(
@@ -120,9 +147,20 @@ def upsert_security(
             asset_type          = EXCLUDED.asset_type,
             -- COALESCE so a caller without the field (enrich_profiles on a profile
             -- that omits it) cannot blank the venue; otherwise this is what records
-            -- a transfer onto the existing security.
-            exchange_code       = COALESCE(EXCLUDED.exchange_code,
-                                           core.security.exchange_code),
+            -- a transfer onto the existing security. An operator's venue
+            -- (`security venue-transfer`, 0027) holds while the vendor still names
+            -- the venue the security left, or none: FMP had no code for TXSE and
+            -- went on reporting ET on the NYSE, inactive, after it moved. Once the
+            -- vendor names any other venue it has caught up, and the override clears.
+            exchange_code       = CASE WHEN {held}
+                                       THEN core.security.venue_override
+                                       ELSE COALESCE(EXCLUDED.exchange_code,
+                                                     core.security.exchange_code)
+                                  END,
+            venue_override      = CASE WHEN {held}
+                                       THEN core.security.venue_override END,
+            venue_override_left = CASE WHEN {held}
+                                       THEN core.security.venue_override_left END,
             -- COALESCE for the same reason as the venue above, and it is the
             -- same class of bug: a caller that does not carry a classification
             -- must not blank the one already stored. Without this the nightly
@@ -138,7 +176,12 @@ def upsert_security(
                                            core.security.industry_id),
             currency            = EXCLUDED.currency,
             country             = EXCLUDED.country,
-            is_actively_trading = EXCLUDED.is_actively_trading,
+            -- Held with the operator's venue: the vendor calling a moved security
+            -- inactive on the venue it left is the same stale view.
+            is_actively_trading = CASE WHEN {held}
+                                       THEN core.security.is_actively_trading
+                                       ELSE EXCLUDED.is_actively_trading
+                                  END,
             is_etf              = EXCLUDED.is_etf,
             is_fund             = EXCLUDED.is_fund,
             -- COALESCE: a caller without screener fields (enrich_profiles, the
@@ -153,7 +196,7 @@ def upsert_security(
             cusip               = COALESCE(EXCLUDED.cusip, core.security.cusip),
             updated_at          = now()
         RETURNING security_id
-        """,
+        """.format(held=_VENUE_OVERRIDE_HELD),
         (
             primary_symbol,
             company_name,
@@ -273,6 +316,40 @@ def mark_delisted(db: Database, *, security_id: int, delisted_date: date) -> boo
         (delisted_date, security_id),
     )
     return True
+
+
+def sessions_apart(db: Database, a: date, b: date, exchange_code: str = "NYSE") -> int:
+    """Open sessions after the earlier date, up to and including the later one.
+
+    Counted on the venue's calendar (every US venue keeps the same holidays), or on
+    weekdays where the calendar does not span the dates: outside its span, no row
+    means unknown, not closed.
+    """
+    lo, hi = sorted((a, b))
+    if lo == hi:
+        return 0
+    start = lo + timedelta(days=1)
+    found = open_sessions(db, exchange_code, start, hi)
+    if found is None or start < found[1] or hi > found[2]:
+        days = (lo + timedelta(days=n) for n in range(1, (hi - lo).days + 1))
+        return sum(1 for d in days if d.weekday() < 5)
+    return len(found[0])
+
+
+def median_volume_before(
+    db: Database, security_id: int, on_or_before: date, bars: int = 20
+) -> Optional[float]:
+    """The median volume of the security's last ``bars`` stored bars up to a date."""
+    val = db.fetchval(
+        """
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY volume)
+          FROM (SELECT volume FROM core.daily_price
+                 WHERE security_id = %s AND trade_date <= %s AND volume IS NOT NULL
+                 ORDER BY trade_date DESC LIMIT %s) recent
+        """,
+        (security_id, on_or_before, bars),
+    )
+    return float(val) if val is not None else None
 
 
 def security_bar_span(
@@ -407,11 +484,22 @@ class SymbolChangeOutcome(NamedTuple):
     ``folded_security_id`` is set when a duplicate security minted under the new
     ticker (by a security-master load that ran before the rename was known) was
     absorbed into the surviving one.
+
+    ``old_company_name`` is the security's name as it stood before this rename
+    overwrote it. It is the only record of the name the vendor keeps serving the
+    *old* ticker under, which is what lets a later security-master load recognise
+    that entry as an echo rather than a listing (:func:`renamed_away_securities`).
+
+    ``reason`` says why a ``conflict`` was refused when it is not the usual one (the
+    new ticker held by another listed security with history): a rename that would
+    change what the instrument is (:func:`rename_instrument_refusal`).
     """
 
     status: str
     security_id: Optional[int]
     folded_security_id: Optional[int] = None
+    old_company_name: Optional[str] = None
+    reason: Optional[str] = None
 
 
 def active_security_for_symbol(
@@ -729,6 +817,129 @@ def reopen_symbol_period(db: Database, *, security_id: int, symbol: str) -> bool
 
 
 # ---------------------------------------------------------------------------
+# Reversing a delisting that was a venue transfer (ADR 0014)
+# ---------------------------------------------------------------------------
+
+
+def open_ticker_holders(db: Database, symbol: str) -> list[int]:
+    """Every security holding an open ``core.symbol_xref`` period on the ticker."""
+    return [
+        int(r["security_id"])
+        for r in db.fetchall(
+            """
+            SELECT DISTINCT security_id FROM core.symbol_xref
+             WHERE symbol = %s AND valid_to IS NULL ORDER BY 1
+            """,
+            (symbol,),
+        )
+    ]
+
+
+def periods_closed_by_delisting(
+    db: Database, *, security_id: int, delisted_date: date
+) -> list[dict]:
+    """The ticker periods :func:`mark_delisted` closed on this security.
+
+    It closes every open period at ``GREATEST(valid_from, delisted_date)``, so a
+    period ending there is one of them -- provided it is still the ticker's latest
+    period, which a later issuer re-listing the ticker would have superseded.
+    """
+    return db.fetchall(
+        """
+        SELECT x.symbol, x.valid_from, x.valid_to
+          FROM core.symbol_xref x
+         WHERE x.security_id = %s
+           AND x.valid_to = GREATEST(x.valid_from, %s::date)
+           AND x.valid_from = (SELECT max(y.valid_from) FROM core.symbol_xref y
+                                WHERE y.symbol = x.symbol)
+         ORDER BY x.symbol, x.valid_from
+        """,
+        (security_id, delisted_date),
+    )
+
+
+class VenueTransferRefused(Exception):
+    """The security changed between a venue transfer's plan and its write."""
+
+
+def reverse_delisting(
+    db: Database,
+    *,
+    security_id: int,
+    delisted_date: date,
+    periods: Sequence[dict],
+) -> None:
+    """Undo :func:`mark_delisted` for a security that never stopped trading.
+
+    The security is listed again, and the ticker periods the delisting closed
+    (``periods``, from :func:`periods_closed_by_delisting`) are re-opened rather
+    than a new one inserted: the ticker never changed hands. Raises
+    :class:`VenueTransferRefused` when the row or a period is not as planned; the
+    caller's transaction then rolls back whatever was written.
+    """
+    row = db.fetchone(
+        """
+        UPDATE core.security
+           SET is_actively_trading = TRUE, delisted_date = NULL, updated_at = now()
+         WHERE security_id = %s AND delisted_date = %s
+        RETURNING security_id
+        """,
+        (security_id, delisted_date),
+    )
+    if row is None:
+        raise VenueTransferRefused(
+            f"security {security_id} is no longer delisted on {delisted_date}"
+        )
+    for p in periods:
+        reopened = db.execute(
+            """
+            UPDATE core.symbol_xref x SET valid_to = NULL
+             WHERE x.security_id = %s AND x.symbol = %s AND x.valid_from = %s
+               AND x.valid_to = %s
+               AND NOT EXISTS (SELECT 1 FROM core.symbol_xref o
+                                WHERE o.symbol = x.symbol AND o.valid_to IS NULL)
+            """,
+            (security_id, p["symbol"], p["valid_from"], p["valid_to"]),
+        )
+        if reopened != 1:
+            raise VenueTransferRefused(
+                f"the {p['symbol']} period from {p['valid_from']} could not be "
+                "re-opened: another security holds the ticker open"
+            )
+
+
+def record_venue_override(
+    db: Database, *, security_id: int, venue: str, left: Optional[str]
+) -> None:
+    """Record the operator's venue, which the nightly upsert keeps (0027).
+
+    The security is also marked actively trading: the vendor calling a moved
+    security inactive on the venue it left is the stale view the override holds out
+    against. ``left`` is that venue; once the vendor reports any other, the upsert
+    clears the override. The venue's ``ref.exchange`` row must exist.
+    """
+    db.execute(
+        """
+        UPDATE core.security
+           SET exchange_code = %s, venue_override = %s, venue_override_left = %s,
+               is_actively_trading = TRUE, updated_at = now()
+         WHERE security_id = %s
+        """,
+        (venue, venue, left, security_id),
+    )
+
+
+def clear_venue_override(db: Database, security_id: int) -> None:
+    db.execute(
+        """
+        UPDATE core.security SET venue_override = NULL, venue_override_left = NULL
+         WHERE security_id = %s AND venue_override IS NOT NULL
+        """,
+        (security_id,),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Merging two securities that are one company
 # ---------------------------------------------------------------------------
 #
@@ -792,6 +1003,11 @@ class MergePlan(NamedTuple):
     victim_actions: int
     colliding_actions: int
     victim_flags: int
+    victim_name: Optional[str] = None
+    # The applied renames, as (old, new), that moved the survivor off the ticker the
+    # victim holds: the victim is the vendor's lingering entry for that old ticker,
+    # re-minted. The merge records its name on each (:func:`record_rename_echo`).
+    echo_of: tuple[tuple[str, str], ...] = ()
 
     @property
     def blockers(self) -> list[str]:
@@ -825,7 +1041,7 @@ def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> Mer
         int(r["security_id"]): r
         for r in db.fetchall(
             """
-            SELECT security_id, primary_symbol, cusip, isin, cik
+            SELECT security_id, primary_symbol, company_name, cusip, isin, cik
               FROM core.security WHERE security_id = ANY(%s)
             """,
             ([survivor_id, victim_id],),
@@ -835,6 +1051,22 @@ def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> Mer
         if sid not in rows:
             raise ValueError(f"no such security: {sid}")
     survivor, victim = rows[survivor_id], rows[victim_id]
+
+    # A victim on a ticker the survivor was renamed away from is a rename echo that
+    # got minted. Found here rather than in the merge so --dry-run shows it.
+    echo_of: tuple[tuple[str, str], ...] = ()
+    if victim["primary_symbol"] != survivor["primary_symbol"]:
+        echo_of = tuple(
+            (r["old_symbol"], r["new_symbol"])
+            for r in db.fetchall(
+                """
+                SELECT old_symbol, new_symbol FROM core.symbol_change
+                 WHERE security_id = %s AND old_symbol = %s AND status = %s
+                 ORDER BY change_date, symbol_change_id
+                """,
+                (survivor_id, victim["primary_symbol"], CHANGE_APPLIED),
+            )
+        )
 
     # A NULL on either side is missing data, not evidence of difference: FMP leaves
     # cik empty on most ETFs, and refusing on that would block the very merges this
@@ -917,6 +1149,8 @@ def compare_securities(db: Database, *, survivor_id: int, victim_id: int) -> Mer
         victim_actions=int(counts["victim_actions"]),
         colliding_actions=int(counts["colliding_actions"]),
         victim_flags=int(counts["victim_flags"]),
+        victim_name=victim["company_name"],
+        echo_of=echo_of,
     )
 
 
@@ -1092,6 +1326,16 @@ def merge_security(
     # Attributes only; the next security-master load rewrites the survivor's.
     db.execute("DELETE FROM core.company_profile WHERE security_id = %s", (victim_id,))
     db.execute("DELETE FROM core.security WHERE security_id = %s", (victim_id,))
+    # Deleting a re-minted rename echo also deletes the only record of the name the
+    # vendor served it under, and the vendor keeps serving it: without this, the next
+    # security-master load mints the same row again.
+    if plan.echo_of and plan.victim_name:
+        record_rename_echo(
+            db,
+            security_id=survivor_id,
+            old_symbol=plan.victim_symbol,
+            company_name=plan.victim_name,
+        )
 
     return MergeReport(
         plan=plan,
@@ -1102,6 +1346,156 @@ def merge_security(
         flags_moved=flags_moved,
         flags_dropped=flags_dropped,
     )
+
+
+#: Everything keyed to a security_id, in the order a purge clears it. The real FKs
+#: on core.security are all NO ACTION, so every child goes before the parent; the
+#: ops tables carry the id without an FK and would otherwise be left pointing at
+#: nothing. core.symbol_change is detached rather than deleted -- see
+#: :func:`purge_securities`.
+SECURITY_FOOTPRINT_TABLES = (
+    "core.daily_price",
+    "core.adjustment_factor",
+    "core.corporate_action",
+    "core.company_profile",
+    "core.symbol_xref",
+    "core.symbol_change",
+    "ops.load_watermark",
+    "ops.operator_override",
+    "ops.data_quality_flag",
+    "core.security",
+)
+
+
+#: The key :func:`security_footprint` and :func:`purge_securities` count the
+#: unresolved renames under. Not a table of its own: those rows stay in
+#: core.symbol_change, closed as ``dismissed`` -- see :func:`purge_securities`.
+UNRESOLVED_RENAMES = "core.symbol_change (unresolved renames)"
+
+
+def unresolved_renames(db: Database, security_ids: list[int]) -> list[dict]:
+    """The ``conflict`` renames that name one of these securities, on either side.
+
+    A conflict row carries the id of the security being renamed, and names the
+    listed security already holding the target ticker only by that ticker, so both
+    are matched -- the ticker the way :func:`active_security_for_symbol` finds the
+    holder that blocks the rename. These are the renames a purge has to close: see
+    :func:`purge_securities`.
+    """
+    ids = list(security_ids)
+    return db.fetchall(
+        """
+        WITH held AS (
+            SELECT s.primary_symbol AS symbol FROM core.security s
+             WHERE s.security_id = ANY(%s) AND s.delisted_date IS NULL
+            UNION
+            SELECT x.symbol FROM core.symbol_xref x
+              JOIN core.security s ON s.security_id = x.security_id
+             WHERE x.security_id = ANY(%s) AND x.valid_to IS NULL
+               AND s.delisted_date IS NULL
+        )
+        SELECT c.old_symbol, c.new_symbol, c.change_date, c.security_id, c.source
+          FROM core.symbol_change c
+         WHERE c.status = %s
+           AND (c.security_id = ANY(%s)
+                OR c.new_symbol IN (SELECT symbol FROM held))
+         ORDER BY c.change_date, c.old_symbol, c.new_symbol
+        """,
+        (ids, ids, CHANGE_CONFLICT, ids),
+    )
+
+
+def security_footprint(db: Database, security_ids: list[int]) -> dict[str, int]:
+    """Rows each table holds for these securities -- what a purge would touch."""
+    ids = list(security_ids)
+    footprint = {UNRESOLVED_RENAMES: len(unresolved_renames(db, ids))}
+    for table in SECURITY_FOOTPRINT_TABLES:
+        footprint[table] = int(
+            db.fetchval(
+                f"SELECT count(*) FROM {table} WHERE security_id = ANY(%s)", (ids,)
+            )
+            or 0
+        )
+    return footprint
+
+
+def purge_securities(
+    db: Database,
+    security_ids: list[int],
+    *,
+    removed_by: str,
+    note: Optional[str] = None,
+) -> dict[str, int]:
+    """Delete these securities and every row keyed to them. Returns rows per table.
+
+    This is the one place fafnir deletes a security that holds history. It exists
+    for a scope decision (ADR 0012) -- instruments the warehouse no longer carries --
+    and NOT for a security that delisted: survivorship-free history is the point of
+    this warehouse, and a delisting is a fact about the security, not a reason to
+    forget it. The caller owns the transaction, so a failure part-way leaves
+    nothing half-removed.
+
+    ``core.symbol_change`` rows are detached (``security_id`` set NULL), not
+    deleted. The rename sweep reads that table to know a change was already
+    recorded; deleting the row would let the vendor's feed re-offer the rename
+    against a ticker nothing holds any more, every night.
+
+    Detaching is only safe for a rename that is already terminal. A ``conflict`` is
+    retried every night, and the purge changes its answer. With the old ticker
+    gone, a conflict whose two sides were both removed can never resolve, and stays
+    in the review queue for good. When only the target's holder was removed, the
+    holder that blocked the rename is gone: the sweep's instrument guard
+    (:func:`rename_instrument_refusal`) still refuses the vendor's pre-launch
+    shuffle (``ABCD -> ABCDU``), but a removal is no reason to carry any rename an
+    operator had not decided on. So every :func:`unresolved_renames` row is
+    dismissed first, as ``removed_by``, and its ``symbol_change_conflict`` flag
+    resolved.
+    """
+    ids = list(security_ids)
+    if not ids:
+        return {UNRESOLVED_RENAMES: 0, **{t: 0 for t in SECURITY_FOOTPRINT_TABLES}}
+    reason = "security descope: one side of this rename is out of scope (ADR 0012)"
+    if note:
+        reason = f"{reason}. {note}"
+    renames = unresolved_renames(db, ids)
+    for rename in renames:
+        dismiss_symbol_change(
+            db,
+            old_symbol=rename["old_symbol"],
+            new_symbol=rename["new_symbol"],
+            change_date=rename["change_date"],
+            note=reason,
+            dismissed_by=removed_by,
+            source=rename["source"],
+        )
+        flag_ids = open_dq_flag_ids_for_record(
+            db,
+            check_name="symbol_change_conflict",
+            record_key={
+                "old_symbol": rename["old_symbol"],
+                "new_symbol": rename["new_symbol"],
+            },
+        )
+        if flag_ids:
+            resolve_dq_flags(
+                db,
+                DqFilter(flag_ids=tuple(flag_ids)),
+                note=reason,
+                resolved_by=removed_by,
+            )
+    removed: dict[str, int] = {UNRESOLVED_RENAMES: len(renames)}
+    for table in SECURITY_FOOTPRINT_TABLES:
+        if table == "core.symbol_change":
+            removed[table] = db.execute(
+                "UPDATE core.symbol_change SET security_id = NULL"
+                " WHERE security_id = ANY(%s)",
+                (ids,),
+            )
+        else:
+            removed[table] = db.execute(
+                f"DELETE FROM {table} WHERE security_id = ANY(%s)", (ids,)
+            )
+    return removed
 
 
 def retarget_symbol(
@@ -1149,6 +1543,40 @@ def retarget_symbol(
     )
 
 
+def rename_instrument_refusal(
+    db: Database,
+    *,
+    security_id: int,
+    old_symbol: str,
+    new_symbol: str,
+    new_name: Optional[str] = None,
+) -> Optional[str]:
+    """Why renaming this security from OLD to NEW would change what it is, or None.
+
+    :func:`fafnir.instruments.rename_changes_instrument`, with the old ticker
+    classified under the name the security is held under and ``new_name`` (the
+    rename feed's, or the other row's) for the new one. Funds and ETFs are never
+    refused. Shared by the nightly sweep (:func:`apply_symbol_change`) and
+    `fafnir security merge-rename`, the two paths that move a held security to a
+    new ticker.
+    """
+    row = db.fetchone(
+        "SELECT company_name, is_etf, is_fund FROM core.security"
+        " WHERE security_id = %s",
+        (security_id,),
+    )
+    if row is None:
+        return None
+    return rename_changes_instrument(
+        old_symbol,
+        new_symbol,
+        old_name=row["company_name"],
+        new_name=new_name or row["company_name"],
+        is_etf=bool(row["is_etf"]),
+        is_fund=bool(row["is_fund"]),
+    )
+
+
 def apply_symbol_change(
     db: Database,
     *,
@@ -1171,11 +1599,16 @@ def apply_symbol_change(
       * ``applied``  -- the rename is now reflected in core.security and the xref.
       * ``conflict`` -- the new ticker already belongs to a different *listed*
         security that carries history. Merging two price histories is not a
-        decision a loader should make silently, so nothing is changed.
+        decision a loader should make silently, so nothing is changed. Also the
+        outcome, with a ``reason``, for a rename that would change what the
+        instrument is (:func:`rename_instrument_refusal`): checked before anything
+        else, so no fold, no free ticker and no later sweep ever carries it.
       * ``ignored``  -- the old ticker belongs to a delisted issuer. That is ticker
         reuse, not a rename, and 0009 already handles it by minting a new id.
       * ``unknown``  -- the old ticker is not in the security master at all, and
-        neither is the new one. Retryable: the security master may catch up.
+        neither is the new one. Retryable: the security master may catch up. Also
+        the outcome when only the new ticker is ours but the rename would change
+        the instrument: that end state is not this rename's, so it is not claimed.
     """
     old_symbol = (old_symbol or "").strip().upper()
     new_symbol = (new_symbol or "").strip().upper()
@@ -1198,10 +1631,28 @@ def apply_symbol_change(
         # is what lets a conflict leave the review queue: a non-terminal audit row
         # can only be closed by a later sweep reaching a terminal outcome.
         already = active_security_for_symbol(db, new_symbol, source)
-        if already is not None:
+        if already is not None and not rename_changes_instrument(
+            old_symbol, new_symbol, old_name=company_name
+        ):
             return SymbolChangeOutcome(CHANGE_APPLIED, already)
-        # Neither ticker is ours. Retryable: the security master may catch up.
+        # Neither ticker is ours, or only the new one is and it names a different
+        # instrument (the vendor's ABCDU -> ABCD for a unit never minted): recording
+        # that as applied would hand the unit's ticker to the share as a renamed-away
+        # name. Retryable: the security master may catch up.
         return SymbolChangeOutcome(CHANGE_UNKNOWN, None)
+
+    # Before the fold and before the free-ticker path: the shuffle this refuses
+    # (ABCD -> ABCDU) is usually unblocked, either because ADR 0012 never mints the
+    # unit or because the unit is still empty and would be folded away.
+    refusal = rename_instrument_refusal(
+        db,
+        security_id=security_id,
+        old_symbol=old_symbol,
+        new_symbol=new_symbol,
+        new_name=company_name,
+    )
+    if refusal:
+        return SymbolChangeOutcome(CHANGE_CONFLICT, security_id, reason=refusal)
 
     folded: Optional[int] = None
     holder = active_security_for_symbol(db, new_symbol, source)
@@ -1210,6 +1661,13 @@ def apply_symbol_change(
             return SymbolChangeOutcome(CHANGE_CONFLICT, security_id)
         folded = holder
 
+    # Read before retarget_symbol overwrites it: the vendor goes on serving the old
+    # ticker under this name for weeks, and once the rename lands nothing else in
+    # the warehouse remembers it.
+    old_company_name = db.fetchval(
+        "SELECT company_name FROM core.security WHERE security_id = %s",
+        (security_id,),
+    )
     retarget_symbol(
         db,
         security_id=security_id,
@@ -1219,7 +1677,7 @@ def apply_symbol_change(
         company_name=company_name,
         source=source,
     )
-    return SymbolChangeOutcome(CHANGE_APPLIED, security_id, folded)
+    return SymbolChangeOutcome(CHANGE_APPLIED, security_id, folded, old_company_name)
 
 
 def symbol_change_status(
@@ -1409,10 +1867,14 @@ def listed_securities(db: Database, source: str = "fmp") -> dict[str, dict]:
         row["primary_symbol"]: {
             "security_id": row["security_id"],
             "company_name": row["company_name"],
+            "is_actively_trading": row["is_actively_trading"],
+            "venue_override": row["venue_override"],
         }
         for row in db.fetchall(
             """
-            SELECT security_id, primary_symbol, company_name FROM core.security
+            SELECT security_id, primary_symbol, company_name, is_actively_trading,
+                   venue_override
+              FROM core.security
              WHERE delisted_date IS NULL AND source = %s
             """,
             (source,),
@@ -1451,6 +1913,96 @@ def delisted_securities(db: Database, source: str = "fmp") -> dict[str, list[dic
             }
         )
     return out
+
+
+def renamed_away_securities(db: Database, source: str = "fmp") -> dict[str, list[dict]]:
+    """Every applied rename, grouped by the ticker the security was renamed AWAY from.
+
+    The other way a ticker stops naming a listed security. A rename closes the old
+    ticker's xref period on a security that stays listed under the new one, so the
+    old ticker is in neither :func:`listed_securities` (no listed row carries it)
+    nor :func:`delisted_securities` (the row that carried it is not delisted). The
+    vendor nonetheless keeps serving the old ticker on the screener for weeks, and
+    without this every such entry mints a second security_id -- a copy of the
+    renamed company that the price step then backfills in full. In production,
+    thirty-one were minted this way between 2026-08-29 and 2026-10-01, and nineteen
+    of them took a vendor copy of the renamed company's price history.
+
+    Shaped like :func:`delisted_securities` so the security-master load can weigh
+    an incoming name against both with the same strict test. Each rename
+    contributes one entry per name the echo may carry: the name the security had
+    before the rename (recorded in ``detail.old_company_name`` by
+    :func:`apply_symbol_change`; absent on renames applied before it was), any
+    name an operator's merge of a re-minted echo recorded in ``detail.echo_names``
+    (:func:`record_rename_echo`), its name now, and the name the rename feed
+    reported. The vendor is inconsistent about which of these it leaves on the
+    stale entry, and every one of them names the same company, so matching any is
+    an echo.
+
+    A rename the security has since reversed (it holds the old ticker again) is
+    left out: that ticker is listed, and the caller never asks about it.
+    """
+    out: dict[str, list[dict]] = {}
+    for row in db.fetchall(
+        """
+        SELECT c.old_symbol, c.new_symbol, c.change_date, s.security_id,
+               s.company_name, c.company_name AS feed_name,
+               c.detail->>'old_company_name' AS old_company_name,
+               c.detail->'echo_names' AS echo_names
+          FROM core.symbol_change c
+          JOIN core.security s ON s.security_id = c.security_id
+         WHERE c.status = 'applied' AND c.source = %s
+           AND s.primary_symbol <> c.old_symbol
+         ORDER BY c.change_date, c.symbol_change_id
+        """,
+        (source,),
+    ):
+        echoes = row["echo_names"] if isinstance(row["echo_names"], list) else []
+        names = (
+            row["old_company_name"],
+            *echoes,
+            row["company_name"],
+            row["feed_name"],
+        )
+        for name in dict.fromkeys(n for n in names if n):
+            out.setdefault(row["old_symbol"], []).append(
+                {
+                    "security_id": row["security_id"],
+                    "company_name": name,
+                    "renamed_to": row["new_symbol"],
+                    "change_date": row["change_date"],
+                }
+            )
+    return out
+
+
+def record_rename_echo(
+    db: Database, *, security_id: int, old_symbol: str, company_name: str
+) -> int:
+    """Remember a name the vendor served a renamed-away ticker under. Returns rows.
+
+    Appends ``company_name`` to ``detail.echo_names`` on every applied rename that
+    moved ``security_id`` off ``old_symbol``, unless it is already there. Called by
+    :func:`merge_security` when the row it deletes is a re-minted echo, because
+    that row's name is exactly the vendor string the load failed to match: a
+    spelling variant ("Mattr Corp. (MAPP)"), or the pre-rename name of a rename
+    applied before ``old_company_name`` was recorded. Once it is on the rename,
+    :func:`renamed_away_securities` offers it and the next load declines the entry
+    instead of minting it again.
+    """
+    return db.execute(
+        """
+        UPDATE core.symbol_change
+           SET detail = jsonb_set(
+                   COALESCE(detail, '{}'::jsonb), '{echo_names}',
+                   COALESCE(detail->'echo_names', '[]'::jsonb)
+                       || jsonb_build_array(%s::text)),
+               updated_at = now()
+         WHERE security_id = %s AND old_symbol = %s AND status = %s
+           AND NOT COALESCE(detail->'echo_names', '[]'::jsonb) ? %s
+        """,
+        (company_name, security_id, old_symbol, CHANGE_APPLIED, company_name),
+    )
 
 
 def security_asset_type(db: Database, security_id: int) -> Optional[str]:
@@ -1631,6 +2183,23 @@ def listed_security_for_declaration(
     )
 
 
+def delisted_rows_for_symbol(
+    db: Database, symbol: str, source: str = "fmp"
+) -> list[dict]:
+    """The delisted securities that retired under ``symbol``, newest first, with what
+    identifies them: the name and CUSIP a declaration's profile is weighed against
+    before a row is minted over them (:func:`fafnir.ingest.tracked.load_tracked`)."""
+    return db.fetchall(
+        """
+        SELECT security_id, primary_symbol, company_name, cusip, delisted_date
+          FROM core.security
+         WHERE source = %s AND primary_symbol = %s AND delisted_date IS NOT NULL
+         ORDER BY delisted_date DESC, security_id DESC
+        """,
+        (source, symbol),
+    )
+
+
 def retarget_tracked_symbol(
     db: Database, *, old_symbol: str, new_symbol: str, source: str = "fmp"
 ) -> bool:
@@ -1738,6 +2307,69 @@ def upsert_daily_prices(
             loaded_at = now()
         """,
         params,
+    )
+
+
+def stored_bars_on(
+    db: Database, security_id: int, trade_dates: Sequence[date]
+) -> dict[date, dict]:
+    """The stored bars of one security on these dates, by date: what a load is about
+    to overwrite. One query, so the price loader can read before it writes."""
+    if not trade_dates:
+        return {}
+    return {
+        r["trade_date"]: r
+        for r in db.fetchall(
+            """
+            SELECT trade_date, open, high, low, close, volume, vwap, source,
+                   ingestion_run_id
+              FROM core.daily_price
+             WHERE security_id = %s AND trade_date = ANY(%s)
+            """,
+            (security_id, list(trade_dates)),
+        )
+    }
+
+
+def splits_near(db: Database, security_id: int, lo: date, hi: date) -> list[dict]:
+    """The splits on file for one security with an ex-date from ``lo`` to ``hi``."""
+    rows = db.fetchall(
+        """
+        SELECT ex_date, split_numerator, split_denominator
+          FROM core.corporate_action
+         WHERE security_id = %s AND action_type = 'split'
+           AND ex_date BETWEEN %s AND %s
+         ORDER BY ex_date
+        """,
+        (security_id, lo, hi),
+    )
+
+    def ratio(v) -> str:
+        return format(Decimal(v).normalize(), "f") if v is not None else "?"
+
+    return [
+        {
+            **r,
+            "split": f"{ratio(r['split_numerator'])}:{ratio(r['split_denominator'])}",
+        }
+        for r in rows
+    ]
+
+
+def open_restatement_conflicts(
+    db: Database, security_id: int, check_name: str, trade_dates: Sequence[date]
+) -> list[dict]:
+    """The open conflict flags (``record_key.date``) on these dates."""
+    if not trade_dates:
+        return []
+    return db.fetchall(
+        """
+        SELECT dq_flag_id, record_key->>'date' AS d
+          FROM ops.data_quality_flag
+         WHERE check_name = %s AND security_id = %s AND resolved_at IS NULL
+           AND record_key->>'date' = ANY(%s)
+        """,
+        (check_name, security_id, [d.isoformat() for d in trade_dates]),
     )
 
 
@@ -1886,6 +2518,14 @@ def delete_corporate_action(
 
 OPERATOR_SOURCE = "operator"
 
+#: Why an operator edit was made (ops.operator_override.reason, migration 0028).
+#: Only a ``data_error`` override is a statement that the vendor's row was wrong,
+#: and so only those become labels (fafnir.dq.labels). ``out_of_scope`` is data
+#: removed because the security does not belong (CELG-RI, 2026-10-14); ``cleanup``
+#: is bookkeeping, such as a merge's leftovers.
+OVERRIDE_REASONS = ("data_error", "out_of_scope", "cleanup")
+DEFAULT_OVERRIDE_REASON = "data_error"
+
 
 class OverrideRefused(RuntimeError):
     """An operator edit that would leave the rows, or their record, ambiguous."""
@@ -1915,16 +2555,18 @@ def _insert_override(
     detail: dict,
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> int:
     import json
 
+    _check_reason(reason)
     return int(
         db.fetchval(
             """
             INSERT INTO ops.operator_override
                 (security_id, target, action_type, key_date, operation, detail,
-                 note, created_by)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                 note, created_by, reason)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING override_id
             """,
             (
@@ -1936,9 +2578,17 @@ def _insert_override(
                 json.dumps(detail, default=str),
                 note,
                 created_by,
+                reason,
             ),
         )
     )
+
+
+def _check_reason(reason: str) -> None:
+    if reason not in OVERRIDE_REASONS:
+        raise OverrideRefused(
+            f"Unknown override reason {reason!r}: one of {', '.join(OVERRIDE_REASONS)}."
+        )
 
 
 def corporate_action_by_id(db: Database, corporate_action_id: int) -> Optional[dict]:
@@ -2077,6 +2727,7 @@ def delete_operator_action(
     note: str,
     created_by: str,
     detail_extra: Optional[dict] = None,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> int:
     """Remove a corporate action and suppress its key. Returns the override id.
 
@@ -2113,6 +2764,7 @@ def delete_operator_action(
         detail={"row": _jsonable(row), **(detail_extra or {})},
         note=note,
         created_by=created_by,
+        reason=reason,
     )
     db.execute(
         "DELETE FROM core.corporate_action WHERE corporate_action_id = %s",
@@ -2134,6 +2786,7 @@ def add_operator_action(
     note: str,
     created_by: str,
     detail_extra: Optional[dict] = None,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, int]:
     """Write a corporate action the feed has wrong or missing.
 
@@ -2213,6 +2866,7 @@ def add_operator_action(
         },
         note=note,
         created_by=created_by,
+        reason=reason,
     )
     return action_id, override_id
 
@@ -2224,6 +2878,7 @@ def redate_operator_action(
     new_ex_date: date,
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, int, int]:
     """Move a corporate action to another ex-date.
 
@@ -2265,6 +2920,7 @@ def redate_operator_action(
         note=note,
         created_by=created_by,
         detail_extra={"redated_to": new_ex_date.isoformat()},
+        reason=reason,
     )
     new_id, add_id = add_operator_action(
         db,
@@ -2281,6 +2937,7 @@ def redate_operator_action(
             "redated_from": row["ex_date"].isoformat(),
             "redated_from_override": delete_id,
         },
+        reason=reason,
     )
     db.execute(
         "UPDATE ops.operator_override SET detail = detail || %s WHERE override_id = %s",
@@ -2296,6 +2953,7 @@ def delete_operator_bars(
     trade_dates: Sequence[date],
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> list[int]:
     """Remove bars and suppress their dates. Returns one override id per bar removed.
 
@@ -2340,6 +2998,7 @@ def delete_operator_bars(
                 detail={"row": _jsonable(bar)},
                 note=note,
                 created_by=created_by,
+                reason=reason,
             )
         )
         db.execute(
@@ -2435,6 +3094,7 @@ def replace_operator_bars(
     changes: Sequence[tuple[dict, dict]],
     note: str,
     created_by: str,
+    reason: str = DEFAULT_OVERRIDE_REASON,
 ) -> tuple[int, list[int]]:
     """Replace vendor bars with transformed copies, recorded as one edit.
 
@@ -2455,6 +3115,7 @@ def replace_operator_bars(
 
     if kind not in PRICE_TRANSFORM_KINDS:
         raise OverrideRefused(f"Unknown bar transform {kind!r}.")
+    _check_reason(reason)
     if not changes:
         raise OverrideRefused("No bars to replace.")
     olds = [old for old, _ in changes]
@@ -2469,8 +3130,8 @@ def replace_operator_bars(
         """
         INSERT INTO ops.operator_override
             (security_id, target, action_type, key_date, operation, detail, note,
-             created_by)
-        SELECT %s, 'daily_price', NULL, x.key_date, 'delete', x.detail, %s, %s
+             created_by, reason)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'delete', x.detail, %s, %s, %s
           FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
          ORDER BY x.key_date
         RETURNING override_id, key_date
@@ -2479,6 +3140,7 @@ def replace_operator_bars(
             security_id,
             note,
             created_by,
+            reason,
             json.dumps(
                 [
                     {
@@ -2525,8 +3187,8 @@ def replace_operator_bars(
         """
         INSERT INTO ops.operator_override
             (security_id, target, action_type, key_date, operation, detail, note,
-             created_by)
-        SELECT %s, 'daily_price', NULL, x.key_date, 'add', x.detail, %s, %s
+             created_by, reason)
+        SELECT %s, 'daily_price', NULL, x.key_date, 'add', x.detail, %s, %s, %s
           FROM jsonb_to_recordset(%s::jsonb) AS x(key_date date, detail jsonb)
          ORDER BY x.key_date
         RETURNING override_id, key_date
@@ -2535,6 +3197,7 @@ def replace_operator_bars(
             security_id,
             note,
             created_by,
+            reason,
             json.dumps(
                 [
                     {
@@ -2806,7 +3469,7 @@ def list_operator_overrides(
         f"""
         SELECT o.override_id, o.security_id, s.primary_symbol, o.target,
                o.action_type, o.key_date, o.operation, o.detail, o.note,
-               o.created_by, o.created_at, o.revoked_at, o.revoked_by,
+               o.reason, o.created_by, o.created_at, o.revoked_at, o.revoked_by,
                o.revoked_note
           FROM ops.operator_override o
           LEFT JOIN core.security s USING (security_id)
@@ -2896,6 +3559,84 @@ def revoke_operator_override(
     return row
 
 
+def overrides_for_reason(
+    db: Database,
+    *,
+    override_ids: Sequence[int] = (),
+    security_id: Optional[int] = None,
+    target: Optional[str] = None,
+    created_on: Optional[date] = None,
+) -> list[dict]:
+    """The overrides `fafnir override set-reason` would touch, oldest first.
+
+    By id (any state, so a revoked edit can still be re-described), or by security,
+    narrowed by target and the day it was made (active ones only). A filter without
+    a security is refused by the caller: re-describing every override in the
+    warehouse is not a thing anyone means.
+    """
+    if override_ids:
+        return db.fetchall(
+            """
+            SELECT override_id, security_id, target, action_type, key_date,
+                   operation, reason, created_at, revoked_at
+              FROM ops.operator_override
+             WHERE override_id = ANY(%s)
+             ORDER BY override_id
+            """,
+            ([int(i) for i in override_ids],),
+        )
+    if security_id is None:
+        raise ValueError("select overrides by id, or by --security-id")
+    return db.fetchall(
+        """
+        SELECT override_id, security_id, target, action_type, key_date,
+               operation, reason, created_at, revoked_at
+          FROM ops.operator_override
+         WHERE security_id = %s AND revoked_at IS NULL
+           AND (%s::text IS NULL OR target = %s::text)
+           AND (%s::date IS NULL OR created_at::date = %s::date)
+         ORDER BY override_id
+        """,
+        (security_id, target, target, created_on, created_on),
+    )
+
+
+def set_override_reason(
+    db: Database,
+    *,
+    override_ids: Sequence[int],
+    reason: str,
+    note: str,
+    set_by: str,
+) -> list[int]:
+    """Re-describe why overrides were made. Returns the ids whose reason changed.
+
+    Only ``reason`` changes. The original note stays as it was, and the change is
+    appended to ``detail.reason_history`` -- from, to, the note, who and when -- so
+    the record still says what the operator thought at the time. A row already
+    carrying ``reason`` is left alone.
+    """
+    _check_reason(reason)
+    if not (note and note.strip()):
+        raise OverrideRefused("A reason change needs a note: it is the whole record.")
+    rows = db.fetchall(
+        """
+        UPDATE ops.operator_override
+           SET detail = jsonb_set(
+                   detail, '{reason_history}',
+                   COALESCE(detail->'reason_history', '[]'::jsonb)
+                   || jsonb_build_array(jsonb_build_object(
+                          'from', reason, 'to', %s::text, 'note', %s::text,
+                          'by', %s::text, 'at', now()))),
+               reason = %s
+         WHERE override_id = ANY(%s) AND reason <> %s
+        RETURNING override_id
+        """,
+        (reason, note, set_by, reason, [int(i) for i in override_ids], reason),
+    )
+    return sorted(int(r["override_id"]) for r in rows)
+
+
 # ---------------------------------------------------------------------------
 # Splitting a security's history: two issuers on one row
 # ---------------------------------------------------------------------------
@@ -2923,6 +3664,33 @@ def revoke_operator_override(
 # since given to another issuer, so a per-symbol pull, a reconciliation or a
 # "two rows share this ticker" check has nothing true to say about it.
 VENDOR_FED_SECURITY = "source <> 'operator'"
+
+# A security with a bar this recent stays in the nightly universe even when the
+# vendor calls it inactive (ADR 0014).
+RECENT_BAR_DAYS = 30
+
+
+def nightly_universe(alias: str = "") -> str:
+    """The securities a nightly load polls: listed, and either actively trading or
+    with a bar in the last :data:`RECENT_BAR_DAYS` days.
+
+    Not ``is_actively_trading`` alone. The nightly security-master load copies the
+    vendor's ``isActivelyTrading`` onto every listed row, and FMP called ET, SUN and
+    four others inactive on the NYSE the week they moved to TXSE, while quoting
+    their prices. Polling only active rows would have frozen them even had the
+    delisting sweep never fired. A security the vendor has served no bar for in
+    thirty days drops out, so a real wind-down stops being polled. The
+    ``trade_date`` bound also keeps the probe to the partitions it needs.
+
+    ``alias`` qualifies the columns, e.g. ``"s."``.
+    """
+    return (
+        f"{alias}delisted_date IS NULL AND ({alias}is_actively_trading"
+        " OR EXISTS (SELECT 1 FROM core.daily_price recent_bar"
+        f" WHERE recent_bar.security_id = {alias or 'core.security.'}security_id"
+        f" AND recent_bar.trade_date >= current_date - {RECENT_BAR_DAYS}))"
+    )
+
 
 # What counts as the date a DQ flag is about. The per-session checks key on
 # trade_date, stale on last_date, the price loader's quarantines on date.
@@ -4083,7 +4851,7 @@ def securities_without_actions_watermark(
     per-symbol full pull, and the absence of a watermark row is the whole test. Same
     rule the price loader already uses: no watermark, full history, once.
     """
-    where = "" if include_inactive else "AND s.is_actively_trading "
+    where = "" if include_inactive else f"AND {nightly_universe('s.')} "
     rows = db.fetchall(
         f"""
         SELECT s.security_id, s.primary_symbol
@@ -4115,7 +4883,7 @@ def universe_securities(db: Database, *, include_inactive: bool = False) -> list
     passes ``include_inactive`` because a universe of only the survivors is exactly
     what makes a history survivorship-biased.
     """
-    where = "AND is_actively_trading " if not include_inactive else ""
+    where = f"AND {nightly_universe()} " if not include_inactive else ""
     rows = db.fetchall(f"""
         SELECT security_id, primary_symbol FROM core.security
          WHERE {VENDOR_FED_SECURITY}
@@ -4139,7 +4907,7 @@ def securities_by_asset_type(
     """
     if not asset_types:
         return []
-    where = "" if include_inactive else "AND is_actively_trading "
+    where = "" if include_inactive else f"AND {nightly_universe()} "
     rows = db.fetchall(
         f"""
         SELECT security_id, primary_symbol FROM core.security
@@ -4168,7 +4936,7 @@ def actions_reconciliation_slice(
     """
     if buckets < 1:
         raise ValueError("buckets must be >= 1")
-    where = "" if include_inactive else "AND is_actively_trading "
+    where = "" if include_inactive else f"AND {nightly_universe()} "
     rows = db.fetchall(
         f"""
         SELECT security_id, primary_symbol FROM core.security
@@ -4311,6 +5079,25 @@ def add_dq_flag(
     )
 
 
+def condition_status(
+    db: Database, *, security_id: int, check_name: str, record_key: dict
+) -> Optional[str]:
+    """``accepted`` if this exact condition was ever accepted (``dq accept``),
+    ``open`` if it is flagged and unresolved, else None. Matched the way
+    :func:`add_dq_flag_once` matches a condition: on the whole record_key."""
+    import json
+
+    return db.fetchval(
+        """
+        SELECT CASE WHEN bool_or(accepted_at IS NOT NULL) THEN 'accepted'
+                    WHEN bool_or(resolved_at IS NULL) THEN 'open' END
+          FROM ops.data_quality_flag
+         WHERE security_id = %s AND check_name = %s AND record_key = %s::jsonb
+        """,
+        (security_id, check_name, json.dumps(record_key)),
+    )
+
+
 def add_dq_flag_once(
     db: Database,
     *,
@@ -4419,7 +5206,7 @@ def add_dq_flag_once(
 # budget that releases the watermark once it is spent. A stored-but-corrupted bar
 # buying down a rejected bar's budget would let ingestion walk past a bar nobody had
 # actually looked at.
-NON_QUARANTINE_PRICE_CHECKS = ("price_scale_collapse",)
+NON_QUARANTINE_PRICE_CHECKS = ("price_scale_collapse", "price_restatement_conflict")
 
 
 def count_price_quarantines(db: Database, security_id: int, date_iso: str) -> int:
@@ -4697,12 +5484,26 @@ def open_dq_flag_ids_for_record(
     return [int(r["dq_flag_id"]) for r in rows]
 
 
+#: How a closure was judged (ops.data_quality_flag.judgement_basis, migration 0028):
+#: ``per_flag`` -- the closer looked at this flag's own evidence; ``by_rule`` -- it
+#: was closed as one of a class. Exported as a label's ``verified``.
+JUDGEMENT_BASES = ("per_flag", "by_rule")
+
+
+def _check_basis(judgement_basis: Optional[str]) -> None:
+    if judgement_basis is not None and judgement_basis not in JUDGEMENT_BASES:
+        raise ValueError(
+            f"judgement_basis must be one of {', '.join(JUDGEMENT_BASES)} or None"
+        )
+
+
 def resolve_dq_flags(
     db: Database,
     filt: DqFilter,
     *,
     note: Optional[str] = None,
     resolved_by: Optional[str] = None,
+    judgement_basis: Optional[str] = None,
 ) -> list[int]:
     """Close the flags the filter selects, stamping who and why. Returns the ids
     actually closed.
@@ -4726,15 +5527,17 @@ def resolve_dq_flags(
             "resolve_dq_flags needs flag ids or at least one filter; refusing to "
             "close the whole queue"
         )
+    _check_basis(judgement_basis)
     where, params = _dq_where(filt._replace(state="open"))
     rows = db.fetchall(
         f"""
         UPDATE ops.data_quality_flag
-           SET resolved_at = now(), resolved_by = %s, resolution_note = %s
+           SET resolved_at = now(), resolved_by = %s, resolution_note = %s,
+               judgement_basis = %s
          {where}
         RETURNING dq_flag_id
         """,
-        [resolved_by, note, *params],
+        [resolved_by, note, judgement_basis, *params],
     )
     return [int(r["dq_flag_id"]) for r in rows]
 
@@ -4745,6 +5548,7 @@ def accept_dq_flags(
     *,
     note: str,
     accepted_by: str,
+    judgement_basis: Optional[str] = None,
 ) -> list[int]:
     """Accept conditions as real, permanent and unfixable. Returns the ids closed.
 
@@ -4769,22 +5573,24 @@ def accept_dq_flags(
             "accept_dq_flags needs a note: an accepted flag is a standing decision "
             "to stop looking, and the note is the whole record of why"
         )
+    _check_basis(judgement_basis)
     where, params = _dq_where(filt._replace(state="open"))
     rows = db.fetchall(
         f"""
         UPDATE ops.data_quality_flag
            SET resolved_at = now(), resolved_by = %s, resolution_note = %s,
-               accepted_at = now(), accepted_by = %s, accepted_note = %s
+               accepted_at = now(), accepted_by = %s, accepted_note = %s,
+               judgement_basis = %s
          {where}
         RETURNING dq_flag_id
         """,
-        [accepted_by, note, accepted_by, note, *params],
+        [accepted_by, note, accepted_by, note, judgement_basis, *params],
     )
     return [int(r["dq_flag_id"]) for r in rows]
 
 
 def reopen_dq_flags(
-    db: Database, flag_ids: Sequence[int]
+    db: Database, flag_ids: Sequence[int], *, reopened_by: str = "unknown"
 ) -> tuple[list[int], list[int]]:
     """Undo a resolution: back to open, provenance cleared. Returns
     ``(reopened, conflicted)``.
@@ -4812,7 +5618,7 @@ def reopen_dq_flags(
                     """
                     UPDATE ops.data_quality_flag
                        SET resolved_at = NULL, resolved_by = NULL,
-                           resolution_note = NULL,
+                           resolution_note = NULL, judgement_basis = NULL,
                            -- Acceptance goes with it. A row that is open again is
                            -- one nobody has decided about, and leaving accepted_at
                            -- set would keep the checks skipping the condition while
@@ -4829,7 +5635,186 @@ def reopen_dq_flags(
             continue
         if row is not None:
             reopened.append(int(row["dq_flag_id"]))
+    # A label stated with the closure (`dq accept|resolve --label`) was that
+    # decision, and goes with it.
+    revoke_flag_labels(
+        db, reopened, note="flag reopened (dq reopen)", revoked_by=reopened_by
+    )
     return reopened, conflicted
+
+
+# ---------------------------------------------------------------------------
+# Stated labels (ops.dq_label, migration 0028)
+# ---------------------------------------------------------------------------
+#
+# What a person said was true about a stretch of a series, for measuring dorq.
+# fafnir.dq.labels merges these with the labels it derives from the repairs and
+# judgements; this is only the storage.
+
+LABEL_CLASSES = ("data_error", "context_gap", "market_fact")
+
+_LABEL_COLUMNS = (
+    "security_id",
+    "members",
+    "first_date",
+    "last_date",
+    "class",
+    "kind",
+    "expect",
+    "codes",
+    "note",
+    "verified",
+    "source",
+    "decided_by",
+    "decided_at",
+    "applies_until",
+)
+
+
+def insert_dq_labels(db: Database, rows: Sequence[dict]) -> list[int]:
+    """Write stated labels; return their ids in order.
+
+    Each row carries the columns of ops.dq_label. ``decided_at`` defaults to now;
+    ``members`` and ``applies_until`` to NULL.
+    """
+    import json
+
+    if not rows:
+        return []
+    payload = [
+        {
+            **{c: r.get(c) for c in _LABEL_COLUMNS},
+            "first_date": _iso_date(r["first_date"]),
+            "last_date": _iso_date(r.get("last_date") or r["first_date"]),
+            "members": (
+                sorted({int(m) for m in r["members"]}) if r.get("members") else None
+            ),
+            "verified": bool(r.get("verified")),
+            "n": n,
+        }
+        for n, r in enumerate(rows)
+    ]
+    out = db.fetchall(
+        """
+        INSERT INTO ops.dq_label
+            (security_id, members, first_date, last_date, class, kind, expect,
+             codes, note, verified, source, decided_by, decided_at, applies_until)
+        SELECT x.security_id, x.members, x.first_date, x.last_date, x.class, x.kind,
+               NULLIF(x.expect, ''), NULLIF(x.codes, ''), x.note, x.verified,
+               x.source, x.decided_by, COALESCE(x.decided_at, now()), x.applies_until
+          FROM jsonb_to_recordset(%s::jsonb) AS x(
+                 security_id bigint, members bigint[], first_date date,
+                 last_date date, class text, kind text, expect text, codes text,
+                 note text, verified boolean, source text, decided_by text,
+                 decided_at timestamptz, applies_until timestamptz, n bigint)
+         ORDER BY x.n
+        RETURNING label_id
+        """,
+        (json.dumps(payload, default=str),),
+    )
+    return [int(r["label_id"]) for r in out]
+
+
+def _iso_date(value) -> str:
+    return value.isoformat() if isinstance(value, date) else str(value)[:10]
+
+
+def list_dq_labels(
+    db: Database,
+    *,
+    security_id: Optional[int] = None,
+    since: Optional[date] = None,
+    kind: Optional[str] = None,
+    include_revoked: bool = False,
+    label_ids: Sequence[int] = (),
+) -> list[dict]:
+    """Stated labels, by security then date. ``since`` keeps the labels whose span
+    reaches it."""
+    clauses, params = ["TRUE"], []
+    if security_id is not None:
+        clauses.append("(l.security_id = %s OR %s = ANY(l.members))")
+        params += [security_id, security_id]
+    if since is not None:
+        clauses.append("l.last_date >= %s")
+        params.append(since)
+    if kind:
+        clauses.append("l.kind = %s")
+        params.append(kind)
+    if label_ids:
+        clauses.append("l.label_id = ANY(%s)")
+        params.append([int(i) for i in label_ids])
+    if not include_revoked:
+        clauses.append("l.revoked_at IS NULL")
+    return db.fetchall(
+        f"""
+        SELECT l.label_id, l.security_id, s.primary_symbol, l.members, l.first_date,
+               l.last_date, l.class, l.kind, l.expect, l.codes, l.note, l.verified,
+               l.source, l.decided_by, l.decided_at, l.applies_until, l.revoked_at,
+               l.revoked_by, l.revoked_note
+          FROM ops.dq_label l
+          LEFT JOIN core.security s ON s.security_id = l.security_id
+         WHERE {' AND '.join(clauses)}
+         ORDER BY l.security_id NULLS FIRST, l.first_date, l.label_id
+        """,
+        params,
+    )
+
+
+def revoke_dq_labels(
+    db: Database, label_ids: Sequence[int], *, note: str, revoked_by: str
+) -> list[int]:
+    """Take stated labels back, keeping their record. Returns the ids revoked."""
+    if not (note and note.strip()):
+        raise ValueError("revoking a label needs a note")
+    rows = db.fetchall(
+        """
+        UPDATE ops.dq_label
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE label_id = ANY(%s) AND revoked_at IS NULL
+        RETURNING label_id
+        """,
+        (revoked_by, note, [int(i) for i in label_ids]),
+    )
+    return sorted(int(r["label_id"]) for r in rows)
+
+
+def revoke_flag_labels(
+    db: Database, flag_ids: Sequence[int], *, note: str, revoked_by: str
+) -> list[int]:
+    """Revoke the labels stated with these flags' closures (source dq_flag:<id>)."""
+    if not flag_ids:
+        return []
+    rows = db.fetchall(
+        """
+        UPDATE ops.dq_label
+           SET revoked_at = now(), revoked_by = %s, revoked_note = %s
+         WHERE source = ANY(%s) AND revoked_at IS NULL
+        RETURNING label_id
+        """,
+        (revoked_by, note, [f"dq_flag:{int(i)}" for i in flag_ids]),
+    )
+    return sorted(int(r["label_id"]) for r in rows)
+
+
+def flags_for_labels(db: Database, flag_ids: Sequence[int]) -> list[dict]:
+    """What a label stated with a flag's closure needs: its security, the date it
+    is about (and a dorq report's end date), its check and dorq code."""
+    if not flag_ids:
+        return []
+    return db.fetchall(
+        f"""
+        SELECT f.dq_flag_id, f.security_id, f.check_name,
+               {_FLAG_DATE_SQL} AS d,
+               CASE WHEN f.detail->>'end_date' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                    THEN (f.detail->>'end_date')::date END AS end_date,
+               f.detail->>'code' AS code,
+               f.detail->'detail'->>'members' AS members
+          FROM ops.data_quality_flag f
+         WHERE f.dq_flag_id = ANY(%s)
+         ORDER BY f.dq_flag_id
+        """,
+        ([int(i) for i in flag_ids],),
+    )
 
 
 # ---------------------------------------------------------------------------

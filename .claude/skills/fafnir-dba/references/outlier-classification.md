@@ -11,6 +11,16 @@ named reason.
 session nearly made came from stopping at the first test that seemed to explain a
 flag.
 
+**With dorq running** (shadow or cut over), most of this sort is already done.
+dorq's report on the same bar names the class — `dorq_bad_print` is §2f,
+`dorq_unreported_split` §2d, `dorq_split_misdated` §2c, `dorq_history_segment`
+§2h, `dorq_scale_shift` and `dorq_date_shift` §2i — and its `detail.hypotheses`
+and `evidence` carry the numbers the queries below compute. Start from dorq's
+reading: find its report for the flag's security and date in the shadow file or
+the queue, check its evidence against the bars, and use the sections below to
+confirm the class and choose the repair. At cutover (DR-0707) the `outlier` check
+retires and this file shrinks to that reading.
+
 ---
 
 ## 1. One first-pass table, then partition

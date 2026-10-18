@@ -34,7 +34,15 @@ def _backticked_checks(text: str) -> set[str]:
         m
         for m in re.findall(r"`([a-z][a-z0-9_]+)`", text)
         if m.startswith(
-            ("price_", "corporate_", "symbol_", "adjustment_", "dividend_", "security_")
+            (
+                "price_",
+                "corporate_",
+                "symbol_",
+                "adjustment_",
+                "dividend_",
+                "security_",
+                "dorq_",
+            )
         )
         or m in {"gap", "outlier", "stale"}
     }
@@ -71,7 +79,16 @@ def test_rule_5_states_the_count_it_lists():
         r"^5\. \*\*(\w+) checks are never yours to auto-resolve", text, re.M
     )
     assert match, "rule 5 no longer opens with a spelled-out count"
-    words = {"Three": 3, "Four": 4, "Five": 5, "Six": 6, "Seven": 7}
+    words = {
+        "Three": 3,
+        "Four": 4,
+        "Five": 5,
+        "Six": 6,
+        "Seven": 7,
+        "Eight": 8,
+        "Nine": 9,
+        "Ten": 10,
+    }
     stated = words.get(match.group(1))
     assert stated is not None, f"unrecognised count word {match.group(1)!r}"
     assert stated == len(NEVER_AUTO_RESOLVE)
