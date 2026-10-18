@@ -92,10 +92,12 @@ def stub_repo(monkeypatch):
         "operator": set(),  # security_ids minted by `security split-history`
     }
 
+    # The loader asks whether FMP feeds a security (ADR 0015); in these tests the
+    # only securities it does not feed are the operator-minted ones.
     monkeypatch.setattr(
         ca.repo,
-        "is_operator_security",
-        lambda db, security_id: security_id in state["operator"],
+        "is_fed_by",
+        lambda db, security_id, vendor: security_id not in state["operator"],
     )
 
     monkeypatch.setattr(

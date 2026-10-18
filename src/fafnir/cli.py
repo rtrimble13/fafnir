@@ -409,18 +409,12 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
         # in the last 30 days stays in (repo.nightly_universe, ADR 0014). A
         # historical backfill wants everything, or the resulting history only
         # contains companies that happened to survive to today.
-        where = "" if include_inactive else f"AND {repo.nightly_universe()} "
-        syms = _split_symbols(symbols) or [
-            r["primary_symbol"]
-            for r in database.fetchall(
-                # Never an operator-minted security (`security split-history`): its
-                # ticker now belongs to another issuer, and pulling it would fetch
-                # that issuer's history.
-                "SELECT primary_symbol FROM core.security "
-                f"WHERE source <> 'operator' {where}"
-                "ORDER BY security_id"
-            )
-        ]
+        # Only securities FMP feeds (repo.fmp_price_universe, ADR 0015): an
+        # operator-minted one or one another vendor minted carries a ticker FMP
+        # serves for a different issuer, and pulling it would fetch that history.
+        syms = _split_symbols(symbols) or repo.fmp_price_universe(
+            database, include_inactive=include_inactive
+        )
         n = daily_price.load_prices(
             database,
             fmp,

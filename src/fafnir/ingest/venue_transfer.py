@@ -97,7 +97,8 @@ def plan_venue_transfer(
 ) -> TransferPlan:
     """Read what recording ``security_id``'s move to ``venue_code`` would change.
 
-    Refuses a venue that is not a listed US venue, an operator-minted security and,
+    Refuses a venue that is not a listed US venue, a security FMP did not mint
+    (operator-minted, or another vendor's: ADR 0015) and,
     for one the sweep stamped delisted, a ticker another security now holds or
     whose period the delisting did not close (re-opening nothing would leave the
     ticker unresolvable: half a repair).
@@ -126,6 +127,12 @@ def plan_venue_transfer(
             f"{symbol} ({security_id}) was minted by `security split-history`: it "
             "holds a history split off another security, and its ticker belongs to "
             "another issuer."
+        )
+    elif row["source"] != repo.FMP_SOURCE:
+        refusals.append(
+            f"{symbol} ({security_id}) was minted by {row['source']}, not FMP: a venue "
+            "transfer reads FMP's price feed, which serves this ticker for whoever "
+            "trades under it now (ADR 0015)."
         )
     periods: list[dict] = []
     if delisted is not None:

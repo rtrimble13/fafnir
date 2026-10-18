@@ -487,6 +487,33 @@ descope` removes an instrument kind taken out of scope.) A
 duplicate that *has* accumulated history is a `conflict` instead: merging two price
 histories is not a decision a loader should make silently.
 
+### Which vendor feeds a security (ADR 0015)
+
+Every FMP loader feeds the securities FMP minted (`core.security.source = 'fmp'`)
+and nothing else. The predicate is `repo.FMP_FED_SECURITY`, and the per-symbol guard
+is `repo.is_fed_by(db, security_id, "fmp")`. Both apply to the price universe
+(`ingest prices`, with or without `--include-inactive`), the corporate-actions
+universes (first load, calendar sweep, reconciliation slice, declared funds), the
+duplicate-identity check and `security dedupe`, the `source vendor-gaps` report and
+`security venue-transfer`.
+
+The reason is how FMP keys history. It serves a ticker's whole history whoever used
+it, so a pull into any security FMP did not mint writes another issuer's bars into
+it:
+
+- **An operator-minted security** (`security split-history`) holds a history split
+  off a ticker that FMP has since given to someone else.
+- **A security another vendor minted** shares its ticker with whoever trades under it
+  today. A Sharadar dead issuer is the case the Sharadar plan brings.
+
+A per-symbol pull that resolves to such a security logs `which FMP does not feed`
+and loads nothing. In `load_prices` stats it counts as `not_fmp_fed`.
+
+Which vendor feeds a security is an explicit assignment, not a guess from `source`.
+Until `core.security_vendor_xref` exists (#55), `source = 'fmp'` is the whole FMP
+rule, and asking `is_fed_by` about any other vendor raises. Once it exists, a
+Sharadar-fed security is the one with an open `is_feed` link.
+
 ### Instruments out of scope: warrants, rights and units (ADR 0012)
 
 `ingest securities` does not mint warrants, rights or units. It classifies each
