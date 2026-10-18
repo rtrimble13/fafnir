@@ -83,6 +83,10 @@ read through the `duk` CLI.
   - [ADR 0009 — `mart` is the whole read seam, and definer-rights views are how](adr/0009-mart-is-the-read-seam.md)
   - [ADR 0010 — An on-host operations agent: a fourth read tier, and mutations stay on the CLI](adr/0010-on-host-operations-agent.md)
   - [ADR 0011 — One version, written in source, tagged `vX.Y.Z`](adr/0011-versioning.md)
+  - [ADR 0012 — Warrants, rights and units are out of scope](adr/0012-warrants-rights-units-out-of-scope.md)
+  - [ADR 0013 — dorq, a Bayesian DQ engine, beside the SQL checks](adr/0013-dorq-dq-engine.md)
+  - [ADR 0014 — A venue transfer is not a delisting](adr/0014-venue-transfer-is-not-a-delisting.md)
+  - [ADR 0015 — Multi-vendor provenance, precedence and audited corrections](adr/0015-multi-vendor-provenance-and-precedence.md)
 
 ## Reference
 

@@ -281,3 +281,24 @@ overwrites, and it prints what it restated.
 > `ingestion_run_id` on every overlap; `dq compare` reads the run's own holding
 > snapshot instead.
 
+## 22. A row's `source` is who supplied it, not who feeds the security (ADR 0015)
+
+Once Sharadar loads, one security's history can hold rows from two vendors.
+`core.daily_price.source` and `core.corporate_action.source` name the party that
+wrote **that row**; `core.security.source` names the vendor that **minted** the
+security. Neither says which vendor loads its next bar: that is the open link with
+`is_feed = true` in `core.security_vendor_xref` (or, while FMP is primary, `source =
+'fmp'`).
+
+> **Wrong answer:** "AAPL is an FMP security, so this 2019 bar came from FMP." Read
+> the bar's own `source`. A Sharadar correction may have replaced it, and
+> `ops.vendor_correction` holds the FMP row it replaced.
+
+> **Wrong answer:** "the vendors disagree on this date, so one of them is broken."
+> A divergence can be a convention (consolidated vs primary-exchange volume). The
+> reconciliation's category says which; only categories the operator chose to
+> correct are ever replaced.
+
+Precedence is `operator > sharadar > tiingo > fmp`. FMP never overwrites a Sharadar
+row, and no vendor overwrites an operator row. `mart` views do not expose `source`
+(ADR 0009); answer provenance questions on the ops tier.

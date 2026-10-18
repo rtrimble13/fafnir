@@ -52,7 +52,7 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
 | Bars FMP never served (gaps, delisted-while-live, dead issuers 1998+) | absent | **Sharadar**, raw recovered from `closeunadj` (`source='sharadar'`) | Sharadar |
 | Nightly prices and actions | FMP | FMP; Sharadar reconciled against it nightly | **Sharadar**, observed raw (ratio exactly 1 on the capture day) |
 | Minting, renames, delistings | FMP screener and sweeps | FMP, plus a permaticker link for every security | **Sharadar TICKERS/ACTIONS** via the xref |
-| Identity | ticker-keyed (`security_id` surrogate) | `core.security_vendor_xref` → permaticker | permaticker authoritative (ADR 0013) |
+| Identity | ticker-keyed (`security_id` surrogate) | `core.security_vendor_xref` → permaticker | permaticker authoritative (the identity ADR, #67) |
 | Fundamentals | none | — | **SF1**, bitemporal, 1998+ (phase 4) |
 | Mutual funds (8 tracked) | FMP, 3 of 8 | FMP 3 of 8 | **Tiingo** for all eight once FMP's tier drops them (phase 5) |
 | `duk -S …` | `db` / `live` | `db` default · `fmp` · `sharadar` | same |
@@ -60,14 +60,14 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
 | Subscriptions | FMP Premium | FMP Premium + Sharadar Bundle (max history, annual) | **Sharadar annual + FMP reduced tier** |
 
 **Survivorship floor: 1998-01-01.** Neither vendor has delistings before 1998, so cross-sectional work before
-that date is survivor-only under any plan. ADR 0013 records it.
+that date is survivor-only under any plan. The identity ADR (#67) records it.
 
 ## Working agreements
 
 1. **Provenance on every row; precedence decides writes.** `source ∈ {fmp, sharadar, tiingo, fred,
-   operator}` says who supplied a row. Writes follow `operator > sharadar > fmp`: a vendor revises its own
+   operator}` says who supplied a row. Writes follow `operator > sharadar > tiingo > fmp`: a vendor revises its own
    rows freely, replaces a lower-precedence vendor's row only through the correction path (audited), and
-   never touches a higher one. ADR 0012 (SA-0103) states this.
+   never touches a higher one. [ADR 0015](../adr/0015-multi-vendor-provenance-and-precedence.md) (SA-0103, #44) states this.
 2. **Corrections are reviewable.** Every FMP row a Sharadar load replaces is written, as it stood, to
    `ops.vendor_correction` (security, date, old values, old source, new source, run, reason:
    `reconcile_divergence | gap_fill | restatement`). `fafnir vendor corrections list|revert` reads it. A
@@ -162,7 +162,7 @@ blocks still name `docs-gate` and a status row; read those two lines as "lint, b
 | [#41](https://github.com/rtrimble13/fafnir/issues/41) tracking | Body rewritten for v2: phases instead of sprints, decided gates, link to this revision |
 | [#42](https://github.com/rtrimble13/fafnir/issues/42) docs machinery | Keep the PR template and `check_doc_links.py`; `docs-gate` becomes optional (not a required check) |
 | [#43](https://github.com/rtrimble13/fafnir/issues/43) licence letters | No longer a gate on paying; eligibility self-check stays a hard stop; answers feed #128 |
-| [#44](https://github.com/rtrimble13/fafnir/issues/44) ADR 0012 | Provenance + **precedence** (`operator > sharadar > fmp`) + audited corrections; per-vendor excision demoted from guarantee to report |
+| [#44](https://github.com/rtrimble13/fafnir/issues/44) ADR 0012 (written as ADR 0015) | Provenance + **precedence** (`operator > sharadar > fmp`) + audited corrections; per-vendor excision demoted from guarantee to report |
 | [#46](https://github.com/rtrimble13/fafnir/issues/46) fill-only write path | Becomes the **precedence write path** + `ops.vendor_correction`; `--reclaim-from` dropped |
 | [#47](https://github.com/rtrimble13/fafnir/issues/47) Sharadar client | Share endpoint knowledge with `duk.sharadar_api`; its UNVERIFIED items are probe inputs for #49 |
 | [#49](https://github.com/rtrimble13/fafnir/issues/49) probe | Runs on the **paid key**, not the free sample; adds "API shape as `duk.sharadar_api` implements it" |
@@ -253,6 +253,13 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-18 · P0, #44: the provenance ADR is ADR 0015.** ADRs 0012–0014 were taken by the time it
+  was written (instrument scope, dorq, venue transfers), so it is
+  [ADR 0015](../adr/0015-multi-vendor-provenance-and-precedence.md); the identity ADR (#67) and the
+  fundamentals ADRs (#86) take the next free numbers when they merge. It ranks `tiingo` between Sharadar
+  and FMP: Sharadar has no mutual funds, so the two never hold the same key, and Tiingo replaces FMP for
+  the funds. It also records that `ops.vendor_correction` is what makes removing Sharadar reversible:
+  the FMP rows it replaced are restored from there.
 - **2026-10-18 · duk source model.** `duk` gained the three-source model ahead of any warehouse-side
   Sharadar code: `duk.sharadar_api` (SEP → SFP fallback, raw recovery from `closeunadj`, redaction) and
   `duk.datasource.sharadar`. The endpoint shape is documented from Sharadar's pages and **not yet measured

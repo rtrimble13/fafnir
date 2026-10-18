@@ -89,6 +89,15 @@ series is **point-in-time stable and reproducible**. See
   indistinguishable from a new listing — and minting it as one would fork a
   company's identity into two `security_id`s. See
   [adr/0005-automatic-universe-maintenance.md](adr/0005-automatic-universe-maintenance.md).
+- **More than one vendor writes to the same security.** Every fact row carries the
+  party that supplied it in `source` (`fmp`, `sharadar`, `tiingo`, `fred`,
+  `operator`); on `core.security` that is the vendor that *minted* it, while which
+  vendor *feeds* its new rows is an explicit assignment. When two parties hold the
+  same key the higher one wins, `operator > sharadar > tiingo > fmp`: a vendor never
+  writes over a higher-ranked row, and replaces a lower-ranked one only through an
+  explicit correction recorded in `ops.vendor_correction`, so it can be reviewed and
+  reverted. See
+  [adr/0015-multi-vendor-provenance-and-precedence.md](adr/0015-multi-vendor-provenance-and-precedence.md).
 
 ## Partitioning & TimescaleDB-readiness
 
