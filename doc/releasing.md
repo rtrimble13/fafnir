@@ -4,6 +4,23 @@ Fafnir is versioned `vX.Y.Z` and deployed by pulling a git checkout. Nothing is
 published to PyPI, so a release is two things: a number that says what is running,
 and a tag that names the commit it came from.
 
+## Before anything merges: the docs gate
+
+Documentation lands in the same PR as the behaviour it describes. The `docs-gate`
+check (`.github/workflows/docs-gate.yml`) fails a pull request that changes
+`src/`, `sql/`, `scripts/` or `etc/` without touching `doc/`, `README.md`,
+`.claude/skills/`, `etc/fafnirrc` or `etc/crontab.example`, and it lists the paths
+that required docs. When nothing a reader relies on changed (a refactor, a test
+helper, a comment), add the `no-docs-needed` label: the check re-runs on its own
+and passes. The same job runs `scripts/check_doc_links.py`, which fails on any
+relative link or `#anchor` in the docs that does not resolve. Run both locally with
+`python3 scripts/check_docs_touched.py --base origin/main` and
+`python3 scripts/check_doc_links.py`.
+
+The gate reports; it does not block. It is deliberately not a required status
+check in branch protection (Sharadar plan v2), so a red `docs-gate` is a prompt to
+add the docs or the label, and the reviewer decides.
+
 ## Cutting a release
 
 ```bash
