@@ -122,9 +122,9 @@ serves today — check that in #128 before scheduling it.
 
 | Expected | Issue | Adds |
 |---|---|---|
-| 0029 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) |
-| 0030 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` |
-| 0031 | #46 | `ops.vendor_correction` (the audit trail of replaced rows) |
+| 0029 | #46 | `ops.vendor_correction` (the audit trail of replaced rows) — **built** |
+| 0030 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) |
+| 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` |
 | 0032 | #66 | `ops.vendor_bar_comparison` (per-session summary; divergences are rows in the correction queue, not a second table) |
 | 0033 | #79 | `mart.v_security_lifecycle` |
 | 0034–0037 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
@@ -253,6 +253,21 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-18 · P0, #46: the precedence write path.** Migration 0029 (not 0031: it merged before #50
+  and #55) adds `ops.vendor_correction`. Both upserts keep their existing `source` parameter as the
+  writer instead of gaining an `owner`, so no FMP call site changed. `upsert_daily_prices` now returns
+  `UpsertResult`, an `int` (rows written, as before) carrying `inserted`, `updated`, `corrected`,
+  `skipped_foreign` and `skipped_suppressed`. `upsert_corporate_action` keeps its `bool` return, which
+  the tests compare with `is True`, and reports the same counts through an optional `counts` dict. A
+  correction replaces an action only when its values differ. Two things beyond the issue:
+  - The restatement guard compared FMP's re-read with any stored bar. A bar Sharadar holds would have
+    raised `price_restatement_conflict` every night, or been reported as restated by an explicit
+    re-fetch that wrote nothing. The price loader now routes another party's dates around the guard,
+    and the upsert skips and counts them.
+  - `security merge` retargets corrections as it does overrides. `security split-history` does not move
+    them yet: no correction exists until #66 makes one, so that is left until a correction can meet a split.
+  `--reclaim-from` stays dropped: reverting corrections by `new_source` covers vendor removal (ADR 0015
+  §5) once a bulk form is needed.
 - **2026-10-18 · P0, #45: FMP feeds what FMP minted.** `VENDOR_FED_SECURITY` (`source <> 'operator'`)
   became `FMP_FED_SECURITY` (`source = 'fmp'`), with `repo.is_fed_by(db, id, "fmp")` as the per-symbol
   guard. Beyond the call sites #45 listed, the same scope now applies to the `source vendor-gaps` report

@@ -3946,6 +3946,136 @@ def override_set_reason(
 
 
 # ---------------------------------------------------------------------------
+# vendor: what one vendor wrote in place of another's (ADR 0015)
+# ---------------------------------------------------------------------------
+@main.group()
+def vendor():
+    """Work with more than one data vendor (ADR 0015)."""
+
+
+@vendor.group("corrections")
+def vendor_corrections():
+    """Rows one vendor replaced in place of another's (ops.vendor_correction)."""
+
+
+@vendor_corrections.command("list")
+@click.option("--symbol", help="Only this security (resolved like the loaders).")
+@click.option("--security-id", type=int, help="Only this security, by id.")
+@click.option("--all", "include_reverted", is_flag=True, help="Include reverted ones.")
+@click.option("--limit", "-n", type=int, default=50, show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="One JSON object per line.")
+@click.pass_context
+def vendor_corrections_list(ctx, symbol, security_id, include_reverted, limit, as_json):
+    """List corrections, newest first.
+
+    \b
+      fafnir vendor corrections list
+      fafnir vendor corrections list --symbol AAPL --all
+
+    Each row is a bar or corporate action a higher-ranked vendor replaced, with the
+    party it replaced and why. `old` is what stood before; `revert` writes it back.
+    """
+    import json as _json
+
+    from fafnir.db import repository as repo
+
+    with Database(ctx.obj["config"].dsn) as database:
+        sid = None
+        if symbol is not None or security_id is not None:
+            sid, _ = _resolve_one_security(database, symbol, security_id)
+        rows = repo.list_vendor_corrections(
+            database, security_id=sid, include_reverted=include_reverted, limit=limit
+        )
+    if as_json:
+        for r in rows:
+            click.echo(_json.dumps(r, default=str, sort_keys=True))
+        return
+    if not rows:
+        click.echo("No corrections.")
+        return
+    for r in rows:
+        key = (
+            f"{r['action_type']} {r['key_date']}"
+            if r["action_type"]
+            else f"bar {r['key_date']}"
+        )
+        state = (
+            f"reverted {r['reverted_at']:%Y-%m-%d} by {r['reverted_by']}"
+            if r["reverted_at"]
+            else "active"
+        )
+        click.echo(
+            f"{r['correction_id']:>6}  security {r['security_id']}  {key}  "
+            f"{r['old_source']} -> {r['new_source']}  {r['reason']}  "
+            f"{r['corrected_at']:%Y-%m-%d}  {state}"
+        )
+
+
+@vendor_corrections.command("revert")
+@click.argument("correction_ids", nargs=-1, type=int, required=True, metavar="ID...")
+@click.option("--note", "-m", required=True, help="Why the correction is undone.")
+@click.option("--by", "reverted_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def vendor_corrections_revert(ctx, correction_ids, note, reverted_by, dry_run, yes):
+    """Write the replaced rows back, keeping the record of the correction.
+
+    \b
+      fafnir vendor corrections revert 41 -m "consolidated volume is the convention"
+
+    Refuses a correction whose row has changed since it was written: a later load or
+    correction would be lost. All or nothing: one refusal reverts none. The affected
+    securities' adjustment factors are recomputed.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    reverted_by = reverted_by or _os_user()
+    if not dry_run and not yes:
+        click.confirm(
+            f"Revert {_plural(len(set(correction_ids)), 'correction')}?", abort=True
+        )
+    with Database(ctx.obj["config"].dsn) as database:
+        done = []
+        try:
+            for cid in dict.fromkeys(correction_ids):
+                done.append(
+                    repo.revert_vendor_correction(
+                        database, cid, by=reverted_by, note=note
+                    )
+                )
+        except repo.RevertRefused as exc:
+            database.rollback()
+            raise click.ClickException(str(exc)) from exc
+        for sid in dict.fromkeys(int(c["security_id"]) for c in done):
+            adjustments.compute_for_security(database, sid)
+        if dry_run:
+            database.rollback()
+        else:
+            database.commit()
+    for c in done:
+        key = (
+            f"{c['action_type']} {c['key_date']}"
+            if c["action_type"]
+            else f"bar {c['key_date']}"
+        )
+        click.echo(
+            f"Correction {c['correction_id']} (security {c['security_id']}, {key}): "
+            f"{c['old_source']}'s row restored."
+        )
+    if dry_run:
+        click.echo("Dry run: nothing changed.")
+        return
+    click.echo(
+        f"Reverted {_plural(len(done), 'correction')} as {reverted_by}. "
+        "Adjustment factors recomputed."
+    )
+
+
+# ---------------------------------------------------------------------------
 # dq + status
 # ---------------------------------------------------------------------------
 @main.group()

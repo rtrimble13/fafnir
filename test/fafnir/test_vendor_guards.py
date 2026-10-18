@@ -260,6 +260,50 @@ def test_a_refetch_overwrites_and_shows_what_it_restated(db, tmp_path, monkeypat
     assert "1767746 -> 88387300 (x50)" in text
 
 
+def test_a_bar_another_vendor_holds_is_not_fmps_to_restate(db):
+    """Once Sharadar corrects a bar (ADR 0015 §3), FMP's re-read of it is neither a
+    restatement to hold and flag nor one to write: the key is not FMP's. Whether
+    the two disagree is the reconcile's question."""
+    d = _sessions(db, 2)
+    sid = _mk(db, "RSSH")
+    fmp = _FMP()
+    _night(db, fmp, "RSSH", [_bar(d[0], 100.0, 5000)])
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": sid,
+                "trade_date": d[0],
+                "open": 25,
+                "high": 25,
+                "low": 25,
+                "close": 25,
+                "volume": 20000,
+            }
+        ],
+        source="sharadar",
+        correct=True,
+    )
+    db.commit()
+
+    nightly = _night(db, fmp, "RSSH", [_bar(d[0], 100.0, 5000), _bar(d[1], 99, 4000)])
+    restated: list = []
+    refetch = _night(
+        db, fmp, "RSSH", [_bar(d[0], 100.0, 5000)], explicit=True, restated=restated
+    )
+
+    assert _stored(db, sid, d[0]) == (25.0, 20000)
+    assert _stored(db, sid, d[1]) == (99.0, 4000)
+    assert _conflicts(db, sid) == {} and restated == []
+    for run_id in (nightly, refetch):
+        params = db.fetchval(
+            "SELECT params FROM ops.ingestion_run WHERE ingestion_run_id = %s",
+            (run_id,),
+        )
+        assert params["skipped_foreign"] == 1 and "restated_count" not in params
+    assert repo.get_watermark(db, "fmp", daily_price.ENDPOINT, sid) == d[1]
+
+
 def test_a_vendor_correction_is_held_too_and_waits_for_a_refetch(db):
     """SKYD: the first prints of three dates were at a phantom 2:1 scale (FMP took a
     warrant dividend for a split). The guard keeps them, and blocks the nightly's

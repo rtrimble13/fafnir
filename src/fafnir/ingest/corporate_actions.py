@@ -105,6 +105,7 @@ class ActionsResult:
     unresolved_rows: int = 0  # of those, symbols this warehouse does not hold
     future_skipped: int = 0  # declared but not yet ex -- correctly not stored
     suppressed: int = 0  # at a key an operator deleted -- set aside, not stored
+    skipped_foreign: int = 0  # at a key another party holds (ADR 0015) -- left alone
     reconciled: int = 0  # securities checked by the rotating reconciliation
     drift: int = 0  # of those, securities where the feed disagreed
 
@@ -118,6 +119,14 @@ class ActionsResult:
         self.unresolved_rows += other.unresolved_rows
         self.future_skipped += other.future_skipped
         self.suppressed += other.suppressed
+        self.skipped_foreign += other.skipped_foreign
+
+
+def _record_skipped_foreign(run, result: ActionsResult) -> None:
+    """Put the keys left to another party (ADR 0015) on the run's params."""
+    params = getattr(run, "params", None)
+    if result.skipped_foreign and isinstance(params, dict):
+        params["skipped_foreign"] = result.skipped_foreign
 
 
 def _parse_date(value) -> Optional[date]:
@@ -202,6 +211,7 @@ def _apply_split(
     if (security_id, "split", ex_date) in suppressed:
         result.suppressed += 1
         return None
+    outcome: dict = {}
     changed = repo.upsert_corporate_action(
         db,
         security_id=security_id,
@@ -210,7 +220,9 @@ def _apply_split(
         split_numerator=num,
         split_denominator=den,
         ingestion_run_id=run.run_id,
+        counts=outcome,
     )
+    result.skipped_foreign += outcome.get("skipped_foreign", 0)
     result.upserted += 1
     if changed:
         result.changed += 1
@@ -253,6 +265,7 @@ def _apply_dividend(
     if (security_id, "dividend", ex_date) in suppressed:
         result.suppressed += 1
         return None
+    outcome: dict = {}
     changed = repo.upsert_corporate_action(
         db,
         security_id=security_id,
@@ -263,7 +276,9 @@ def _apply_dividend(
         payment_date=_parse_date(rec.get("paymentDate")),
         declaration_date=_parse_date(rec.get("declarationDate")),
         ingestion_run_id=run.run_id,
+        counts=outcome,
     )
+    result.skipped_foreign += outcome.get("skipped_foreign", 0)
     result.upserted += 1
     if changed:
         result.changed += 1
@@ -464,6 +479,7 @@ def load_actions(
         if owns_run:
             run.symbols_requested = len(symbols)
             run.rows_inserted = result.upserted
+            _record_skipped_foreign(run, result)
             run.bytes_downloaded = fmp.bytes_downloaded
         logger.info(
             "Loaded %d corporate actions (%d changed) across %d symbols",
@@ -894,5 +910,6 @@ def run_actions(
 
         run.symbols_requested = result.symbols_pulled
         run.rows_inserted = result.upserted
+        _record_skipped_foreign(run, result)
         run.bytes_downloaded = fmp.bytes_downloaded
     return result

@@ -8,6 +8,7 @@ them into the DataFrame contracts the CLI expects.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, NamedTuple, Optional, Sequence
@@ -1292,6 +1293,22 @@ def merge_security(
         "UPDATE ops.operator_override SET security_id = %s WHERE security_id = %s",
         (survivor_id, victim_id),
     )
+    # The victim's vendor corrections follow its rows (ADR 0015). One whose key the
+    # survivor already has an active correction for stays on the victim's id as a
+    # record: two active corrections of one key would make revert ambiguous.
+    db.execute(
+        """
+        UPDATE ops.vendor_correction v SET security_id = %s
+         WHERE v.security_id = %s
+           AND NOT (v.reverted_at IS NULL AND EXISTS (
+                SELECT 1 FROM ops.vendor_correction s
+                 WHERE s.security_id = %s AND s.reverted_at IS NULL
+                   AND s.target = v.target
+                   AND s.action_type IS NOT DISTINCT FROM v.action_type
+                   AND s.key_date = v.key_date))
+        """,
+        (survivor_id, victim_id, survivor_id),
+    )
 
     # The victim's watermark is usually the *fresher* of the two -- it is the row the
     # daily load has been feeding since the duplicate was minted. Taking the later
@@ -2267,49 +2284,273 @@ def count_recent_listings(db: Database, days: int = 7) -> int:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Vendor precedence (ADR 0015 §3)
+# ---------------------------------------------------------------------------
+
+#: Who wins when two parties hold a value for the same key. A writer revises its own
+#: rows; it never writes over a higher-ranked row; it replaces a lower-ranked row only
+#: when the caller asks for a correction (``correct=True``), and each replaced row is
+#: kept in ``ops.vendor_correction`` first. Operator rows are written by the operator
+#: commands and are never replaced by a vendor.
+PRECEDENCE: dict[str, int] = {"operator": 4, "sharadar": 3, "tiingo": 2, "fmp": 1}
+
+#: Why a correction was made; the CHECK on ops.vendor_correction.reason.
+CORRECTION_REASONS = ("reconcile_divergence", "gap_fill", "restatement")
+
+_BAR_VALUES = ("open", "high", "low", "close", "volume", "vwap")
+_ACTION_VALUES = (
+    "record_date",
+    "payment_date",
+    "declaration_date",
+    "split_numerator",
+    "split_denominator",
+    "dividend_amount",
+    "currency",
+)
+
+
+def _rank(source: str) -> int:
+    """A source's precedence. One this module does not know outranks everyone: a row
+    written by an unknown party is never replaced on a guess."""
+    return PRECEDENCE.get(source, 1_000)
+
+
+def _check_writer(source: str, correct: bool, reason: str) -> None:
+    if source not in PRECEDENCE:
+        raise ValueError(
+            f"unknown source {source!r}: a writer must be one of {sorted(PRECEDENCE)}"
+        )
+    if correct:
+        if source == "operator":
+            raise ValueError(
+                "an operator row is written by the operator commands, not as a "
+                "correction"
+            )
+        if reason not in CORRECTION_REASONS:
+            raise ValueError(
+                f"unknown correction reason {reason!r}: expected one of "
+                f"{', '.join(CORRECTION_REASONS)}"
+            )
+
+
+def _as_date(value) -> date:
+    return date.fromisoformat(value) if isinstance(value, str) else value
+
+
+def _json(value: dict) -> str:
+    return json.dumps(value, default=str, sort_keys=True)
+
+
+class UpsertResult(int):
+    """What a bar upsert did. Its integer value is the rows written, which is what the
+    callers of :func:`upsert_daily_prices` have always read; the attributes are the
+    breakdown ADR 0015 needs.
+
+    ``inserted``: keys nobody held. ``updated``: the writer's own rows revised.
+    ``corrected``: rows a lower-ranked party held, replaced through the correction
+    path and recorded in ``ops.vendor_correction``. ``skipped_foreign``: keys another
+    party holds, left exactly as they were. ``skipped_suppressed``: keys an operator
+    edited, which a correction never writes.
+    """
+
+    inserted: int
+    updated: int
+    corrected: int
+    skipped_foreign: int
+    skipped_suppressed: int
+
+    def __new__(
+        cls,
+        *,
+        inserted: int = 0,
+        updated: int = 0,
+        corrected: int = 0,
+        skipped_foreign: int = 0,
+        skipped_suppressed: int = 0,
+    ) -> "UpsertResult":
+        self = super().__new__(cls, inserted + updated + corrected)
+        self.inserted = inserted
+        self.updated = updated
+        self.corrected = corrected
+        self.skipped_foreign = skipped_foreign
+        self.skipped_suppressed = skipped_suppressed
+        return self
+
+    def __repr__(self) -> str:
+        return (
+            f"UpsertResult(inserted={self.inserted}, updated={self.updated}, "
+            f"corrected={self.corrected}, skipped_foreign={self.skipped_foreign}, "
+            f"skipped_suppressed={self.skipped_suppressed})"
+        )
+
+
+def _held_bars(db: Database, rows: Sequence[dict]) -> dict[tuple[int, date], dict]:
+    """The stored bars at the keys a write is about to touch, by key.
+
+    Read by security and date range rather than by exact key, so the trade_date
+    bound prunes the yearly partitions; the few extra rows are ignored.
+    """
+    dates = [_as_date(r["trade_date"]) for r in rows]
+    found = db.fetchall(
+        """
+        SELECT security_id, trade_date, open, high, low, close, volume, vwap,
+               source, ingestion_run_id, loaded_at
+          FROM core.daily_price
+         WHERE security_id = ANY(%s) AND trade_date BETWEEN %s AND %s
+        """,
+        (sorted({int(r["security_id"]) for r in rows}), min(dates), max(dates)),
+    )
+    return {(int(r["security_id"]), r["trade_date"]): r for r in found}
+
+
+def _record_correction(
+    db: Database,
+    *,
+    security_id: int,
+    target: str,
+    action_type: Optional[str],
+    key_date: date,
+    old: dict,
+    old_fields: Sequence[str],
+    new: dict,
+    new_source: str,
+    reason: str,
+    ingestion_run_id: Optional[int],
+) -> None:
+    """Keep the row a correction is about to replace, as it stood (ADR 0015 §3)."""
+    old_row = {f: old.get(f) for f in (*old_fields, "ingestion_run_id", "loaded_at")}
+    db.execute(
+        """
+        INSERT INTO ops.vendor_correction
+            (security_id, target, action_type, key_date, old_source, new_source,
+             old_row, new_row, reason, ingestion_run_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)
+        """,
+        (
+            security_id,
+            target,
+            action_type,
+            key_date,
+            old["source"],
+            new_source,
+            _json(old_row),
+            _json({f: new.get(f) for f in old_fields}),
+            reason,
+            ingestion_run_id,
+        ),
+    )
+
+
 def upsert_daily_prices(
     db: Database,
     rows: Sequence[dict],
     *,
     ingestion_run_id: Optional[int] = None,
     source: str = "fmp",
-) -> int:
-    """Bulk upsert raw OHLCV rows.
+    correct: bool = False,
+    reason: str = "reconcile_divergence",
+) -> UpsertResult:
+    """Upsert raw OHLCV rows under ADR 0015's precedence. Returns an
+    :class:`UpsertResult`: the rows written, with the breakdown.
 
     Each row dict must have: security_id, trade_date, open, high, low, close,
-    volume, and optionally vwap. Returns number of rows written.
+    volume, and optionally vwap.
+
+    ``source`` is the writer. It revises its own rows. A key another party holds is
+    left exactly as it is (``skipped_foreign``), unless ``correct`` is set and the
+    writer outranks that party: then the stored row is kept in
+    ``ops.vendor_correction`` and replaced, relabelled as the writer's. A correction
+    also never writes a key an operator edited (``ops.operator_override``); an
+    ordinary load relies on the loader setting those aside first, as it always has.
+
+    The conflict clause enforces the same rule, so a row another writer changed
+    between the read and the write is still never overwritten by a lower rank.
     """
+    _check_writer(source, correct, reason)
     if not rows:
-        return 0
-    params = [
-        (
-            r["security_id"],
-            r["trade_date"],
-            r["open"],
-            r["high"],
-            r["low"],
-            r["close"],
-            r.get("volume", 0),
-            r.get("vwap"),
-            source,
-            ingestion_run_id,
+        return UpsertResult()
+    held = _held_bars(db, rows)
+    suppressed: dict[int, frozenset] = {}
+    write: list[dict] = []
+    counts = {"inserted": 0, "updated": 0, "corrected": 0}
+    skipped_foreign = skipped_suppressed = 0
+    for r in rows:
+        sid, day = int(r["security_id"]), _as_date(r["trade_date"])
+        if correct:
+            if sid not in suppressed:
+                suppressed[sid] = suppressed_price_dates(db, sid)
+            if day in suppressed[sid]:
+                skipped_suppressed += 1
+                continue
+        existing = held.get((sid, day))
+        if existing is None:
+            counts["inserted"] += 1
+        elif existing["source"] == source:
+            counts["updated"] += 1
+        elif correct and _rank(source) > _rank(existing["source"]):
+            _record_correction(
+                db,
+                security_id=sid,
+                target="daily_price",
+                action_type=None,
+                key_date=day,
+                old=existing,
+                old_fields=_BAR_VALUES,
+                new=r,
+                new_source=source,
+                reason=reason,
+                ingestion_run_id=ingestion_run_id,
+            )
+            counts["corrected"] += 1
+        else:
+            skipped_foreign += 1
+            continue
+        write.append(r)
+    if write:
+        db.executemany(
+            f"""
+            INSERT INTO core.daily_price
+                (security_id, trade_date, open, high, low, close, volume, vwap,
+                 source, ingestion_run_id, loaded_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+            ON CONFLICT (security_id, trade_date) DO UPDATE SET
+                open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+                close = EXCLUDED.close, volume = EXCLUDED.volume, vwap = EXCLUDED.vwap,
+                source = EXCLUDED.source, ingestion_run_id = EXCLUDED.ingestion_run_id,
+                loaded_at = now()
+            WHERE core.daily_price.source = EXCLUDED.source
+               OR (%s AND {_rank_sql("core.daily_price.source")}
+                          < {_rank_sql("EXCLUDED.source")})
+            """,
+            [
+                (
+                    r["security_id"],
+                    r["trade_date"],
+                    r["open"],
+                    r["high"],
+                    r["low"],
+                    r["close"],
+                    r.get("volume", 0),
+                    r.get("vwap"),
+                    source,
+                    ingestion_run_id,
+                    correct,
+                )
+                for r in write
+            ],
         )
-        for r in rows
-    ]
-    return db.executemany(
-        """
-        INSERT INTO core.daily_price
-            (security_id, trade_date, open, high, low, close, volume, vwap,
-             source, ingestion_run_id, loaded_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
-        ON CONFLICT (security_id, trade_date) DO UPDATE SET
-            open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
-            close = EXCLUDED.close, volume = EXCLUDED.volume, vwap = EXCLUDED.vwap,
-            source = EXCLUDED.source, ingestion_run_id = EXCLUDED.ingestion_run_id,
-            loaded_at = now()
-        """,
-        params,
+    return UpsertResult(
+        **counts,
+        skipped_foreign=skipped_foreign,
+        skipped_suppressed=skipped_suppressed,
     )
+
+
+def _rank_sql(column: str) -> str:
+    """:data:`PRECEDENCE` as a SQL expression over ``column``; unknown ranks highest."""
+    whens = " ".join(f"WHEN '{s}' THEN {r}" for s, r in PRECEDENCE.items())
+    return f"(CASE {column} {whens} ELSE 1000 END)"
 
 
 def stored_bars_on(
@@ -2402,6 +2643,9 @@ def upsert_corporate_action(
     declaration_date: Optional[date] = None,
     ingestion_run_id: Optional[int] = None,
     source: str = "fmp",
+    correct: bool = False,
+    reason: str = "reconcile_divergence",
+    counts: Optional[dict] = None,
 ) -> bool:
     """Upsert one corporate action. Returns True if the row was new or CHANGED.
 
@@ -2417,11 +2661,90 @@ def upsert_corporate_action(
     ``ingestion_run_id`` is updated too (it was not before), so it names the run
     that last *changed* the row -- the question anyone reading lineage is asking.
 
-    A row an operator wrote (``source = 'operator'``, see :func:`add_operator_action`)
-    is never overwritten: the operator wrote it because the feed has this event wrong
-    or missing, and a vendor copy arriving at the same key is the thing being
-    corrected, not a correction.
+    Writes follow ADR 0015's precedence. ``source`` is the writer and revises its own
+    rows. A row another party holds is left exactly as it is -- an operator's row
+    above all: the operator wrote it because the feed has this event wrong or
+    missing, and a vendor copy arriving at the same key is the thing being
+    corrected, not a correction. With ``correct`` set, a writer that outranks the
+    holder replaces a row whose values differ, keeping it in
+    ``ops.vendor_correction`` first; a correction never writes a key an operator
+    deleted. ``counts``, when given, accumulates ``skipped_foreign``,
+    ``skipped_suppressed`` and ``corrected``; the return value stays a plain bool,
+    because callers test it with ``is``.
     """
+    _check_writer(source, correct, reason)
+    values = {
+        "record_date": record_date,
+        "payment_date": payment_date,
+        "declaration_date": declaration_date,
+        "split_numerator": split_numerator,
+        "split_denominator": split_denominator,
+        "dividend_amount": dividend_amount,
+        "currency": currency,
+    }
+
+    def tally(key: str) -> None:
+        if counts is not None:
+            counts[key] = counts.get(key, 0) + 1
+
+    if correct and (security_id, action_type, ex_date) in suppressed_action_keys(
+        db, security_id
+    ):
+        tally("skipped_suppressed")
+        return False
+    existing = db.fetchone(
+        f"""
+        SELECT corporate_action_id, source, ingestion_run_id, loaded_at,
+               {", ".join(_ACTION_VALUES)}
+          FROM core.corporate_action
+         WHERE security_id = %s AND action_type = %s AND ex_date = %s
+        """,
+        (security_id, action_type, ex_date),
+    )
+    if existing is not None and existing["source"] != source:
+        differs = db.fetchval(
+            f"""
+            SELECT ({", ".join(_ACTION_VALUES)}) IS DISTINCT FROM
+                   ({", ".join(f"%s::{t}" for t in _ACTION_TYPES)})
+              FROM core.corporate_action WHERE corporate_action_id = %s
+            """,
+            (*(values[f] for f in _ACTION_VALUES), existing["corporate_action_id"]),
+        )
+        if not (correct and _rank(source) > _rank(existing["source"]) and differs):
+            if differs:
+                tally("skipped_foreign")
+            return False
+        _record_correction(
+            db,
+            security_id=security_id,
+            target="corporate_action",
+            action_type=action_type,
+            key_date=ex_date,
+            old=existing,
+            old_fields=_ACTION_VALUES,
+            new=values,
+            new_source=source,
+            reason=reason,
+            ingestion_run_id=ingestion_run_id,
+        )
+        replaced = db.execute(
+            f"""
+            UPDATE core.corporate_action
+               SET {", ".join(f"{f} = %s" for f in _ACTION_VALUES)},
+                   source = %s, ingestion_run_id = %s, loaded_at = now()
+             WHERE corporate_action_id = %s AND source = %s
+            """,
+            (
+                *(values[f] for f in _ACTION_VALUES),
+                source,
+                ingestion_run_id,
+                existing["corporate_action_id"],
+                existing["source"],
+            ),
+        )
+        if replaced:
+            tally("corrected")
+        return replaced > 0
     return (
         db.execute(
             """
@@ -2440,7 +2763,7 @@ def upsert_corporate_action(
             currency = EXCLUDED.currency,
             ingestion_run_id = EXCLUDED.ingestion_run_id,
             loaded_at = now()
-        WHERE core.corporate_action.source <> 'operator'
+        WHERE core.corporate_action.source = EXCLUDED.source
           AND (core.corporate_action.record_date,
                core.corporate_action.payment_date,
                core.corporate_action.declaration_date,
@@ -2474,6 +2797,119 @@ def upsert_corporate_action(
         )
         > 0
     )
+
+
+# The SQL types of _ACTION_VALUES, in order, for comparing typed parameters.
+_ACTION_TYPES = ("date", "date", "date", "numeric", "numeric", "numeric", "text")
+_BAR_TYPES = ("numeric", "numeric", "numeric", "numeric", "bigint", "numeric")
+
+
+def list_vendor_corrections(
+    db: Database,
+    *,
+    security_id: Optional[int] = None,
+    include_reverted: bool = False,
+    limit: int = 0,
+) -> list[dict]:
+    """The rows one vendor replaced in place of another's, newest first."""
+    clauses, params = [], []
+    if security_id is not None:
+        clauses.append("security_id = %s")
+        params.append(security_id)
+    if not include_reverted:
+        clauses.append("reverted_at IS NULL")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    lim = f"LIMIT {int(limit)}" if limit else ""
+    return db.fetchall(
+        f"""
+        SELECT correction_id, security_id, target, action_type, key_date,
+               old_source, new_source, old_row, new_row, reason, ingestion_run_id,
+               corrected_at, reverted_at, reverted_by, revert_note
+          FROM ops.vendor_correction
+          {where}
+         ORDER BY correction_id DESC
+          {lim}
+        """,
+        params,
+    )
+
+
+class RevertRefused(Exception):
+    """A correction that cannot be reverted, and why."""
+
+
+def revert_vendor_correction(
+    db: Database, correction_id: int, *, by: str, note: Optional[str] = None
+) -> dict:
+    """Write a correction's ``old_row`` back and mark it reverted (ADR 0015 §3).
+
+    Refuses, changing nothing, when the correction does not exist or is already
+    reverted, or when the corrected row no longer holds exactly what the correction
+    wrote: a later load or correction changed it since, and writing the old values
+    over that would lose it. Returns the correction as it was. The caller recomputes
+    the security's adjustment factors.
+    """
+    c = db.fetchone(
+        "SELECT * FROM ops.vendor_correction WHERE correction_id = %s FOR UPDATE",
+        (correction_id,),
+    )
+    if c is None:
+        raise RevertRefused(f"No correction {correction_id}.")
+    if c["reverted_at"] is not None:
+        raise RevertRefused(
+            f"Correction {correction_id} was already reverted "
+            f"({c['reverted_at']:%Y-%m-%d} by {c['reverted_by']})."
+        )
+    if c["target"] == "daily_price":
+        table, fields, types = "core.daily_price", _BAR_VALUES, _BAR_TYPES
+        key_sql, key = "security_id = %s AND trade_date = %s", (
+            c["security_id"],
+            c["key_date"],
+        )
+    else:
+        table, fields, types = "core.corporate_action", _ACTION_VALUES, _ACTION_TYPES
+        key_sql, key = "security_id = %s AND action_type = %s AND ex_date = %s", (
+            c["security_id"],
+            c["action_type"],
+            c["key_date"],
+        )
+    old, new = c["old_row"], c["new_row"]
+    restored = db.execute(
+        f"""
+        UPDATE {table}
+           SET {", ".join(f"{f} = %s::{t}" for f, t in zip(fields, types))},
+               source = %s, ingestion_run_id = %s,
+               loaded_at = COALESCE(%s::timestamptz, now())
+         WHERE {key_sql}
+           AND source = %s
+           AND ({", ".join(fields)}) IS NOT DISTINCT FROM
+               ({", ".join(f"%s::{t}" for t in types)})
+        """,
+        (
+            *(old.get(f) for f in fields),
+            c["old_source"],
+            old.get("ingestion_run_id"),
+            old.get("loaded_at"),
+            *key,
+            c["new_source"],
+            *(new.get(f) for f in fields),
+        ),
+    )
+    if not restored:
+        raise RevertRefused(
+            f"Correction {correction_id}: the {c['target']} row on "
+            f"{c['key_date']} no longer holds what the correction wrote "
+            f"({c['new_source']}), so it was changed since. Nothing reverted."
+        )
+    db.execute(
+        """
+        UPDATE ops.vendor_correction
+           SET reverted_at = now(), reverted_by = %s, revert_note = %s
+         WHERE correction_id = %s
+        """,
+        (by, note, correction_id),
+    )
+    return c
 
 
 def corporate_actions_for(db: Database, security_id: int) -> list[dict]:

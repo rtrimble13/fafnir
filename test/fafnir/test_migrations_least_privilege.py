@@ -310,6 +310,7 @@ OPS_READABLE = (
     "ops.data_quality_flag",
     "ops.ingestion_run",
     "ops.load_watermark",
+    "ops.vendor_correction",
     "landing.fmp_raw",
     "meta.schema_migration",
     # Everything fafnir_read reaches is included by design: triage starts from a
