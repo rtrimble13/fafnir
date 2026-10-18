@@ -12,14 +12,25 @@ from duk.datasource import db as ds_db
 from duk.datasource.base import DataSourceError, resolve_source, shape_price_dataframe
 
 
-def test_resolve_source_default():
+def test_resolve_source_default_is_the_warehouse():
+    # duk reads fafnir unless told otherwise: an empty or absent default is db.
     assert resolve_source(None, "db") == "db"
-    assert resolve_source(None, "live") == "live"
+    assert resolve_source(None, None) == "db"
+    assert resolve_source(None, "") == "db"
+    assert resolve_source(None, "fmp") == "fmp"
+    assert resolve_source(None, "sharadar") == "sharadar"
 
 
 def test_resolve_source_override():
-    assert resolve_source("live", "db") == "live"
-    assert resolve_source("DB", "live") == "db"
+    assert resolve_source("fmp", "db") == "fmp"
+    assert resolve_source("DB", "fmp") == "db"
+    assert resolve_source("Sharadar", "db") == "sharadar"
+
+
+def test_resolve_source_live_is_an_alias_for_fmp():
+    # The pre-1.6 spelling keeps working, as the explicit flag and as the default.
+    assert resolve_source("live", "db") == "fmp"
+    assert resolve_source(None, "live") == "fmp"
 
 
 def test_resolve_source_invalid():

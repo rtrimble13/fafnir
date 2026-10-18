@@ -17,6 +17,7 @@ from duk.config import get_config
 from duk.datasource import base as ds_base
 from duk.datasource import db as ds_db
 from duk.datasource import live as ds_live
+from duk.datasource import sharadar as ds_sharadar
 from duk.fmp_api import (
     actively_trading_list_api,
     get_yield_curve,
@@ -89,6 +90,51 @@ def parse_security_argument(argument):
         sys.exit(1)
 
 
+def require_source_credentials(ctx, source, *, needs_key=True):
+    """Exit 1 with an actionable message when the active source cannot be read.
+
+    ``db`` needs a DSN; ``fmp`` and ``sharadar`` need that vendor's key. Stated
+    once so every command gives the same instruction, and so a missing DSN under
+    the db default reads as configuration advice rather than a psycopg traceback.
+    """
+    cfg = ctx.obj["config"]
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if source == "db":
+        if not cfg.dsn:
+            logger.error("No warehouse DSN configured")
+            click.echo(
+                "Error: no fafnir DSN configured. Set FAFNIR_DSN or [database].dsn "
+                "in ~/.dukrc, or read a vendor directly with -S fmp / -S sharadar.",
+                err=True,
+            )
+            sys.exit(1)
+        return None
+    if not needs_key:
+        return None
+    if source == "fmp":
+        if not cfg.fmp_key:
+            logger.error("FMP API key not configured")
+            click.echo(
+                "Error: FMP API key not configured. Set FMP_API_KEY environment "
+                "variable or add fmp_key to [api] section in ~/.dukrc",
+                err=True,
+            )
+            sys.exit(1)
+        return cfg.fmp_key
+    if source == "sharadar":
+        if not cfg.sharadar_key:
+            logger.error("Sharadar API key not configured")
+            click.echo(
+                "Error: Sharadar API key not configured. Set SHARADAR_API_KEY "
+                "environment variable or add sharadar_key to [api] section in "
+                "~/.dukrc",
+                err=True,
+            )
+            sys.exit(1)
+        return cfg.sharadar_key
+    return None
+
+
 def resolve_security_identifier(ctx, identifier):
     """Turn an identifier into the ``(symbol, security_id)`` of one security.
 
@@ -102,7 +148,18 @@ def resolve_security_identifier(ctx, identifier):
     """
     logger = ctx.obj.get("logger", logging.getLogger("duk"))
     cfg = ctx.obj["config"]
-    source = ctx.obj.get("source", "live")
+    source = ctx.obj.get("source", "db")
+
+    if source == "sharadar":
+        # Sharadar's TICKERS carries CUSIPs and the CIK, but duk does not read it
+        # yet; the warehouse (which will hold the permaticker link) and FMP's
+        # search both resolve identifiers today. Refuse rather than guess.
+        click.echo(
+            f"Error: {identifier.describe()} cannot be resolved against the "
+            "Sharadar source yet; pass a ticker, or resolve it with -S db / -S fmp.",
+            err=True,
+        )
+        sys.exit(1)
 
     try:
         if source == "db":
@@ -144,18 +201,20 @@ def resolve_security_identifier(ctx, identifier):
 @click.option(
     "--source",
     "-S",
-    type=click.Choice(["live", "db"], case_sensitive=False),
+    type=click.Choice(["db", "fmp", "sharadar", "live"], case_sensitive=False),
     default=None,
-    help="Data source: 'db' (fafnir warehouse) or 'live' (FMP API). "
-    "Defaults to [general].default_source (db when a DSN is set, else live).",
+    help="Data source: 'db' (the fafnir warehouse, the default), or a vendor's API "
+    "directly: 'fmp' or 'sharadar' ('live' is the older name for fmp). "
+    "Defaults to [general].default_source, else db.",
 )
 @click.pass_context
 def main(ctx, config, source):
     """
     duk - A CLI tool for downloading markets and financial data.
 
-    Reads from the fafnir PostgreSQL warehouse (db mode) or the FMP API directly
-    (live mode). Use 'duk <subprogram> --help' for information on specific subprograms.
+    Reads the fafnir PostgreSQL warehouse by default (-S db), or a vendor's API
+    directly (-S fmp, -S sharadar). Use 'duk <subprogram> --help' for information
+    on specific subprograms.
     """
     # Ensure that ctx.obj exists and is a dict
     ctx.ensure_object(dict)
@@ -290,17 +349,8 @@ def ph(
 
     # Resolve data source and credentials
     cfg = ctx.obj["config"]
-    source = ctx.obj.get("source", "live")
-    api_key = cfg.fmp_key
-
-    if source == "live" and not api_key:
-        logger.error("FMP API key not configured")
-        click.echo(
-            "Error: FMP API key not configured. Set FMP_API_KEY environment variable "
-            "or add fmp_key to [api] section in ~/.dukrc",
-            err=True,
-        )
-        sys.exit(1)
+    source = ctx.obj.get("source", "db")
+    api_key = require_source_credentials(ctx, source)
 
     # An identifier is resolved to ONE security up front, so everything downstream
     # -- the query, the log line, the -o filename -- works on a ticker exactly as it
@@ -354,6 +404,18 @@ def ph(
                 dsn=cfg.dsn,
                 symbol=symbol,
                 security_id=security_id,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                limit=limit,
+                fields=fields,
+                adjusted=adj,
+            )
+        elif source == "sharadar":
+            df = ds_sharadar.price_history(
+                api_key=api_key,
+                base_url=cfg.sharadar_base_url or None,
+                symbol=symbol,
                 start_date=start_date,
                 end_date=end_date,
                 frequency=frequency,
@@ -551,17 +613,19 @@ def yc(
 
     # Resolve data source and credentials
     cfg = ctx.obj["config"]
-    source = ctx.obj.get("source", "live")
+    source = ctx.obj.get("source", "db")
     api_key = cfg.fmp_key
 
-    if source == "live" and not api_key:
-        logger.error("FMP API key not configured")
+    if source == "sharadar":
+        # Sharadar sells equity and fund data; it has no treasury curve.
         click.echo(
-            "Error: FMP API key not configured. Set FMP_API_KEY environment variable "
-            "or add fmp_key to [api] section in ~/.dukrc",
+            "Error: yc has no Sharadar backend (Sharadar carries no treasury "
+            "rates). Use -S fmp, or -S db once the FRED series land.",
             err=True,
         )
         sys.exit(1)
+    if source == "fmp":
+        require_source_credentials(ctx, source)
 
     # Determine output format
     if output_csv and output_json:
@@ -609,11 +673,10 @@ def yc(
     # Yield-curve data is not yet in the fafnir warehouse (economic-series is a
     # fast-follow), so yc always reads live from FMP regardless of --source.
     if source == "db":
-        logger.warning("yc has no db backend yet; falling back to live FMP source")
+        logger.warning("yc has no db backend yet; falling back to the FMP source")
         if not api_key:
             click.echo(
-                "Error: yc requires the FMP API (live). Set FMP_API_KEY or use "
-                "--source live.",
+                "Error: yc requires the FMP API. Set FMP_API_KEY or use -S fmp.",
                 err=True,
             )
             sys.exit(1)
@@ -868,7 +931,7 @@ def ls(
 
     # Resolve data source and credentials
     cfg = ctx.obj["config"]
-    source = ctx.obj.get("source", "live")
+    source = ctx.obj.get("source", "db")
     api_key = cfg.fmp_key
 
     # ------------------------------------------------------------------
@@ -905,14 +968,16 @@ def ls(
         )
         return
 
-    if source == "live" and not api_key:
-        logger.error("FMP API key not configured")
+    if source == "sharadar":
+        # Listing and screening read the warehouse snapshot or FMP's screener;
+        # Sharadar's TICKERS/DAILY tables are not wired into duk.
         click.echo(
-            "Error: FMP API key not configured. Set FMP_API_KEY environment variable "
-            "or add fmp_key to [api] section in ~/.dukrc",
+            "Error: ls is not available from the Sharadar source; use -S db "
+            "(the warehouse) or -S fmp.",
             err=True,
         )
         sys.exit(1)
+    require_source_credentials(ctx, source)
 
     # Helper function to parse comparison operators
     def parse_filter_values(value_tuple):
@@ -1214,7 +1279,7 @@ def _ls_company_summary(
     """
     logger = ctx.obj.get("logger", logging.getLogger("duk"))
     cfg = ctx.obj["config"]
-    source = ctx.obj.get("source", "live")
+    source = ctx.obj.get("source", "db")
 
     if any(screening_flags):
         click.echo(
@@ -1245,6 +1310,7 @@ def _ls_company_summary(
         sys.exit(1)
     if limit is not None:
         logger.debug("--limit is ignored in company-summary mode")
+    require_source_credentials(ctx, source)
 
     # Validated here rather than inside the datasource so a typo'd identifier is a
     # parse error naming the scheme, not a lookup that reports the security missing.
