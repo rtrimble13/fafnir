@@ -131,11 +131,15 @@ serves today — check that in #128 before scheduling it.
 | 0038 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
 | (optional) | #114, #116 | fund distribution types; FRED economic series |
 
-## Issue dispositions (proposed 2026-10-18 — pending the operator's confirmation)
+## Issue dispositions (applied 2026-10-18)
 
-Ninety-five issues are open. The table below is the recommendation this revision makes for each; none
-has been closed or edited yet. "Edit" means the issue body is rewritten to the v2 scope described in the
-note; "keep" means the body stands as written.
+Ninety-five issues were open when v2 was drafted; the operator approved the dispositions below and they
+were applied the same day: 28 closed (each with a one-line reason), 27 bodies rewritten (a *Revised
+2026-10-18* note on top of the v1 text, the superseded sentences replaced, `docs-gate` and the
+status-row items removed from the definition of done), and the tracking issue #41 rewritten for the
+phases. 67 issues remain open. "Keep" bodies were left exactly as written, so their definition-of-done
+blocks still name `docs-gate` and a status row; read those two lines as "lint, build-test, security" and
+"phase note".
 
 ### Close
 
