@@ -108,8 +108,9 @@ log_dir = "var/fafnir/log"
 # dorq_backfill_max = 500
 
 # --- duk (read CLI) settings -------------------------------------------------
-# duk reuses [api].fmp_key (live mode) and [database] (db mode).
-# default_source: "db" or "live". If unset, duk uses db when a DSN is configured.
+# duk reuses [api].fmp_key (-S fmp), [api].sharadar_key (-S sharadar) and
+# [database] (-S db). default_source: "db" (the default), "fmp" or "sharadar";
+# "live" is accepted as the older name for fmp.
 default_source = "db"
 default_output_dir = "var/duk"
 default_output_type = "csv"

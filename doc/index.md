@@ -27,7 +27,8 @@ read through the `duk` CLI.
 - [dorq](dorq.md) — the Bayesian data-quality engine: install, configure, the
   shadow period, `dq compare`, labels (`dq export-labels`, `dq label`), calibration
   ([ADR 0013](adr/0013-dorq-dq-engine.md))
-- [duk CLI](duk.md) — reading the warehouse (db) vs the API (live); also
+- [duk CLI](duk.md) — reading the warehouse (`db`, the default) or a vendor's API
+  directly (`fmp`, `sharadar`); also
   [from Claude Code on a laptop](duk.md#from-claude-code-on-a-laptop): the socket
   tunnel, the agent role, and the Bash sandbox
 - [Operations Agent](agent.md) — running an agent on the host for DQ triage,
@@ -58,10 +59,11 @@ read through the `duk` CLI.
     that followed: the outlier classification order, the plausibility gate, the
     survivorship check before deleting a segment, computed dry-run predictions
     (**applied**)
-  - [Sharadar adoption (COA 2-M)](plans/sharadar-adoption.md) — the living plan:
-    17 weekly sprints (S01–S17) adopting Sharadar as system of record while
-    downgrading, not cancelling, FMP; status by sprint, parallel-run evidence and
-    the decision log; tracked in [#41](https://github.com/rtrimble13/fafnir/issues/41)
+  - [Sharadar adoption](plans/sharadar-adoption.md) — the living plan, revised
+    2026-10-18: Sharadar (Bundle, max history) becomes the system of record in one
+    warehouse — it fills the history FMP never had and corrects what FMP has wrong —
+    while FMP drops to a lower tier; six phases, the issue dispositions and the
+    decision log; tracked in [#41](https://github.com/rtrimble13/fafnir/issues/41)
     (**in progress**)
   - [Sharadar COA assessment](plans/sharadar-coa-assessment.md) — the courses of
     action considered and why COA 2-M was chosen (reference)
