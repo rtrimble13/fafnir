@@ -26,7 +26,7 @@ Two rules about `mart` that matter when you are tempted to add a view:
 
 | Relation | Grain |
 |---|---|
-| `core.security` | one row per listed security (`security_id`; keyed on `(source, symbol)`) |
+| `core.security` | one row per listed security (`security_id`; keyed on `(source, symbol)`). `source` is the party that minted it; the FMP loaders feed `source = 'fmp'` rows only (`repo.FMP_FED_SECURITY`, ADR 0015) |
 | `core.symbol_xref` | `(security_id, symbol, valid_from)` — ticker over time |
 | `core.daily_price` | `(security_id, trade_date)`, partitioned by year, **raw** |
 | `core.corporate_action` | `(security_id, action_type, ex_date)` |

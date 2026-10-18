@@ -253,6 +253,13 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-18 · P0, #45: FMP feeds what FMP minted.** `VENDOR_FED_SECURITY` (`source <> 'operator'`)
+  became `FMP_FED_SECURITY` (`source = 'fmp'`), with `repo.is_fed_by(db, id, "fmp")` as the per-symbol
+  guard. Beyond the call sites #45 listed, the same scope now applies to the `source vendor-gaps` report
+  and `security venue-transfer`, both of which read FMP's feed for a security; the `ingest prices`
+  universe moved into `repo.fmp_price_universe` so it is tested. `is_fed_by` refuses any vendor but FMP
+  until `core.security_vendor_xref` exists (#55). The write-side operator guard in
+  `upsert_corporate_action` is left for #46, which replaces it with precedence.
 - **2026-10-18 · P0, #44: the provenance ADR is ADR 0015.** ADRs 0012–0014 were taken by the time it
   was written (instrument scope, dorq, venue transfers), so it is
   [ADR 0015](../adr/0015-multi-vendor-provenance-and-precedence.md); the identity ADR (#67) and the

@@ -449,10 +449,12 @@ def load_actions(
             if sec_id is None:
                 logger.warning("Unknown symbol %s; skipping actions", symbol)
                 continue
-            if repo.is_operator_security(db, sec_id):
-                # See daily_price.load_symbol_prices: the ticker is another issuer's.
+            if not repo.is_fed_by(db, sec_id, repo.FMP_SOURCE):
+                # See daily_price.load_symbol_prices: FMP serves this ticker for
+                # another issuer (ADR 0015).
                 logger.warning(
-                    "%s resolves to operator-minted security %s; skipping actions",
+                    "%s resolves to security %s, which FMP does not feed; skipping "
+                    "actions",
                     symbol,
                     sec_id,
                 )
@@ -522,9 +524,10 @@ def sweep_calendar(
     def _resolve(symbol: str) -> Optional[int]:
         if symbol not in resolved:
             sec_id = repo.resolve_security_id(db, symbol)
-            # An operator-minted security holds a split-off history under a ticker
-            # that is now another issuer's; the calendar's events are not its own.
-            if sec_id is not None and repo.is_operator_security(db, sec_id):
+            # Only a security FMP feeds takes FMP's calendar events (ADR 0015): an
+            # operator-minted or another vendor's security carries a ticker FMP
+            # now reports for a different issuer.
+            if sec_id is not None and not repo.is_fed_by(db, sec_id, repo.FMP_SOURCE):
                 sec_id = None
             resolved[symbol] = sec_id
         return resolved[symbol]
