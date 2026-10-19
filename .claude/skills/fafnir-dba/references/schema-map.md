@@ -38,6 +38,7 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `ops.operator_override` | `override_id`; one per operator edit, `reason` = `data_error`/`out_of_scope`/`cleanup` |
 | `core.vendor_security` | `(vendor, vendor_table, vendor_key)`; a vendor's own master (Sharadar TICKERS), never written into `core.security` |
 | `core.security_vendor_xref` | `(vendor, vendor_key, valid_from)`; open = `valid_to IS NULL`; one open link per key and per (security, vendor); `is_feed` = who loads new rows, one per security |
+| `core.security_vendor_rejection` | `(security_id, vendor, vendor_key)`; a person's "not this key" (`vendor link reject`), which the linking engine never proposes again |
 | `core.vendor_security_event` | `(vendor, vendor_key, event_date, action, contra_ticker)`; listings, delistings, renames, deals from ACTIONS |
 | `ops.vendor_correction` | `correction_id`; one per row a higher-ranked vendor replaced (ADR 0015), `old_row` = the replaced row; active = `reverted_at IS NULL` |
 | `ops.dq_label` | `label_id`; a label a person stated (`dq label`, `--label`); `security_id` NULL for a cohort (`members`) |
@@ -103,7 +104,7 @@ copied once, with a comment, in `duk.datasource.db`. **Do not add a third copy.*
 `sudo -u fafnir`. Per-person and per-agent login roles are members of these
 groups and are deployment facts, not migrations.
 
-The vendor identity tables (0031) are `core`, so they follow the tiers above:
+The vendor identity tables (0031, and the rejections of 0032) are `core`, so they follow the tiers above:
 `fafnir_read` and `fafnir_ops` read them, and `fafnir_app` does not, because no mart
 view exposes them yet (#79). To see which Sharadar key a security is, or who feeds it:
 `SELECT vendor, vendor_key, valid_from, valid_to, is_feed FROM

@@ -4020,7 +4020,7 @@ def vendor():
     """Work with more than one data vendor (ADR 0015)."""
 
 
-@vendor.command("link")
+@vendor.group("link", invoke_without_command=True)
 @click.option(
     "--vendor",
     "vendor_name",
@@ -4060,7 +4060,16 @@ def vendor_link(ctx, vendor_name, dry_run, symbols, new, prices):
     security gets vendor_xref_ambiguous or vendor_xref_unmatched, with a reason. An
     existing link is never changed. One ops.ingestion_run per run (endpoint link or
     link:new). See doc/ingestion.md, "Linking to a vendor's identity".
+
+    \b
+    A person decides what the engine cannot (doc/operations.md, "Resolving vendor
+    links"):
+      fafnir vendor link show SYMBOL        # candidates, links, rejections, flags
+      fafnir vendor link accept --security-id N --vendor-key K -m NOTE
+      fafnir vendor link reject --security-id N --vendor-key K -m NOTE
     """
+    if ctx.invoked_subcommand is not None:
+        return
     from fafnir.db import repository as repo
     from fafnir.ingest import vendor_link as vl
 
@@ -4078,19 +4087,13 @@ def vendor_link(ctx, vendor_name, dry_run, symbols, new, prices):
             if missing:
                 raise click.ClickException(f"No security for: {', '.join(missing)}")
 
-        def source_for(n: int):
-            use_api = prices == "api" or (
-                prices == "auto"
-                and n <= vl.API_MAX_CANDIDATES
-                and bool(cfg.sharadar_api_key)
-            )
-            if use_api:
-                return vl.ApiCloses(_sharadar_client(cfg))
-            return vl.BulkCloses(database, cfg.sharadar_bulk_dir)
-
         try:
             result = vl.link(
-                database, source_for, security_ids=ids, new=new, dry_run=dry_run
+                database,
+                _link_closes(cfg, database, prices),
+                security_ids=ids,
+                new=new,
+                dry_run=dry_run,
             )
         except vl.LinkError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -4113,6 +4116,267 @@ def vendor_link(ctx, vendor_name, dry_run, symbols, new, prices):
         counts.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))
     ):
         click.echo(f"  {outcome:<10} {reason or '':<24} {n}")
+
+
+def _link_closes(cfg, database, prices: str):
+    """``source_for(n)`` for the linking engine: Sharadar's closes from the API
+    for a small run with a key set (or ``--prices api``), else the bulk files."""
+    from fafnir.ingest import vendor_link as vl
+
+    def source_for(n: int):
+        use_api = prices == "api" or (
+            prices == "auto"
+            and n <= vl.API_MAX_CANDIDATES
+            and bool(cfg.sharadar_api_key)
+        )
+        if use_api:
+            return vl.ApiCloses(_sharadar_client(cfg))
+        return vl.BulkCloses(database, cfg.sharadar_bulk_dir)
+
+    return source_for
+
+
+_REVIEW_TARGET = [
+    click.option(
+        "--symbol", help="The security, by ticker (resolved like the loaders)."
+    ),
+    click.option("--security-id", type=int, help="The security, by id."),
+]
+
+
+def _review_target(f):
+    for opt in reversed(_REVIEW_TARGET):
+        f = opt(f)
+    return f
+
+
+@vendor_link.command("show")
+@click.argument("symbol_arg", metavar="[SYMBOL]", required=False)
+@_review_target
+@click.option(
+    "--evaluate",
+    is_flag=True,
+    help="Also run the engine's price test on the candidates (reads Sharadar's closes)",
+)
+@click.option(
+    "--prices",
+    type=click.Choice(["auto", "bulk", "api"]),
+    default="auto",
+    show_default=True,
+    help="With --evaluate: where Sharadar's closes come from",
+)
+@click.pass_context
+def vendor_link_show(ctx, symbol_arg, symbol, security_id, evaluate, prices):
+    """A security's Sharadar identity: links, rejections, open flags, candidates.
+
+    \b
+      fafnir vendor link show META
+      fafnir vendor link show --security-id 1234 --evaluate
+
+    Candidates are the Sharadar stocks and funds sharing a ticker with it, each with
+    its status: linked, candidate, rejected, no_overlap (the dates never meet) or
+    taken (another security's open link holds it). --evaluate prints what the
+    engine would decide today, sampled prices included: vendor data, so keep it on
+    the host. Writes nothing.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import vendor_link as vl
+    from fafnir.ingest import vendor_review as vr
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol or symbol_arg, security_id)
+        sec = vr.review_security(database, sid)
+        links = repo.vendor_links_of(database, sid, vl.VENDOR)
+        rejections = repo.vendor_rejections(database, vl.VENDOR, sid)
+        flags = vr.open_flags(database, sid)
+        linked_key = next(
+            (r["vendor_key"] for r in links if r["valid_to"] is None), None
+        )
+        everything = repo.vendor_link_candidates(database, vl.VENDOR, vl.PRICED_TABLES)
+        said_no = {(sid, r["vendor_key"]) for r in rejections}
+        matches = vl.ticker_matches(sec, everything, said_no, linked_key)
+        decision = None
+        if evaluate:
+            # The security's own key competes again: show what the engine says now.
+            pool = [
+                dict(c, taken=False) if c["vendor_key"] == linked_key else c
+                for c in everything
+            ]
+            try:
+                (decision,), _ = vl.evaluate(
+                    database, [sec], pool, _link_closes(cfg, database, prices), said_no
+                )
+            except vl.LinkError as exc:
+                raise click.ClickException(str(exc)) from exc
+
+    click.echo(
+        f"{sym} (security {sid}, {sec['asset_type']}): {sec['company_name']}; "
+        f"bars {sec['first_trade_date']} .. {sec['last_trade_date']}; tickers "
+        f"{', '.join(sorted(sec['tickers'] or [])) or '-'}"
+    )
+    click.echo("Links:" if links else "Links: none")
+    for r in links:
+        span = f"{r['valid_from']} .. {r['valid_to'] or 'open'}"
+        conf = f", confidence {r['confidence']}" if r["confidence"] is not None else ""
+        feed = ", FEED" if r["is_feed"] else ""
+        click.echo(
+            f"  {r['vendor_key']:<10} {span:<26} {r['match_method']}{conf}{feed} "
+            f"(by {r['created_by']})"
+        )
+    for r in rejections:
+        click.echo(
+            f"Rejected: {r['vendor_key']} by {r['rejected_by']} "
+            f"{r['rejected_at']:%Y-%m-%d}: {r['note']}"
+        )
+    for f in flags:
+        detail = f.get("detail") or {}
+        click.echo(
+            f"Open flag {f['dq_flag_id']}: {f['check_name']} ({f['severity']}), "
+            f"reason {detail.get('reason')}"
+        )
+    click.echo("Candidates:" if matches else "Candidates: none share a ticker")
+    for c in matches:
+        click.echo(
+            f"  {c['vendor_key']:<10} {c['status']:<11} {c['vendor_table']:<7} "
+            f"{c['ticker']:<8} {c['first_price_date']} .. {c['last_price_date']}  "
+            f"{c['name'] or ''}"
+        )
+    if decision is not None:
+        click.echo(
+            f"Engine today: {decision.outcome}"
+            + (f" ({decision.reason})" if decision.reason else "")
+            + (
+                f" -> {decision.vendor_key}, confidence {decision.confidence}"
+                if decision.vendor_key
+                else ""
+            )
+        )
+        ev = decision.evidence
+        for r in [ev] if ev else decision.candidates:
+            if "samples" in r:
+                for smp in r["samples"]:
+                    click.echo(
+                        f"    {smp['date']}  fmp {smp['fmp']}  sharadar {smp['sharadar']}"
+                    )
+            elif "agreed" in r:
+                click.echo(
+                    f"  {r['vendor_key']}: {r['agreed']} of {r['of']} agree"
+                    + (f", {r['identifier']} matches" if r.get("identifier") else "")
+                )
+
+
+@vendor_link.command("accept")
+@_review_target
+@click.option("--vendor-key", required=True, help="The permaticker to link it to.")
+@click.option(
+    "--from",
+    "valid_from",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    help="When the link starts  [default: where the two price histories meet]",
+)
+@click.option(
+    "--note", "-m", required=True, help="Why: kept on the link and the flags."
+)
+@click.option("--by", help="Who decided  [default: the OS user running the command]")
+@click.option("--dry-run", is_flag=True, help="Say what would change; write nothing.")
+@click.pass_context
+def vendor_link_accept(
+    ctx, symbol, security_id, vendor_key, valid_from, note, by, dry_run
+):
+    """Link a security to a vendor key by hand (match_method manual).
+
+    \b
+      fafnir vendor link accept --security-id 1234 --vendor-key 199059 \\
+          -m "share class B, CUSIP on the 10-K" --dry-run
+
+    Refused when another security's open link holds the key (reject or close it
+    there first), or when the security's own open link is its feed. Any other open
+    link of the security is closed the day before this one starts. Resolves the
+    security's open vendor_xref_* flags, and withdraws a rejection of this pair.
+    The engine never moves a manual link.
+    """
+    from datetime import timedelta
+
+    from fafnir.ingest import vendor_review as vr
+
+    by = by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        try:
+            plan = vr.plan_accept(
+                database,
+                security_id=sid,
+                vendor_key=vendor_key,
+                valid_from=valid_from.date() if valid_from else None,
+            )
+        except vr.ReviewRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        resolved = []
+        if not dry_run:
+            resolved = vr.apply_accept(database, plan, by=by, note=note)
+            # Durable before it is reported (test_cli_commit_before_output).
+            database.commit()
+
+    head = "Would" if dry_run else "Did"
+    if plan.noop:
+        click.echo(f"{sym} (security {sid}) is already linked to {vendor_key}.")
+    else:
+        if plan.close is not None:
+            click.echo(
+                f"{head} close the link to {plan.close['vendor_key']} "
+                f"(from {plan.close['valid_from']}) on "
+                f"{plan.valid_from - timedelta(days=1)}."
+            )
+        click.echo(
+            f"{head} link {sym} (security {sid}) to {vendor_key} from "
+            f"{plan.valid_from}, manual, by {by}."
+        )
+    if plan.unrejects:
+        click.echo(f"{head} withdraw the rejection of {vendor_key} for it.")
+    n = len(plan.flags) if dry_run else len(resolved)
+    if n:
+        click.echo(f"{head} resolve {_plural(n, 'vendor_xref flag')}.")
+
+
+@vendor_link.command("reject")
+@_review_target
+@click.option("--vendor-key", required=True, help="The permaticker it is not.")
+@click.option("--note", "-m", required=True, help="Why: kept with the rejection.")
+@click.option("--by", help="Who decided  [default: the OS user running the command]")
+@click.option("--dry-run", is_flag=True, help="Say what would change; write nothing.")
+@click.pass_context
+def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
+    """Record that a security is NOT a vendor key; the engine never proposes it again.
+
+    \b
+      fafnir vendor link reject --security-id 1234 --vendor-key 199059 \\
+          -m "different issuer: prices diverge after the 2009 spin-off" --dry-run
+
+    If the security's open link is to that key, it is closed today (refused if it
+    is the security's feed). Its flags stay open: the security is still
+    undecided, and the next `fafnir vendor link` looks again without that key.
+    """
+    from fafnir.ingest import vendor_review as vr
+
+    by = by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        sid, sym = _resolve_one_security(database, symbol, security_id)
+        try:
+            plan = vr.plan_reject(database, security_id=sid, vendor_key=vendor_key)
+        except vr.ReviewRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        if not dry_run:
+            vr.apply_reject(database, plan, by=by, note=note)
+            database.commit()
+
+    head = "Would" if dry_run else "Did"
+    if plan.close is not None:
+        click.echo(
+            f"{head} close the link to {vendor_key} (from {plan.close['valid_from']})."
+        )
+    verb = "restate the rejection" if plan.restates else "record a rejection"
+    click.echo(f"{head} {verb}: {sym} (security {sid}) is not {vendor_key}, by {by}.")
 
 
 @vendor.group("corrections")

@@ -74,6 +74,16 @@ These are not style guidance. Each one is a way this system gets damaged.
     transaction block and rolls back work it has already announced. Redirect to a
     file and `tail` it. (`dq resolve` now commits before it prints; the rule stands
     anyway, because it is about the shape of the pipeline, not that one bug.)
+12. **A vendor link is a person's decision. Propose it; never make it.** For a
+    `vendor_xref_unmatched` or `vendor_xref_ambiguous` flag, you may run `fafnir
+    vendor link show <SYM> --evaluate` (it writes nothing). Propose the
+    `vendor link accept` or `reject` that the evidence supports: the key, the
+    sampled closes that agree or not, the shared identifier, and the dry run's
+    output. **Never run `accept` or `reject` without `--dry-run`**, even with an
+    explicit yes. A link decides which vendor's data a security receives (#98), and
+    a wrong one is a silent cross-issuer feed, which no DQ check is built to catch.
+    The operator runs it. See
+    [operations.md › Resolving vendor links](../../../doc/operations.md#resolving-vendor-links).
 
 ## Check the environment before planning anything
 

@@ -235,12 +235,14 @@ def test_0031_leaves_existing_rows_byte_identical(db):
     _bars(db, a, dt.date(2024, 1, 2), 30)
     _bars(db, b, dt.date(2019, 12, 2), 20)
     before = _fingerprint(db)
+    # Every migration from 0031 on: a later one (0032) depends on its tables.
+    later = [v for v, _, state in m.status(db.dsn) if v >= "0031"]
     try:
-        assert m.rollback(db.dsn, steps=1) == ["0031"]
+        assert m.rollback(db.dsn, steps=len(later))[-1] == "0031"
         assert db.fetchval("SELECT to_regclass('core.security_vendor_xref')") is None
         assert _fingerprint(db) == before
     finally:
         # Re-applied whatever happened: the rest of the suite needs 0031.
         applied = m.migrate(db.dsn)
-    assert applied == ["0031"]
+    assert applied == later
     assert _fingerprint(db) == before

@@ -625,6 +625,8 @@ manual or the engine's, is never moved.
      is filed under `CLA1`, and 3,304 of the 3,331 suffixed TICKERS rows list the
      root.
    - A permaticker another open link holds is not a candidate.
+   - A permaticker a person rejected for the security (`vendor link reject`, #63) is
+     never a candidate for it.
    - A ticker is compared with `.` read as `-`. Sharadar writes 505 share classes
      as `BRK.B`, where FMP writes `BRK-B`.
 2. **The decisive test.** The overlap is cut into five equal windows, and the
@@ -666,6 +668,12 @@ are never posted.
 | `fafnir vendor link` | every unlinked security (endpoint `link`) |
 | `fafnir vendor link --new` | the securities first seen since the last successful full run (`link:new`) |
 | `fafnir vendor link --symbols A,B` | those |
+
+**What a person decides.** The flags are resolved by hand with `fafnir vendor link
+show|accept|reject`
+([operations.md › Resolving vendor links](operations.md#resolving-vendor-links)). An
+accepted link is `manual`, and like every link it is never moved by the engine. A
+rejected pair is never proposed again.
 
 **The nightly run.** `daily_update.sh` runs `--new` after the price step, not
 straight after the security master as #62 first had it. The decision compares the
