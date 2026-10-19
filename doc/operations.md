@@ -832,3 +832,17 @@ there is nothing for `fafnir db refresh-marts` to refresh.
 
 Scheduling both, and practising the restore, are in
 [install_hetzner.md §9](install_hetzner.md#9-backups).
+
+**Sharadar's files are not backed up, by decision.** The dump holds the file ledger,
+`landing.sharadar_file`, but not the files it names under `[sharadar] bulk_dir`,
+and `backup_offsite.sh` copies only the dump directory. There are two reasons:
+- The files are re-downloadable while the subscription lasts, and a fresh
+  download is the current one anyway.
+- Off-site copies of a vendor's whole tables are the licence's question, not a
+  backup's.
+
+What a restore brings back is everything loaded from them: the Sharadar rows are
+in `core`, and they are in the dump. After a restore onto a new host, ledger rows
+whose files are gone describe nothing; the next bulk download records the files
+again. As Sharadar rows reach `core`, the dump grows with `core.daily_price`
+(see [backfill.md](backfill.md#disk-budget-with-sharadar)).

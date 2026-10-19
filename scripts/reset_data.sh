@@ -42,9 +42,11 @@ Scopes:
   dq-flags      ops.data_quality_flag only. Clears accumulated flag history.
 
   all           Every core/ops/landing table: prices, actions, factors, security
-                master, xrefs, profiles, watermarks, DQ flags, ingestion runs and
-                landing payloads. Identity sequences restart. Reference data and
-                migrations are kept.
+                master, xrefs, applied renames, profiles, watermarks, DQ flags,
+                ingestion runs, landing payloads and the Sharadar file ledger
+                (the files under [sharadar] bulk_dir stay; the next download
+                records them again). Identity sequences restart. Reference data
+                and migrations are kept.
 
 Options:
   --yes         Execute. Without it this only reports what would be deleted.
@@ -122,9 +124,9 @@ case "${SCOPE}" in
         ;;
     all)
         TABLES="core.daily_price, core.corporate_action, core.adjustment_factor,
-                core.symbol_xref, core.company_profile, core.security,
-                ops.data_quality_flag, ops.load_watermark, ops.ingestion_run,
-                landing.fmp_raw"
+                core.symbol_xref, core.symbol_change, core.company_profile,
+                core.security, ops.data_quality_flag, ops.load_watermark,
+                ops.ingestion_run, landing.fmp_raw, landing.sharadar_file"
         RESTART_IDENTITY="RESTART IDENTITY"
         NEXT="fafnir ingest securities --enrich
   fafnir ingest prices --include-inactive --from <start-date>
