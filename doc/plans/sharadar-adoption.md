@@ -275,6 +275,23 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
     a security a Sharadar feed, it must also take it out of FMP's universes so one vendor feeds it. The
     `s.{FMP_FED_SECURITY}` callers assume a bare column, so #98 changes the predicate and its callers
     together.
+- **2026-10-19 · P1, #56: boundary mappings.** `fafnir.ingest.sharadar_map` holds the pure functions every
+  loader calls: `map_exchange`, `map_category`, `map_classification`, `split_ratio`,
+  `split_product_after`, `as_declared_dividend`, `recover_raw`. Tests cover every branch, plus the round
+  trip `recover_raw(adjust(raw)) == raw` at 6 dp for factors 1, 2, 7, 112 and 1/20, by ratio and by
+  factor. The table and its reasons are in
+  [ingestion.md](../ingestion.md#sharadar-field-mapping). The decisions:
+  - **Exchanges.** `NYSEARCA` and `NYSEMKT` map to `AMEX`, as FMP files them; the operator confirms with
+    the SQL in the module before the first load.
+  - **Asset types.** CEFs are `equity` + `is_fund`. ETN, ETD and ETMF are `etf`. Preferreds are `equity`.
+    `UNIT` and `IDX` map to none.
+  - **Where it is recorded.** The issue named ADR 0013 for this, but 0013 is taken, so the decisions live
+    here and in ingestion.md. The identity ADR (#67) cites them.
+  - **Departures, forced by #49.**
+    - Dividends convert by the ACTIONS split product, because the value is split-adjusted.
+    - `recover_raw` takes an optional exact factor beside the documented ratio; #75 chooses which to pass.
+  - **For #58.** Bulk TICKERS writes `table` in legacy codes (`SEP`, `SFP`, `SF1`, `SF2`, `SF3B`), so its
+    loader maps them to the modern names.
 - **2026-10-19 · P0, #52: the bulk downloader.** `fafnir source sharadar-bulk [--tables …] [--years 5|10|full]
   [--force]`. For each table it:
   - downloads the zip (via the 302, without the key);

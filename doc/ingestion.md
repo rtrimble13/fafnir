@@ -259,6 +259,47 @@ ACTIONS would mis-state every earlier dividend as well as the recovered prices.
   returns everything it should have narrowed, so loaders assert their filters in the
   rows they get back.
 
+### Sharadar field mapping
+
+The boundary is `fafnir.ingest.sharadar_map` (#56): pure functions with no database
+access, which every Sharadar loader calls. The vocabularies are the ones the first
+full TICKERS file used (#52, 2026-10-19).
+
+| Sharadar | fafnir | Rule |
+|---|---|---|
+| `exchange` `NYSE`, `NASDAQ`, `BATS`, `TXSE`, `OTC` | `exchange_code`, same code | `map_exchange` |
+| `exchange` `NYSEMKT`, `NYSEARCA` | `AMEX` | FMP files NYSE Arca listings under AMEX (SPY is `AMEX` there), and a security keeps one venue whichever vendor described it. Confirm on the host before the first load: `SELECT exchange_code, count(*) FROM core.security WHERE is_etf GROUP BY 1` |
+| `exchange` `INDEX` | none, silently | not a venue |
+| any other `exchange` | none, with a warning | the caller decides; nothing invents a `ref.exchange` row |
+| `category` common, preferred or ADR stock (Domestic, ADR, Canadian; Primary/Secondary Class) | `asset_type = equity` | `map_category` |
+| `category` `ETF`, `ETN`, `ETD`, `ETMF` | `etf`, `is_etf` | each trades on the session like an ETF |
+| `category` `CEF`, `CEF Preferred` | `equity`, `is_fund` | as FMP stores its funds today; `fund` is the declared NAV-priced mutual fund (ADR 0006). The price validator reads `equity` + `is_fund` as NAV-priced, so a CEF bar with only a close is accepted, as FMP's are (#75) |
+| `category` `MF` | `fund`, `is_fund` | NAV-priced |
+| `category` `UNIT`, `IDX` | none, silently | units are out of scope (ADR 0012); an index is not a security |
+| `sector`, `industry` | a name already in `ref.sector` / `ref.industry` | `map_classification`: case, commas and spacing ignored; two reviewed industry aliases (`Drug Manufacturers - Major`, `Furnishings`); anything else is none, and `missing_classification` flags the security |
+| split `value` | `split_numerator / split_denominator` | `split_ratio`: `Fraction(str(value)).limit_denominator(1000)`, 4 → 4/1, 0.25 → 1/4; non-positive refused |
+| dividend `value` | `dividend_amount`, as declared | `as_declared_dividend(value, split_product_after(splits, ex_date))`, quantized to 6 dp half-up; non-positive refused |
+| SEP/SFP `closeunadj` | raw `close` | `recover_raw` |
+| SEP/SFP `open`, `high`, `low` | raw, × factor | factor = `closeunadj / close`, or the ACTIONS split product when the caller passes it (exact, where the ratio carries the close's 3-dp rounding; #75 chooses) |
+| SEP/SFP `volume` | raw, ÷ factor | rounded half-up to a whole share |
+
+Measured on the 2026-10-19 file: every exchange and category maps except the 29
+`UNIT` and `IDX` rows. Sharadar's sectors are FMP's eleven verbatim. Its industries
+follow the same Yahoo-style list, so all but the aliased legacy names match as they
+stand.
+
+Two departures from the issue as written, both forced by #49's measurements:
+
+- **`as_declared_dividend` takes the split product, not `closeunadj / close`.**
+  The value is split-adjusted, so the identity the issue anticipated does not
+  apply. The product of the ACTIONS splits is exact; the price ratio is not.
+- **`map_category` takes no table.** Each category names the same thing in stocks
+  and funds.
+
+One fact for #58: bulk TICKERS writes its `table` column in legacy codes (`SEP`,
+`SFP`, `SF1`, `SF2`, `SF3B`), whereas the API returns the modern names that
+`core.vendor_security.vendor_table` stores.
+
 ## What FMP restates, and the guard
 
 The nightly price load re-reads the last `overlap_days` (5) sessions of every
