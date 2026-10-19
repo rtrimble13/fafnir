@@ -264,9 +264,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
   runs resume; the same content twice is one file. The shared reader is `sharadar_files.rows(db, file_id,
   bulk_dir)`, which refuses a deleted, missing or resized file. Download errors drop the pre-signed query
   string, which is credentials plus noise.
-  - **Not yet measured:** the zips' members and the wall-clock. The build session reached the 302 but its
-    network policy blocks `static-sharadar.nyc3.digitaloceanspaces.com`. The first operator run records
-    both.
+  - **Measured: the first full download** (2026-10-19, cloud session, once
+    `static-sharadar.nyc3.digitaloceanspaces.com` was allowed). Five tables, 1.9 GB of zips, under 4 minutes,
+    most of it counting rows:
+
+    | Table | Rows | Zip |
+    |---|---|---|
+    | tickers | 74,420 | 4.8 MB |
+    | actions | 718,464 | 10 MB |
+    | stocks | 45,451,818 | 907 MB |
+    | funds | 15,760,389 | 322 MB |
+    | fundamentals | 3,218,845 | 632 MB |
+
+    Each zip holds one `<modern name>.csv`. Every header matched its schema with no unknown column. #50's
+    projection held for the price files; SF1 came in under it (632 MB, not ~1.1 GB).
 - **2026-10-19 · P0, #50: the file ledger.** Migration 0030 adds `landing.sharadar_file`, one row per
   downloaded file: table, `full`/`delta`, filters, path, `member`, sha256 (unique), bytes, rows, header,
   run and status. `fafnir.sources.sharadar_files` reads a file as typed rows, streamed. Differences from

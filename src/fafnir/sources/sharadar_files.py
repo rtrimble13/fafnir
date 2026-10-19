@@ -8,8 +8,8 @@ every loader (#52's downloader checks headers with it; #55, #58, #75 read with i
 types a value the same way.
 
 * **Containers.** A bulk file is a zip holding one CSV (measured 2026-10-19:
-  ``/bulk-sharadar/<table>.csv.zip``; the member's name is UNVERIFIED, so a zip
-  with exactly one ``.csv`` member needs none named). A slice saved from the API
+  ``/bulk-sharadar/<table>.csv.zip`` holding ``<modern name>.csv``; a zip with
+  exactly one ``.csv`` member needs none named). A slice saved from the API
   may be a plain or gzipped CSV. All are streamed: a 45M-row SEP is never in
   memory.
 * **Types** follow Sharadar's own schemas (``GET /v1.0/schema/<table>``,

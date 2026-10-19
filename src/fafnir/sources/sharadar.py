@@ -66,8 +66,10 @@ key and corrects this docstring, the constants and ``duk.sharadar_api`` together
    is a DigitalOcean Spaces URL (``static-sharadar.nyc3.digitaloceanspaces.com``,
    ``/bulk-sharadar/<table>.csv.zip``), so a host's egress must allow that host as
    well as ``api.sharadar.com``. ``tickers`` and ``descriptions`` publish a full
-   snapshot only. The zip's members are UNVERIFIED: the build session's network
-   could not reach the download host.
+   snapshot only. MEASURED (first full download, 2026-10-19): each zip holds one
+   CSV named for the table's modern name (``stocks.csv`` when ``SEP`` was asked
+   for), whose header matches the table's ``/v1.0/schema``. Full history totals
+   1.9 GB of zips across tickers, actions, SEP, SFP and SF1.
 9. **Schemas** -- ``GET /schema/{table}?format=postgres`` serves a table's schema
    without a key. DOCUMENTED; an input for the bulk reader's header check (#52).
 
