@@ -167,7 +167,7 @@ blocks still name `docs-gate` and a status row; read those two lines as "lint, b
 | [#47](https://github.com/rtrimble13/fafnir/issues/47) Sharadar client | Share endpoint knowledge with `duk.sharadar_api`; its UNVERIFIED items are probe inputs for #49 |
 | [#49](https://github.com/rtrimble13/fafnir/issues/49) probe | Runs on the **paid key**, not the free sample; adds "API shape as `duk.sharadar_api` implements it" |
 | [#50](https://github.com/rtrimble13/fafnir/issues/50) landing migration | File ledger only; no typed landing tables; size M → S |
-| [#52](https://github.com/rtrimble13/fafnir/issues/52) bulk downloader | Drop the "load into typed landing" step; loaders read the gzip files |
+| [#52](https://github.com/rtrimble13/fafnir/issues/52) bulk downloader | Drop the "load into typed landing" step; loaders read the downloaded zips (Sharadar's bulk format, #47) |
 | [#57](https://github.com/rtrimble13/fafnir/issues/57) subscribe | Bundle, **max history, annual**; first smoke test `duk -S sharadar ph AAPL -n 5` |
 | [#59](https://github.com/rtrimble13/fafnir/issues/59) initial production load | No shadow timer: download + master load + probe report |
 | [#66](https://github.com/rtrimble13/fafnir/issues/66) reconciliation | Output is the **correction queue** (`fafnir vendor reconcile` → `fafnir vendor correct`), plus the per-session summary; one ops table, not two |
@@ -235,7 +235,7 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | FMP's licence does not permit retaining data after a downgrade | #43's letter; the agreement stays in force on a lower tier (the assessment's reading); cancellation only on written confirmation |
 | Personal-licence eligibility fails (professional use) | #43 self-check before paying — the one remaining hard stop |
 | Backfill floods the DQ queue | #76 measures first; dorq's backfill path and the SQL checks as they are |
-| Host disk | #50 size projection on the bulk files (gzip on disk, no typed copy) |
+| Host disk | #50 size projection on the bulk files (zips on disk, no typed copy) |
 
 ## Decision log
 
@@ -254,16 +254,29 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 ## [built] notes
 
 - **2026-10-19 · P0, #47: the Sharadar client.** `fafnir.sources.sharadar.SharadarClient` on
-  `BaseSource`: `ping`, `tables`, `query` (cursor-paged) and `bulk_export` (streams to
-  `<sha256><suffix>` under `[sharadar] bulk_dir`, via a temporary name). `fafnir source ping` makes one
-  request and writes nothing.
-  - **Nothing measured.** `sharadar.com` could not be reached from the build host, so every API mechanic in
-    the module docstring is marked `UNVERIFIED`: base URL, `api_key` auth, `format=json`, filter and
-    `qopts.columns` syntax, `meta.next_cursor_id` paging and its row cap, the rate limit, and the
-    `qopts.export` bulk flow and file format. These eight items are #49's item 1. The ping against the free
-    sample is an operator step.
+  `BaseSource`: `ping`, `tables`, `query` and `bulk_export`. `fafnir source ping` makes one request and
+  writes nothing.
+  - **Built from Sharadar's agent guide, not yet measured.** The build host's network could not reach the
+    vendor, so the module docstring labels each mechanic `DOCUMENTED` or `UNVERIFIED`. It is the direct
+    API at `api.sharadar.com/v1.0/data/{table}`, not Nasdaq Data Link: no `qopts.*` and no `datatable`
+    cursor.
+    - **Documented:** key as `api_key` or the `x-api-key` header (the client sends the header); tables by
+      modern name or legacy code; slices by `ticker`, `from`, `to` and `fields`; `limit` (default
+      10,000) / `offset` paging (`query` pages by offset); bulk as the same route with
+      `years=5|10|full`, answering a 302 to a pre-signed **zip**.
+    - **Unverified, for #49:** the JSON payload shape, a list in `ticker`, which date `from`/`to` filter
+      where a table has two, a `lastupdated` filter for the nightly delta (#58), the largest `limit` and
+      the default sort under offset paging, the rate limit, and the zip's contents.
+    - **Operator step:** the ping against the free sample (`SHARADAR_API_KEY=test-api-key fafnir source
+      ping`).
+  - **Bulk.** `bulk_export(table, dir, years=...)` follows the redirect by hand, so the key header never
+    reaches the link's host. It streams to `<sha256><suffix>` under `[sharadar] bulk_dir` via a temporary
+    name. The files are zips, not the gzip CSVs #50 and #52 assumed: the ledger and the shared reader
+    read a zip member.
   - **duk now shares this module's endpoint knowledge.** `duk.sharadar_api` imports the default base URL,
-    the price tables and the payload parser from it, so #49 corrects one module, not two.
+    the price tables and the payload parser from it, so #49 corrects one module, not two. duk's date
+    filter was the Nasdaq Data Link spelling (`date.gte` / `date.lte`) and is now the documented `from` /
+    `to`; its test asserted the old spelling and was corrected with it.
   - **The key.** `SHARADAR_API_KEY` is read from the environment and nowhere else. `[api].sharadar_key`
     stays duk's, and fafnir ignores it, but names it when the env var is missing.
   - **Redaction.** It now masks a client's key by value, as well as by the `api_key=` pattern, and also

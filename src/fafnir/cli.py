@@ -4112,7 +4112,12 @@ def source():
     show_default=True,
     help="Vendor to reach",
 )
-@click.option("--table", default="TICKERS", show_default=True, help="Table to ask")
+@click.option(
+    "--table",
+    default="tickers",
+    show_default=True,
+    help="Table to ask: a name (stocks, tickers) or a legacy code (SEP, SF1)",
+)
 @click.option("--ticker", default="AAPL", show_default=True, help="Ticker to ask for")
 @click.pass_context
 def source_ping(ctx, vendor, table, ticker):
@@ -4126,21 +4131,21 @@ def source_ping(ctx, vendor, table, ticker):
 
     client = _sharadar_client(ctx.obj["config"])
     try:
-        r = client.ping(table=table.upper(), ticker=ticker)
+        r = client.ping(table=table, ticker=ticker)
     except SourceError as exc:
         raise click.ClickException(f"{vendor} ping FAILED: {exc}") from None
     click.echo(f"GET {r['url']}  ticker={r['ticker']}")
     click.echo(
         f"  HTTP {r['status']}, {r['rows']} row(s), {r['bytes']} bytes, "
-        f"{r['elapsed_ms']} ms{', paged (cursor returned)' if r['paged'] else ''}"
+        f"{r['elapsed_ms']} ms"
     )
     if r["columns"]:
         click.echo(f"  columns: {', '.join(r['columns'])}")
     if not r["rows"]:
         raise click.ClickException(
             f"{vendor} answered with no rows for {r['ticker']} in {r['table']}: try "
-            "a ticker the subscription covers, or check the endpoint "
-            "(SHARADAR_BASE_URL)."
+            "a ticker the subscription covers (the free test-api-key serves roughly "
+            "the DJIA names), or check the endpoint (SHARADAR_BASE_URL)."
         )
     click.echo(f"{vendor}: OK")
 

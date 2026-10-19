@@ -4,52 +4,62 @@ Sharadar source client (plan SA-0106, #47).
 Everything Sharadar-facing goes through :class:`SharadarClient`, which inherits
 throttling, retry/backoff, byte metering and secret redaction from
 :class:`~fafnir.sources.base.BaseSource`, as :class:`~fafnir.sources.fmp.FMPClient`
-does. ``duk -S sharadar`` (``duk.sharadar_api``) takes its base URL and price tables
-from here, so a correction to either is made once.
+does. ``duk -S sharadar`` (``duk.sharadar_api``) takes its base URL, price tables
+and payload parser from here, so a correction is made once.
 
-API MECHANICS -- what this module assumes, and how sure it is
---------------------------------------------------------------
+API MECHANICS -- what this module relies on, and on what evidence
+-----------------------------------------------------------------
 
-The repository does not adopt an endpoint on the strength of its documentation
-(ADR 0007), and Sharadar's documentation could not be read from where this module
-was written: ``sharadar.com/docs`` is rendered by JavaScript, and the build host
-could not reach it at all. Every item below is therefore **UNVERIFIED** until
-``fafnir source probe-sharadar`` (SA-0201, #49) measures it against the paid key
-and corrects this docstring, the constants and ``duk.sharadar_api`` in one PR.
+The repository adopts an endpoint on a probe's evidence, not its documentation
+(ADR 0007). The items marked DOCUMENTED come from Sharadar's own agent guide
+(supplied by the operator on 2026-10-19); none has yet been measured from this
+repository, because the build host's network could not reach the vendor.
+``fafnir source probe-sharadar`` (SA-0201, #49) measures every item on the paid
+key and corrects this docstring, the constants and ``duk.sharadar_api`` together.
 
-1. **Base URL** -- ``https://api.sharadar.com/v1.0/data``, one path per table
-   (``.../SEP``). UNVERIFIED. Overridable without a release:
-   ``SHARADAR_BASE_URL`` or ``[api].sharadar_base_url``, shared with duk.
-2. **Authentication** -- the key as an ``api_key`` query parameter. UNVERIFIED.
-   If it turns out to be a header, only :meth:`SharadarClient._call` changes; the
-   key is masked by value in everything this client logs or raises either way.
-3. **Format** -- ``format=json``. The payload is either a list of row objects or
-   the datatable shape, ``{"datatable": {"columns": [{"name": ...}], "data":
-   [[...]]}, "meta": {...}}``. :func:`rows_from_payload` accepts both. UNVERIFIED
-   which one Sharadar sends.
-4. **Filters** -- a column name with an operator suffix: ``ticker=AAPL``,
-   ``date.gte=2020-01-01``, ``date.lte=...``, ``lastupdated.gte=...`` (the
-   nightly-delta filter). A comma-separated value is a list (``ticker=A,B``).
-   UNVERIFIED.
-5. **Columns** -- ``qopts.columns=ticker,date,close``. UNVERIFIED.
-6. **Pagination** -- a page holds at most :attr:`SharadarClient.PAGE_ROWS` rows
-   (10,000, UNVERIFIED); a longer result carries ``meta.next_cursor_id`` and the
-   next page is requested with ``qopts.cursor_id``. A response without a cursor is
-   the last page. UNVERIFIED -- and a row cap that truncates silently instead
-   (FMP's habit, see ``FMPClient.EOD_MAX_ROWS``) is exactly what the probe checks.
-7. **Rate limits** -- unknown. ``[sharadar] rate_per_min`` (default 60) throttles
-   proactively; a 429 is retried with backoff by the base class.
-8. **Bulk export** -- a table request with ``qopts.export=true`` returns
-   ``{"datatable_bulk_download": {"file": {"status": ..., "link": ...}}}``. The
-   status is ``creating`` or ``regenerating`` while the vendor builds the file and
-   ``fresh`` once ``link`` (a short-lived, pre-signed URL) can be downloaded.
-   UNVERIFIED, including the file's format (zip or gzip): :meth:`bulk_export`
-   keeps whatever arrives and names it by content.
+1. **Base URL** -- ``https://api.sharadar.com/v1.0``, tables at
+   ``/data/{table}``. DOCUMENTED. It is the direct Sharadar API, *not* Nasdaq Data
+   Link: ``data.nasdaq.com`` and its ``qopts.*`` / ``datatable`` conventions do not
+   apply. Overridable without a release: ``SHARADAR_BASE_URL`` or
+   ``[api].sharadar_base_url``, shared with duk.
+2. **Authentication** -- ``api_key`` (or ``apiKey``) on the query string, or the
+   ``x-api-key`` header. DOCUMENTED. This client sends the header, so the key is in
+   no URL, and therefore in no requests exception, log line or traceback that
+   renders one; it is also masked by value in everything this client logs or
+   raises. The header is sent to Sharadar only: a bulk download's redirect target
+   is fetched without it (item 8). The vendor's ``test-api-key`` serves the free
+   sample universe (roughly the DJIA names); a 403 ``Exceeds free tier`` means the
+   request ran as free-tier.
+3. **Tables** -- a modern name (``stocks``, ``tickers``) or a legacy code (``SEP``,
+   ``SF1``); both resolve. DOCUMENTED. This client uses the legacy code where one
+   exists (SEP, SFP, SF1: the names the plan and duk use) and the modern name
+   otherwise.
+4. **Format** -- ``format=json`` (or ``csv``). DOCUMENTED. The JSON *payload
+   shape* is not: :func:`rows_from_payload` accepts a list of row objects, the
+   datatable shape, and a list under ``data`` / ``rows`` / ``results``. UNVERIFIED.
+5. **Slices** -- ``ticker``, ``from``, ``to`` (calendar dates, ``YYYY-MM-DD``) and
+   ``fields`` (the columns), plus ``sort``. DOCUMENTED. Whether ``ticker`` takes a
+   list, and which column ``from``/``to`` filter on a table with two dates
+   (fundamentals has ``calendardate`` and ``date``), is UNVERIFIED. So is a
+   ``lastupdated`` filter, which the nightly delta needs (#58).
+6. **Paging** -- ``limit`` (default 10,000) and ``offset`` / ``skip``. DOCUMENTED.
+   The largest ``limit`` honoured, and the default sort order (offset paging is
+   only stable under a fixed order), are UNVERIFIED. The vendor says not to page a
+   whole table: that is what bulk is for (item 8).
+7. **Rate limits** -- not documented. ``[sharadar] rate_per_min`` (default 60)
+   throttles proactively; a 429 is retried with backoff by the base class.
+8. **Bulk** -- the same ``GET /data/{table}`` with ``years=5|10|full`` answers
+   HTTP 302 to a pre-signed zip, subscription-gated. DOCUMENTED. ``tickers`` and
+   ``descriptions`` publish a full snapshot only, whatever ``years`` says. The zip's
+   contents (one CSV? its name?) are UNVERIFIED.
+9. **Schemas** -- ``GET /schema/{table}?format=postgres`` serves a table's schema
+   without a key. DOCUMENTED; unused here, an input for the probe and the bulk
+   reader's header check (#52).
 
-What is *not* in doubt is the field contract duk already relies on: SEP and SFP's
-``open/high/low/close/volume`` are split-adjusted, ``closeadj`` is adjusted for
-splits and dividends, and ``closeunadj`` is the close as traded (ADR 0015 and
-``duk.sharadar_api``). Nothing here interprets rows: this client fetches them.
+The field contract duk relies on is unchanged: the price tables carry unadjusted
+(``closeunadj``), split-adjusted (``open/high/low/close/volume``) and fully
+adjusted (``closeadj``) series. Nothing here interprets rows: this client fetches
+them.
 """
 
 from __future__ import annotations
@@ -70,14 +80,18 @@ from fafnir.sources.base import BaseSource, SourceError
 
 logger = get_logger("source.sharadar")
 
-#: Default base of Sharadar's table API (UNVERIFIED -- module docstring, item 1).
+#: Base of Sharadar's table API (item 1).
 DEFAULT_BASE_URL = "https://api.sharadar.com/v1.0/data"
 
 #: The equity and fund price tables. A ticker is looked up in SEP first, then
 #: SFP, which holds ETFs and closed-end funds.
 PRICE_TABLES = ("SEP", "SFP")
 
+#: The ``years`` values a bulk download takes (item 8).
+BULK_YEARS = ("5", "10", "full")
+
 __all__ = [
+    "BULK_YEARS",
     "BulkExport",
     "DEFAULT_BASE_URL",
     "PRICE_TABLES",
@@ -88,7 +102,7 @@ __all__ = [
 
 
 def rows_from_payload(data: Any) -> list[dict]:
-    """Normalise either payload shape (item 3) to a list of row dicts.
+    """Normalise the payload shapes item 4 allows for to a list of row dicts.
 
     Raises :class:`SourceError` for an error payload; the caller redacts.
     """
@@ -109,16 +123,9 @@ def rows_from_payload(data: Any) -> list[dict]:
     return []
 
 
-def _next_cursor(data: Any) -> Optional[str]:
-    if isinstance(data, dict) and isinstance(data.get("meta"), dict):
-        cursor = data["meta"].get("next_cursor_id")
-        return str(cursor) if cursor else None
-    return None
-
-
 @dataclass(frozen=True)
 class BulkExport:
-    """One downloaded export file, named by its content."""
+    """One downloaded bulk file, named by its content."""
 
     table: str
     path: Path
@@ -129,29 +136,33 @@ class BulkExport:
 class SharadarClient(BaseSource):
     name = "sharadar"
 
-    # Tables, centralized for easy correction (the FMPClient pattern).
-    T_TICKERS = "TICKERS"
-    T_ACTIONS = "ACTIONS"
+    # Tables (item 3), centralized for easy correction (the FMPClient pattern).
+    T_TICKERS = "tickers"
+    T_ACTIONS = "actions"
     T_SEP = "SEP"
     T_SFP = "SFP"
     T_SF1 = "SF1"
-    T_DAILY = "DAILY"
-    T_INDICATORS = "INDICATORS"
-    #: What the plan reads. Not an API listing: whether the API can list its
-    #: tables is unknown (item 1), and the subscription decides which answer.
-    TABLES = (T_TICKERS, T_ACTIONS, T_SEP, T_SFP, T_SF1, T_DAILY, T_INDICATORS)
+    T_DAILY = "daily"
+    T_METRICS = "metrics"
+    T_DESCRIPTIONS = "descriptions"
+    #: What the plan reads, of the Bundle's tables.
+    TABLES = (
+        T_TICKERS,
+        T_ACTIONS,
+        T_SEP,
+        T_SFP,
+        T_SF1,
+        T_DAILY,
+        T_METRICS,
+        T_DESCRIPTIONS,
+    )
 
-    # Item 6: rows per page, and a bound on a runaway cursor. 1,000 pages of
-    # 10,000 rows is ten million: past SEP's whole history, so hitting it means the
-    # cursor is not advancing, not that the table is that long.
+    # Item 6: rows per page (the documented default), and a bound on a runaway.
+    # 1,000 pages of 10,000 rows is ten million: a slice that long belongs in a
+    # bulk download, so hitting it means the paging is not advancing.
     PAGE_ROWS = 10_000
     MAX_PAGES = 1_000
 
-    # Item 8: how long to wait for the vendor to build an export, and how often to
-    # ask. SEP's full history is the largest file; minutes, not hours, is the
-    # expectation the probe will confirm or correct.
-    EXPORT_POLL_SECONDS = 15
-    EXPORT_MAX_WAIT_SECONDS = 1800
     DOWNLOAD_CHUNK_BYTES = 1 << 20
 
     def __init__(
@@ -165,15 +176,17 @@ class SharadarClient(BaseSource):
         if not api_key:
             raise ValueError("Sharadar API key is required")
         super().__init__(rate_per_min=rate_per_min, **kwargs)
-        self._api_key = api_key
         self._secrets = (api_key,)
+        self._key_header = {"x-api-key": api_key}  # item 2
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
+
+    def _url(self, table: str) -> str:
+        return f"{self.base_url}/{table}"
 
     def _call(self, table: str, params: Optional[dict] = None) -> tuple[Any, int, int]:
         merged = dict(params or {})
         merged.setdefault("format", "json")
-        merged["api_key"] = self._api_key  # item 2
-        return self._get(f"{self.base_url}/{table}", merged)
+        return self._get(self._url(table), merged, headers=self._key_header)
 
     def _rows(self, data: Any) -> list[dict]:
         try:
@@ -193,7 +206,7 @@ class SharadarClient(BaseSource):
         data, status, nbytes = self._call(table, {"ticker": ticker.upper()})
         rows = self._rows(data)
         return {
-            "url": f"{self.base_url}/{table}",
+            "url": self._url(table),
             "table": table,
             "ticker": ticker.upper(),
             "status": status,
@@ -201,7 +214,6 @@ class SharadarClient(BaseSource):
             "bytes": nbytes,
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "columns": sorted(rows[0]) if rows else [],
-            "paged": _next_cursor(data) is not None,
         }
 
     # -- tables -------------------------------------------------------------
@@ -209,57 +221,67 @@ class SharadarClient(BaseSource):
         self,
         table: str,
         filters: Optional[dict] = None,
-        columns: Optional[Sequence[str]] = None,
+        fields: Optional[Sequence[str]] = None,
         *,
         max_pages: Optional[int] = None,
     ) -> list[dict]:
-        """Every row of ``table`` matching ``filters`` (item 4), all pages.
+        """Every row of a slice of ``table`` (item 5), all pages (item 6).
 
-        ``filters`` are passed as given (``{"ticker": "AAPL", "date.gte":
-        "2020-01-01"}``). Stops on a page without a cursor, or on a cursor that
-        repeats -- a server that ignores it would otherwise be read ``max_pages``
-        times.
+        ``filters`` are passed as given (``{"ticker": "AAPL", "from":
+        "2020-01-01"}``). Stops on a short page, or on a page whose first row
+        repeats the previous page's -- a server that ignored ``offset`` would
+        otherwise be read ``max_pages`` times. For a whole table use
+        :meth:`bulk_export`.
         """
         params = dict(filters or {})
-        if columns:
-            params["qopts.columns"] = ",".join(columns)  # item 5
+        if fields:
+            params["fields"] = ",".join(fields)
+        params["limit"] = self.PAGE_ROWS
         limit = max_pages or self.MAX_PAGES
         out: list[dict] = []
-        seen: set[str] = set()
-        for _ in range(limit):
+        first_of_last: Optional[dict] = None
+        for page in range(limit):
+            params["offset"] = page * self.PAGE_ROWS
             data, _, _ = self._call(table, params)
-            out.extend(self._rows(data))
-            cursor = _next_cursor(data)
-            if cursor is None:
-                return out
-            if cursor in seen:
+            rows = self._rows(data)
+            if rows and rows[0] == first_of_last:
                 logger.warning(
-                    "Sharadar %s: cursor %s repeated; stopping at %d rows",
+                    "Sharadar %s: offset %d repeated the previous page; stopping at "
+                    "%d rows",
                     table,
-                    cursor,
+                    params["offset"],
                     len(out),
                 )
                 return out
-            seen.add(cursor)
-            params["qopts.cursor_id"] = cursor
+            out.extend(rows)
+            if len(rows) < self.PAGE_ROWS:
+                return out
+            first_of_last = rows[0]
         raise SourceError(
-            f"Sharadar {table}: more than {limit} pages; the cursor is not "
-            "advancing, or the filter is far wider than intended"
+            f"Sharadar {table}: more than {limit} pages of {self.PAGE_ROWS} rows; "
+            "a slice that long belongs in a bulk download"
         )
 
-    # -- bulk export --------------------------------------------------------
-    def bulk_export(self, table: str, dest_dir: str | Path, **filters) -> BulkExport:
-        """Request ``table``'s export (item 8), wait for it, and stream it to
+    # -- bulk ---------------------------------------------------------------
+    def bulk_export(
+        self, table: str, dest_dir: str | Path, *, years: str = "full"
+    ) -> BulkExport:
+        """Download ``table``'s pre-built zip (item 8) to
         ``dest_dir/<sha256><suffix>``.
 
-        The file is written under a temporary name and renamed once complete, so
-        a failed download leaves nothing that looks like a file. Downloading the
-        same content twice lands on the same name.
+        The redirect is followed by hand: the pre-signed link is fetched without
+        the key header, which would otherwise go to whichever host the link names.
+        The file is written under a temporary name and renamed once complete, so a
+        failed download leaves nothing that looks like a file, and the same
+        content twice lands on the same name.
         """
-        link = self._export_link(table, filters)
+        years = str(years)
+        if years not in BULK_YEARS:
+            raise ValueError(f"years must be one of {BULK_YEARS}, not {years!r}")
+        link = self._bulk_link(table, years)
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True)
-        suffix = "".join(Path(urlsplit(link).path).suffixes) or ".bin"
+        suffix = "".join(Path(urlsplit(link).path).suffixes) or ".zip"
         digest = hashlib.sha256()
         nbytes = 0
         fd, tmp_name = tempfile.mkstemp(prefix=f".{table}-", suffix=".part", dir=dest)
@@ -275,43 +297,50 @@ class SharadarClient(BaseSource):
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-        logger.info("Sharadar %s export: %d bytes -> %s", table, nbytes, final.name)
+        logger.info("Sharadar %s bulk: %d bytes -> %s", table, nbytes, final.name)
         return BulkExport(table, final, nbytes, digest.hexdigest())
 
-    def _export_link(self, table: str, filters: dict) -> str:
-        params = {**filters, "qopts.export": "true"}
-        deadline = time.monotonic() + self.EXPORT_MAX_WAIT_SECONDS
-        while True:
-            data, _, _ = self._call(table, params)
-            file = (
-                (data.get("datatable_bulk_download") or {}).get("file") or {}
-                if isinstance(data, dict)
-                else {}
-            )
-            status = str(file.get("status") or "").lower()
-            if status == "fresh" and file.get("link"):
-                return str(file["link"])
-            if not file:
-                self._rows(data)  # an error payload raises here, redacted
-                raise SourceError(
-                    f"Sharadar {table} export: no datatable_bulk_download in the "
-                    "response; the export flow is UNVERIFIED (see "
-                    "fafnir.sources.sharadar, item 8)"
-                )
-            if time.monotonic() >= deadline:
-                raise SourceError(
-                    f"Sharadar {table} export still {status or 'unknown'} after "
-                    f"{self.EXPORT_MAX_WAIT_SECONDS}s"
-                )
-            logger.info("Sharadar %s export is %s; waiting", table, status)
-            time.sleep(self.EXPORT_POLL_SECONDS)
-
-    def _stream(self, url: str):
-        """Yield the body of ``url`` in chunks, metered. The link carries its own
-        credentials (a pre-signed URL), so it is redacted like a key."""
+    def _bulk_link(self, table: str, years: str) -> str:
+        """The pre-signed link the bulk request redirects to."""
+        url = self._url(table)
         self.limiter.acquire()
         try:
-            resp = self._session.get(url, stream=True, timeout=self.timeout)
+            resp = self._session.get(
+                url,
+                params={"years": years},
+                headers=self._key_header,
+                allow_redirects=False,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise SourceError(
+                f"GET {self._redact(url)} failed: "
+                f"{type(exc).__name__}: {self._redact(str(exc))}"
+            ) from None
+        self.request_count += 1
+        self.bytes_downloaded += len(resp.content or b"")
+        location = resp.headers.get("Location")
+        if resp.status_code in (301, 302, 303, 307, 308) and location:
+            return location
+        detail = ""
+        try:
+            self._rows(resp.json())
+        except SourceError as exc:
+            detail = f": {exc}"
+        except ValueError:
+            pass
+        raise SourceError(
+            f"Sharadar {table} bulk (years={years}) answered HTTP "
+            f"{resp.status_code} without a redirect{detail}. Bulk is "
+            "subscription-gated; a 403 'Exceeds free tier' is the free key."
+        )
+
+    def _stream(self, url: str):
+        """Yield the body of ``url`` in chunks, metered, without the key header.
+        The link carries its own credentials, so it is redacted like a key."""
+        self.limiter.acquire()
+        try:
+            resp = requests.get(url, stream=True, timeout=self.timeout)
             resp.raise_for_status()
         except requests.RequestException as exc:
             raise SourceError(

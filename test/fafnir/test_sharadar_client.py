@@ -1,9 +1,9 @@
 """
 SharadarClient (plan SA-0106, #47): HTTP mocked, no network.
 
-The payload shapes here are synthetic, shaped like the API mechanics the client's
-docstring records as UNVERIFIED. They pin what the client does with each shape, not
-that Sharadar sends it: that is the probe's job (#49).
+The requests follow what Sharadar documents (the client's docstring, item by
+item); the payloads are synthetic. They pin what the client sends and what it does
+with each answer, not that Sharadar answers so: that is the probe's job (#49).
 """
 
 from __future__ import annotations
@@ -60,14 +60,26 @@ class _Resp:
 
 
 class _Session:
-    """Answers each GET from a queue; records what was asked."""
+    """Answers each GET from a queue; records what was asked, headers included."""
 
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls: list[tuple[str, dict]] = []
+        self.headers: list[dict] = []
+        self.redirects: list[bool] = []
 
-    def get(self, url, params=None, timeout=None, stream=False):
+    def get(
+        self,
+        url,
+        params=None,
+        headers=None,
+        timeout=None,
+        stream=False,
+        allow_redirects=True,
+    ):
         self.calls.append((url, dict(params or {})))
+        self.headers.append(dict(headers or {}))
+        self.redirects.append(allow_redirects)
         resp = self.responses.pop(0)
         if isinstance(resp, Exception):
             raise resp
@@ -80,14 +92,13 @@ def _client(*responses, **kw):
     return c
 
 
-def _datatable(rows, cursor=None):
+def _datatable(rows):
     names = list(rows[0]) if rows else ["ticker"]
     return {
         "datatable": {
             "columns": [{"name": n} for n in names],
             "data": [[r[n] for n in names] for r in rows],
-        },
-        "meta": {"next_cursor_id": cursor},
+        }
     }
 
 
@@ -102,13 +113,14 @@ def _no_sleep(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ping_asks_one_table_and_reports_without_the_key():
+def test_ping_asks_one_table_with_the_key_in_a_header_only():
     c = _client(_Resp(body=_datatable([{"ticker": "AAPL", "name": "Apple"}])))
     r = c.ping(ticker="aapl")
     [(url, params)] = c._session.calls
-    assert url == f"{DEFAULT_BASE_URL}/TICKERS"
-    assert params == {"ticker": "AAPL", "format": "json", "api_key": KEY}
-    assert (r["rows"], r["columns"], r["paged"]) == (1, ["name", "ticker"], False)
+    assert url == f"{DEFAULT_BASE_URL}/tickers"
+    assert params == {"ticker": "AAPL", "format": "json"}  # no key in the URL
+    assert c._session.headers == [{"x-api-key": KEY}]
+    assert (r["rows"], r["columns"]) == (1, ["name", "ticker"])
     assert KEY not in json.dumps(r)
     assert c.request_count == 1 and c.bytes_downloaded > 0
 
@@ -124,35 +136,41 @@ def test_a_list_of_rows_is_read_as_is():
     assert c.query("SEP", {"ticker": "A"}) == [{"ticker": "A", "close": 1.5}]
 
 
-def test_query_follows_the_cursor_and_passes_columns_and_filters():
-    c = _client(
-        _Resp(body=_datatable([{"ticker": "A", "date": "2024-01-02"}], cursor="c1")),
-        _Resp(body=_datatable([{"ticker": "A", "date": "2024-01-03"}], cursor="c2")),
-        _Resp(body=_datatable([{"ticker": "A", "date": "2024-01-04"}])),
-    )
+def _page(start, n):
+    return _Resp(body=[{"ticker": "A", "i": i} for i in range(start, start + n)])
+
+
+def test_query_pages_by_offset_and_passes_fields_and_filters(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 2)
+    c = _client(_page(0, 2), _page(2, 2), _page(4, 1))
     rows = c.query(
-        "SEP", {"ticker": "A", "date.gte": "2024-01-01"}, columns=["ticker", "date"]
+        "SEP", {"ticker": "A", "from": "2024-01-01"}, fields=["ticker", "date"]
     )
-    assert [r["date"] for r in rows] == ["2024-01-02", "2024-01-03", "2024-01-04"]
+    assert [r["i"] for r in rows] == [0, 1, 2, 3, 4]
     params = [p for _, p in c._session.calls]
-    assert all(p["qopts.columns"] == "ticker,date" for p in params)
-    assert all(p["date.gte"] == "2024-01-01" for p in params)
-    assert [p.get("qopts.cursor_id") for p in params] == [None, "c1", "c2"]
+    assert [(p["limit"], p["offset"]) for p in params] == [(2, 0), (2, 2), (2, 4)]
+    assert all(p["fields"] == "ticker,date" for p in params)
+    assert all(p["from"] == "2024-01-01" for p in params)
 
 
-def test_a_repeated_cursor_stops_the_read(caplog):
-    page = _datatable([{"ticker": "A"}], cursor="same")
-    c = _client(_Resp(body=page), _Resp(body=page))
+def test_a_full_last_page_costs_one_empty_request(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 2)
+    c = _client(_page(0, 2), _Resp(body=[]))
+    assert len(c.query("SEP")) == 2 and len(c._session.calls) == 2
+
+
+def test_a_server_that_ignores_offset_stops_the_read(monkeypatch, caplog):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 2)
+    c = _client(_page(0, 2), _page(0, 2))
     with caplog.at_level(logging.WARNING):
         assert len(c.query("SEP")) == 2
-    assert "repeated" in caplog.text
+    assert "repeated the previous page" in caplog.text
 
 
-def test_a_cursor_that_never_ends_is_refused():
-    pages = [
-        _Resp(body=_datatable([{"ticker": "A"}], cursor=f"c{i}")) for i in range(3)
-    ]
-    with pytest.raises(SourceError, match="more than 3 pages"):
+def test_paging_that_never_ends_is_refused(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 1)
+    pages = [_page(i, 1) for i in range(3)]
+    with pytest.raises(SourceError, match="belongs in a bulk download"):
         _client(*pages).query("SEP", max_pages=3)
 
 
@@ -162,7 +180,7 @@ def test_the_key_is_required():
 
 
 def test_tables_are_the_ones_the_plan_reads():
-    assert {"TICKERS", "ACTIONS", "SEP", "SFP", "SF1"} <= set(_client().tables())
+    assert {"tickers", "actions", "SEP", "SFP", "SF1"} <= set(_client().tables())
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +193,8 @@ def _leaks(text: str) -> bool:
 
 
 def test_an_http_error_is_redacted():
+    # The client never puts the key in a URL; this one stands for a server or
+    # proxy that echoes it, which the value-based mask still catches.
     url = f"{DEFAULT_BASE_URL}/SEP?ticker=A&api_key={KEY}"
     c = _client(_Resp(status=403, body={}, url=url))
     with pytest.raises(SourceError) as exc:
@@ -228,67 +248,78 @@ def test_redact_masks_a_literal_secret_and_signed_link_credentials():
 # ---------------------------------------------------------------------------
 
 
-def _export(status, link=None):
-    file = {"status": status}
-    if link:
-        file["link"] = link
-    return _Resp(body={"datatable_bulk_download": {"file": file}})
+def _redirect(link=SIGNED, status=302):
+    return _Resp(status=status, body={}, headers={"Location": link})
 
 
-def test_a_bulk_export_waits_streams_and_names_the_file_by_content(tmp_path):
-    body = b"ticker,date,close\nA,2024-01-02,1.5\n" * 1000
-    c = _client(
-        _export("creating"),
-        _export("regenerating"),
-        _export("fresh", SIGNED),
-        _Resp(raw=body),
-    )
-    out = c.bulk_export("SEP", tmp_path, **{"date.gte": "2024-01-01"})
+@pytest.fixture()
+def link_fetches(monkeypatch):
+    """The pre-signed link is fetched with plain `requests.get`, not the client's
+    session: what it was asked, and with which headers."""
+    asked: list = []
+    queue: list = []
+
+    def get(url, **kw):
+        asked.append((url, kw))
+        return queue.pop(0)
+
+    monkeypatch.setattr(mod.requests, "get", get)
+    return asked, queue
+
+
+def test_bulk_follows_the_redirect_without_the_key(tmp_path, link_fetches):
+    asked, queue = link_fetches
+    body = b"PK\x03\x04 synthetic zip bytes " * 1000
+    queue.append(_Resp(raw=body))
+    c = _client(_redirect())
+    out = c.bulk_export("SEP", tmp_path, years="10")
     sha = hashlib.sha256(body).hexdigest()
     assert (out.table, out.bytes, out.sha256) == ("SEP", len(body), sha)
-    assert out.path == tmp_path / f"{sha}.csv.gz"
+    assert out.path == tmp_path / f"{sha}.csv.gz"  # the link's own suffix
     assert out.path.read_bytes() == body
-    asked = c._session.calls
-    assert asked[0][1]["qopts.export"] == "true"
-    assert asked[0][1]["date.gte"] == "2024-01-01"
-    assert asked[-1][0] == SIGNED  # the link as given, with its own credentials
+    [(url, params)] = c._session.calls
+    assert (url, params) == (f"{DEFAULT_BASE_URL}/SEP", {"years": "10"})
+    assert c._session.headers == [{"x-api-key": KEY}]
+    assert c._session.redirects == [False]  # followed by hand, below
+    [(link, kw)] = asked
+    assert link == SIGNED and "headers" not in kw and kw["stream"] is True
     assert c.bytes_downloaded >= len(body)
 
 
-def test_the_same_export_twice_is_one_file(tmp_path):
-    body = b"same bytes"
-    c = _client(_export("fresh", SIGNED), _Resp(raw=body))
+def test_the_same_bulk_file_twice_is_one_file(tmp_path, link_fetches):
+    _, queue = link_fetches
+    queue.extend([_Resp(raw=b"same bytes"), _Resp(raw=b"same bytes")])
+    c = _client(_redirect(), _redirect())
     first = c.bulk_export("SEP", tmp_path)
-    c._session = _Session(_export("fresh", SIGNED), _Resp(raw=body))
     second = c.bulk_export("SEP", tmp_path)
     assert first.path == second.path
     assert [p.name for p in tmp_path.iterdir()] == [first.path.name]
 
 
-def test_a_broken_download_leaves_nothing_and_hides_the_link(tmp_path):
+def test_a_broken_download_leaves_nothing_and_hides_the_link(tmp_path, link_fetches):
     class _Broken(_Resp):
         def iter_content(self, chunk_size=1):
             yield b"partial"
             raise requests.exceptions.ChunkedEncodingError(f"broke at {SIGNED}")
 
-    c = _client(_export("fresh", SIGNED), _Broken(raw=b"x"))
+    _, queue = link_fetches
+    queue.append(_Broken(raw=b"x"))
     with pytest.raises(SourceError) as exc:
-        c.bulk_export("SEP", tmp_path)
+        _client(_redirect()).bulk_export("SEP", tmp_path)
     assert "deadbeefcafe" not in str(exc.value)
     assert list(tmp_path.iterdir()) == []
 
 
-def test_an_export_that_never_finishes_is_refused(tmp_path, monkeypatch):
-    monkeypatch.setattr(SharadarClient, "EXPORT_MAX_WAIT_SECONDS", 0)
-    c = _client(_export("creating"))
-    with pytest.raises(SourceError, match="still creating"):
+def test_bulk_without_a_redirect_says_why(tmp_path):
+    c = _client(_Resp(status=403, body={"error": "Exceeds free tier"}))
+    with pytest.raises(SourceError, match="HTTP 403 without a redirect: .*free tier"):
         c.bulk_export("SEP", tmp_path)
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_a_response_without_an_export_says_the_flow_is_unverified(tmp_path):
-    c = _client(_Resp(body=_datatable([{"ticker": "A"}])))
-    with pytest.raises(SourceError, match="UNVERIFIED"):
-        c.bulk_export("SEP", tmp_path)
+def test_bulk_years_are_checked(tmp_path):
+    with pytest.raises(ValueError, match="years"):
+        _client().bulk_export("SEP", tmp_path, years="3")
 
 
 # ---------------------------------------------------------------------------

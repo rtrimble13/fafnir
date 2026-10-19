@@ -6,16 +6,15 @@ FMP. It exists so a series can be checked against the warehouse from an
 independent vendor, and so a symbol fafnir does not hold yet can be read before
 it is loaded.
 
-**Endpoint shape is UNVERIFIED against a paid key.** It follows Sharadar's own
-documentation pages (``sharadar.com/docs/stocks``: a table API authenticated by an
-``api_key`` query parameter and filtered by query parameters, ``format=json|csv``),
-and the column names SEP has carried since the Nasdaq Data Link era. The base URL,
-the table path and the parameter spelling are therefore configurable
-(``[api].sharadar_base_url`` / ``SHARADAR_BASE_URL``), and the parser accepts the
-two payload shapes the vendor has used: a list of row objects, and the datatable
-shape (``{"datatable": {"columns": [...], "data": [[...]]}}``). The warehouse-side
-probe (``fafnir source probe-sharadar``, plan issue SA-0201) is where the shape is
-measured; correct this module from its findings rather than from memory.
+**The request follows Sharadar's documentation and is not yet measured.** The
+vendor's agent guide documents ``GET https://api.sharadar.com/v1.0/data/{table}``,
+the key as an ``api_key`` query parameter, and ``ticker`` / ``from`` / ``to``
+filters with ``format=json``; ``fafnir.sources.sharadar`` records the evidence item
+by item. The payload *shape* is undocumented, so the parser (shared with that
+module) accepts a list of row objects and the datatable shape. The base URL stays
+configurable (``[api].sharadar_base_url`` / ``SHARADAR_BASE_URL``), and the
+warehouse-side probe (``fafnir source probe-sharadar``, plan issue SA-0201)
+measures the rest; correct this module from its findings rather than from memory.
 
 Field semantics (Sharadar's documented SEP contract):
 
@@ -116,9 +115,9 @@ def price_table_api(
         "api_key": api_key,
     }
     if from_date:
-        params["date.gte"] = from_date.strftime("%Y-%m-%d")
+        params["from"] = from_date.strftime("%Y-%m-%d")
     if to_date:
-        params["date.lte"] = to_date.strftime("%Y-%m-%d")
+        params["to"] = to_date.strftime("%Y-%m-%d")
 
     logger.debug(f"Requesting {table} rows for {symbol} from Sharadar")
     try:

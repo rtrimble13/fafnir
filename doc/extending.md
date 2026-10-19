@@ -29,10 +29,14 @@ patterns to add new sources, tables, and consumers.
      `BaseSource` masks that value in everything it logs or raises, on top of the
      `api_key=` pattern `redact_secrets` already knows. A key echoed in an error
      body, a header or a dict's repr has no `param=` in front of it.
-   - **Unmeasured mechanics marked `UNVERIFIED`** in the module docstring (base
-     URL, auth, pagination, bulk export flow), each one a probe item, with the
-     base URL overridable from config. The repository adopts an endpoint on a
-     probe's evidence, not its documentation (ADR 0007).
+   - **Every API mechanic labelled by its evidence** in the module docstring:
+     `DOCUMENTED` (the vendor says so) or `UNVERIFIED` (nobody does yet), each one
+     a probe item, with the base URL overridable from config. The repository
+     adopts an endpoint on a probe's evidence, not its documentation (ADR 0007).
+   - **The key in a header, not the URL**, where the vendor allows it
+     (`x-api-key`): requests renders URLs into its exceptions, and a URL with no
+     key cannot leak one. Never forward that header to a redirect's host: the
+     bulk download follows its 302 by hand, without the key.
    - **A key that never touches the rc file** when it is the warehouse's primary
      feed: `FafnirConfig.sharadar_api_key` reads `SHARADAR_API_KEY` only.
    - **A `fafnir source ping --vendor <name>`** that makes one request and writes

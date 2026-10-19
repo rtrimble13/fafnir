@@ -112,7 +112,9 @@ class BaseSource:
         self.request_count = 0
         self._session = requests.Session()
 
-    def _get(self, url: str, params: dict | None = None) -> tuple[Any, int, int]:
+    def _get(
+        self, url: str, params: dict | None = None, headers: dict | None = None
+    ) -> tuple[Any, int, int]:
         """GET with throttle + exponential backoff on 429/5xx/timeouts.
 
         Returns (parsed_json, http_status, nbytes). Raises SourceError on
@@ -125,7 +127,9 @@ class BaseSource:
             is_last = attempt == self.max_retries - 1
             self.limiter.acquire()
             try:
-                resp = self._session.get(url, params=params, timeout=self.timeout)
+                resp = self._session.get(
+                    url, params=params, headers=headers, timeout=self.timeout
+                )
             except requests.RequestException as exc:
                 if is_last:
                     # `from None`, not `from exc`: the chained RequestException
