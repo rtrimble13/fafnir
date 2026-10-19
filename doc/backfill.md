@@ -550,6 +550,48 @@ session):
   `sharadar_files.rows` with no parse error. A full `stocks` read takes 260 s
   (about 175,000 rows a second); `funds` takes 95 s and `fundamentals` 180 s.
 
+### On the production host
+
+The first population of a host (#59), in order. Each command runs as `fafnir` with the
+environment file sourced:
+
+```bash
+sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
+  scripts/backup_dump.sh                          # 1. a restorable copy first
+  git pull && fafnir --version && fafnir db migrate'  # 2. deploy main; 0030, 0031
+```
+
+Step 2 is [releasing.md › Deploying it](releasing.md#deploying-it); add its `pip
+install` if `pyproject.toml` changed. Before step 3:
+- set an absolute `[sharadar] bulk_dir` in `~fafnir/.fafnirrc` (the relative default
+  follows the working directory);
+- note the free space on its filesystem (`df -h /var/lib/fafnir` for the path used
+  above). The full set needs about 2 GB, and a later refresh about 4 GB at peak
+  ([disk budget](#disk-budget-with-sharadar)).
+
+Then:
+
+```bash
+sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/fafnir
+  time fafnir source sharadar-bulk                # 3. tickers, actions, SEP, SFP, SF1
+  psql "$FAFNIR_DSN" -X -f scripts/landing_sizes.sql
+  fafnir source probe-sharadar                    # 4. verdicts; --json stays on the host
+  time fafnir ingest sharadar-master              # 5. TICKERS + ACTIONS -> vendor tables
+  fafnir status'
+```
+
+- **Table names.** `--tables` takes any case: `TICKERS` and `tickers` are the same
+  table.
+- **What to record on #59** (aggregates only, never vendor values):
+  - the dump's path;
+  - each table's rows, bytes and time, from step 3's output;
+  - the disk free before and after step 3;
+  - the probe's verdict table;
+  - the master load's counts by table and delisted flag, and its time;
+  - anything that did not work as written here.
+- **A table that fails** in step 3 does not undo the others. Re-run step 3: the
+  tables already on record are skipped.
+
 ## Disk budget with Sharadar
 
 Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in

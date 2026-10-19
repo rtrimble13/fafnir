@@ -149,6 +149,15 @@ def test_legacy_names_map_to_the_modern_ones():
     ]
 
 
+def test_a_modern_name_in_capitals_is_the_modern_name():
+    # `--tables TICKERS,ACTIONS,SEP,SFP,SF1`, as #59's runbook wrote it.
+    assert [sf.canonical_table(t) for t in ("TICKERS", "Actions", "SF3B")] == [
+        "tickers",
+        "actions",
+        "holdings_investor",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # The ledger (migration 0030)
 # ---------------------------------------------------------------------------
