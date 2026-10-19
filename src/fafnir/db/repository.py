@@ -6738,7 +6738,7 @@ def link_scope(
     return db.fetchall(
         """
         SELECT s.security_id, s.primary_symbol, s.company_name, s.asset_type,
-               s.cik, s.cusip, s.isin,
+               s.cik, s.cusip, s.isin, s.is_fund, s.is_etf, s.delisted_date,
                ARRAY(SELECT DISTINCT x.symbol FROM core.symbol_xref x
                       WHERE x.security_id = s.security_id) AS tickers,
                span.first_trade_date, span.last_trade_date

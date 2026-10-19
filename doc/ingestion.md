@@ -639,18 +639,28 @@ manual or the engine's, is never moved.
 | Outcome | When | Written |
 |---|---|---|
 | linked | one candidate agrees on ≥ 4 of 5 samples; or several do and exactly one shares an identifier | a link: `match_method = ticker_span_price`, `valid_from` the overlap's start, confidence `0.9 × agreed/sampled + 0.1 × corroboration` (1 for an identifier, else the name similarity) |
-| ambiguous | several agree with no identifier to choose (`several_agree`); or one permaticker wins for two securities (`key_claimed_twice`, usually a duplicate identity) | `vendor_xref_ambiguous` |
-| unmatched | `no_candidate`, `price_disagrees` (a candidate had 4+ samples), `insufficient_overlap` (none did), `not_covered_asset_type` (a NAV-priced mutual fund, at `info`) | `vendor_xref_unmatched` |
+| ambiguous | several agree with no identifier to choose (`several_agree`); one permaticker wins for several securities: the live one on the vendor's current ticker is linked and the others are `duplicate_of_linked` (a missed rename's rows, for `security merge-rename`), and with no such claimant none is linked (`key_claimed_twice`) | `vendor_xref_ambiguous` |
+| unmatched | `no_candidate`; `no_bars` (no span to compare: a re-mint shell); `price_disagrees` (a candidate had 4+ samples); `insufficient_overlap` (none did); `not_covered_asset_type` at `info` (a mutual fund: `asset_type = 'fund'`, or `is_fund` and not an ETF with no candidate) | `vendor_xref_unmatched` |
 
 **Evidence.** The sampled dates and both prices are kept in the link's `evidence`
 and in the flags' `detail`. They stay in the database: they are vendor data, and
 are never posted.
 
+**The first production run** (2026-10-19, dry run, 21,903 securities) linked 13,937.
+What it could not link shaped three rules:
+- **Mutual funds.** 4,577 of its 4,826 `no_candidate` were mutual funds. FMP files
+  them on NASDAQ as `equity` with `is_fund`. They are `not_covered_asset_type` now.
+- **Rename chains.** Every key claimed twice was claimed by rows with different
+  tickers: missed renames. In 742 of the 905 keys exactly one claimant was live on
+  the vendor's current ticker, and that claimant is now linked.
+- **Shells.** About 125 securities had no bars. They are `no_bars` now.
+
 **Idempotence.**
 - A run evaluates only unlinked securities.
 - Flags are written once per open condition.
-- When a security's outcome changes, its open flag of the other kind is resolved
-  (`resolved_by = fafnir vendor link`). A link resolves both kinds.
+- When a security's outcome changes, its open flag of the other kind, or of the
+  same kind with another reason, is resolved (`resolved_by = fafnir vendor
+  link`), and the new one written. A link resolves both kinds.
 
 **Sharadar's closes.**
 - **A full run** reads the ledger's current SEP and SFP files, one filtered pass

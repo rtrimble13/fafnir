@@ -984,18 +984,21 @@ permaticker this security can be linked to. The record key is `{"vendor":
 
 | Reason | Meaning | `candidates` |
 |---|---|---|
-| `no_candidate` | No Sharadar stock or fund shares a ticker with it over an overlapping span | `taken_key` (another security's link holds it), `no_overlap_key` (the ticker matched, the dates did not) |
-| `price_disagrees` | A candidate had 4+ sampled bars and they did not agree | `vendor_key`, `ticker`, `agreed` of `of` |
+| `no_candidate` | No Sharadar stock or fund shares a ticker with it over an overlapping span | `taken_key` (another security's link holds it), `rejected_key` (a person said no), `no_overlap_key` (the ticker matched, the dates did not) |
+| `no_bars` | The security has no bars, so no span to compare: usually a re-mint shell | as above |
+| `price_disagrees` | A candidate had 4+ sampled bars and they did not agree | `vendor_key`, `ticker`, `agreed` of `of`, and the `samples` (date, `fmp`, `sharadar`) |
 | `insufficient_overlap` | No candidate had 4 sampled bars to compare | as above |
-| `not_covered_asset_type` | A NAV-priced mutual fund: Sharadar does not price them | none |
+| `not_covered_asset_type` | A mutual fund (`asset_type = 'fund'`, or `is_fund` and not an ETF with no candidate): Sharadar does not price them | as for `no_candidate` |
 
 **Diagnose.** The link's evidence is in the database, never in a post.
 - **`taken_key`:** another security already holds the permaticker, which usually
   means a duplicate identity. Look for `security_duplicate_identity` on the same
   ticker.
-- **`price_disagrees`:** compare `duk -S db ph <SYM>` with `duk -S sharadar ph
-  <SYM>` over the overlap. A constant ratio is a split on one side only; noise is
-  a different issuer.
+- **`price_disagrees`:** the candidate's `samples` hold both closes. A constant
+  ratio between them (2, 1/10, …) is a split on one side only; noise is a different
+  issuer. `duk -S db ph <SYM>` against `duk -S sharadar ph <SYM>` shows the whole
+  overlap.
+- **`no_bars`:** a shell with no history. `security dedupe` folds those.
 - **`not_covered_asset_type`:** expected. Nothing to do.
 
 **Decide.** A link a person makes is #63's (`match_method = manual`); the engine
@@ -1014,14 +1017,19 @@ Warn. `fafnir vendor link` could not choose. `detail.reason`:
 - **`several_agree`:** two or more candidates agreed on price, and no identifier
   (CIK, CUSIP) singled one out. That means share classes, or a vendor duplicate.
   `candidates` lists them with their agreement.
-- **`key_claimed_twice`:** one permaticker won for two FMP securities.
-  `candidates` names the key and `also_claimed_by`. The two FMP rows are almost
-  always one issuer: a venue transfer or a re-mint that left a second
-  `security_id`. That is a duplicate identity to fold (`security merge`, after a dry
-  run and an explicit yes), not a linking problem.
+- **`duplicate_of_linked`:** one permaticker won for several FMP securities, and
+  `candidates[0].linked_security` is the one linked to it (the claimant live on the
+  vendor's current ticker). This row is another `security_id` for the same issuer,
+  almost always a rename the loader missed: the old ticker's row and the new
+  one's, each holding the history FMP serves under both. Fold it into the linked
+  security with `security merge-rename`, after a dry run and an explicit yes.
+- **`key_claimed_twice`:** as above, but no claimant is live on the current ticker
+  (a chain of delisted rows, usually), so none was linked. `candidates` names the
+  key and `also_claimed_by`. Fold the rows, then the next `vendor link` links the
+  survivor.
 
-**Close with:** the fold (the next `vendor link` then links the survivor and
-resolves this flag), or a manual link (#63).
+**Close with:** the fold (the next `vendor link` resolves this flag, or links the
+survivor), or a manual link (#63).
 
 ---
 

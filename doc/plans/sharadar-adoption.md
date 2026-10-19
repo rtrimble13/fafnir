@@ -256,6 +256,28 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P1, #62 follow-up: what the first production run taught the engine.**
+  - **The dry run** (21,903 securities): linked 13,937, `no_candidate` 4,826, `key_claimed_twice`
+    1,852, `price_disagrees` 1,213, `insufficient_overlap` 47, `several_agree` 28.
+  - **The operator's queries showed:**
+    - `no_candidate`: 4,577 were mutual funds, which FMP files on NASDAQ as `equity` + `is_fund`. Sharadar
+      prices none.
+    - `key_claimed_twice`: every claimed key's rows carried different tickers, so these were missed
+      renames, not venue transfers. In 742 of 905 keys exactly one claimant was live on the vendor's
+      current ticker.
+    - `price_disagrees`: 928 candidates agreed on 1–3 of 5 samples. That suggests a split on one side, but
+      the flags did not keep the prices to prove it.
+  - **The engine now:**
+    - flags an `is_fund` non-ETF with no candidate `not_covered_asset_type` (`info`), and a security with no
+      bars `no_bars`;
+    - links the live claimant on the current ticker and flags the rest `duplicate_of_linked`, naming it:
+      a merge worklist for `security merge-rename`;
+    - keeps the sampled closes in every flag's candidates, so a SQL query can test the split hypothesis
+      before the price test changes;
+    - resolves an open flag whose reason changed within the same check, so the first run's flags are
+      replaced, not left behind.
+  - **Expected effect on a re-run:** about 14,680 linked, about 4,580 not covered, about 250
+    `no_candidate`.
 - **2026-10-19 · P1, #63: manual link review.** `fafnir vendor link show|accept|reject`, with `--dry-run`,
   `--by` (default the OS user) and commit-before-output. The runbook is in
   [operations.md › Resolving vendor links](../operations.md#resolving-vendor-links).

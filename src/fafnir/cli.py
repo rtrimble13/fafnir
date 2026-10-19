@@ -4254,15 +4254,14 @@ def vendor_link_show(ctx, symbol_arg, symbol, security_id, evaluate, prices):
         )
         ev = decision.evidence
         for r in [ev] if ev else decision.candidates:
-            if "samples" in r:
-                for smp in r["samples"]:
-                    click.echo(
-                        f"    {smp['date']}  fmp {smp['fmp']}  sharadar {smp['sharadar']}"
-                    )
-            elif "agreed" in r:
+            if "agreed" in r and not ev:
                 click.echo(
                     f"  {r['vendor_key']}: {r['agreed']} of {r['of']} agree"
                     + (f", {r['identifier']} matches" if r.get("identifier") else "")
+                )
+            for smp in r.get("samples", ()):
+                click.echo(
+                    f"    {smp['date']}  fmp {smp['fmp']}  sharadar {smp['sharadar']}"
                 )
 
 
