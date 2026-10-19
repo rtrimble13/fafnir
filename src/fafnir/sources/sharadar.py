@@ -29,23 +29,28 @@ key and corrects this docstring, the constants and ``duk.sharadar_api`` together
    raises. The header is sent to Sharadar only: a bulk download's redirect target
    is fetched without it (item 8). The vendor's ``test-api-key`` serves the free
    sample universe (roughly the DJIA names); a 403 ``Exceeds free tier`` means the
-   request ran as free-tier.
+   request ran as free-tier. MEASURED 2026-10-19: a missing or invalid key is
+   *not* refused -- it is served as free tier (AAPL's prices from five years back;
+   ``TWO``'s refused) -- so a 200 proves nothing about the key.
+   :meth:`SharadarClient.tier` asks for what only a subscription serves.
 3. **Tables** -- a modern name (``stocks``, ``tickers``) or a legacy code (``SEP``,
    ``SF1``); both resolve. DOCUMENTED. This client uses the legacy code where one
    exists (SEP, SFP, SF1: the names the plan and duk use) and the modern name
    otherwise.
-4. **Format** -- ``format=json`` (or ``csv``). DOCUMENTED. The JSON *payload
-   shape* is not: :func:`rows_from_payload` accepts a list of row objects, the
-   datatable shape, and a list under ``data`` / ``rows`` / ``results``. UNVERIFIED.
+4. **Format** -- ``format=json`` (or ``csv``). DOCUMENTED. MEASURED 2026-10-19 on
+   ``tickers``, ``SEP`` and ``actions``: ``{"count": n, "data": [{...}, ...]}``,
+   ``count`` the rows returned; an error is ``{"error": ..., "description": ...}``.
+   :func:`rows_from_payload` also accepts a bare list and the datatable shape.
 5. **Slices** -- ``ticker``, ``from``, ``to`` (calendar dates, ``YYYY-MM-DD``) and
    ``fields`` (the columns), plus ``sort``. DOCUMENTED. Whether ``ticker`` takes a
    list, and which column ``from``/``to`` filter on a table with two dates
    (fundamentals has ``calendardate`` and ``date``), is UNVERIFIED. So is a
    ``lastupdated`` filter, which the nightly delta needs (#58).
 6. **Paging** -- ``limit`` (default 10,000) and ``offset`` / ``skip``. DOCUMENTED.
-   The largest ``limit`` honoured, and the default sort order (offset paging is
-   only stable under a fixed order), are UNVERIFIED. The vendor says not to page a
-   whole table: that is what bulk is for (item 8).
+   The largest ``limit`` honoured is UNVERIFIED. MEASURED 2026-10-19 (free tier):
+   ``SEP`` answers newest date first by default, and ``sort=date`` reverses it --
+   offset paging is only stable under a fixed order, which the probe confirms.
+   The vendor says not to page a whole table: that is what bulk is for (item 8).
 7. **Rate limits** -- not documented. ``[sharadar] rate_per_min`` (default 60)
    throttles proactively; a 429 is retried with backoff by the base class.
 8. **Bulk** -- the same ``GET /data/{table}`` with ``years=5|10|full`` answers
@@ -165,6 +170,11 @@ class SharadarClient(BaseSource):
 
     DOWNLOAD_CHUNK_BYTES = 1 << 20
 
+    # A ticker outside the free sample: a delisted issuer the full-history
+    # subscription serves and the free tier refuses (item 2).
+    TIER_PROBE_TABLE = T_SEP
+    TIER_PROBE_TICKER = "TWO"
+
     def __init__(
         self,
         api_key: str,
@@ -215,6 +225,37 @@ class SharadarClient(BaseSource):
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "columns": sorted(rows[0]) if rows else [],
         }
+
+    def tier(self) -> str:
+        """``paid`` or ``free``: which tier Sharadar serves this key as, or
+        ``unknown (...)`` when the answer is neither.
+
+        One request, for a ticker the free sample does not hold. Needed because
+        an invalid key is not refused (item 2): only a refusal of what a
+        subscription would serve shows the key is not working.
+        """
+        url = self._url(self.TIER_PROBE_TABLE)
+        self.limiter.acquire()
+        try:
+            resp = self._session.get(
+                url,
+                params={"ticker": self.TIER_PROBE_TICKER, "limit": 1, "format": "json"},
+                headers=self._key_header,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise SourceError(
+                f"GET {self._redact(url)} failed: "
+                f"{type(exc).__name__}: {self._redact(str(exc))}"
+            ) from None
+        self.request_count += 1
+        self.bytes_downloaded += len(resp.content or b"")
+        body = self._redact(resp.text or "")
+        if resp.status_code == 200:
+            return "paid"
+        if resp.status_code == 403 and "free tier" in body.lower():
+            return "free"
+        return f"unknown (HTTP {resp.status_code}: {body[:120]})"
 
     # -- tables -------------------------------------------------------------
     def query(

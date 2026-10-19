@@ -267,8 +267,15 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
     - **Unverified, for #49:** the JSON payload shape, a list in `ticker`, which date `from`/`to` filter
       where a table has two, a `lastupdated` filter for the nightly delta (#58), the largest `limit` and
       the default sort under offset paging, the rate limit, and the zip's contents.
-    - **Operator step:** the ping against the free sample (`SHARADAR_API_KEY=test-api-key fafnir source
-      ping`).
+    - **Measured 2026-10-19, free tier.** The cloud session reached the API, but not with the paid key.
+      - The payload is `{"count": n, "data": [...]}`; an error is `{"error", "description"}`.
+      - `SEP` answers newest date first, and `sort=date` reverses that.
+      - The free tier serves AAPL's prices from five years back and refuses `TWO` with 403 `Exceeds free
+        tier`.
+      - **A missing or invalid key is not refused; it is served as free tier.** So `fafnir source ping`
+        now also reports the tier the key is served as (`SharadarClient.tier()`, one request for a
+        non-sample ticker), and `--require-paid` fails on anything but `paid`.
+    - **Operator step:** `fafnir source ping --require-paid` with the subscription's key.
   - **Bulk.** `bulk_export(table, dir, years=...)` follows the redirect by hand, so the key header never
     reaches the link's host. It streams to `<sha256><suffix>` under `[sharadar] bulk_dir` via a temporary
     name. The files are zips, not the gzip CSVs #50 and #52 assumed: the ledger and the shared reader

@@ -4119,13 +4119,21 @@ def source():
     help="Table to ask: a name (stocks, tickers) or a legacy code (SEP, SF1)",
 )
 @click.option("--ticker", default="AAPL", show_default=True, help="Ticker to ask for")
+@click.option(
+    "--require-paid",
+    is_flag=True,
+    help="Fail unless the key is served as a subscription, not the free tier",
+)
 @click.pass_context
-def source_ping(ctx, vendor, table, ticker):
-    """Make one small request to a vendor and show what came back.
+def source_ping(ctx, vendor, table, ticker, require_paid):
+    """Make one small request to a vendor and show what came back, then which
+    tier the vendor serves the key as.
 
-    Proves the key, the base URL and the payload parser work together. Costs one
-    request and writes nothing. Exits non-zero when the request fails or returns
-    no rows (an empty answer is not proof the key works).
+    Proves the key, the base URL and the payload parser work together. Costs two
+    requests and writes nothing. Exits non-zero when a request fails or returns no
+    rows (an empty answer is not proof the key works), and with --require-paid
+    when the key is served as the free tier: Sharadar serves a missing or invalid
+    key as free tier rather than refusing it.
     """
     from fafnir.sources.base import SourceError
 
@@ -4147,6 +4155,18 @@ def source_ping(ctx, vendor, table, ticker):
             "a ticker the subscription covers (the free test-api-key serves roughly "
             "the DJIA names), or check the endpoint (SHARADAR_BASE_URL)."
         )
+    try:
+        tier = client.tier()
+    except SourceError as exc:
+        raise click.ClickException(f"{vendor} tier check FAILED: {exc}") from None
+    click.echo(f"  tier: {tier}")
+    if tier == "free":
+        click.echo(
+            "  The key is served as the FREE tier: missing, invalid, or not the "
+            "subscription's (Sharadar does not refuse an invalid key)."
+        )
+    if require_paid and tier != "paid":
+        raise click.ClickException(f"{vendor}: the key is not served as paid ({tier})")
     click.echo(f"{vendor}: OK")
 
 

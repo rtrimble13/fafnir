@@ -37,6 +37,10 @@ class _Resp:
         self.content = raw if raw is not None else json.dumps(body).encode()
         self.url = url
 
+    @property
+    def text(self):
+        return self.content.decode("utf-8", "replace")
+
     def json(self):
         if self._body is None:
             raise ValueError("not json")
@@ -336,7 +340,7 @@ def rc(tmp_path, monkeypatch):
     return str(path)
 
 
-def _ping(rc, monkeypatch, *responses):
+def _ping(rc, monkeypatch, *responses, args=()):
     made = []
 
     def factory(key, **kw):
@@ -344,7 +348,7 @@ def _ping(rc, monkeypatch, *responses):
         return _client(*responses, **{k: v for k, v in kw.items() if k == "base_url"})
 
     monkeypatch.setattr(mod, "SharadarClient", factory)
-    out = CliRunner().invoke(cli.main, ["--config", rc, "source", "ping"])
+    out = CliRunner().invoke(cli.main, ["--config", rc, "source", "ping", *args])
     return out, made
 
 
@@ -356,13 +360,51 @@ def test_ping_without_a_key_names_the_env_var_and_ignores_duks(rc, monkeypatch):
     assert "rc-key-duk-only" not in out.output
 
 
-def test_ping_reports_what_came_back(rc, monkeypatch):
+_PAID = _Resp(body={"count": 1, "data": [{"ticker": "TWO"}]})
+# What Sharadar answered a free-tier request for a non-sample ticker, 2026-10-19.
+_FREE = _Resp(
+    status=403,
+    body={"error": "Exceeds free tier", "description": "Please sign up at /subscribe."},
+)
+
+
+def test_ping_reports_what_came_back_and_the_tier(rc, monkeypatch):
     monkeypatch.setenv("SHARADAR_API_KEY", KEY)
-    out, made = _ping(rc, monkeypatch, _Resp(body=_datatable([{"ticker": "AAPL"}])))
+    out, made = _ping(
+        rc, monkeypatch, _Resp(body=_datatable([{"ticker": "AAPL"}])), _PAID
+    )
     assert out.exit_code == 0, out.output
     assert made[0][0] == KEY and made[0][1]["rate_per_min"] == 60
-    assert "1 row(s)" in out.output and "sharadar: OK" in out.output
+    assert "1 row(s)" in out.output and "tier: paid" in out.output
+    assert "sharadar: OK" in out.output
     assert not _leaks(out.output)
+
+
+def test_ping_says_when_the_key_is_served_as_free_tier(rc, monkeypatch):
+    monkeypatch.setenv("SHARADAR_API_KEY", KEY)
+    rows = _Resp(body={"count": 1, "data": [{"ticker": "AAPL"}]})
+    out, _ = _ping(rc, monkeypatch, rows, _FREE)
+    assert out.exit_code == 0 and "tier: free" in out.output
+    assert "FREE tier" in out.output
+    strict, _ = _ping(rc, monkeypatch, rows, _FREE, args=["--require-paid"])
+    assert strict.exit_code != 0 and "not served as paid (free)" in strict.output
+
+
+def test_tier_asks_for_a_non_sample_ticker():
+    c = _client(_PAID, _FREE, _Resp(status=500, body={"error": f"boom {KEY}"}))
+    assert c.tier() == "paid"
+    url, params = c._session.calls[0]
+    assert url == f"{DEFAULT_BASE_URL}/SEP"
+    assert params == {"ticker": "TWO", "limit": 1, "format": "json"}
+    assert c._session.headers[0] == {"x-api-key": KEY}
+    assert c.tier() == "free"
+    unknown = c.tier()
+    assert unknown.startswith("unknown (HTTP 500") and not _leaks(unknown)
+
+
+def test_the_payload_shape_sharadar_sends_is_read():
+    body = {"count": 2, "data": [{"ticker": "A", "close": 1}, {"ticker": "A"}]}
+    assert len(_client(_Resp(body=body)).query("SEP", {"ticker": "A"})) == 2
 
 
 def test_ping_fails_on_no_rows_and_on_an_error(rc, monkeypatch):
