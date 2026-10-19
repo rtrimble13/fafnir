@@ -589,6 +589,9 @@ sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/faf
   - the probe's verdict table;
   - the master load's counts by table and delisted flag, and its time;
   - anything that did not work as written here.
+- **Measured on the production host** (2026-10-19): step 3 took 2 min 45 s for
+  1.97 GB, most of it counting rows; step 5 took 11 s. The counts matched the cloud
+  run's exactly.
 - **A table that fails** in step 3 does not undo the others. Re-run step 3: the
   tables already on record are skipped.
 

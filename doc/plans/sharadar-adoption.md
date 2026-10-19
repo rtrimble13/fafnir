@@ -251,9 +251,25 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-18 | `duk`: `-S db` is the default; `-S fmp` and `-S sharadar` read a vendor directly; `live` kept as an alias | shipped, [duk.md](../duk.md) |
 | 2026-10-18 | dorq integration unchanged by this plan | this revision |
 | 2026-10-18 | **Subscribed**: Sharadar Bundle, max history, annual, from 2026-10-18 to 2027-10-18. Renewal reminder **2027-09-18** (30 days ahead: a lapse triggers the licence's 30-day deletion clause). Key in `/etc/fafnir/fafnir.env` on the host, never an rc file | #57 |
+| 2026-10-19 | **First production population** of the Sharadar files and the vendor master, on the host (#59). This date replaces plan v1's "parallel-run session 1" | #59 |
 
 ## [built] notes
 
+- **2026-10-19 · P1, #59: first production population, on the host.**
+  - **`source sharadar-bulk`:** 5 tables, 1,966,247,912 bytes downloaded, 2 min 45 s (runs 381–385, files
+    1–5).
+    - Rows match the cloud measurements exactly: tickers 74,420; actions 718,464; stocks 45,451,818; funds
+      15,760,389; fundamentals 3,218,845.
+    - Most of the time was the row count. The `stocks` zip downloaded in 11 s and took 67 s to count.
+    - The ledger reports 1,875 MB on disk.
+  - **`ingest sharadar-master`:** 11.0 s (runs 386, 387).
+    - TICKERS: 61,146 rows, with 13,274 investors skipped.
+    - ACTIONS: 142,852 events, with 571,824 splits and dividends, 654 duplicates and 3,134 unresolved rows
+      skipped.
+    - Every count matches the cloud run on the same files.
+    - `fafnir status` shows the Sharadar block.
+  - **Warehouse beside it:** 21,959 securities and 65.5M bars (`core.daily_price` 11 GB). `landing.fmp_raw`
+    is 6.1 GB, three times the Sharadar files.
 - **2026-10-19 · P1, #59: the production sequence, written down.**
   [backfill.md](../backfill.md#on-the-production-host) gives the host's order:
   dump, deploy and migrate (0030, 0031), `sharadar-bulk`, the ledger sizes, the probe, `ingest
