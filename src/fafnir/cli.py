@@ -262,6 +262,27 @@ def _fmp_client(cfg):
     return FMPClient(key, rate_per_min=cfg.request_rate_per_min)
 
 
+def _sharadar_client(cfg):
+    from fafnir.config import SHARADAR_KEY_ENV_VAR
+    from fafnir.sources.sharadar import SharadarClient
+
+    key = cfg.sharadar_api_key
+    if not key:
+        hint = (
+            " [api].sharadar_key in the rc file is duk's; fafnir reads the key from "
+            "the environment only."
+            if cfg.sharadar_key_in_rc
+            else ""
+        )
+        raise click.ClickException(
+            f"No Sharadar API key. Set {SHARADAR_KEY_ENV_VAR} (on a host, in "
+            f"/etc/fafnir/fafnir.env).{hint}"
+        )
+    return SharadarClient(
+        key, base_url=cfg.sharadar_base_url, rate_per_min=cfg.sharadar_rate_per_min
+    )
+
+
 @ingest.command("securities")
 @click.option("--universe", default=None, help="Universe id (default from config)")
 @click.option("--no-etfs", is_flag=True, help="Exclude ETFs")
@@ -4081,6 +4102,72 @@ def vendor_corrections_revert(ctx, correction_ids, note, reverted_by, dry_run, y
 @main.group()
 def source():
     """Inspect the upstream data source."""
+
+
+@source.command("ping")
+@click.option(
+    "--vendor",
+    type=click.Choice(["sharadar"]),
+    default="sharadar",
+    show_default=True,
+    help="Vendor to reach",
+)
+@click.option(
+    "--table",
+    default="tickers",
+    show_default=True,
+    help="Table to ask: a name (stocks, tickers) or a legacy code (SEP, SF1)",
+)
+@click.option("--ticker", default="AAPL", show_default=True, help="Ticker to ask for")
+@click.option(
+    "--require-paid",
+    is_flag=True,
+    help="Fail unless the key is served as a subscription, not the free tier",
+)
+@click.pass_context
+def source_ping(ctx, vendor, table, ticker, require_paid):
+    """Make one small request to a vendor and show what came back, then which
+    tier the vendor serves the key as.
+
+    Proves the key, the base URL and the payload parser work together. Costs two
+    requests and writes nothing. Exits non-zero when a request fails or returns no
+    rows (an empty answer is not proof the key works), and with --require-paid
+    when the key is served as the free tier: Sharadar serves a missing or invalid
+    key as free tier rather than refusing it.
+    """
+    from fafnir.sources.base import SourceError
+
+    client = _sharadar_client(ctx.obj["config"])
+    try:
+        r = client.ping(table=table, ticker=ticker)
+    except SourceError as exc:
+        raise click.ClickException(f"{vendor} ping FAILED: {exc}") from None
+    click.echo(f"GET {r['url']}  ticker={r['ticker']}")
+    click.echo(
+        f"  HTTP {r['status']}, {r['rows']} row(s), {r['bytes']} bytes, "
+        f"{r['elapsed_ms']} ms"
+    )
+    if r["columns"]:
+        click.echo(f"  columns: {', '.join(r['columns'])}")
+    if not r["rows"]:
+        raise click.ClickException(
+            f"{vendor} answered with no rows for {r['ticker']} in {r['table']}: try "
+            "a ticker the subscription covers (the free test-api-key serves roughly "
+            "the DJIA names), or check the endpoint (SHARADAR_BASE_URL)."
+        )
+    try:
+        tier = client.tier()
+    except SourceError as exc:
+        raise click.ClickException(f"{vendor} tier check FAILED: {exc}") from None
+    click.echo(f"  tier: {tier}")
+    if tier == "free":
+        click.echo(
+            "  The key is served as the FREE tier: missing, invalid, or not the "
+            "subscription's (Sharadar does not refuse an invalid key)."
+        )
+    if require_paid and tier != "paid":
+        raise click.ClickException(f"{vendor}: the key is not served as paid ({tier})")
+    click.echo(f"{vendor}: OK")
 
 
 @source.command("probe-prices")

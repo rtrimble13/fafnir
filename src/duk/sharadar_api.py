@@ -6,16 +6,15 @@ FMP. It exists so a series can be checked against the warehouse from an
 independent vendor, and so a symbol fafnir does not hold yet can be read before
 it is loaded.
 
-**Endpoint shape is UNVERIFIED against a paid key.** It follows Sharadar's own
-documentation pages (``sharadar.com/docs/stocks``: a table API authenticated by an
-``api_key`` query parameter and filtered by query parameters, ``format=json|csv``),
-and the column names SEP has carried since the Nasdaq Data Link era. The base URL,
-the table path and the parameter spelling are therefore configurable
-(``[api].sharadar_base_url`` / ``SHARADAR_BASE_URL``), and the parser accepts the
-two payload shapes the vendor has used: a list of row objects, and the datatable
-shape (``{"datatable": {"columns": [...], "data": [[...]]}}``). The warehouse-side
-probe (``fafnir source probe-sharadar``, plan issue SA-0201) is where the shape is
-measured; correct this module from its findings rather than from memory.
+**The request follows Sharadar's documentation and is not yet measured.** The
+vendor's agent guide documents ``GET https://api.sharadar.com/v1.0/data/{table}``,
+the key as an ``api_key`` query parameter, and ``ticker`` / ``from`` / ``to``
+filters with ``format=json``; ``fafnir.sources.sharadar`` records the evidence item
+by item. The payload *shape* is undocumented, so the parser (shared with that
+module) accepts a list of row objects and the datatable shape. The base URL stays
+configurable (``[api].sharadar_base_url`` / ``SHARADAR_BASE_URL``), and the
+warehouse-side probe (``fafnir source probe-sharadar``, plan issue SA-0201)
+measures the rest; correct this module from its findings rather than from memory.
 
 Field semantics (Sharadar's documented SEP contract):
 
@@ -44,15 +43,21 @@ import requests
 
 from duk.date_utils import get_api_date_range
 from duk.fmp_api import redact_secrets
+from fafnir.sources.base import SourceError
+from fafnir.sources.sharadar import (  # noqa: F401 -- re-exported
+    DEFAULT_BASE_URL,
+    PRICE_TABLES,
+    rows_from_payload,
+)
 
 logger = logging.getLogger(__name__)
 
-#: Default base of Sharadar's table API (UNVERIFIED -- see the module docstring).
-DEFAULT_BASE_URL = "https://api.sharadar.com/v1.0/data"
-#: The equity-price table. Funds (ETFs, CEFs) live in SFP; `duk` tries SEP first
-#: and falls back to SFP when SEP returns no rows, so one spelling of a ticker
-#: works for both.
-PRICE_TABLES = ("SEP", "SFP")
+# The base URL, the price tables and the payload parser are the warehouse
+# client's (fafnir.sources.sharadar), so the probe (#49) corrects them once for
+# both. SEP holds equities, SFP funds (ETFs, CEFs): `duk` tries SEP first and
+# falls back to SFP when SEP returns no rows, so one spelling of a ticker works
+# for both.
+
 #: Columns the price tables carry; the parser requires `date` and `close`.
 PRICE_COLUMNS = (
     "ticker",
@@ -74,21 +79,10 @@ class SharadarAPIError(Exception):
 
 def _rows_from_payload(data: Any) -> List[Dict[str, Any]]:
     """Normalise either payload shape to a list of row dicts."""
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    if isinstance(data, dict):
-        if "datatable" in data and isinstance(data["datatable"], dict):
-            table = data["datatable"]
-            names = [c.get("name") for c in table.get("columns", [])]
-            return [dict(zip(names, row)) for row in table.get("data", [])]
-        for key in ("data", "rows", "results"):
-            if isinstance(data.get(key), list):
-                return _rows_from_payload(data[key])
-        if "error" in data or "message" in data:
-            raise SharadarAPIError(
-                f"Sharadar API error: {data.get('error') or data.get('message')}"
-            )
-    return []
+    try:
+        return rows_from_payload(data)
+    except SourceError as exc:
+        raise SharadarAPIError(str(exc)) from None
 
 
 def price_table_api(
@@ -121,9 +115,9 @@ def price_table_api(
         "api_key": api_key,
     }
     if from_date:
-        params["date.gte"] = from_date.strftime("%Y-%m-%d")
+        params["from"] = from_date.strftime("%Y-%m-%d")
     if to_date:
-        params["date.lte"] = to_date.strftime("%Y-%m-%d")
+        params["to"] = to_date.strftime("%Y-%m-%d")
 
     logger.debug(f"Requesting {table} rows for {symbol} from Sharadar")
     try:

@@ -111,8 +111,10 @@ class TestPriceTableAPI:
         assert url == f"{DEFAULT_BASE_URL}/SEP"
         assert params["ticker"] == "ACME"
         assert params["api_key"] == SECRET
-        assert params["date.gte"] == "2020-01-01"
-        assert params["date.lte"] == "2020-01-31"
+        # Sharadar's documented spelling (agent guide, 2026-10-19); the Nasdaq
+        # Data Link era's `date.gte` / `date.lte` would be ignored.
+        assert params["from"] == "2020-01-01"
+        assert params["to"] == "2020-01-31"
 
     @mock.patch("duk.sharadar_api.requests.get")
     def test_base_url_override(self, mock_get):

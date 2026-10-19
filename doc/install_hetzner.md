@@ -694,6 +694,8 @@ sudo tee /etc/fafnir/fafnir.env > /dev/null <<'ENV'
 # Socket + peer auth (§3.6): no database password needed.
 FAFNIR_DSN="host=/var/run/postgresql port=5432 dbname=fafnir user=fafnir_ingest"
 FMP_API_KEY="your_fmp_pro_key"
+# Once subscribed to Sharadar. fafnir reads this key from here only, never ~/.fafnirrc.
+SHARADAR_API_KEY="your_sharadar_key"
 FAFNIR_SQL_DIR="/opt/fafnir/sql"
 # The CLI's own rotating fafnir.log. Its config default is RELATIVE
 # ("var/fafnir/log"), so without this it follows the working directory --
@@ -718,6 +720,14 @@ Why each line matters:
 - **`FAFNIR_LOG_DIR`** — same idea, for the same reason. It overrides `log_dir` in
   `~/.fafnirrc`, and the systemd units set it so the CLI's `fafnir.log` lands
   beside the unit logs instead of following the working directory.
+- **`SHARADAR_API_KEY`** — the Sharadar subscription's key. Unlike `FMP_API_KEY`
+  it has no `~/.fafnirrc` fallback: fafnir reads it from the environment and
+  nowhere else, so this root-owned, `0640` file is its only home on the host
+  (`[api].sharadar_key` in an rc file is duk's, for a laptop, and fafnir ignores
+  it). Check it with `fafnir source ping`: one request, nothing written, and the
+  key never printed. When the bulk downloads start, also set an absolute
+  `[sharadar] bulk_dir` in `~fafnir/.fafnirrc` (its default is relative, like
+  `log_dir`'s).
 - **`PATH`** — cron gives you `/usr/bin:/bin` only, so the venv must be prepended or
   `fafnir: command not found` is all you get.
 - **`FAFNIR_BACKUP_REMOTE`** — needs the `:/path` suffix. rsync decides a

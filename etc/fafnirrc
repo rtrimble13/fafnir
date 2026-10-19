@@ -26,6 +26,11 @@ user = "fafnir_ingest"
 [api]
 # Financial Modeling Prep (Professional plan). Prefer FMP_API_KEY env var.
 fmp_key = ""
+# Sharadar's endpoint, shared with duk. Leave unset for the client's default; set
+# it (or SHARADAR_BASE_URL) only if `fafnir source probe-sharadar` finds the API
+# elsewhere. The Sharadar KEY is not set here: fafnir reads SHARADAR_API_KEY from
+# the environment only (see [sharadar] below).
+# sharadar_base_url = "https://api.sharadar.com/v1.0/data"
 # Fast-follow economic sources:
 fred_key = ""
 bls_key = ""
@@ -46,6 +51,10 @@ request_rate_per_min = 280
 # Re-pull overlap window (days) on incremental price loads, to absorb late
 # corrections / re-adjustments.
 overlap_days = 5
+
+# The vendor new securities' bars come from: "fmp" until the Sharadar cutover
+# (doc/plans/sharadar-adoption.md, P3), then "sharadar". Nothing reads it before.
+# primary_price_vendor = "fmp"
 
 # Corporate actions (ADR 0007).
 #   actions_mode  : "symbol"   -- one splits + one dividends request per security,
@@ -87,6 +96,17 @@ log_dir = "var/fafnir/log"
 # and prints what it restated.
 # restatement_max_ratio = 1.25
 # restatement_max_volume_ratio = 3
+
+# --- Sharadar (doc/plans/sharadar-adoption.md) ------------------------------
+# The key is SHARADAR_API_KEY in the environment (on a host, /etc/fafnir/fafnir.env)
+# and never this file: fafnir ignores a key here. [api].sharadar_key is duk's.
+# [sharadar]
+# Proactive throttle. Sharadar's limit is not yet measured (#49); 429s are retried.
+# rate_per_min = 60
+# Where bulk export files land, named by content. The default,
+# "var/fafnir/landing/sharadar", is relative to the working directory; on a host
+# make it absolute.
+# bulk_dir = "/var/lib/fafnir/landing/sharadar"
 
 # --- data quality: the dorq engine (doc/dorq.md, ADR 0013) -------------------
 [dq]

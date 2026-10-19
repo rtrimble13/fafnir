@@ -51,13 +51,16 @@ with one. With `--adj`, every price is scaled by `closeadj / close`. SEP (stocks
 is read first and SFP (ETFs, closed-end funds) when SEP has no rows, so one
 spelling of a ticker works for both. Sharadar has no mutual funds.
 
-> **The endpoint shape is unverified against a paid key.** `duk.sharadar_api`
-> follows Sharadar's documentation pages (a table API keyed by `api_key`, filtered by
-> `ticker` and `date.gte`/`date.lte`, `format=json`) and accepts both payload shapes
-> the vendor has used. If a request fails, the error names
+> **The request follows Sharadar's documentation and is not yet measured.**
+> `duk.sharadar_api` sends what the vendor documents: `GET
+> https://api.sharadar.com/v1.0/data/{table}` with `api_key`, `ticker`, `from` / `to`
+> and `format=json`. The JSON payload's shape is undocumented, so both shapes the
+> vendor has used are accepted. If a request fails, the error names
 > `[api].sharadar_base_url` / `SHARADAR_BASE_URL`, which override the base URL. The
-> warehouse-side probe, `fafnir source probe-sharadar`, is where the shape is
-> measured and this module corrected ([plan](plans/sharadar-adoption.md)).
+> warehouse-side probe, `fafnir source probe-sharadar`, is where the request is
+> measured and corrected ([plan](plans/sharadar-adoption.md)). duk takes the default
+> base URL, the price tables and the payload parser from the warehouse's client
+> (`fafnir.sources.sharadar`), so one correction serves both.
 
 ## Configuration
 
