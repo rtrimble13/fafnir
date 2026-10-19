@@ -255,6 +255,27 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P1, #62: the linking engine.** `fafnir vendor link --vendor sharadar [--dry-run]
+  [--symbols …] [--new] [--prices auto|bulk|api]` links FMP-minted securities to their permaticker. It
+  finds candidates by ticker over overlapping spans, decides on 5 sampled raw closes against `closeunadj`
+  (≥ 4 must agree), breaks ties with a shared CIK/CUSIP, and flags the rest `vendor_xref_ambiguous` or
+  `vendor_xref_unmatched` with a reason. The rules are in
+  [ingestion.md](../ingestion.md#linking-to-a-vendors-identity).
+  - **Additions to the issue:**
+    - an `insufficient_overlap` reason (no candidate had 4 bars to compare), kept apart from
+      `price_disagrees`;
+    - `key_claimed_twice`: one permaticker won by two FMP rows, usually a venue-transfer or re-mint
+      duplicate for `security merge`;
+    - a flag of the other kind is resolved when the outcome changes.
+    - tickers compared with `.` read as `-`: Sharadar writes 505 share classes `BRK.B`, FMP `BRK-B`.
+  - **Measured.** 3,304 of 3,331 suffixed dead-issuer tickers (`CLA1`) list their root in `related_tickers`,
+    so no suffix-stripping rule is needed. Reading closes for 15,000 tickers × 5 dates from SEP takes 84 s;
+    rows are filtered on the raw text and parsed only when wanted, against 246 s for a parse-everything read.
+  - **Nightly placement.** `--new` runs in `daily_update.sh` after `ingest prices`, not after `ingest
+    securities` as the issue had it. A security minted tonight has no bars to compare until the price step.
+  - **Operator step.** After deploying: `fafnir vendor link --dry-run` for the counts, then `fafnir vendor
+    link`. Post the counts by outcome and reason on #62. Linking rates are not measured here: the cloud
+    session has no FMP data.
 - **2026-10-19 · P1, #59: first production population, on the host.**
   - **`source sharadar-bulk`:** 5 tables, 1,966,247,912 bytes downloaded, 2 min 45 s (runs 381–385, files
     1–5).

@@ -602,6 +602,76 @@ descope` removes an instrument kind taken out of scope.) A
 duplicate that *has* accumulated history is a `conflict` instead: merging two price
 histories is not a decision a loader should make silently.
 
+### Linking to a vendor's identity
+
+`fafnir vendor link --vendor sharadar` (#62) links FMP-minted securities to their
+Sharadar permaticker in `core.security_vendor_xref`. Nothing is fed from the link:
+feed assignment is `fafnir vendor feed` (#98). The FMP screener never supplied a
+CUSIP or CIK for most securities (ADR 0005), so a link rests on the ticker and the
+dates, and the prices decide it.
+
+**What the engine evaluates.** Every `source = 'fmp'` security, active or delisted,
+with no open Sharadar link. A linked security is never evaluated again, and a link,
+manual or the engine's, is never moved.
+
+**How it decides one security:**
+
+1. **Candidates.** The Sharadar stocks and funds that are known by any ticker
+   `core.symbol_xref` has held for the security, and whose price history overlaps
+   the security's own bars. "Known by" means the candidate's own ticker, a
+   `related_tickers` entry, or the other side of a `tickerchangefrom`/`to` event.
+   - A rename (FB → META) is found through the event.
+   - A dead issuer's reused ticker is found through `related_tickers`: its history
+     is filed under `CLA1`, and 3,304 of the 3,331 suffixed TICKERS rows list the
+     root.
+   - A permaticker another open link holds is not a candidate.
+   - A ticker is compared with `.` read as `-`. Sharadar writes 505 share classes
+     as `BRK.B`, where FMP writes `BRK-B`.
+2. **The decisive test.** The overlap is cut into five equal windows, and the
+   security's first stored bar in each is a sample. Its raw close is compared with
+   Sharadar's `closeunadj` on that date, within max($0.01, 1 bp).
+3. **Corroboration.** A shared CIK or CUSIP (an ISIN's CUSIP counts), and the
+   similarity of the names.
+4. **Decision:**
+
+| Outcome | When | Written |
+|---|---|---|
+| linked | one candidate agrees on ≥ 4 of 5 samples; or several do and exactly one shares an identifier | a link: `match_method = ticker_span_price`, `valid_from` the overlap's start, confidence `0.9 × agreed/sampled + 0.1 × corroboration` (1 for an identifier, else the name similarity) |
+| ambiguous | several agree with no identifier to choose (`several_agree`); or one permaticker wins for two securities (`key_claimed_twice`, usually a duplicate identity) | `vendor_xref_ambiguous` |
+| unmatched | `no_candidate`, `price_disagrees` (a candidate had 4+ samples), `insufficient_overlap` (none did), `not_covered_asset_type` (a NAV-priced mutual fund, at `info`) | `vendor_xref_unmatched` |
+
+**Evidence.** The sampled dates and both prices are kept in the link's `evidence`
+and in the flags' `detail`. They stay in the database: they are vendor data, and
+are never posted.
+
+**Idempotence.**
+- A run evaluates only unlinked securities.
+- Flags are written once per open condition.
+- When a security's outcome changes, its open flag of the other kind is resolved
+  (`resolved_by = fafnir vendor link`). A link resolves both kinds.
+
+**Sharadar's closes.**
+- **A full run** reads the ledger's current SEP and SFP files, one filtered pass
+  each (`sharadar_files.select`, which parses only the wanted ticker-and-date rows).
+  On the 2026-10-19 SEP file, 15,000 tickers × 5 dates took 84 s.
+- **A small run** (`--new`, a few `--symbols`; at most 200 candidate tickers, with a
+  key set) asks the API, one request per candidate.
+- **`--prices bulk|api`** forces either.
+
+**Modes:**
+
+| Command | Evaluates |
+|---|---|
+| `fafnir vendor link --dry-run` | everything, and prints the counts by outcome and reason; writes nothing |
+| `fafnir vendor link` | every unlinked security (endpoint `link`) |
+| `fafnir vendor link --new` | the securities first seen since the last successful full run (`link:new`) |
+| `fafnir vendor link --symbols A,B` | those |
+
+**The nightly run.** `daily_update.sh` runs `--new` after the price step, not
+straight after the security master as #62 first had it. The decision compares the
+security's own bars, and a security minted tonight has none until its history is
+pulled. Before the first full run, `--new` says so and does nothing.
+
 ### Which vendor feeds a security (ADR 0015)
 
 Every FMP loader feeds the securities FMP minted (`core.security.source = 'fmp'`)
@@ -716,7 +786,7 @@ refused.
 
 ```
 ensure-partitions → symbol-changes → securities → delisted →
-prices → actions → adjust --changed → refresh-marts
+prices → vendor link --new → actions → adjust --changed → refresh-marts
 ```
 
 then, as its own job after the load, `dq run` (`fafnir-dq`).

@@ -975,6 +975,56 @@ promptly.
 
 ---
 
+## `vendor_xref_unmatched` — no Sharadar identity for an FMP security
+
+Warn; `info` for a mutual fund. `fafnir vendor link` (#62) found no Sharadar
+permaticker this security can be linked to. The record key is `{"vendor":
+"sharadar"}`, one flag per security. `detail.reason` says why, and
+`detail.candidates` lists what was considered:
+
+| Reason | Meaning | `candidates` |
+|---|---|---|
+| `no_candidate` | No Sharadar stock or fund shares a ticker with it over an overlapping span | `taken_key` (another security's link holds it), `no_overlap_key` (the ticker matched, the dates did not) |
+| `price_disagrees` | A candidate had 4+ sampled bars and they did not agree | `vendor_key`, `ticker`, `agreed` of `of` |
+| `insufficient_overlap` | No candidate had 4 sampled bars to compare | as above |
+| `not_covered_asset_type` | A NAV-priced mutual fund: Sharadar does not price them | none |
+
+**Diagnose.** The link's evidence is in the database, never in a post.
+- **`taken_key`:** another security already holds the permaticker, which usually
+  means a duplicate identity. Look for `security_duplicate_identity` on the same
+  ticker.
+- **`price_disagrees`:** compare `duk -S db ph <SYM>` with `duk -S sharadar ph
+  <SYM>` over the overlap. A constant ratio is a split on one side only; noise is
+  a different issuer.
+- **`not_covered_asset_type`:** expected. Nothing to do.
+
+**Decide.** A link a person makes is #63's (`match_method = manual`); the engine
+never moves one. Until #63 ships there is no command for it: report, do not write
+links by hand.
+
+**Close with:** the next `fafnir vendor link` that links it, which resolves the flag
+itself. A `not_covered_asset_type` flag may be accepted (`dq accept`) with a note.
+
+---
+
+## `vendor_xref_ambiguous` — more than one Sharadar identity fits
+
+Warn. `fafnir vendor link` could not choose. `detail.reason`:
+
+- **`several_agree`:** two or more candidates agreed on price, and no identifier
+  (CIK, CUSIP) singled one out. That means share classes, or a vendor duplicate.
+  `candidates` lists them with their agreement.
+- **`key_claimed_twice`:** one permaticker won for two FMP securities.
+  `candidates` names the key and `also_claimed_by`. The two FMP rows are almost
+  always one issuer: a venue transfer or a re-mint that left a second
+  `security_id`. That is a duplicate identity to fold (`security merge`, after a dry
+  run and an explicit yes), not a linking problem.
+
+**Close with:** the fold (the next `vendor link` then links the survivor and
+resolves this flag), or a manual link (#63).
+
+---
+
 ## The `dorq_*` family — dorq's judgement of a bar
 
 Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**

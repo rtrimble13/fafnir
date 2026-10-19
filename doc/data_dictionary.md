@@ -256,9 +256,9 @@ not built yet.
 | `vendor` / `vendor_key` | TEXT | |
 | `valid_from` / `valid_to` | DATE | Open = `valid_to IS NULL`; `valid_to ≥ valid_from`. |
 | `is_feed` | BOOLEAN | This vendor loads the security's new rows (ADR 0015 §2). Only on an open link. |
-| `match_method` | TEXT CHECK | `minted`, `ticker_span_price`, `identifier`, `manual`. |
+| `match_method` | TEXT CHECK | `minted` (#71); `ticker_span_price`, written by `fafnir vendor link` (#62): a shared ticker over overlapping spans, confirmed by ≥ 4 of 5 sampled raw closes; `identifier` (a shared CUSIP/FIGI/CIK alone); `manual` (#63). |
 | `confidence` | NUMERIC(4,3) | 0–1. |
-| `evidence` | JSONB | What the match rests on, so a link can be reviewed without re-running the matcher. |
+| `evidence` | JSONB | What the match rests on, so a link can be reviewed without re-running the matcher. For `ticker_span_price`: `samples` (date, `fmp`, `sharadar`), `agreed` of `of`, `ticker`, `matched_on`, `identifier`, `name_similarity`, the `others` considered and the `run_id`. Vendor data: never posted. |
 | `created_by` / `created_at` / `note` | | `created_by` may not be blank. |
 
 Its unique indexes:

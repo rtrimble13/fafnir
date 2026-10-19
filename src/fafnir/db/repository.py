@@ -6715,3 +6715,171 @@ def vendor_status(db: Database, vendor: str, order: Sequence[str] = ()) -> dict:
         (vendor,),
     )
     return {"tables": tables, "events": int(events or 0), "last_run": last}
+
+
+# ---------------------------------------------------------------------------
+# core.security_vendor_xref -- the linking engine (#62)
+# ---------------------------------------------------------------------------
+
+
+def link_scope(
+    db: Database,
+    vendor: str,
+    *,
+    security_ids: Optional[Sequence[int]] = None,
+    first_seen_since: Optional[datetime] = None,
+) -> list[dict]:
+    """The FMP-minted securities with no open link to ``vendor``: identity, every
+    ticker ``core.symbol_xref`` has held for it, and the span of its bars (None
+    when it has none). ``security_ids`` and ``first_seen_since`` narrow it."""
+    return db.fetchall(
+        """
+        SELECT s.security_id, s.primary_symbol, s.company_name, s.asset_type,
+               s.cik, s.cusip, s.isin,
+               ARRAY(SELECT DISTINCT x.symbol FROM core.symbol_xref x
+                      WHERE x.security_id = s.security_id) AS tickers,
+               span.first_trade_date, span.last_trade_date
+          FROM core.security s
+          LEFT JOIN LATERAL (
+                SELECT min(p.trade_date) AS first_trade_date,
+                       max(p.trade_date) AS last_trade_date
+                  FROM core.daily_price p
+                 WHERE p.security_id = s.security_id) span ON true
+         WHERE s.source = 'fmp'
+           AND NOT EXISTS (
+                SELECT 1 FROM core.security_vendor_xref l
+                 WHERE l.security_id = s.security_id AND l.vendor = %(vendor)s
+                   AND l.valid_to IS NULL)
+           AND (%(ids)s::bigint[] IS NULL OR s.security_id = ANY(%(ids)s::bigint[]))
+           AND (%(since)s::timestamptz IS NULL OR s.first_seen_at >= %(since)s)
+         ORDER BY s.security_id
+        """,
+        {
+            "vendor": vendor,
+            "ids": list(security_ids) if security_ids is not None else None,
+            "since": first_seen_since,
+        },
+    )
+
+
+def count_linked(db: Database, vendor: str) -> int:
+    """FMP-minted securities that hold an open link to ``vendor``."""
+    return int(
+        db.fetchval(
+            """
+            SELECT count(DISTINCT l.security_id)
+              FROM core.security_vendor_xref l
+              JOIN core.security s USING (security_id)
+             WHERE l.vendor = %s AND l.valid_to IS NULL AND s.source = 'fmp'
+            """,
+            (vendor,),
+        )
+        or 0
+    )
+
+
+def vendor_link_candidates(
+    db: Database, vendor: str, tables: Sequence[str]
+) -> list[dict]:
+    """The vendor's master rows in ``tables``, each with every ticker it is known
+    by (its own, ``related_tickers``, and the other side of its ticker changes)
+    and whether an open link already holds its key."""
+    return db.fetchall(
+        """
+        SELECT v.vendor_key, v.vendor_table, v.ticker, v.name, v.cik, v.cusips,
+               v.first_price_date, v.last_price_date,
+               ARRAY(
+                   SELECT DISTINCT t FROM unnest(
+                       ARRAY[v.ticker] || COALESCE(v.related_tickers, '{}')
+                       || ARRAY(SELECT e.contra_ticker
+                                  FROM core.vendor_security_event e
+                                 WHERE e.vendor = v.vendor
+                                   AND e.vendor_key = v.vendor_key
+                                   AND e.action IN ('tickerchangefrom',
+                                                    'tickerchangeto')
+                                   AND e.contra_ticker IS NOT NULL)) AS t
+               ) AS aliases,
+               EXISTS (SELECT 1 FROM core.security_vendor_xref l
+                        WHERE l.vendor = v.vendor AND l.vendor_key = v.vendor_key
+                          AND l.valid_to IS NULL) AS taken
+          FROM core.vendor_security v
+         WHERE v.vendor = %s AND v.vendor_table = ANY(%s)
+        """,
+        (vendor, list(tables)),
+    )
+
+
+def first_bars_on_or_after(
+    db: Database, probes: Sequence[tuple[int, int, date, date]]
+) -> dict[int, tuple[date, Decimal]]:
+    """For each probe ``(id, security_id, lo, hi)``, the first stored bar of the
+    security in ``lo..hi``: ``{id: (trade_date, close)}``, probes with no bar left
+    out. One index probe each, so sampling a few dates of a long history reads a
+    few rows, not the history."""
+    out: dict[int, tuple[date, Decimal]] = {}
+    for i in range(0, len(probes), 5000):
+        chunk = probes[i : i + 5000]
+        rows = db.fetchall(
+            """
+            SELECT t.probe, b.trade_date, b.close
+              FROM unnest(%s::int[], %s::bigint[], %s::date[], %s::date[])
+                   AS t(probe, sid, lo, hi)
+             CROSS JOIN LATERAL (
+                   SELECT p.trade_date, p.close FROM core.daily_price p
+                    WHERE p.security_id = t.sid
+                      AND p.trade_date BETWEEN t.lo AND t.hi
+                    ORDER BY p.trade_date
+                    LIMIT 1) b
+            """,
+            [list(c) for c in zip(*chunk)],
+        )
+        out.update({r["probe"]: (r["trade_date"], r["close"]) for r in rows})
+    return out
+
+
+def insert_vendor_link(
+    db: Database,
+    *,
+    security_id: int,
+    vendor: str,
+    vendor_key: str,
+    valid_from: date,
+    match_method: str,
+    confidence: Optional[float],
+    evidence: dict,
+    created_by: str,
+    note: Optional[str] = None,
+) -> None:
+    """Open a link from a security to a vendor key (never a feed: #98 assigns
+    feeds)."""
+    db.execute(
+        """
+        INSERT INTO core.security_vendor_xref
+            (security_id, vendor, vendor_key, valid_from, match_method, confidence,
+             evidence, created_by, note)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+        """,
+        (
+            security_id,
+            vendor,
+            vendor_key,
+            valid_from,
+            match_method,
+            confidence,
+            json.dumps(evidence, default=str, sort_keys=True),
+            created_by,
+            note,
+        ),
+    )
+
+
+def last_successful_run(db: Database, source: str, endpoint: str) -> Optional[dict]:
+    """The newest successful ``ops.ingestion_run`` of ``source``/``endpoint``."""
+    return db.fetchone(
+        """
+        SELECT ingestion_run_id, started_at, params FROM ops.ingestion_run
+         WHERE source = %s AND endpoint = %s AND status = 'success'
+         ORDER BY ingestion_run_id DESC LIMIT 1
+        """,
+        (source, endpoint),
+    )

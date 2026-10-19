@@ -70,6 +70,15 @@ fafnir ingest delisted
 echo "==> Incremental prices (active universe)"
 fafnir ingest prices
 
+# Link tonight's new listings to their Sharadar identity (#62). AFTER prices, not
+# straight after the security master: the link is decided by comparing the
+# security's own bars with Sharadar's, and a security minted tonight has none until
+# the step above pulls its history. Upkeep: a missing Sharadar master or key costs
+# the link, never the night's load. Until the first full `fafnir vendor link` it
+# says so and does nothing.
+echo "==> Vendor links (new listings)"
+upkeep fafnir vendor link --vendor sharadar --new
+
 # Incremental once `actions_mode` is "auto" in the config: one market-wide calendar
 # sweep against a watermark, a full pull only for securities that have never had one,
 # and a 1/30 slice reconciled against the per-symbol feed so a vendor coverage gap
