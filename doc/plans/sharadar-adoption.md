@@ -254,6 +254,28 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P1, #58: the Sharadar master and events.** `fafnir ingest sharadar-master [--from-file
+  FILE_ID]` loads the ledger's current TICKERS into `core.vendor_security`, then its ACTIONS into
+  `core.vendor_security_event`, resolving each row's ticker to a permaticker through the master. It reads
+  the files #52 recorded and downloads nothing. One run per file (`master:<table>`). Rows are upserted
+  through a staging COPY, and a row equal to the stored one is not written, so a re-run is a no-op.
+  `fafnir status` gains a Sharadar block, printed only once the tables hold rows.
+  - **Measured on the 2026-10-19 files** (cloud session, local database):
+    - TICKERS: 74,420 rows → 61,146. The counts by table and delisted flag match the file.
+    - ACTIONS: 718,464 rows → 142,852 events.
+    - Time: 12.5 s for both; the re-run took 7.6 s and wrote nothing.
+  - **Where the file differs from the issue:**
+    - `SF3B` rows are institutional investors, so they are skipped (13,274).
+    - ACTIONS uses about seventy action names, not the sixteen the issue lists. Every action but `split`
+      and `dividend` is kept, so that none is silently dropped.
+    - 3,134 rows name a ticker TICKERS does not hold, mostly acquirers outside the dataset. They are
+      skipped and counted by action.
+    - The event grain repeats for 375 acquisitions that differ only in `contraname`. The first name in
+      sort order is kept (654 rows collapsed).
+  - **Not built here:**
+    - a TICKERS/ACTIONS delta, since the downloader fetches full files only;
+    - the issue's "last shadow run" line, since plan v2 has no shadow run. The status block shows the
+      newest master load instead.
 - **2026-10-19 · P0, #57: subscribed, key installed.** The Bundle (max history, annual) runs
   2026-10-18 → 2027-10-18; the renewal reminder is 2027-09-18. The key went into the host's
   `/etc/fafnir/fafnir.env`.

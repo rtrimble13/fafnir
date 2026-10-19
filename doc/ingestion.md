@@ -63,6 +63,7 @@ Sharadar (plan v2): files on disk and a ledger, read by the loaders still to com
 | Command | Sharadar request | Target | Natural key |
 |---|---|---|---|
 | `source sharadar-bulk` | `GET /v1.0/data/<table>?years=full` → 302 → pre-signed `<table>.csv.zip` | the file under `[sharadar] bulk_dir`; `landing.sharadar_file` | sha256 (one row per content) |
+| `ingest sharadar-master` | none: reads the ledger's current `tickers` and `actions` files | `core.vendor_security`, `core.vendor_security_event` | `(vendor, vendor_table, vendor_key)`; the event grain |
 | `source ping`, `source probe-sharadar` | slices of `tickers`, `SEP`, `actions`, `SF1` | nothing (read-only) | — |
 
 > **Verify before the first production backfill:** the `symbol-change` payload
@@ -296,9 +297,9 @@ Two departures from the issue as written, both forced by #49's measurements:
 - **`map_category` takes no table.** Each category names the same thing in stocks
   and funds.
 
-One fact for #58: bulk TICKERS writes its `table` column in legacy codes (`SEP`,
-`SFP`, `SF1`, `SF2`, `SF3B`), whereas the API returns the modern names that
-`core.vendor_security.vendor_table` stores.
+Bulk TICKERS writes its `table` column in legacy codes (`SEP`, `SFP`, `SF1`, `SF2`,
+`SF3B`), whereas the API returns the modern names that
+`core.vendor_security.vendor_table` stores. The master loader (#58) maps them.
 
 ## What FMP restates, and the guard
 

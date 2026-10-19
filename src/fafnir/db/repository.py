@@ -6527,3 +6527,191 @@ def sharadar_file(db: Database, file_id: int) -> Optional[dict]:
     return db.fetchone(
         "SELECT * FROM landing.sharadar_file WHERE file_id = %s", (file_id,)
     )
+
+
+# ---------------------------------------------------------------------------
+# core.vendor_security / core.vendor_security_event -- a vendor's own view (#58)
+# ---------------------------------------------------------------------------
+
+#: core.vendor_security's loaded columns, in COPY order (the key first).
+VENDOR_SECURITY_COLUMNS = (
+    "vendor",
+    "vendor_table",
+    "vendor_key",
+    "ticker",
+    "name",
+    "exchange",
+    "category",
+    "is_delisted",
+    "cusips",
+    "figi",
+    "cik",
+    "sic_code",
+    "sector",
+    "industry",
+    "fama_industry",
+    "currency",
+    "location",
+    "first_price_date",
+    "last_price_date",
+    "first_quarter",
+    "last_quarter",
+    "related_tickers",
+    "attributes",
+    "vendor_last_updated",
+)
+VENDOR_EVENT_COLUMNS = (
+    "vendor",
+    "vendor_key",
+    "event_date",
+    "action",
+    "ticker",
+    "value",
+    "contra_ticker",
+    "contra_name",
+    "contra_vendor_key",
+)
+
+
+class UpsertCounts(NamedTuple):
+    inserted: int
+    updated: int
+    unchanged: int
+
+
+def _stage_and_upsert(
+    db: Database,
+    target: str,
+    columns: Sequence[str],
+    keys: Sequence[str],
+    conflict: str,
+    rows: Iterable[dict],
+    ingestion_run_id: Optional[int],
+) -> UpsertCounts:
+    """COPY ``rows`` into a temporary table shaped like ``target``, then upsert
+    them in one statement. A row whose values all match the stored row is not
+    written, so a re-run of the same file changes nothing, ``loaded_at`` and
+    ``ingestion_run_id`` included. ``keys`` are the columns of the conflict target
+    ``conflict`` (which may wrap them in expressions); the others are updated."""
+    cols = ", ".join(columns)
+    data = [c for c in columns if c not in keys]
+    changed = " OR ".join(f"t.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in data)
+    sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in data)
+    n = 0
+    # A transaction block, so the temporary table lives until the upsert on an
+    # autocommit connection too (a savepoint inside the caller's transaction).
+    with db.transaction():
+        db.execute(
+            f"CREATE TEMP TABLE _stage (LIKE {target} INCLUDING DEFAULTS) "
+            "ON COMMIT DROP"
+        )
+        with db.conn.cursor() as cur:
+            with cur.copy(f"COPY _stage ({cols}) FROM STDIN") as copy:
+                for row in rows:
+                    copy.write_row(
+                        [
+                            (
+                                json.dumps(row[c], sort_keys=True)
+                                if isinstance(row[c], dict)
+                                else row[c]
+                            )
+                            for c in columns
+                        ]
+                    )
+                    n += 1
+        written = db.fetchall(
+            f"""
+            INSERT INTO {target} AS t ({cols}, ingestion_run_id)
+            SELECT {cols}, %s FROM _stage
+            ON CONFLICT ({conflict}) DO UPDATE
+               SET {sets}, ingestion_run_id = EXCLUDED.ingestion_run_id,
+                   loaded_at = now()
+             WHERE {changed}
+            RETURNING (xmax = 0) AS inserted
+            """,
+            (ingestion_run_id,),
+        )
+        db.execute("DROP TABLE _stage")
+    inserted = sum(1 for r in written if r["inserted"])
+    return UpsertCounts(inserted, len(written) - inserted, n - len(written))
+
+
+def upsert_vendor_securities(
+    db: Database, rows: Iterable[dict], ingestion_run_id: Optional[int]
+) -> UpsertCounts:
+    """Upsert a vendor's master rows on ``(vendor, vendor_table, vendor_key)``. The
+    rows must be unique on that key."""
+    return _stage_and_upsert(
+        db,
+        "core.vendor_security",
+        VENDOR_SECURITY_COLUMNS,
+        ("vendor", "vendor_table", "vendor_key"),
+        "vendor, vendor_table, vendor_key",
+        rows,
+        ingestion_run_id,
+    )
+
+
+def upsert_vendor_events(
+    db: Database, rows: Iterable[dict], ingestion_run_id: Optional[int]
+) -> UpsertCounts:
+    """Upsert a vendor's events on their grain, ``(vendor, vendor_key, event_date,
+    action, contra_ticker)``. The rows must be unique on it."""
+    return _stage_and_upsert(
+        db,
+        "core.vendor_security_event",
+        VENDOR_EVENT_COLUMNS,
+        ("vendor", "vendor_key", "event_date", "action", "contra_ticker"),
+        "vendor, vendor_key, event_date, action, COALESCE(contra_ticker, '')",
+        rows,
+        ingestion_run_id,
+    )
+
+
+def vendor_keys_by_ticker(
+    db: Database, vendor: str, tables: Sequence[str]
+) -> dict[str, str]:
+    """``ticker -> vendor_key`` from the vendor's master. A ticker in several of
+    ``tables`` takes the key of the first, in the order given."""
+    rows = db.fetchall(
+        """
+        SELECT DISTINCT ON (ticker) ticker, vendor_key
+          FROM core.vendor_security
+         WHERE vendor = %s AND vendor_table = ANY(%s)
+         ORDER BY ticker, array_position(%s::text[], vendor_table)
+        """,
+        (vendor, list(tables), list(tables)),
+    )
+    return {r["ticker"]: r["vendor_key"] for r in rows}
+
+
+def vendor_status(db: Database, vendor: str, order: Sequence[str] = ()) -> dict:
+    """What ``fafnir status`` says about a vendor: master rows by table and
+    delisted flag (tables in ``order`` first), the event count, and the newest
+    master load."""
+    tables = db.fetchall(
+        """
+        SELECT vendor_table,
+               count(*) FILTER (WHERE is_delisted IS NOT TRUE) AS listed,
+               count(*) FILTER (WHERE is_delisted)             AS delisted
+          FROM core.vendor_security
+         WHERE vendor = %s
+         GROUP BY vendor_table
+         ORDER BY array_position(%s::text[], vendor_table), vendor_table
+        """,
+        (vendor, list(order)),
+    )
+    events = db.fetchval(
+        "SELECT count(*) FROM core.vendor_security_event WHERE vendor = %s", (vendor,)
+    )
+    last = db.fetchone(
+        """
+        SELECT ingestion_run_id, endpoint, status, started_at
+          FROM ops.ingestion_run
+         WHERE source = %s AND endpoint LIKE 'master:%%'
+         ORDER BY ingestion_run_id DESC
+         LIMIT 1
+        """,
+        (vendor,),
+    )
+    return {"tables": tables, "events": int(events or 0), "last_run": last}

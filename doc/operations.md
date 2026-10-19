@@ -231,7 +231,7 @@ flag is only the notification.
 ## Monitoring
 
 ```bash
-fafnir status                 # securities, price rows, latest date, open DQ flags
+fafnir status                 # securities, price rows, latest date, open DQ flags, Sharadar
 fafnir dq list                # the open queue, by check and severity
 scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 scripts/monitor.sh            # all of the below in one pass; non-zero if any tripped
@@ -277,6 +277,20 @@ Things to watch:
   The flag is raised once, on the night the name changes, not nightly.
 - **Unapplied renames** — the `Renames` line in `fafnir status`. Each one is a
   company whose identity is currently split across two `security_id`s.
+- **Sharadar** — once `fafnir ingest sharadar-master` has run, `fafnir status` ends
+  with a block for the vendor's own tables. A host that has never loaded them prints
+  the lines above unchanged.
+  ```
+  Sharadar   : stocks 6319 listed, 14692 delisted
+               funds 6394 listed, 3612 delisted
+               fundamentals 5519 listed, 12347 delisted
+               insiders 5593 listed, 6670 delisted
+               events 142852; last load 2026-10-19 17:08 (master:actions, run 5, success)
+  ```
+  - **The counts** are `core.vendor_security` rows by table and delisted flag, and
+    the `core.vendor_security_event` row count.
+  - **The last load** is the newest `master:*` run. A status other than `success`
+    there is a failed load: its `error_message` in `ops.ingestion_run` says why.
 - **New listings** — the `New (7d)` line. A week of zero on a working FMP key means
   the security-master step is not running, and the universe is quietly going stale.
 - **Freshness** — `fafnir status` latest date should track the last trading day.

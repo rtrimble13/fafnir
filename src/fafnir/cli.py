@@ -542,6 +542,52 @@ def ingest_delisted(ctx, full):
     )
 
 
+@ingest.command("sharadar-master")
+@click.option(
+    "--from-file",
+    "file_id",
+    type=int,
+    default=None,
+    metavar="FILE_ID",
+    help="Load this ledger file (TICKERS or ACTIONS) instead of the current ones",
+)
+@click.pass_context
+def ingest_sharadar_master(ctx, file_id):
+    """Load Sharadar's security master and lifecycle events into the vendor tables.
+
+    TICKERS goes to core.vendor_security, ACTIONS (all but splits and dividends) to
+    core.vendor_security_event; core.security is not touched. Without --from-file,
+    loads the ledger's current TICKERS, then its current ACTIONS (events resolve to
+    a permaticker through the master). Reads the files under [sharadar] bulk_dir;
+    downloads nothing. Re-running a file changes nothing. One ops.ingestion_run per
+    file (endpoint master:<table>). Exits non-zero if a file failed.
+    """
+    from fafnir.ingest import sharadar_master
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        try:
+            results = sharadar_master.load(
+                database, cfg.sharadar_bulk_dir, file_id=file_id
+            )
+        except FileNotFoundError as exc:
+            raise click.ClickException(str(exc)) from exc
+    failed = []
+    for r in results:
+        if r.error:
+            failed.append(r.table)
+            click.echo(f"{r.table:<8} file {r.file_id}: FAILED: {r.error}")
+            continue
+        click.echo(
+            f"{r.table:<8} file {r.file_id}: {r.rows} rows read; {r.inserted} new, "
+            f"{r.updated} changed, {r.unchanged} unchanged (run {r.run_id})"
+        )
+        for reason, n in r.skipped.items():
+            click.echo(f"{'':<8} skipped {n}: {reason}")
+    if failed:
+        raise click.ClickException(f"{len(failed)} file(s) failed: {', '.join(failed)}")
+
+
 @ingest.command("actions")
 @click.option("--symbols", help="Comma-separated symbols (always pulled per symbol)")
 @click.option(
@@ -6300,6 +6346,9 @@ def status(ctx):
         new_listings = repo.count_recent_listings(database, days=7)
         pending_renames = repo.count_unapplied_symbol_changes(database)
         rename_sample = repo.unapplied_symbol_changes(database, limit=10)
+        sharadar = repo.vendor_status(
+            database, "sharadar", order=("stocks", "funds", "fundamentals", "insiders")
+        )
     click.echo(
         f"Securities : {counts.get('securities', 0)} "
         f"(active {counts.get('active', 0)}, delisted {counts.get('delisted', 0)})"
@@ -6323,6 +6372,30 @@ def status(ctx):
                 f"             {row['old_symbol']} -> {row['new_symbol']} "
                 f"({row['change_date']}, {row['status']})"
             )
+    for line in _vendor_status_lines("Sharadar", sharadar):
+        click.echo(line)
+
+
+def _vendor_status_lines(label: str, st: dict) -> list[str]:
+    """The `status` block for a vendor's own tables (#58): its master by table and
+    delisted flag, its events, and its newest master load. Nothing for a vendor
+    with no rows, so a host without one prints what it always did."""
+    if not st["tables"]:
+        return []
+    lines = [
+        f"{t['vendor_table']} {t['listed']} listed, {t['delisted']} delisted"
+        for t in st["tables"]
+    ]
+    tail = f"events {st['events']}"
+    run = st["last_run"]
+    if run:
+        tail += (
+            f"; last load {run['started_at']:%Y-%m-%d %H:%M} "
+            f"({run['endpoint']}, run {run['ingestion_run_id']}, {run['status']})"
+        )
+    lines.append(tail)
+    head = f"{label:<11}: "
+    return [(head if i == 0 else " " * len(head)) + x for i, x in enumerate(lines)]
 
 
 if __name__ == "__main__":
