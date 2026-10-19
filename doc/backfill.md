@@ -490,6 +490,7 @@ fafnir source ping --require-paid                        # the key is the subscr
 fafnir source sharadar-bulk                              # tickers, actions, SEP, SFP, SF1
 fafnir source sharadar-bulk --tables SEP --force         # re-download one table
 psql "${FAFNIR_DSN}" -X -f scripts/landing_sizes.sql     # what the ledger now holds
+fafnir ingest sharadar-master                            # TICKERS + ACTIONS -> the vendor tables
 ```
 
 `sharadar-bulk` downloads each table's whole-history file and records it in

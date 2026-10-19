@@ -225,9 +225,28 @@ tables arrive empty. The Sharadar master and events load from TICKERS and ACTION
 | `first_price_date` / `last_price_date` | DATE CHECK | The price history's span; last ≥ first. |
 | `first_quarter` / `last_quarter` | DATE | The fundamentals' span. |
 | `attributes` | JSONB | Vendor fields without a column (`scalemarketcap`, `scalerevenue`, `sicsector`, `sicindustry`, `firstadded`, `secfilings`, `companysite`). |
-| `vendor_last_updated` / `ingestion_run_id` / `loaded_at` | | The vendor's `lastupdated`, the run and the load time. |
+| `vendor_last_updated` / `ingestion_run_id` / `loaded_at` | | The vendor's `lastupdated`, the run and the load time. `ingestion_run_id` and `loaded_at` move only when a value changes. |
 
-**Cadence:** the bulk load, then the nightly delta (#58).
+**Population (`fafnir ingest sharadar-master`, #58).** One row per TICKERS row:
+- **`vendor_table`:** the file's `table` column is in legacy codes (`SEP`, `SFP`,
+  `SF1`, `SF2`), which map to the modern names. `SF3B` rows (`holdings_investor`)
+  list institutional investors, not securities, and are skipped.
+- **Mapped fields:**
+  - `isdelisted` `Y`/`N` becomes `is_delisted`;
+  - `cik` is the digits of the `secfilings` URL's `CIK=` parameter, as the SEC
+    writes them (ten, zero-padded);
+  - `firstquarter` / `lastquarter`, which are text in the file, become dates.
+- **Not mapped:** values are stored as the vendor states them. `exchange` stays
+  `NYSEARCA`, for instance; `fafnir.ingest.sharadar_map` maps it where a loader
+  needs fafnir's code ([ingestion.md](ingestion.md#sharadar-field-mapping)).
+- **Upserted:** a row equal to the stored one is not written. Nothing is deleted, so a
+  row the vendor stops sending stays.
+
+Measured on the 2026-10-19 full file: 74,420 rows, 61,146 loaded, 13,274 investors
+skipped.
+
+**Cadence:** each full TICKERS file the bulk download records. A nightly delta is
+not built yet.
 
 #### `core.security_vendor_xref` — fafnir's security ↔ a vendor's key, over time. **Grain:** `(vendor, vendor_key, valid_from)`.
 
@@ -267,6 +286,24 @@ resolves), `ingestion_run_id`, `loaded_at`. The grain is a unique index with
 `COALESCE(contra_ticker, '')`, since most events have no contra party. ACTIONS rows
 carry only a ticker, so #58 resolves each to its permaticker through TICKERS
 before writing here. Splits and dividends go to `core.corporate_action` (#73).
+
+**Population (`fafnir ingest sharadar-master`, #58).**
+- **Which actions:** every ACTIONS action except `split` and `dividend`. The file
+  uses about seventy action names (2026-10-19), among them a family of
+  `acquisition*` variants, `exchangefrom`/`to`, `namechangefrom`/`to` and
+  `spacmerger`. They are kept as given rather than filtered to a list.
+- **Resolving a row:** the row's ticker resolves through the loaded master, in
+  the order stocks, funds, fundamentals, insiders. A row whose ticker resolves
+  nowhere is skipped and counted by action in the run's `params.skipped`; they are
+  mostly acquirers outside the dataset. The contra ticker resolves the same way,
+  into `contra_vendor_key`, which is NULL when it does not.
+- **Duplicates on the grain:** the file repeats the grain for some acquisitions,
+  differing only in `contra_name`. The loader keeps the name that sorts first and
+  counts the rest as `duplicate`.
+
+Measured on the 2026-10-19 full file: 718,464 rows → 142,852 events, after
+skipping 571,824 splits and dividends, 3,134 unresolved rows and 654 duplicates.
+Loading both files took 12.5 s; a re-run took 7.6 s and wrote nothing.
 
 ## Schema: `mart`
 
