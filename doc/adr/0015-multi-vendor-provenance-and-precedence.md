@@ -171,9 +171,10 @@ never vendor values. Raw evidence stays on the host.
 - **Adjustment factors are always recomputed after any change to actions,** whether
   a correction, a revert or an excision. They are derived from mixed-vendor actions,
   as `fafnir adjust` already assumes.
-- **Every vendor write path takes an `owner`.** The FMP loaders pass `owner='fmp'` and
-  behave exactly as today, because every vendor row today is FMP's (#46 proves it with
-  the existing tests unmodified).
+- **Every vendor write path names its writer.** The upserts take it as `source`, which
+  they already had; the FMP loaders pass the default, `fmp`, and behave exactly as
+  today, because every vendor row today is FMP's (#46 proves it with the existing
+  tests unmodified).
 - **`ops.vendor_correction` holds FMP data.** It is FMP's to keep or delete under
   FMP's licence, like `landing.fmp_raw`, and is covered by the same retention answer
   (#43).

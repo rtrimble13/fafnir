@@ -23,7 +23,9 @@ research-grade.
   calendar's span are unknown rather than closed — the seed writes open days only —
   so those bars are kept.
 - **Idempotent.** Loads upsert on the natural key (`ON CONFLICT ... DO UPDATE`).
-  Re-pulling a window converges to the same state.
+  Re-pulling a window converges to the same state. An upsert revises only the rows
+  its own vendor supplied; a key another party holds is left exactly as it is (see
+  [Who may write a row](#who-may-write-a-row-precedence-adr-0015)).
 - **Incremental & resumable.** Per-symbol watermarks (`ops.load_watermark`) bound
   each pull to the new tail, with a configurable overlap (`overlap_days`, default 5)
   to absorb late corrections. A load that dies mid-universe resumes from its
@@ -214,7 +216,7 @@ ratios and any split on file within 30 days. The date still counts as loaded, so
 watermark moves past it. A zero volume on either side is no ratio and restates
 nothing.
 
-An **explicit** re-fetch (`--from`) overwrites, as before, and:
+An **explicit** re-fetch (`--from`) overwrites FMP's own bars, as before, and:
 - prints every bar it restated beyond the thresholds, close and volume, old -> new
   (the table that would have shown the x50 volume on the spot);
 - records them in its run's `params.restated` (the first 500) and
@@ -513,6 +515,47 @@ Which vendor feeds a security is an explicit assignment, not a guess from `sourc
 Until `core.security_vendor_xref` exists (#55), `source = 'fmp'` is the whole FMP
 rule, and asking `is_fed_by` about any other vendor raises. Once it exists, a
 Sharadar-fed security is the one with an open `is_feed` link.
+
+### Who may write a row: precedence (ADR 0015)
+
+Every row of `core.daily_price` and `core.corporate_action` carries the party that
+supplied it in `source`. The parties rank `operator > sharadar > tiingo > fmp`
+(`repo.PRECEDENCE`), and both upserts (`upsert_daily_prices`,
+`upsert_corporate_action`) follow one rule:
+
+- **A vendor revises its own rows.** FMP re-reading an FMP bar behaves as it always
+  did, restatement guard included.
+- **It never writes over a row another party holds.** The key is left exactly as it
+  is, `source`, `ingestion_run_id` and `loaded_at` included, and counted as
+  `skipped_foreign`: on the price upsert's result, in `load_prices` stats, and in
+  the run's `params.skipped_foreign`. A date another vendor holds is not FMP's to
+  restate either, so the restatement guard neither flags nor resolves anything on
+  it. Whether FMP's read disagrees with that row is the reconcile's question.
+- **It replaces a lower-ranked vendor's row only when the caller asks:**
+  `correct=True` with a `reason` (`reconcile_divergence`; `gap_fill` and
+  `restatement` are reserved). Each replaced row is first written to
+  `ops.vendor_correction` as it stood, in the same transaction, and the key moves
+  to the correcting vendor. An action whose values already agree is not a
+  correction. A correction never writes a key an operator edited
+  (`ops.operator_override`); that key is counted as `skipped_suppressed`.
+- **No vendor writes an operator row**, with or without `correct`, and an operator
+  cannot be passed as a correcting writer. Operator edits go through the operator
+  commands.
+
+So nothing a vendor already supplied changes until a correcting load runs, and a
+correction can be reviewed and undone:
+
+```bash
+fafnir vendor corrections list [--symbol S | --security-id N] [--all] [--json]
+fafnir vendor corrections revert ID... -m "why" [--dry-run] [--yes]
+```
+
+`revert` writes each replaced row back exactly (values, `source`, run and load
+time) and recomputes the security's adjustment factors. It refuses a row that
+changed after the correction, for example a later revision by the correcting
+vendor, and refuses one already reverted. Several ids are reverted together or
+not at all. Removing a vendor (ADR 0015 §5) is the same restore applied to every
+correction it made.
 
 ### Instruments out of scope: warrants, rights and units (ADR 0012)
 

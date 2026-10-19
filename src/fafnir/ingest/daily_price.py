@@ -651,6 +651,13 @@ def _window_start(
     return backfill_start
 
 
+def _tally_skipped_foreign(run, n: int) -> None:
+    """Add to the run's ``params.skipped_foreign`` (ADR 0015)."""
+    params = getattr(run, "params", None)
+    if isinstance(params, dict):
+        params["skipped_foreign"] = params.get("skipped_foreign", 0) + n
+
+
 def load_symbol_prices(
     db: Database,
     fmp: FMPClient,
@@ -826,6 +833,13 @@ def load_symbol_prices(
             )
 
     stored = repo.stored_bars_on(db, sec_id, [r["trade_date"] for r in clean])
+    # A date another party holds is not FMP's to restate (ADR 0015): the upsert
+    # skips and counts it, so the guard neither flags nor resolves anything there.
+    # Whether FMP's read disagrees with that row is the reconcile's question.
+    theirs = {d for d, old in stored.items() if old["source"] != repo.FMP_SOURCE}
+    foreign = [r for r in clean if r["trade_date"] in theirs]
+    if foreign:
+        clean = [r for r in clean if r["trade_date"] not in theirs]
     clean, held, scaled = _guard_bars(
         db,
         sec_id,
@@ -844,7 +858,17 @@ def load_symbol_prices(
             held
         )
 
-    written = repo.upsert_daily_prices(db, clean, ingestion_run_id=run.run_id)
+    written = repo.upsert_daily_prices(db, clean + foreign, ingestion_run_id=run.run_id)
+    if written.skipped_foreign:
+        # Keys another party holds (ADR 0015): left as they are, and counted on the
+        # run rather than as quarantines, which keep meaning "the feed sent a bad
+        # row". Today every vendor row is FMP's, so this stays at zero until a
+        # second vendor loads.
+        _tally_skipped_foreign(run, written.skipped_foreign)
+        if stats is not None:
+            stats["skipped_foreign"] = (
+                stats.get("skipped_foreign", 0) + written.skipped_foreign
+            )
 
     # Advance the watermark only up to the latest *contiguous* clean date: never
     # past the earliest quarantined bar, so the overlap re-fetches that date next

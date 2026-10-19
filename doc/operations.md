@@ -710,6 +710,12 @@ It compares **raw** closes, and both sides are unadjusted — `core.daily_price`
 side, FMP's `historical-price-eod/non-split-adjusted` on the other — so a split in
 the compared window is not by itself a reason for the two to disagree.
 
+Once a second vendor loads, a vendor that outranks another replaces its rows only in
+an explicit correction (ADR 0015), and each one is kept. `fafnir vendor corrections
+list` shows them; `fafnir vendor corrections revert ID -m "why"` puts the replaced row
+back exactly and recomputes the security's factors. See
+[ingestion.md](ingestion.md#who-may-write-a-row-precedence-adr-0015).
+
 ## Maintenance tasks
 
 - **Partitions & calendar horizon** — kept rolling automatically by

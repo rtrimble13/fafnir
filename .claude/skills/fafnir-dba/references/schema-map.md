@@ -36,6 +36,7 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `ops.data_quality_flag` | `dq_flag_id`; one per open condition, except `price_*` |
 | `ops.load_watermark` | `(source, endpoint, security_id)`; `security_id = 0` means whole-endpoint |
 | `ops.operator_override` | `override_id`; one per operator edit, `reason` = `data_error`/`out_of_scope`/`cleanup` |
+| `ops.vendor_correction` | `correction_id`; one per row a higher-ranked vendor replaced (ADR 0015), `old_row` = the replaced row; active = `reverted_at IS NULL` |
 | `ops.dq_label` | `label_id`; a label a person stated (`dq label`, `--label`); `security_id` NULL for a cohort (`members`) |
 | `landing.fmp_raw` | `raw_id` — endpoint + symbol + `fetched_at` |
 | `meta.schema_migration` | `version` |

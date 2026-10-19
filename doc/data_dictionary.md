@@ -160,7 +160,7 @@ returns a total-return NAV series with no special case.
 | `open` `high` `low` `close` | NUMERIC(20,6) | **Raw** prices. |
 | `volume` | BIGINT | **Raw** volume (shares), in the share count of the day it traded. Taken from `unadjustedVolume` where the payload offers it, else `volume`. |
 | `vwap` | NUMERIC(20,6) | Volume-weighted average price (nullable). |
-| `source` | TEXT | `fmp`, or `operator` for a vendor bar an operator re-dated or re-scaled with `fafnir prices shift` / `rescale` (see `ops.operator_override`, migration 0026). The price loader never overwrites an `operator` bar: a vendor bar on its date is set aside. |
+| `source` | TEXT | Who supplied the bar: `fmp`, `sharadar`, `tiingo`, or `operator` for a vendor bar an operator re-dated or re-scaled with `fafnir prices shift` / `rescale` (see `ops.operator_override`, migration 0026). Writes follow ADR 0015 precedence (`operator > sharadar > tiingo > fmp`): a vendor revises its own bars and leaves every other party's alone; a higher-ranked vendor replaces a lower one's bar only in an explicit correction, which keeps the replaced bar in `ops.vendor_correction` (0029). No vendor overwrites an `operator` bar: a vendor bar on its date is set aside. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | Lineage. NULL on an `operator` bar; the vendor bar it replaced, with its run, is kept in the override's `detail.row`. |
 | `loaded_at` | TIMESTAMPTZ | |
 
@@ -184,7 +184,7 @@ happened (ADR 0007).
 | `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. |
 | `currency` | TEXT | |
-| `source` | TEXT | `fmp`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). The loaders never overwrite an `operator` row, and the reconciliation does not compare it against the feed. |
+| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the reconciliation does not compare it against the feed. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 
@@ -472,6 +472,31 @@ and `fafnir security split-history`; undone by `fafnir override revoke`
 At most one active override per `(security_id, target, action_type, key_date,
 operation)`: a `delete` and an `add` may share a key, which is how a wrong vendor row
 is replaced by a corrected one.
+
+### `ops.vendor_correction` — rows one vendor replaced. **Grain:** `correction_id`.
+Every `core.daily_price` / `core.corporate_action` row a higher-ranked vendor
+replaced in an explicit correction ([ADR 0015](adr/0015-multi-vendor-provenance-and-precedence.md)
+§3), as it stood, written in the same transaction as the replacement (migration
+0029). Listed and undone with `fafnir vendor corrections list|revert`. Active means
+`reverted_at IS NULL`. `old_row` is the replaced vendor's data, so it is kept or
+deleted under that vendor's licence, like `landing.fmp_raw`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `correction_id` | BIGINT IDENTITY PK | |
+| `security_id` | BIGINT | No FK, as `operator_override`; `security merge` retargets a victim's corrections (a victim correction on a key the survivor already has an active one for stays with the victim's id). |
+| `target` | TEXT CHECK | `daily_price` or `corporate_action`. |
+| `action_type` | TEXT CHECK | `split` / `dividend` for an action; NULL for a bar. |
+| `key_date` | DATE | `trade_date` for a bar, `ex_date` for an action. |
+| `old_source` / `new_source` | TEXT CHECK | The party replaced and the one that replaced it. They differ, and `old_source` is never `operator`. |
+| `old_row` | JSONB | The replaced row's value columns, `ingestion_run_id` and `loaded_at`: what a revert writes back. |
+| `new_row` | JSONB | The values the correction wrote. A revert refuses when the row no longer holds them. |
+| `reason` | TEXT CHECK | `reconcile_divergence`; `gap_fill` and `restatement` are reserved for the loaders that will use them. |
+| `ingestion_run_id` | BIGINT | The correcting run, when it has one. |
+| `corrected_at` | TIMESTAMPTZ | |
+| `reverted_at` / `reverted_by` / `revert_note` | | Set by `vendor corrections revert`; `reverted_at` and `reverted_by` are set together. |
+
+At most one active correction per `(security_id, target, action_type, key_date)`.
 
 ### `ops.dq_label` — labels a person stated. **Grain:** `label_id`.
 What someone checked and found true about a stretch of one series, or a cohort, for
