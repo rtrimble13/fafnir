@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -139,6 +140,12 @@ def rows_from_payload(data: Any) -> list[dict]:
                 f"Sharadar API error: {data.get('error') or data.get('message')}"
             )
     return []
+
+
+def _no_query(text: str) -> str:
+    """Drop every URL query string from ``text``. A pre-signed link's query is its
+    credentials plus noise; the host and path say which file failed."""
+    return re.sub(r"\?[^\s'\")]*", "", text)
 
 
 @dataclass(frozen=True)
@@ -397,8 +404,8 @@ class SharadarClient(BaseSource):
             resp.raise_for_status()
         except requests.RequestException as exc:
             raise SourceError(
-                f"GET {self._redact(url)} failed: "
-                f"{type(exc).__name__}: {self._redact(str(exc))}"
+                f"GET {_no_query(url)} failed: "
+                f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
             ) from None
         self.request_count += 1
         with resp:
@@ -409,6 +416,6 @@ class SharadarClient(BaseSource):
                         yield chunk
             except requests.RequestException as exc:
                 raise SourceError(
-                    f"GET {self._redact(url)} broke off: "
-                    f"{type(exc).__name__}: {self._redact(str(exc))}"
+                    f"GET {_no_query(url)} broke off: "
+                    f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
                 ) from None

@@ -253,6 +253,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P0, #52: the bulk downloader.** `fafnir source sharadar-bulk [--tables …] [--years 5|10|full]
+  [--force]`. For each table it:
+  - downloads the zip (via the 302, without the key);
+  - checks the header against the table's schema: a missing column fails the table, naming it; an unknown
+    column is a warning kept in `params.unmapped_columns`;
+  - counts rows, records the file, and supersedes older full files.
+
+  One `ops.ingestion_run` per table (`bulk:<table>`); a table on record is skipped unless `--force`, so
+  runs resume; the same content twice is one file. The shared reader is `sharadar_files.rows(db, file_id,
+  bulk_dir)`, which refuses a deleted, missing or resized file. Download errors drop the pre-signed query
+  string, which is credentials plus noise.
+  - **Not yet measured:** the zips' members and the wall-clock. The build session reached the 302 but its
+    network policy blocks `static-sharadar.nyc3.digitaloceanspaces.com`. The first operator run records
+    both.
 - **2026-10-19 · P0, #50: the file ledger.** Migration 0030 adds `landing.sharadar_file`, one row per
   downloaded file: table, `full`/`delta`, filters, path, `member`, sha256 (unique), bytes, rows, header,
   run and status. `fafnir.sources.sharadar_files` reads a file as typed rows, streamed. Differences from

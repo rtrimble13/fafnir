@@ -58,6 +58,13 @@ the Professional plan in the original `duk`.
 | `ingest actions` | `splits`, `dividends`; `splits-calendar`, `dividends-calendar` | `core.corporate_action` | (security_id, action_type, ex_date) |
 | `adjust` | (derived) | `core.adjustment_factor` | (security_id, effective_date) |
 
+Sharadar (plan v2): files on disk and a ledger, read by the loaders still to come.
+
+| Command | Sharadar request | Target | Natural key |
+|---|---|---|---|
+| `source sharadar-bulk` | `GET /v1.0/data/<table>?years=full` → 302 → pre-signed `<table>.csv.zip` | the file under `[sharadar] bulk_dir`; `landing.sharadar_file` | sha256 (one row per content) |
+| `source ping`, `source probe-sharadar` | slices of `tickers`, `SEP`, `actions`, `SF1` | nothing (read-only) | — |
+
 > **Verify before the first production backfill:** the `symbol-change` payload
 > field names (`date`, `oldSymbol`, `newSymbol`, `companyName`) and the
 > `splits` / `dividends` stable field names (`numerator`/`denominator`, `dividend`/`adjDividend`) should

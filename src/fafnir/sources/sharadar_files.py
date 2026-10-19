@@ -268,3 +268,37 @@ def count_rows(path: str | Path, member: Optional[str] = None) -> int:
         reader = csv.reader(fh)
         next(reader, None)
         return sum(1 for fields in reader if fields)
+
+
+def ledger_path(bulk_dir: str | Path, entry: dict) -> Path:
+    """Where a ledger row's file is: ``path`` is relative to ``bulk_dir``."""
+    return Path(bulk_dir) / entry["path"]
+
+
+def rows(db, file_id: int, bulk_dir: str | Path) -> Iterator[dict]:
+    """The typed rows of a file the ledger holds: the one reader the loaders use.
+
+    Refuses a file the ledger marks deleted, one missing from ``bulk_dir`` (after
+    a restore onto a new host, the ledger comes back without the files), and one
+    whose size differs from what was recorded, which is a different file under the
+    same name.
+    """
+    from fafnir.db import repository as repo
+
+    entry = repo.sharadar_file(db, file_id)
+    if entry is None:
+        raise SharadarFileError(f"no file {file_id} in landing.sharadar_file")
+    if entry["status"] == "deleted":
+        raise SharadarFileError(f"file {file_id} ({entry['path']}) is marked deleted")
+    path = ledger_path(bulk_dir, entry)
+    if not path.is_file():
+        raise SharadarFileError(
+            f"file {file_id} is not at {path}: re-download it "
+            "(`fafnir source sharadar-bulk --force`), or check [sharadar] bulk_dir"
+        )
+    if path.stat().st_size != entry["bytes"]:
+        raise SharadarFileError(
+            f"{path} is {path.stat().st_size} bytes; the ledger recorded "
+            f"{entry['bytes']} for file {file_id}"
+        )
+    return iter_rows(path, entry["vendor_table"], member=entry["member"])

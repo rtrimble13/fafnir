@@ -483,6 +483,56 @@ them.
 
 ---
 
+## Sharadar initial population
+
+```bash
+fafnir source ping --require-paid                        # the key is the subscription's
+fafnir source sharadar-bulk                              # tickers, actions, SEP, SFP, SF1
+fafnir source sharadar-bulk --tables SEP --force         # re-download one table
+psql "${FAFNIR_DSN}" -X -f scripts/landing_sizes.sql     # what the ledger now holds
+```
+
+`sharadar-bulk` downloads each table's whole-history file and records it in
+`landing.sharadar_file`. It loads nothing into `core`; the loaders do that, reading
+the files (#55, #58, #75). For each table:
+
+- **Download.** It asks `api.sharadar.com` for the table with `years=full`
+  (`--years 5|10` for less). The answer is a 302 to a pre-signed zip on
+  `static-sharadar.nyc3.digitaloceanspaces.com`, which it fetches **without** the key.
+  It streams the zip to `[sharadar] bulk_dir/<sha256>.csv.zip` under a temporary name,
+  so a broken download leaves nothing behind.
+- **Check the header.** The header is checked against the table's schema:
+  - **A missing column** fails the table, naming the column and what the file has
+    instead. The file is kept for inspection and not recorded.
+  - **An unknown column** is a warning, kept in the run's `params.unmapped_columns`
+    and read as text.
+- **Record it.** It counts the rows and records the file, then marks the table's
+  older full files `superseded`.
+
+Its behaviour across runs:
+- **One run row per table.** `ops.ingestion_run` gets `source = sharadar`,
+  `endpoint = bulk:<table>`, with the bytes downloaded and, in `params`, the rows,
+  file and header findings.
+- **Resumable.** A table the ledger already holds is skipped (no request), so a run
+  that stopped part-way picks up at the first table it had not finished. One
+  table's failure does not undo the others; the command exits non-zero naming the
+  failures.
+- **Idempotent.** With `--force`, content identical to a file on record is that
+  file again: no second row, no second copy on disk.
+
+Before the first run:
+- **Egress.** The host's egress must allow **both** `api.sharadar.com` and the
+  download host. A blocked download host fails at the download with `Tunnel
+  connection failed` or a connection error.
+- **`bulk_dir`.** Set `[sharadar] bulk_dir` to an absolute path (a Volume if the
+  local disk is tight).
+
+**What to expect** (from the projection below, not yet a measured run): about 2.4 GB
+of zips across the five tables. Most of it is SEP (~1.0 GB) and SF1 (~1.1 GB). Then
+each file is read once to count its rows: SEP is ~45M rows, a few minutes of CPU.
+The wall-clock is the host's download speed; record it in the plan's [built] note on
+the first run.
+
 ## Disk budget with Sharadar
 
 Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in
