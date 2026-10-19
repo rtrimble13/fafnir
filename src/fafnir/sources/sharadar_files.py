@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Collection, Iterator, Mapping, Optional
 
 #: Legacy codes Sharadar still accepts in its paths, to the modern names the ledger
 #: stores (``landing.sharadar_file.vendor_table``).
@@ -277,14 +277,12 @@ def ledger_path(bulk_dir: str | Path, entry: dict) -> Path:
     return Path(bulk_dir) / entry["path"]
 
 
-def rows(db, file_id: int, bulk_dir: str | Path) -> Iterator[dict]:
-    """The typed rows of a file the ledger holds: the one reader the loaders use.
-
-    Refuses a file the ledger marks deleted, one missing from ``bulk_dir`` (after
-    a restore onto a new host, the ledger comes back without the files), and one
-    whose size differs from what was recorded, which is a different file under the
-    same name.
-    """
+def checked_path(db, file_id: int, bulk_dir: str | Path) -> tuple[dict, Path]:
+    """The ledger row of a file and where it is, after the checks every reader
+    makes: refuses a file the ledger marks deleted, one missing from ``bulk_dir``
+    (after a restore onto a new host, the ledger comes back without the files), and
+    one whose size differs from what was recorded, which is a different file under
+    the same name."""
     from fafnir.db import repository as repo
 
     entry = repo.sharadar_file(db, file_id)
@@ -303,4 +301,54 @@ def rows(db, file_id: int, bulk_dir: str | Path) -> Iterator[dict]:
             f"{path} is {path.stat().st_size} bytes; the ledger recorded "
             f"{entry['bytes']} for file {file_id}"
         )
+    return entry, path
+
+
+def rows(db, file_id: int, bulk_dir: str | Path) -> Iterator[dict]:
+    """The typed rows of a file the ledger holds: the one reader the loaders use.
+    The file is checked first (:func:`checked_path`)."""
+    entry, path = checked_path(db, file_id, bulk_dir)
     return iter_rows(path, entry["vendor_table"], member=entry["member"])
+
+
+def select(
+    db, file_id: int, bulk_dir: str | Path, wanted: Mapping[str, Collection[str]]
+) -> Iterator[dict]:
+    """The typed rows of a ledger file whose ``ticker`` is a key of ``wanted`` and
+    whose ``date`` (``YYYY-MM-DD``) is in that key's collection.
+
+    Both are tested on the raw text, and only a row that passes is converted. A
+    price table is 45M rows, and a caller that wants a few dates for each of
+    thousands of tickers would otherwise parse most of them.
+    """
+    entry, path = checked_path(db, file_id, bulk_dir)
+    table, name = entry["vendor_table"], path.name
+    with open_text(path, entry["member"]) as fh:
+        reader = csv.reader(fh)
+        cols = [c.strip() for c in next(reader, [])]
+        if "ticker" not in cols or "date" not in cols:
+            raise SharadarFileError(f"{name}: needs ticker and date columns")
+        t, d = cols.index("ticker"), cols.index("date")
+        width = len(cols)
+        convert = [_CONVERTERS.get(column_type(table, c) or "text", str) for c in cols]
+        for line, fields in enumerate(reader, start=2):
+            if len(fields) != width:
+                if fields:
+                    raise SharadarFileError(
+                        f"{name} line {line}: {len(fields)} fields, the header has "
+                        f"{width}"
+                    )
+                continue
+            dates = wanted.get(fields[t])
+            if dates is None or fields[d] not in dates:
+                continue
+            row = {}
+            for col, conv, text in zip(cols, convert, fields):
+                try:
+                    row[col] = None if text == "" else conv(text)
+                except (ValueError, InvalidOperation) as exc:
+                    raise SharadarFileError(
+                        f"{name} line {line}, column {col}: {text!r} is not a "
+                        f"{column_type(table, col)} ({exc})"
+                    ) from None
+            yield row

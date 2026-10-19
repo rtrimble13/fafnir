@@ -4020,6 +4020,101 @@ def vendor():
     """Work with more than one data vendor (ADR 0015)."""
 
 
+@vendor.command("link")
+@click.option(
+    "--vendor",
+    "vendor_name",
+    type=click.Choice(["sharadar"]),
+    default="sharadar",
+    show_default=True,
+)
+@click.option("--dry-run", is_flag=True, help="Decide and print counts; write nothing.")
+@click.option("--symbols", help="Comma-separated tickers: only these securities.")
+@click.option(
+    "--new",
+    "new",
+    is_flag=True,
+    help="Only securities first seen since the last full run (the nightly mode).",
+)
+@click.option(
+    "--prices",
+    type=click.Choice(["auto", "bulk", "api"]),
+    default="auto",
+    show_default=True,
+    help="Where Sharadar's closes come from: the bulk files, or the API (auto: the "
+    "API for a small run when a key is set)",
+)
+@click.pass_context
+def vendor_link(ctx, vendor_name, dry_run, symbols, new, prices):
+    """Link FMP-minted securities to the vendor's identity (core.security_vendor_xref).
+
+    \b
+      fafnir vendor link --dry-run          # counts by outcome; writes nothing
+      fafnir vendor link                    # every unlinked security
+      fafnir vendor link --new              # those first seen since the last full run
+      fafnir vendor link --symbols META,BID
+
+    A candidate shares a ticker with the security, and its price history overlaps
+    the security's bars. Five sampled raw closes against Sharadar's closeunadj
+    decide it: one candidate agreeing on at least four is linked. Otherwise the
+    security gets vendor_xref_ambiguous or vendor_xref_unmatched, with a reason. An
+    existing link is never changed. One ops.ingestion_run per run (endpoint link or
+    link:new). See doc/ingestion.md, "Linking to a vendor's identity".
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import vendor_link as vl
+
+    if new and symbols:
+        raise click.ClickException("Give --new or --symbols, not both.")
+    cfg = ctx.obj["config"]
+
+    with Database(cfg.dsn) as database:
+        ids = None
+        if symbols:
+            ids, missing = [], []
+            for sym in _split_symbols(symbols):
+                sid = repo.resolve_security_id(database, sym)
+                (ids.append(sid) if sid is not None else missing.append(sym))
+            if missing:
+                raise click.ClickException(f"No security for: {', '.join(missing)}")
+
+        def source_for(n: int):
+            use_api = prices == "api" or (
+                prices == "auto"
+                and n <= vl.API_MAX_CANDIDATES
+                and bool(cfg.sharadar_api_key)
+            )
+            if use_api:
+                return vl.ApiCloses(_sharadar_client(cfg))
+            return vl.BulkCloses(database, cfg.sharadar_bulk_dir)
+
+        try:
+            result = vl.link(
+                database, source_for, security_ids=ids, new=new, dry_run=dry_run
+            )
+        except vl.LinkError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    if result.note:
+        click.echo(result.note)
+        return
+    counts = result.counts()
+    head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+    click.echo(
+        f"{head} {len(result.outcomes)} securities evaluated ({result.mode}); "
+        f"{result.already_linked} already linked"
+        + (
+            f"; Sharadar closes from {result.price_source}"
+            if result.price_source
+            else ""
+        )
+    )
+    for (outcome, reason), n in sorted(
+        counts.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))
+    ):
+        click.echo(f"  {outcome:<10} {reason or '':<24} {n}")
+
+
 @vendor.group("corrections")
 def vendor_corrections():
     """Rows one vendor replaced in place of another's (ops.vendor_correction)."""

@@ -41,7 +41,10 @@ crontab etc/crontab.example   # edit paths/times first
 
 The daily job performs, in order:
 `ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked →
-ingest delisted → ingest prices → ingest actions → adjust → refresh-marts`.
+ingest delisted → ingest prices → vendor link --new → ingest actions → adjust →
+refresh-marts`. `vendor link --new` links tonight's new listings to Sharadar
+([ingestion.md](ingestion.md#linking-to-a-vendors-identity)). Like the universe
+steps, it warns and carries on if it fails.
 
 Data quality is a second job, `fafnir-dq` (`scripts/run_dq_checks.sh`), which runs
 once the daily has finished; the cron example chains it in the same entry. It is
