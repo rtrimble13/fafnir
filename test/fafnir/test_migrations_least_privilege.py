@@ -217,6 +217,9 @@ FORBIDDEN_TO_APP = (
     "ops.data_quality_flag",
     "landing.fmp_raw",
     "landing.sharadar_file",
+    "core.vendor_security",
+    "core.security_vendor_xref",
+    "core.vendor_security_event",
 )
 
 
@@ -314,6 +317,9 @@ OPS_READABLE = (
     "ops.vendor_correction",
     "landing.fmp_raw",
     "landing.sharadar_file",
+    "core.vendor_security",
+    "core.security_vendor_xref",
+    "core.vendor_security_event",
     "meta.schema_migration",
     # Everything fafnir_read reaches is included by design: triage starts from a
     # flag and ends in the bars and actions that explain it.
@@ -352,6 +358,47 @@ def _migrate_and_open_as_ops(dsn: str):
     with Database(dsn, autocommit=True) as owner:
         owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_ops")
     return Database(_as_ops_dsn(dsn), autocommit=True)
+
+
+# The vendor identity tables (0031, #55) are core: fafnir_read reads them, as it
+# reads the rest of core, and no mart view exposes them yet (a mart view is a
+# grant, #79). The read member is created here because no other test needs one.
+READ_MEMBER_ROLE = "fafnir_read_member_test"
+READ_MEMBER_PASSWORD = "read_member_test_password"
+VENDOR_IDENTITY = (
+    "core.vendor_security",
+    "core.security_vendor_xref",
+    "core.vendor_security_event",
+)
+
+
+def test_fafnir_read_can_read_the_vendor_identity_tables(least_privilege_dsn):
+    m.migrate(least_privilege_dsn)
+    with _admin() as admin:
+        if admin.fetchval(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (READ_MEMBER_ROLE,)
+        ):
+            admin.execute(
+                f"ALTER ROLE {READ_MEMBER_ROLE} LOGIN PASSWORD '{READ_MEMBER_PASSWORD}'"
+            )
+            admin.execute(f"GRANT fafnir_read TO {READ_MEMBER_ROLE}")
+        else:
+            admin.execute(
+                f"CREATE ROLE {READ_MEMBER_ROLE} LOGIN PASSWORD "
+                f"'{READ_MEMBER_PASSWORD}' IN ROLE fafnir_read"
+            )
+    with Database(least_privilege_dsn, autocommit=True) as owner:
+        owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_read")
+    parts = conninfo_to_dict(least_privilege_dsn)
+    parts.update(user=READ_MEMBER_ROLE, password=READ_MEMBER_PASSWORD)
+    failures = []
+    with Database(make_conninfo(**parts), autocommit=True) as reader:
+        for relation in VENDOR_IDENTITY:
+            try:
+                reader.fetchval(f"SELECT count(*) FROM {relation}")
+            except Exception as exc:  # noqa: BLE001 -- the message is the report
+                failures.append(f"{relation}: {type(exc).__name__}: {exc}")
+    assert not failures, "fafnir_read cannot read:\n  " + "\n  ".join(failures)
 
 
 def test_fafnir_ops_can_read_the_operational_record(least_privilege_dsn):

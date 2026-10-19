@@ -157,11 +157,21 @@ def test_is_fed_by(db, with_sharadar):
     assert not repo.is_fed_by(db, 999_999, "fmp")
 
 
-def test_another_vendors_feed_cannot_be_asked_yet(db, with_sharadar):
-    # Sharadar's feed is the is_feed link in core.security_vendor_xref (#55), which
-    # does not exist yet. A guess here would be the bug this module prevents.
-    with pytest.raises(ValueError, match="core.security_vendor_xref"):
-        repo.is_fed_by(db, with_sharadar["sharadar_dead"], "sharadar")
+def test_another_vendors_feed_is_its_open_is_feed_link(db, with_sharadar):
+    # Sharadar's feed is an explicit open is_feed link in core.security_vendor_xref
+    # (#55), never a guess from who minted the security.
+    dead = with_sharadar["sharadar_dead"]
+    assert not repo.is_fed_by(db, dead, "sharadar")  # minted by it, but not linked
+    db.execute(
+        "INSERT INTO core.security_vendor_xref (security_id, vendor, vendor_key, "
+        "valid_from, is_feed, match_method, created_by) "
+        "VALUES (%s, 'sharadar', '900001', '2001-01-02', true, 'minted', 'test')",
+        (dead,),
+    )
+    assert repo.is_fed_by(db, dead, "sharadar")
+    assert not repo.is_fed_by(db, dead, "fmp")
+    with pytest.raises(ValueError, match="unknown vendor"):
+        repo.is_fed_by(db, dead, "polygon")
 
 
 # ---------------------------------------------------------------------------

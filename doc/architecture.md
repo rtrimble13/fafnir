@@ -131,6 +131,11 @@ production. Every query is parameterized.
           │   │
           │   └── core.symbol_xref            (ticker history)
           │
+          ├── core.security_vendor_xref ──► core.vendor_security
+          │       (a vendor's key over time;      (the vendor's own master)
+          │        is_feed = who loads new rows)  core.vendor_security_event
+          │                                       (its lifecycle events)
+          │
           ├── core.daily_price                (raw OHLCV, partitioned)
           │       └► mart.v_daily_price_adjusted (× adjustment_factor)
           │
@@ -138,6 +143,11 @@ production. Every query is parameterized.
 
  ops.ingestion_run ◄── every loader      landing.fmp_raw ◄── raw payloads
  ops.data_quality_flag ◄── quarantine/DQ ops.load_watermark ◄── incremental marks
+ ops.vendor_correction ◄── replaced rows landing.sharadar_file ◄── Sharadar files on disk
 ```
+
+A vendor's view of a security never overwrites `core.security` (ADR 0015): it lives
+in `core.vendor_security`, keyed by the vendor's own id, and
+`core.security_vendor_xref` says which fafnir security that id is, from when to when.
 
 See the [data dictionary](data_dictionary.md) for every table and column.

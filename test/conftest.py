@@ -58,6 +58,8 @@ def db(migrated_dsn):
                      core.security, ops.data_quality_flag, ops.ingestion_run,
                      ops.load_watermark, ops.operator_override, ops.dq_label,
                      ops.vendor_correction,
+                     core.security_vendor_xref, core.vendor_security,
+                     core.vendor_security_event,
                      landing.fmp_raw, landing.sharadar_file,
                      -- ref is otherwise kept (it is seeded reference data), but the
                      -- declared universe is per-test state, not reference data.

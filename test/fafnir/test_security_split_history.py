@@ -1111,3 +1111,38 @@ def test_undo_takes_back_one_split_not_every_split_into_that_destination(two_iss
     )
     assert _bars(db, qsi) == {}
     assert set(_bars(db, sid)) == set(OLD) | {"2024-03-04", "2024-03-05"} | set(NEW)
+
+
+def test_undo_keeps_the_row_a_vendor_identity_is_linked_to(two_issuers):
+    # A split-off history may be linked to a Sharadar dead issuer (#62). The undo puts
+    # the history back but keeps the row: deleting it would drop a link no rule
+    # rebuilds (#55).
+    db, sid = two_issuers
+    assert _split_off("--yes").exit_code == 0
+    dest = _dest(db, sid)
+    db.execute(
+        "INSERT INTO core.security_vendor_xref (security_id, vendor, vendor_key, "
+        "valid_from, match_method, created_by) "
+        "VALUES (%s, 'sharadar', '900001', '2001-01-02', 'manual', 'tester')",
+        (dest,),
+    )
+    out = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--into-security-id",
+        str(dest),
+        "--undo",
+        "-m",
+        "wrong boundary",
+        "--yes",
+    )
+    assert out.exit_code == 0, out.output
+    assert db.fetchval("SELECT count(*) FROM core.security") == 2
+    assert (
+        db.fetchval(
+            "SELECT security_id FROM core.security_vendor_xref WHERE vendor_key = '900001'"
+        )
+        == dest
+    )

@@ -203,6 +203,71 @@ actions load. Deterministic and point-in-time stable.
 
 ---
 
+### Vendor identity (migration 0031, ADR 0015)
+
+A vendor's view of a security lives beside `core.security`, never in it. These
+tables arrive empty. The Sharadar master and events load from TICKERS and ACTIONS
+(#58). Links come from the linking engine (#62), manual review (#63) and minting
+(#71). `fafnir_read` and `fafnir_ops` read them; no mart view exposes them yet (#79).
+
+#### `core.vendor_security` — a vendor's own security master. **Grain:** `(vendor, vendor_table, vendor_key)`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `vendor` | TEXT CHECK | `sharadar`, `tiingo`, `fmp`. |
+| `vendor_table` | TEXT | Sharadar's modern table name the row describes (`stocks`, `funds`, `fundamentals`, `insiders`). TICKERS has one row per table a security is in, all with one permaticker. |
+| `vendor_key` | TEXT | Sharadar's `permaticker`, as text. |
+| `ticker` | TEXT | The vendor's ticker **today**. A dead issuer's reused ticker carries a numeric suffix (`CLA1`), and history is filed under it. |
+| `name`, `exchange`, `category`, `is_delisted` | | As the vendor states them. |
+| `cusips`, `related_tickers` | TEXT[] | Space-separated lists in TICKERS. |
+| `figi`, `cik`, `sic_code` | TEXT | `cik` from the `secfilings` URL. |
+| `sector`, `industry`, `fama_industry`, `currency`, `location` | TEXT | |
+| `first_price_date` / `last_price_date` | DATE CHECK | The price history's span; last ≥ first. |
+| `first_quarter` / `last_quarter` | DATE | The fundamentals' span. |
+| `attributes` | JSONB | Vendor fields without a column (`scalemarketcap`, `scalerevenue`, `sicsector`, `sicindustry`, `firstadded`, `secfilings`, `companysite`). |
+| `vendor_last_updated` / `ingestion_run_id` / `loaded_at` | | The vendor's `lastupdated`, the run and the load time. |
+
+**Cadence:** the bulk load, then the nightly delta (#58).
+
+#### `core.security_vendor_xref` — fafnir's security ↔ a vendor's key, over time. **Grain:** `(vendor, vendor_key, valid_from)`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `security_id` | BIGINT FK → core.security | |
+| `vendor` / `vendor_key` | TEXT | |
+| `valid_from` / `valid_to` | DATE | Open = `valid_to IS NULL`; `valid_to ≥ valid_from`. |
+| `is_feed` | BOOLEAN | This vendor loads the security's new rows (ADR 0015 §2). Only on an open link. |
+| `match_method` | TEXT CHECK | `minted`, `ticker_span_price`, `identifier`, `manual`. |
+| `confidence` | NUMERIC(4,3) | 0–1. |
+| `evidence` | JSONB | What the match rests on, so a link can be reviewed without re-running the matcher. |
+| `created_by` / `created_at` / `note` | | `created_by` may not be blank. |
+
+Its unique indexes:
+- **One open link per vendor key.** A permaticker is one fafnir security at a time.
+- **One open link per security and vendor.** A security is one identity per vendor.
+- **One feeding link per security.** One vendor loads its new rows.
+
+When a security goes away:
+- **`security merge` and the stub fold** move the victim's links to the survivor. Both
+  refuse when the two securities hold open links to the same vendor, or both have a
+  feeding link: one has to be closed first (#63). `force` does not lift that refusal,
+  and the automatic fold declines it instead of failing the load.
+- **`security split-history --undo`** keeps a destination that holds links instead of
+  deleting it.
+
+**Cadence:** written by #62, #63 and #71.
+
+#### `core.vendor_security_event` — a vendor's lifecycle events. **Grain:** `(vendor, vendor_key, event_date, action, contra_ticker)`.
+
+`vendor`, `vendor_key`, `event_date`, `action` (ACTIONS other than splits and
+dividends: `listed`, `delisted`, `tickerchangefrom`/`to`, `acquisitionby`,
+`mergerfrom`, `relation`, …), `ticker`, `value` (as given: a price, a deal value in
+millions, or NULL), `contra_ticker`, `contra_name`, `contra_vendor_key` (when it
+resolves), `ingestion_run_id`, `loaded_at`. The grain is a unique index with
+`COALESCE(contra_ticker, '')`, since most events have no contra party. ACTIONS rows
+carry only a ticker, so #58 resolves each to its permaticker through TICKERS
+before writing here. Splits and dividends go to `core.corporate_action` (#73).
+
 ## Schema: `mart`
 
 ### `mart.v_daily_price_adjusted` — adjusted OHLCV (VIEW)

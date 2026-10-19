@@ -124,7 +124,7 @@ serves today — check that in #128 before scheduling it.
 |---|---|---|
 | 0029 | #46 | `ops.vendor_correction` (the audit trail of replaced rows) — **built** |
 | 0030 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) — **built** |
-| 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` |
+| 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` — **built** |
 | 0032 | #66 | `ops.vendor_bar_comparison` (per-session summary; divergences are rows in the correction queue, not a second table) |
 | 0033 | #79 | `mart.v_security_lifecycle` |
 | 0034–0037 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
@@ -253,6 +253,28 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P1, #55: vendor identity.** Migration 0031 adds `core.vendor_security` (a vendor's own
+  master), `core.security_vendor_xref` (security ↔ vendor key, dated, with evidence and `is_feed`) and
+  `core.vendor_security_event` (lifecycle events). All three arrive empty. What #49 measured shaped them:
+  - **Keys and names.** `vendor_table` takes modern names, permaticker is the key, and events carry only a
+    ticker until #58 resolves them through TICKERS.
+  - **Additions to the issue's DDL:**
+    - a unique index allowing **one feeding link per security**, with a CHECK that a feed is an open link
+      (ADR 0015 §2);
+    - CHECKs on vendor, method, range, confidence, `created_by`, and the price-date span.
+  - **No explicit GRANT.** Read access comes from the default privileges, as for every migration since
+    0021: `fafnir_read` and `fafnir_ops` read the tables, `fafnir_app` has no USAGE on core. A new
+    least-privilege test reads them as a real `fafnir_read` member.
+  - **`is_fed_by(db, id, "sharadar"|"tiingo")`** now reads the open `is_feed` link instead of raising.
+  - **Code that deletes a security now handles links:**
+    - `security merge` and the stub fold move links to the survivor, and refuse two open links to one
+      vendor, or two feeds (`force` cannot lift it; the fold declines rather than fail the sweep);
+    - `security split-history --undo` keeps a destination that holds links;
+    - `reset_data.sh --scope all` lists the three tables.
+  - **Handed to #98:** FMP's rule is still `source = 'fmp'` alone. When `fafnir vendor feed` first gives
+    a security a Sharadar feed, it must also take it out of FMP's universes so one vendor feeds it. The
+    `s.{FMP_FED_SECURITY}` callers assume a bare column, so #98 changes the predicate and its callers
+    together.
 - **2026-10-19 · P0, #52: the bulk downloader.** `fafnir source sharadar-bulk [--tables …] [--years 5|10|full]
   [--force]`. For each table it:
   - downloads the zip (via the 302, without the key);
