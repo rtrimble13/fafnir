@@ -129,8 +129,10 @@ NUMERIC_BY_DEFAULT = {"fundamentals"}
 
 
 def canonical_table(name: str) -> str:
-    """``SEP`` -> ``stocks``; a modern name is returned as given."""
-    return LEGACY_NAMES.get(name.upper(), name)
+    """``SEP`` -> ``stocks``; a modern name in lower case (``TICKERS`` -> ``tickers``).
+    The API takes any of these spellings (2026-10-19); the ledger and the vendor
+    tables store the modern, lower-case name."""
+    return LEGACY_NAMES.get(name.upper(), name.lower())
 
 
 def _to_date(text: str) -> date:

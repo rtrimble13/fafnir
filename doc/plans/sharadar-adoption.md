@@ -254,6 +254,16 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P1, #59: the production sequence, written down.**
+  [backfill.md](../backfill.md#on-the-production-host) gives the host's order:
+  dump, deploy and migrate (0030, 0031), `sharadar-bulk`, the ledger sizes, the probe, `ingest
+  sharadar-master`, `status`. It also lists what to record on #59.
+  - **Runbook correction.** The issue's `--tables TICKERS,ACTIONS,SEP,SFP,SF1` failed: only the lowercase
+    `tickers` and `actions` were known names. Table names are now case-insensitive. The API takes every
+    spelling and redirects `TICKERS` and `tickers` to the same `tickers.csv.zip` (checked 2026-10-19).
+  - **No parallel-run date.** The issue's decision-log item, "parallel-run session 1 date", has no
+    counterpart in plan v2. The log records the date of the first production population instead, once
+    the operator has run it.
 - **2026-10-19 · P1, #58: the Sharadar master and events.** `fafnir ingest sharadar-master [--from-file
   FILE_ID]` loads the ledger's current TICKERS into `core.vendor_security`, then its ACTIONS into
   `core.vendor_security_event`, resolving each row's ticker to a permaticker through the master. It reads
