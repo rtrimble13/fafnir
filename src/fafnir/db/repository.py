@@ -558,6 +558,60 @@ def security_has_history(db: Database, security_id: int) -> bool:
     )
 
 
+def vendor_link_conflicts(db: Database, victim_id: int, survivor_id: int) -> list[str]:
+    """Why ``victim_id``'s vendor links cannot move to ``survivor_id``, if they cannot.
+
+    A security is one identity per vendor (core.security_vendor_xref allows one open
+    link per security and vendor) and has one feeding vendor. Two securities that
+    both hold an open link to the same vendor are two vendor identities, and one
+    has to be closed by a person (#63) before they can become one security.
+    """
+    out = [
+        f"both hold an open {r['vendor']} link ({r['victim_key']} and "
+        f"{r['survivor_key']}): close one first"
+        for r in db.fetchall(
+            """
+            SELECT v.vendor, v.vendor_key AS victim_key, s.vendor_key AS survivor_key
+              FROM core.security_vendor_xref v
+              JOIN core.security_vendor_xref s
+                ON s.vendor = v.vendor AND s.security_id = %s AND s.valid_to IS NULL
+             WHERE v.security_id = %s AND v.valid_to IS NULL
+             ORDER BY v.vendor
+            """,
+            (survivor_id, victim_id),
+        )
+    ]
+    feeds = db.fetchval(
+        """
+        SELECT count(DISTINCT security_id) FROM core.security_vendor_xref
+         WHERE security_id IN (%s, %s) AND is_feed
+        """,
+        (victim_id, survivor_id),
+    )
+    if feeds == 2:
+        out.append("both are fed by a linked vendor: one security has one feed")
+    return out
+
+
+def _move_vendor_links(db: Database, *, from_id: int, to_id: int) -> None:
+    """Retarget every vendor link, open or closed, to the security that survives.
+    :func:`vendor_link_conflicts` must have come back empty."""
+    db.execute(
+        "UPDATE core.security_vendor_xref SET security_id = %s WHERE security_id = %s",
+        (to_id, from_id),
+    )
+
+
+def has_vendor_links(db: Database, security_id: int) -> bool:
+    return bool(
+        db.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM core.security_vendor_xref "
+            "WHERE security_id = %s)",
+            (security_id,),
+        )
+    )
+
+
 def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bool:
     """Absorb a history-free duplicate security into the one that owns the history.
 
@@ -572,6 +626,10 @@ def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bo
     changing nothing -- when the guard rejects the fold.
     """
     if victim_id == survivor_id or security_has_history(db, victim_id):
+        return False
+    # A stub linked to a vendor identity the survivor also holds is two identities,
+    # not a duplicate: leave it for a person rather than fail the load.
+    if vendor_link_conflicts(db, victim_id, survivor_id):
         return False
     # Soft references first (no FK, so nothing enforces this order but us).
     #
@@ -612,6 +670,7 @@ def fold_empty_security(db: Database, *, victim_id: int, survivor_id: int) -> bo
         "UPDATE core.symbol_change SET security_id = %s WHERE security_id = %s",
         (survivor_id, victim_id),
     )
+    _move_vendor_links(db, from_id=victim_id, to_id=survivor_id)
     db.execute("DELETE FROM core.symbol_xref WHERE security_id = %s", (victim_id,))
     db.execute("DELETE FROM core.company_profile WHERE security_id = %s", (victim_id,))
     db.execute("DELETE FROM core.security WHERE security_id = %s", (victim_id,))
@@ -1200,6 +1259,13 @@ def merge_security(
             "refusing to merge: " + "; ".join(plan.blockers),
             plan,
         )
+    # Not a guard on the evidence, so force does not lift it: the merged security
+    # could not hold both links (ADR 0015).
+    links = vendor_link_conflicts(db, victim_id, survivor_id)
+    if links:
+        raise MergeRefused(
+            "refusing to merge, even with force: " + "; ".join(links), plan
+        )
 
     # Bars first. ON CONFLICT DO NOTHING is the survivor-wins rule: a session both
     # rows hold keeps the survivor's copy, and the guard has already established
@@ -1337,6 +1403,7 @@ def merge_security(
         "UPDATE core.symbol_change SET security_id = %s WHERE security_id = %s",
         (survivor_id, victim_id),
     )
+    _move_vendor_links(db, from_id=victim_id, to_id=survivor_id)
     # The victim's xref rows are dropped rather than repointed: the ticker they name
     # is the one the caller is about to open a fresh period for against the
     # survivor, with the rename's own effective date. Keeping them would leave two
@@ -4107,6 +4174,8 @@ def set_override_reason(
 # core.security_vendor_xref exists (#55), the minting vendor is the whole rule.
 FMP_SOURCE = "fmp"
 FMP_FED_SECURITY = f"source = '{FMP_SOURCE}'"
+#: Vendors whose feed is an explicit link in core.security_vendor_xref (#55).
+LINKED_VENDORS = ("sharadar", "tiingo")
 
 # A security with a bar this recent stays in the nightly universe even when the
 # vendor calls it inactive (ADR 0014).
@@ -4165,20 +4234,30 @@ _SPLIT_ACTION_FIELDS = (
 def is_fed_by(db: Database, security_id: int, vendor: str) -> bool:
     """True when ``vendor``'s loaders may write this security's new rows (ADR 0015 §2).
 
-    Only FMP's feed is assignable today: it feeds the securities it minted
-    (:data:`FMP_FED_SECURITY`). Another vendor's feed is the open ``is_feed`` link in
-    ``core.security_vendor_xref``, which does not exist yet (#55), so asking about one
-    is an error rather than a guess. An unknown ``security_id`` is fed by nobody.
+    FMP feeds the securities it minted (:data:`FMP_FED_SECURITY`). Any other vendor
+    feeds the securities with an open link to it in ``core.security_vendor_xref``
+    whose ``is_feed`` is true (#55); the table allows one such feeding link per
+    security. An unknown ``security_id`` is fed by nobody, and so is an
+    operator-minted one unless a link says otherwise.
     """
-    if vendor != FMP_SOURCE:
-        raise ValueError(
-            f"feed assignment for {vendor!r} is not defined yet: it arrives with "
-            "core.security_vendor_xref (#55). Only 'fmp' can be asked today."
+    if vendor == FMP_SOURCE:
+        return bool(
+            db.fetchval(
+                "SELECT source = %s FROM core.security WHERE security_id = %s",
+                (FMP_SOURCE, security_id),
+            )
         )
+    if vendor not in LINKED_VENDORS:
+        raise ValueError(f"unknown vendor {vendor!r}: expected one of {LINKED_VENDORS}")
     return bool(
         db.fetchval(
-            "SELECT source = %s FROM core.security WHERE security_id = %s",
-            (FMP_SOURCE, security_id),
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM core.security_vendor_xref
+                 WHERE security_id = %s AND vendor = %s
+                   AND is_feed AND valid_to IS NULL)
+            """,
+            (security_id, vendor),
         )
     )
 
@@ -5177,6 +5256,9 @@ def undo_history_split(
         and not still_edited
         and not left["bars"]
         and not left["actions"]
+        # A vendor identity linked to the split-off history keeps the row: deleting
+        # it would drop the link, which no rule rebuilds.
+        and not has_vendor_links(db, destination_id)
     ):
         # What is left on it is about the split itself (a coverage flag on the moved
         # range); fold_empty_security's rule applies -- flags follow the survivor.

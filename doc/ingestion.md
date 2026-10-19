@@ -583,9 +583,13 @@ A per-symbol pull that resolves to such a security logs `which FMP does not feed
 and loads nothing. In `load_prices` stats it counts as `not_fmp_fed`.
 
 Which vendor feeds a security is an explicit assignment, not a guess from `source`.
-Until `core.security_vendor_xref` exists (#55), `source = 'fmp'` is the whole FMP
-rule, and asking `is_fed_by` about any other vendor raises. Once it exists, a
-Sharadar-fed security is the one with an open `is_feed` link.
+For FMP it is `source = 'fmp'`. For any other vendor it is an open link with
+`is_feed = true` in `core.security_vendor_xref` (#55), and `is_fed_by(db, id,
+"sharadar")` reads exactly that. The table allows one feeding link per security.
+
+Nothing sets a Sharadar feed link before `fafnir vendor feed` (#98). When it does, it
+must also take the security out of FMP's rule, which today reads `source` alone, so
+that one vendor feeds it.
 
 ### Who may write a row: precedence (ADR 0015)
 
