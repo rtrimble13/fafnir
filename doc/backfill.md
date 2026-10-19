@@ -433,6 +433,56 @@ The command exits non-zero on `feeds_agree`, `ratio_mismatch`, `volume_adjusted`
 
 ---
 
+## Confirming the Sharadar feed
+
+```bash
+fafnir source probe-sharadar                      # 200 securities, seed 0
+fafnir source probe-sharadar --sample 500 --seed 7
+fafnir source probe-sharadar --json > /var/lib/fafnir/probe-sharadar-$(date +%F).json
+```
+
+Run it before any Sharadar load, and again after a change to the client or the
+loaders. It draws a deterministic sample from TICKERS: listed and delisted
+securities, stratified by the decade of their first price, a tenth of them funds.
+It asks the paid feed every question the loaders' design rests on, then gives each
+answer a verdict:
+
+- **PASS:** the fact is as the design assumes.
+- **NOTE:** a fact the design must accommodate. The detail says how.
+- **BLOCK:** the fact contradicts the design. The command exits non-zero, and nothing
+  loads until the plan's decision log records a mitigation.
+
+It writes nothing, and costs about two requests per sampled security plus 30: 427
+requests and 108 MB for the default 200 securities.
+
+**The `--json` report holds vendor rows** (the worst cases, as evidence). Keep it on
+the host. Post only the verdicts and the aggregates the terminal report prints: the
+repo and its issues are public (ADR 0012 §8).
+
+What the first run on the paid key found (2026-10-19, 200 securities, seed 0):
+
+| # | Item | Verdict | What it means for the loaders |
+|---|---|---|---|
+| 1 | API mechanics | NOTE `measured` | 16 of 16 behaviours as documented or assumed. **An unknown parameter is ignored, not refused**, so a misspelt filter returns everything; loaders assert their filters in the rows they get back. TICKERS' `table` filter takes `stocks` / `fundamentals` / `funds`, not `SEP`. |
+| 2 | Precision | NOTE `precision_3dp` | Every price field carries at most 3 decimal places. The raw close (`closeunadj`) is exact to that; a raw open/high/low recovered from the split-adjusted fields carries up to 0.0005 × the cumulative split factor of error. Volume is split-adjusted too, and whole on 94.5% of bars. |
+| 3 | Raw recovery | PASS `ratio_matches_within_rounding` | All 127,726 split-affected bars agree with the ACTIONS split product: 73% exactly, the rest within the rounding of the stored decimals; none beyond. 71% of recovered raw volumes are whole, so the loader rounds. |
+| 4 | Split direction | PASS `split_value_new_per_old` | AAPL's 4-for-1 on 2020-08-31 is `value = 4`, and a 1-for-4 is 0.25. All 131 sampled splits step the unadjusted/adjusted ratio by their value. |
+| 5 | Dividend value | NOTE `dividend_split_adjusted` | AAPL's $0.77 of 2019-11-07 is `0.1925` = 0.77 / 4. The loader multiplies by the split product after the ex-date to store the amount as declared. |
+| 6 | Ticker keys | NOTE `history_under_current_ticker` | META's bars start 2012-05-18, under META, and `FB` returns nothing. A dead issuer's ticker carries a numeric suffix: 2,880 of 14,692 delisted, 911 on a root a live security trades under today. Loaders key on `permaticker`. |
+| 7 | permaticker | NOTE `permaticker_shared` | All 17,842 tickers listed for both stocks and fundamentals carry one permaticker. SEP and SF1 rows carry no `permaticker`; they reach it through TICKERS. |
+| 8 | Same-day values | PASS `same_day_raw_confirmed` | On 2026-10-16, `close == closeunadj` for all 100 listed securities sampled. |
+| 9 | Update behaviour | NOTE `history_restamped_on_adjustment` | Every split or dividend re-stamps `lastupdated` on the whole history (`closeadj` moves). A `lastupdated` delta re-reads whole histories. |
+| 10 | Row shapes | PASS `recorded` | No null in the price rows; the zeros (22,042, all volume) are values. SF1 has nulls, kept as NULL. |
+| 11 | API as implemented | PASS `as_implemented` | Every behaviour the client and duk rely on holds. |
+
+No blocking verdict. The download host for bulk files is
+`static-sharadar.nyc3.digitaloceanspaces.com` (a 302 from `api.sharadar.com`), so
+the host's egress must allow both hosts. The zip's members were not measured on this
+run, because the session's network could not reach the download host. #52 measures
+them.
+
+---
+
 ## Clearing data for a reload
 
 `scripts/reset_data.sh` truncates the tables a reload has to **replace** rather than

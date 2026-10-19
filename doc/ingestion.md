@@ -188,6 +188,70 @@ Two details follow from the endpoint choice:
 
 Full rationale and the migration consequences: [adr/0004](adr/0004-unadjusted-price-feed.md).
 
+## Sharadar's fields, as measured
+
+No Sharadar loader exists yet (#58, #75). These are the facts it will rest on, as
+`fafnir source probe-sharadar` measured them on the paid key on 2026-10-19. The
+verdict table, and how to re-run the probe, are in
+[backfill.md](backfill.md#confirming-the-sharadar-feed).
+
+**Prices (SEP; SFP the same).**
+- **Raw close:** `closeunadj`, the close as traded.
+- **Split-adjusted:** `open`, `high`, `low`, `close` and `volume`.
+- **Split- and dividend-adjusted:** `closeadj`.
+
+On the newest session the raw and split-adjusted closes are equal, as they must be.
+`core.daily_price` stays raw (ADR 0004), so the loader recovers raw values with the
+vendor's own identities:
+
+```
+raw open/high/low = field  × closeunadj / close
+raw volume        = volume × close / closeunadj      (rounded to a whole share)
+```
+
+Two limits follow from the data:
+
+- **Every price field carries at most 3 decimal places.** The raw close is exact to
+  that. A recovered open/high/low carries up to 0.0005 × the cumulative split factor
+  of error: about 5.6¢ on a 1998 AAPL bar (×112). Recovery is exact only for the
+  close. #75 watches the cases where it matters.
+- **Volume is split-adjusted, so not always whole:** 5.5% of bars in the sample. A
+  recovered raw volume was whole on 71% of split-affected bars, so the loader rounds.
+
+**Splits (ACTIONS, `action = split`).** `value` is new shares per old: a 4-for-1 is
+4, and a 1-for-4 reverse split is 0.25. That is the direction
+`core.corporate_action` reads (a 2-for-1 is 2 / 1), so `value` maps to
+`split_numerator / split_denominator` unchanged, a reverse split as its rational (1 /
+4). Across the sample, `closeunadj /
+close` matched the cumulative split product after each date on all 127,726
+split-affected bars, within the 3-decimal rounding.
+
+**Dividends (ACTIONS, `action = dividend`).** `value` is **split-adjusted**, not as
+declared: AAPL's $0.77 of 2019-11-07 is 0.1925 (÷ 4). `core.corporate_action`
+holds the amount as declared, against the raw prior close (ADR 0001), so the loader
+multiplies by the product of the splits after the ex-date. A split missing from
+ACTIONS would mis-state every earlier dividend as well as the recovered prices.
+
+**Identity.**
+- **History is keyed by the current ticker.** META's bars start in 2012, under
+  META; `FB` returns nothing.
+- **A dead issuer's reused ticker carries a numeric suffix** (`CLA1`): 20% of
+  delisted tickers, a third of them on a root a live security trades under today.
+- **`permaticker` is the stable key.** It is the same across a security's TICKERS
+  rows (stocks, fundamentals, insiders), but SEP and SF1 rows carry only the ticker.
+  So a loader resolves rows through TICKERS and keys on `permaticker` (#55), never on
+  the ticker of the day.
+
+**Updates.**
+- **`lastupdated` moves on the whole history** whenever a split or dividend
+  restates `closeadj`. A delta keyed on it re-reads entire histories after every
+  dividend. The raw fields it reads do not change, so the loader compares before it
+  writes.
+- **Filters:** `lastupdated`, `lastupdated.gte`, `date` and `ticker` lists are all
+  honoured. **An unknown parameter is ignored, not refused:** a misspelt filter
+  returns everything it should have narrowed, so loaders assert their filters in the
+  rows they get back.
+
 ## What FMP restates, and the guard
 
 The nightly price load re-reads the last `overlap_days` (5) sessions of every
