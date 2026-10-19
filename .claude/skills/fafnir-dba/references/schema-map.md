@@ -39,6 +39,7 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `ops.vendor_correction` | `correction_id`; one per row a higher-ranked vendor replaced (ADR 0015), `old_row` = the replaced row; active = `reverted_at IS NULL` |
 | `ops.dq_label` | `label_id`; a label a person stated (`dq label`, `--label`); `security_id` NULL for a cohort (`members`) |
 | `landing.fmp_raw` | `raw_id` — endpoint + symbol + `fetched_at` |
+| `landing.sharadar_file` | `file_id`; one row per downloaded file (sha256 unique), the file itself on disk under `[sharadar] bulk_dir` |
 | `meta.schema_migration` | `version` |
 
 **What landing actually keeps.** `landing.fmp_raw` holds the payloads for prices,
@@ -51,6 +52,13 @@ looks like a finding**. On 2026-09-10 that
 produced a confident "173/173 off-screener" that was an artefact of the missing
 rows. To ask whether the screener still lists a name, read
 `core.security.updated_at`, which the nightly load stamps.
+
+`landing.sharadar_file` is different again: it is a **ledger, not the data**. Each row
+names a file under `[sharadar] bulk_dir` (`path` is relative to it), and the rows are
+in that file, not in the database. So a question about what Sharadar said is
+answered by reading the file (`fafnir.sources.sharadar_files.iter_rows`), and a
+ledger row whose `status` is `deleted`, or whose file is missing after a restore,
+has nothing behind it.
 
 ## The mart seam
 

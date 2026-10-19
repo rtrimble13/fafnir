@@ -216,6 +216,7 @@ FORBIDDEN_TO_APP = (
     "core.security",
     "ops.data_quality_flag",
     "landing.fmp_raw",
+    "landing.sharadar_file",
 )
 
 
@@ -312,6 +313,7 @@ OPS_READABLE = (
     "ops.load_watermark",
     "ops.vendor_correction",
     "landing.fmp_raw",
+    "landing.sharadar_file",
     "meta.schema_migration",
     # Everything fafnir_read reaches is included by design: triage starts from a
     # flag and ends in the bars and actions that explain it.

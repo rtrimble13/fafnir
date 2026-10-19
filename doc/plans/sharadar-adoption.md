@@ -123,7 +123,7 @@ serves today — check that in #128 before scheduling it.
 | Expected | Issue | Adds |
 |---|---|---|
 | 0029 | #46 | `ops.vendor_correction` (the audit trail of replaced rows) — **built** |
-| 0030 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) |
+| 0030 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) — **built** |
 | 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` |
 | 0032 | #66 | `ops.vendor_bar_comparison` (per-session summary; divergences are rows in the correction queue, not a second table) |
 | 0033 | #79 | `mart.v_security_lifecycle` |
@@ -253,6 +253,27 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P0, #50: the file ledger.** Migration 0030 adds `landing.sharadar_file`, one row per
+  downloaded file: table, `full`/`delta`, filters, path, `member`, sha256 (unique), bytes, rows, header,
+  run and status. `fafnir.sources.sharadar_files` reads a file as typed rows, streamed. Differences from
+  the issue:
+  - **Zip, not gzip.** Bulk files are zips (#49), so the ledger has a `member` column, and the reader
+    takes zip, gzip and plain CSV alike.
+  - **Relative paths.** `path` is relative to `bulk_dir`, so the directory can move to a Volume.
+  - **What `status` tracks.** It is the file's lifecycle (`downloaded`, `superseded`, `deleted`), not a
+    loader's progress, because several loaders read one file.
+  - **Types follow Sharadar's own schemas** (`/v1.0/schema`): price fields come back as `Decimal` from
+    the text, never float; volume is a `Decimal` because it is not always whole; an empty field is
+    `None`; a value that does not parse fails, naming its line and column.
+  - **Size, projected from the paid feed:** one full set of stocks, funds, fundamentals, actions and
+    tickers is ~2.4 GB of zips (~5 GB during a refresh). `core` gains at most ~4.6 GB of delisted
+    issuers' bars (151 B a bar, measured). `scripts/landing_sizes.sql` reports the actual figures.
+  - **Backups.** The bulk files are not backed up, by decision: they are re-downloadable while
+    subscribed, and the licence decides off-site copies. The dump holds the ledger and everything
+    loaded from the files.
+  - **`reset_data.sh --scope all`.** It now lists the ledger, which references `ops.ingestion_run`. It
+    also lists `core.symbol_change`, whose absence already made that scope fail on `main` with a
+    foreign-key error.
 - **2026-10-19 · P0, #49: the Sharadar probe.** `fafnir source probe-sharadar` lives in its own module,
   `fafnir.sources.sharadar_probe`, not `probe.py`, which holds FMP's probes. Run on the paid key over 200
   securities (seed 0, 427 requests, 108 MB), it found **no blocking verdict**. The table is in

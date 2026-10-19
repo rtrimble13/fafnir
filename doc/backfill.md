@@ -483,6 +483,54 @@ them.
 
 ---
 
+## Disk budget with Sharadar
+
+Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in
+`landing.sharadar_file`. Nothing is copied into a landing table. So Sharadar adds
+three things to the host's disk:
+
+1. **The files.**
+2. **The rows it adds to `core`.** Bars of issuers FMP never held; a correction
+   replaces a bar, it does not add one.
+3. **The dumps,** which grow with `core`.
+
+Projected from the paid feed on 2026-10-19:
+- **Row counts** come from TICKERS' first and last price dates.
+- **Bytes per row and compression** come from CSV slices of each table.
+- **Bytes per bar in `core.daily_price`** come from 260,800 synthetic bars on
+  the test database: 151 bytes, heap plus primary key.
+
+| | Rows | CSV | On disk (zip, ~3.3×) |
+|---|---|---|---|
+| `stocks` (SEP) | ~45.5M, 55% from delisted issuers | ~70 B/row → ~3.2 GB | **~1.0 GB** |
+| `funds` (SFP) | ~15.8M, 32% delisted | ~70 B/row → ~1.1 GB | **~0.35 GB** |
+| `fundamentals` (SF1) | ~3.5M (17,866 issuers × ~4.5 rows a quarter) | ~1 KB/row → ~3.5 GB | **~1.1 GB** |
+| `actions`, `tickers` | ~1M (estimated from the sample's events per issuer), ~50k | | **< 0.1 GB** |
+| **One full set** | | | **~2.4 GB** |
+
+- **Files.** A refresh downloads a new full set before the old one is
+  superseded, so allow **~5 GB** at peak. `daily` and `metrics` are not in that
+  figure; they are not needed before the fundamentals phase (P4), and each is of
+  the order of `stocks`.
+- **`core`.** At most ~30M bars of delisted issuers (stocks and funds) are new to
+  the warehouse. At 151 bytes a bar that is **~4.6 GB**, an upper bound: some of
+  those issuers FMP already holds.
+- **Dumps.** Each nightly dump grows in proportion to `core.daily_price`, and
+  `backup_dump.sh` keeps 14. Measure the bytes per bar of the current dump (its
+  size over `core.daily_price`'s row count), multiply by the new bars, and check
+  `FAFNIR_BACKUP_RETAIN_DAYS` still fits.
+
+Together that is about 10 GB plus the dumps' growth, on top of the 1990 FMP
+figures in [install_hetzner.md §1.1](install_hetzner.md#11-sizing), which has the
+row. On the recommended 80 GB host that leaves the disk under half full. Read the actual figures any time with:
+
+```bash
+psql "${FAFNIR_DSN}" -X -f scripts/landing_sizes.sql
+du -sh /var/lib/fafnir/landing/sharadar     # your [sharadar] bulk_dir
+```
+
+---
+
 ## Clearing data for a reload
 
 `scripts/reset_data.sh` truncates the tables a reload has to **replace** rather than
@@ -508,7 +556,7 @@ scripts/reset_data.sh --scope all --yes --vacuum
 | `market-data` | prices + actions + factors + price watermarks | security master (skips re-ingesting ~8k securities) |
 | `landing` | `landing.fmp_raw` | everything else — reclaims disk, loses the payload audit trail |
 | `dq-flags` | `ops.data_quality_flag` | everything else |
-| `all` | every core/ops/landing table, identities restarted | reference data, partitions, migrations |
+| `all` | every core/ops/landing table (applied renames and the Sharadar file ledger included), identities restarted | reference data, partitions, migrations, the Sharadar files on disk |
 
 Each scope prints the exact reload sequence to run next. Three design notes worth
 knowing:

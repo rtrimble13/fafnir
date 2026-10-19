@@ -52,9 +52,14 @@ backfill. Estimates for the active US equity + ETF universe (~8k symbols):
 |---|---|---|---|---|
 | 2015 (~10 y) | ~1.5 GB | ~1 GB | ~6–8 GB | 40 GB |
 | 1990 (~35 y) | ~4 GB | ~2–3 GB | ~15–20 GB | **80 GB** |
+| **+ Sharadar** (plan v2) | + up to ~4.6 GB (delisted issuers' bars) | + ~2.4 GB of files on disk, ~5 GB during a refresh | ~+10 GB, plus the dumps' growth | **80 GB** still |
 
 Empty schema (all migrations + seeds + 39 years of partitions and calendar) is
-**16 MB**, so essentially all of the above is price history.
+**16 MB**, so essentially all of the above is price history. The Sharadar row is
+projected from the paid feed; the arithmetic is in
+[backfill.md › Disk budget with Sharadar](backfill.md#disk-budget-with-sharadar). Its
+files live under `[sharadar] bulk_dir`, so set that to an absolute path, on a Volume
+(§3.3) if the local disk is tight.
 
 CPU and RAM matter less than you'd expect — the backfill is network-bound (throttled
 to 280 FMP requests/min), not compute-bound.
