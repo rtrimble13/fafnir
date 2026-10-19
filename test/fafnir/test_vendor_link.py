@@ -63,6 +63,41 @@ def test_overlap_and_sample_windows():
     ]
 
 
+def test_ticker_matches_says_why_each_row_is_or_is_not_a_candidate():
+    sec = {
+        "security_id": 7,
+        "tickers": ["ZZQ"],
+        "first_trade_date": date(2020, 1, 2),
+        "last_trade_date": date(2020, 12, 31),
+    }
+    span = {"first_price_date": date(2020, 1, 2), "last_price_date": date(2020, 12, 31)}
+
+    def row(key, alias, taken=False, **kw):
+        return dict(span, vendor_key=key, aliases=[alias], taken=taken, **kw)
+
+    rows = [
+        row("1", "ZZQ", taken=True),  # this security's own link
+        row("2", "ZZQ"),
+        row("3", "ZZQ", taken=True),
+        row("4", "ZZQ"),
+        row(
+            "5",
+            "ZZQ",
+            first_price_date=date(2022, 1, 3),
+            last_price_date=date(2022, 12, 30),
+        ),
+        row("6", "OTHER"),
+    ]
+    got = vl.ticker_matches(sec, rows, rejected={(7, "4")}, linked_key="1")
+    assert [(r["vendor_key"], r["status"]) for r in got] == [
+        ("1", "linked"),
+        ("2", "candidate"),
+        ("4", "rejected"),
+        ("5", "no_overlap"),
+        ("3", "taken"),
+    ]
+
+
 def test_tolerance():
     assert vl.agrees(D("10.005"), D("10.000"))  # within $0.01
     assert not vl.agrees(D("10.02"), D("10.000"))
@@ -279,9 +314,10 @@ def test_a_reused_ticker_links_each_issuer_to_its_own_key(db):
 
 
 @pytestmark_integration
-def test_a_venue_transfer_that_left_two_rows_is_ambiguous_for_both(db):
-    # One issuer, two FMP rows (the old venue's, delisted, and the new one's). Both
-    # agree with the one permaticker: a duplicate identity for #63 to merge.
+def test_two_rows_of_one_issuer_link_the_live_one_and_name_the_duplicate(db):
+    # One issuer, two FMP rows (the old one delisted, the new one live), both
+    # agreeing with the one permaticker. The live row on the vendor's current
+    # ticker is the security; the other is a duplicate to merge.
     old = _sec(
         db,
         "ZZV",
@@ -294,6 +330,41 @@ def test_a_venue_transfer_that_left_two_rows_is_ambiguous_for_both(db):
     new = _sec(db, "ZZV", Y(2018, 4, 2), Y(2024, 6, 28))
     _vendor(db, "900020", "ZZV", Y(2010, 1, 4), Y(2024, 6, 28))
     _, src = _source({"ZZV": close_of})
+    by_id = {o.security_id: o for o in vl.link(db, src).outcomes}
+    assert (by_id[new].outcome, by_id[new].vendor_key) == ("linked", "900020")
+    assert (by_id[old].outcome, by_id[old].reason) == (
+        "ambiguous",
+        "duplicate_of_linked",
+    )
+    assert _links(db)[new]["evidence"]["duplicates"] == [old]
+    (flag,) = _flags(db)
+    assert (flag["security_id"], flag["check_name"]) == (old, "vendor_xref_ambiguous")
+    assert flag["detail"]["candidates"] == [
+        {"vendor_key": "900020", "linked_security": new}
+    ]
+
+
+@pytestmark_integration
+def test_a_rename_chain_with_no_live_row_on_the_current_ticker_links_nothing(db):
+    # Both rows delisted (the issuer is gone): nothing says which is the security.
+    a = _sec(
+        db,
+        "ZZW",
+        Y(2010, 1, 4),
+        Y(2015, 6, 30),
+        delisted_date=Y(2015, 7, 1),
+        tickers=[("ZZW", Y(2010, 1, 4), Y(2015, 6, 30))],
+    )
+    b = _sec(
+        db,
+        "ZZW2",
+        Y(2010, 1, 4),
+        Y(2018, 6, 29),
+        delisted_date=Y(2018, 7, 2),
+        tickers=[("ZZW2", Y(2015, 7, 1), Y(2018, 6, 29))],
+    )
+    _vendor(db, "900021", "ZZW2", Y(2010, 1, 4), Y(2018, 6, 29), related=["ZZW"])
+    _, src = _source({"ZZW2": close_of})
     result = vl.link(db, src)
     assert {(o.outcome, o.reason) for o in result.outcomes} == {
         ("ambiguous", "key_claimed_twice")
@@ -301,12 +372,34 @@ def test_a_venue_transfer_that_left_two_rows_is_ambiguous_for_both(db):
     assert _links(db) == {}
     flags = _flags(db)
     assert [(f["security_id"], f["check_name"]) for f in flags] == [
-        (old, "vendor_xref_ambiguous"),
-        (new, "vendor_xref_ambiguous"),
+        (a, "vendor_xref_ambiguous"),
+        (b, "vendor_xref_ambiguous"),
     ]
     assert flags[0]["detail"]["candidates"] == [
-        {"vendor_key": "900020", "also_claimed_by": [new]}
+        {"vendor_key": "900021", "also_claimed_by": [b]}
     ]
+
+
+@pytestmark_integration
+def test_mutual_funds_and_shells_have_their_own_reasons(db):
+    mf = _sec(db, "ZZMFX", Y(2020, 1, 2), Y(2020, 12, 31), is_fund=True)
+    cef = _sec(db, "ZZCEF", Y(2020, 1, 2), Y(2020, 12, 31), is_fund=True)
+    _vendor(db, "900022", "ZZCEF", Y(2020, 1, 2), Y(2020, 12, 31), table="funds")
+    shell = _sec(db, "ZZSHL", Y(2020, 1, 2), Y(2019, 1, 1))  # no bars
+    _vendor(db, "900023", "ZZSHL", Y(2020, 1, 2), Y(2020, 12, 31))
+    _, src = _source({"ZZCEF": close_of})
+    by_id = {o.security_id: o for o in vl.link(db, src).outcomes}
+    assert (by_id[mf].outcome, by_id[mf].reason) == (
+        "unmatched",
+        "not_covered_asset_type",
+    )
+    assert (by_id[cef].outcome, by_id[cef].vendor_key) == ("linked", "900022")
+    assert (by_id[shell].reason, by_id[shell].candidates) == (
+        "no_bars",
+        [{"no_overlap_key": "900023"}],
+    )
+    severities = {f["security_id"]: f["severity"] for f in _flags(db)}
+    assert severities == {mf: "info", shell: "warn"}
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +439,11 @@ def test_unmatched_reasons(db):
     }
     assert by["ZZLATE"].candidates == [{"no_overlap_key": "900032"}]
     assert by["ZZOFF"].candidates[0]["agreed"] == 0
+    samples = by["ZZOFF"].candidates[0]["samples"]
+    assert len(samples) == 5 and all(
+        set(x) == {"date", "fmp", "sharadar"} and isinstance(x["fmp"], str)
+        for x in samples
+    )
     severities = {f["security_id"]: f["severity"] for f in _flags(db)}
     assert severities[by["ZZMF"].security_id] == "info"
     assert severities[by["ZZOFF"].security_id] == "warn"
@@ -639,3 +737,31 @@ def test_the_command(db, tmp_path, monkeypatch):
     done = run()
     assert done.exit_code == 0 and "Run " in done.output and "linked" in done.output
     assert "no full" not in run("--new").output
+
+
+@pytestmark_integration
+def test_a_new_reason_in_the_same_check_replaces_the_old_flag(db):
+    # The first production run flagged mutual funds no_candidate; this engine says
+    # not_covered_asset_type. The open flag must not keep the old reason's slot.
+    mf = _sec(db, "ZZOLDX", Y(2020, 1, 2), Y(2020, 12, 31), is_fund=True)
+    repo.add_dq_flag_once(
+        db,
+        check_name="vendor_xref_unmatched",
+        severity="warn",
+        security_id=mf,
+        table_name="core.security_vendor_xref",
+        record_key={"vendor": "sharadar"},
+        detail={"reason": "no_candidate", "candidates": []},
+    )
+    _vendor(db, "900200", "ZZUNRELATED", Y(2020, 1, 2), Y(2020, 12, 31))
+    _, src = _source({})
+    vl.link(db, src)
+    (now,) = _flags(db)
+    assert (now["severity"], now["detail"]["reason"]) == (
+        "info",
+        "not_covered_asset_type",
+    )
+    (old,) = _flags(db, "resolved")
+    assert old["resolved_by"] == "fafnir vendor link"
+    vl.link(db, src)  # same reason again: nothing new, nothing closed
+    assert len(_flags(db)) == 1 and len(_flags(db, "resolved")) == 1

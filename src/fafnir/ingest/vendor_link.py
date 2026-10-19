@@ -27,14 +27,19 @@ For each FMP-minted security without an open Sharadar link:
    - **One candidate agrees** on at least four samples: link it
      (``ticker_span_price``, confidence 0.9 × agreement + 0.1 × corroboration).
    - **Several agree:** the one with an identifier match is linked if it is the
-     only one; otherwise ``vendor_xref_ambiguous``. A key two securities both
-     win is ambiguous for both.
+     only one; otherwise ``vendor_xref_ambiguous`` (``several_agree``).
+   - **One key, several securities:** the claimant that is live and trades under
+     the vendor's current ticker is linked, and the others are
+     ``duplicate_of_linked`` (a missed rename's two rows); with no such claimant
+     none is linked (``key_claimed_twice``).
    - **None agrees:** ``vendor_xref_unmatched``, with a reason:
      - ``no_candidate``;
+     - ``no_bars``: the security has no bars, so no span (a re-mint shell);
      - ``price_disagrees``: a candidate had four samples, and they did not agree;
      - ``insufficient_overlap``: no candidate had four sampled bars to compare;
-     - ``not_covered_asset_type``: a NAV-priced mutual fund (``asset_type =
-       'fund'``), which Sharadar does not price. Flagged at ``info``.
+     - ``not_covered_asset_type``: a mutual fund, ``asset_type = 'fund'`` or an
+       ``is_fund`` non-ETF with no candidate. Sharadar does not price them.
+       Flagged at ``info``.
 
 Writes are idempotent:
 - A linked security leaves the scope, so it is not evaluated again.
@@ -366,7 +371,7 @@ def evaluate(
                 sid,
                 sym,
                 "unmatched",
-                "no_candidate",
+                _no_candidate_reason(s),
                 candidates=[{"taken_key": k} for k in held]
                 + [{"rejected_key": k} for k in said_no]
                 + [{"no_overlap_key": k} for k in apart],
@@ -425,11 +430,45 @@ def evaluate(
         s = by_id[sid]
         outcomes[sid] = _decide(s, results)
 
-    _refuse_double_claims(outcomes)
+    _settle_double_claims(outcomes, by_id)
     return [outcomes[s["security_id"]] for s in securities], source_name
 
 
+def _no_candidate_reason(s: dict) -> str:
+    """Why nothing shares a ticker and a span with the security.
+
+    - ``not_covered_asset_type``: a mutual fund. FMP files them on NASDAQ as
+      ``equity`` with ``is_fund`` (4,577 of the first production run's 4,826
+      ``no_candidate``), and Sharadar prices none. A closed-end fund is
+      ``is_fund`` too, but Sharadar has it, so only one with no candidate lands
+      here.
+    - ``no_bars``: a security with no bars has no span to overlap. Usually a
+      re-mint shell (``security dedupe``).
+    - ``no_candidate``: everything else.
+    """
+    if s.get("is_fund") and not s.get("is_etf"):
+        return "not_covered_asset_type"
+    if s.get("first_trade_date") is None:
+        return "no_bars"
+    return "no_candidate"
+
+
+def _sample_json(rows: list[dict]) -> list[dict]:
+    """Samples as JSON text: a flag's ``detail`` is plain JSON."""
+    return [
+        {
+            "date": r["date"].isoformat(),
+            "fmp": str(r["fmp"]),
+            "sharadar": None if r["sharadar"] is None else str(r["sharadar"]),
+        }
+        for r in rows
+    ]
+
+
 def _summary(r: dict) -> dict:
+    """A candidate in a flag's ``detail``, its samples included: they stay in the
+    database (vendor data, never posted) and are what tells a split on one side
+    (a constant ratio) from a different issuer (noise)."""
     c = r["candidate"]
     return {
         "vendor_key": c["vendor_key"],
@@ -438,6 +477,7 @@ def _summary(r: dict) -> dict:
         "agreed": r["agreed"],
         "of": r["of"],
         "identifier": r["identifier"],
+        "samples": _sample_json(r["samples"]),
     }
 
 
@@ -494,27 +534,87 @@ def _decide(s: dict, results: list[dict]) -> Outcome:
     )
 
 
-def _refuse_double_claims(outcomes: dict[int, Outcome]) -> None:
-    """A key two securities both win is one security's at most: neither is linked."""
-    claims = Counter(o.vendor_key for o in outcomes.values() if o.outcome == "linked")
+def _settle_double_claims(outcomes: dict[int, Outcome], securities: dict) -> None:
+    """A key several securities win is one security's at most.
+
+    In the first production run these were rename chains: the row a missed rename
+    left behind and the row minted for the new ticker, both holding the history FMP
+    serves under either. When exactly one claimant is live and trades under the
+    vendor's current ticker (742 of 905 keys), it is the security: it is linked,
+    and every other claimant is ``duplicate_of_linked``, naming it, for `security
+    merge-rename`. Otherwise no claimant is linked (``key_claimed_twice``).
+    """
+    by_key: dict[str, list[Outcome]] = defaultdict(list)
     for o in outcomes.values():
-        if o.outcome == "linked" and claims[o.vendor_key] > 1:
-            others = sorted(
-                x.security_id
-                for x in outcomes.values()
-                if x.vendor_key == o.vendor_key and x is not o
-            )
-            o.outcome, o.reason = "ambiguous", "key_claimed_twice"
-            o.candidates = [{"vendor_key": o.vendor_key, "also_claimed_by": others}]
+        if o.outcome == "linked":
+            by_key[o.vendor_key].append(o)
+    for key, claimants in by_key.items():
+        if len(claimants) < 2:
+            continue
+        current = ticker_key(claimants[0].evidence["ticker"])
+        winners = [
+            o
+            for o in claimants
+            if securities[o.security_id].get("delisted_date") is None
+            and ticker_key(securities[o.security_id]["primary_symbol"]) == current
+        ]
+        ids = sorted(o.security_id for o in claimants)
+        winner = winners[0] if len(winners) == 1 else None
+        if winner is not None:
+            winner.evidence["duplicates"] = [i for i in ids if i != winner.security_id]
+        for o in claimants:
+            if o is winner:
+                continue
+            if winner is not None:
+                o.outcome, o.reason = "ambiguous", "duplicate_of_linked"
+                o.candidates = [
+                    {"vendor_key": key, "linked_security": winner.security_id}
+                ]
+            else:
+                o.outcome, o.reason = "ambiguous", "key_claimed_twice"
+                o.candidates = [
+                    {
+                        "vendor_key": key,
+                        "also_claimed_by": [i for i in ids if i != o.security_id],
+                    }
+                ]
             o.vendor_key = o.confidence = o.valid_from = None
             o.evidence = {}
 
 
 def _write(db: Database, outcomes: Sequence[Outcome], run: RunLog) -> None:
     for o in outcomes:
-        current = None
-        if o.outcome == "linked":
-            evidence = dict(o.evidence, run_id=run.run_id)
+        current = (
+            None
+            if o.outcome == "linked"
+            else (UNMATCHED if o.outcome == "unmatched" else AMBIGUOUS)
+        )
+        note = f"vendor link run {run.run_id}: now {o.outcome}" + (
+            f" ({o.reason})" if o.reason else ""
+        )
+        # Retire what no longer holds before writing what does: an open flag of
+        # the other check, and one of the same check with another reason (it would
+        # otherwise keep its slot, and the new reason would never be written).
+        stale = [
+            f["dq_flag_id"]
+            for f in repo.list_dq_flags(
+                db,
+                repo.DqFilter(
+                    checks=(UNMATCHED, AMBIGUOUS), security_ids=(o.security_id,)
+                ),
+                limit=100,
+            )
+            if f["check_name"] != current
+            or (f.get("detail") or {}).get("reason") != o.reason
+        ]
+        if stale:
+            repo.resolve_dq_flags(
+                db,
+                repo.DqFilter(flag_ids=tuple(stale)),
+                note=note,
+                resolved_by=CREATED_BY,
+            )
+        if current is None:
             repo.insert_vendor_link(
                 db,
                 security_id=o.security_id,
@@ -523,11 +623,10 @@ def _write(db: Database, outcomes: Sequence[Outcome], run: RunLog) -> None:
                 valid_from=o.valid_from,
                 match_method="ticker_span_price",
                 confidence=o.confidence,
-                evidence=evidence,
+                evidence=dict(o.evidence, run_id=run.run_id),
                 created_by=CREATED_BY,
             )
         else:
-            current = UNMATCHED if o.outcome == "unmatched" else AMBIGUOUS
             repo.add_dq_flag_once(
                 db,
                 check_name=current,
@@ -538,14 +637,6 @@ def _write(db: Database, outcomes: Sequence[Outcome], run: RunLog) -> None:
                 detail={"reason": o.reason, "candidates": o.candidates},
                 ingestion_run_id=run.run_id,
             )
-        stale = [c for c in (UNMATCHED, AMBIGUOUS) if c != current]
-        repo.resolve_dq_flags(
-            db,
-            repo.DqFilter(checks=tuple(stale), security_ids=(o.security_id,)),
-            note=f"vendor link run {run.run_id}: now {o.outcome}"
-            + (f" ({o.reason})" if o.reason else ""),
-            resolved_by=CREATED_BY,
-        )
 
 
 def link(

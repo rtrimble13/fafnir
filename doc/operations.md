@@ -763,10 +763,12 @@ Both decisions survive the engine:
 | Flag reason | Usual decision |
 |---|---|
 | `several_agree` | Reject the share class or duplicate that is not this security; the engine links the other. Or `accept` the right one when the evidence is outside the prices (CUSIP on a filing). |
-| `key_claimed_twice` | Usually one issuer with two FMP rows: fold them (`security merge`, after its dry run). The next run links the survivor. |
+| `duplicate_of_linked` | Another row of the linked security's issuer, usually a missed rename: fold it into `linked_security` with `security merge-rename` (dry run first). |
+| `key_claimed_twice` | The same, with no live claimant on the vendor's current ticker: fold the rows; the next run links the survivor. |
 | `price_disagrees` | Compare `duk -S db ph <SYM>` with `duk -S sharadar ph <SYM>`. A constant ratio is a split on one side only: fix that, then rerun. Noise means a different issuer: `reject`. |
 | `no_candidate`, `insufficient_overlap` | Nothing to accept unless you know the key from elsewhere. Then `accept` with the evidence in `-m`. |
-| `not_covered_asset_type` | A mutual fund; Sharadar does not price them. `dq accept` it. |
+| `no_bars` | A shell with no history: `security dedupe`. |
+| `not_covered_asset_type` | A mutual fund (about 4,600 in production); Sharadar does not price them. `dq accept` them, with a note. |
 
 ## Reconciliation
 
