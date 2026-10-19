@@ -278,6 +278,8 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
     Each zip holds one `<modern name>.csv`. Every header matched its schema with no unknown column. #50's
     projection held for the price files; SF1 came in under it (632 MB, not ~1.1 GB).
+    Every row of all five files then read through `sharadar_files.rows` with no parse error: stocks in
+    260 s, funds in 95 s, fundamentals in 180 s.
 - **2026-10-19 · P0, #50: the file ledger.** Migration 0030 adds `landing.sharadar_file`, one row per
   downloaded file: table, `full`/`delta`, filters, path, `member`, sha256 (unique), bytes, rows, header,
   run and status. `fafnir.sources.sharadar_files` reads a file as typed rows, streamed. Differences from

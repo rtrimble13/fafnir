@@ -545,9 +545,9 @@ session):
   columns).
 - **Time:** most of each run is counting rows, not the download. A host on a slower
   link will differ.
-- **Reading:** reading back through `sharadar_files.rows` takes about 190,000 price
-  rows a second (a full `stocks` read is about 4 minutes) and about 20,000
-  fundamentals rows a second.
+- **Reading:** every row of all five files reads back through
+  `sharadar_files.rows` with no parse error. A full `stocks` read takes 260 s
+  (about 175,000 rows a second); `funds` takes 95 s and `fundamentals` 180 s.
 
 ## Disk budget with Sharadar
 
