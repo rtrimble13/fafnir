@@ -6345,3 +6345,103 @@ def read_security_count(db: Database) -> dict:
             count(*) FILTER (WHERE delisted_date IS NOT NULL) AS delisted
         FROM core.security
         """) or {}
+
+
+# ---------------------------------------------------------------------------
+# landing.sharadar_file -- the Sharadar file ledger (#50, #52)
+# ---------------------------------------------------------------------------
+
+
+def current_sharadar_full(db: Database, vendor_table: str) -> Optional[dict]:
+    """The newest full file of ``vendor_table`` still on disk, or None."""
+    return db.fetchone(
+        """
+        SELECT * FROM landing.sharadar_file
+         WHERE vendor_table = %s AND kind = 'full' AND status = 'downloaded'
+         ORDER BY fetched_at DESC, file_id DESC
+         LIMIT 1
+        """,
+        (vendor_table,),
+    )
+
+
+def record_sharadar_file(
+    db: Database,
+    *,
+    vendor_table: str,
+    kind: str,
+    filters: dict,
+    path: str,
+    member: Optional[str],
+    sha256: str,
+    nbytes: int,
+    rows: Optional[int],
+    columns: Optional[list[str]],
+    ingestion_run_id: Optional[int],
+) -> tuple[dict, bool]:
+    """Record a downloaded file; ``(row, created)``.
+
+    A file whose content the ledger already holds is not recorded again: the
+    existing row comes back with ``created`` False. If it had been marked
+    superseded or deleted, it is current again -- the vendor is serving it.
+    """
+    row = db.fetchone(
+        """
+        INSERT INTO landing.sharadar_file
+            (vendor_table, kind, filters, path, member, sha256, bytes, rows,
+             columns, ingestion_run_id)
+        VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (sha256) DO NOTHING
+        RETURNING *
+        """,
+        (
+            vendor_table,
+            kind,
+            json.dumps(filters, sort_keys=True),
+            path,
+            member,
+            sha256,
+            nbytes,
+            rows,
+            columns,
+            ingestion_run_id,
+        ),
+    )
+    if row is not None:
+        return row, True
+    existing = (
+        db.fetchone(
+            """
+        UPDATE landing.sharadar_file
+           SET status = 'downloaded', status_at = now()
+         WHERE sha256 = %s AND status <> 'downloaded'
+        RETURNING *
+        """,
+            (sha256,),
+        )
+        or db.fetchone(
+            "SELECT * FROM landing.sharadar_file WHERE sha256 = %s", (sha256,)
+        )
+    )
+    return existing, False
+
+
+def supersede_sharadar_fulls(db: Database, vendor_table: str, keep_file_id: int) -> int:
+    """Mark every other current full file of ``vendor_table`` superseded."""
+    rows = db.fetchall(
+        """
+        UPDATE landing.sharadar_file
+           SET status = 'superseded', status_at = now()
+         WHERE vendor_table = %s AND kind = 'full' AND status = 'downloaded'
+           AND file_id <> %s
+        RETURNING file_id
+        """,
+        (vendor_table, keep_file_id),
+    )
+    return len(rows)
+
+
+def sharadar_file(db: Database, file_id: int) -> Optional[dict]:
+    return db.fetchone(
+        "SELECT * FROM landing.sharadar_file WHERE file_id = %s", (file_id,)
+    )

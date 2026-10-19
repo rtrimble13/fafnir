@@ -52,7 +52,7 @@ backfill. Estimates for the active US equity + ETF universe (~8k symbols):
 |---|---|---|---|---|
 | 2015 (~10 y) | ~1.5 GB | ~1 GB | ~6–8 GB | 40 GB |
 | 1990 (~35 y) | ~4 GB | ~2–3 GB | ~15–20 GB | **80 GB** |
-| **+ Sharadar** (plan v2) | + up to ~4.6 GB (delisted issuers' bars) | + ~2.4 GB of files on disk, ~5 GB during a refresh | ~+10 GB, plus the dumps' growth | **80 GB** still |
+| **+ Sharadar** (plan v2) | + up to ~4.6 GB (delisted issuers' bars) | + 1.9 GB of files on disk (measured), ~4 GB during a refresh | ~+10 GB, plus the dumps' growth | **80 GB** still |
 
 Empty schema (all migrations + seeds + 39 years of partitions and calendar) is
 **16 MB**, so essentially all of the above is price history. The Sharadar row is

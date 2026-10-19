@@ -66,8 +66,10 @@ key and corrects this docstring, the constants and ``duk.sharadar_api`` together
    is a DigitalOcean Spaces URL (``static-sharadar.nyc3.digitaloceanspaces.com``,
    ``/bulk-sharadar/<table>.csv.zip``), so a host's egress must allow that host as
    well as ``api.sharadar.com``. ``tickers`` and ``descriptions`` publish a full
-   snapshot only. The zip's members are UNVERIFIED: the build session's network
-   could not reach the download host.
+   snapshot only. MEASURED (first full download, 2026-10-19): each zip holds one
+   CSV named for the table's modern name (``stocks.csv`` when ``SEP`` was asked
+   for), whose header matches the table's ``/v1.0/schema``. Full history totals
+   1.9 GB of zips across tickers, actions, SEP, SFP and SF1.
 9. **Schemas** -- ``GET /schema/{table}?format=postgres`` serves a table's schema
    without a key. DOCUMENTED; an input for the bulk reader's header check (#52).
 
@@ -84,6 +86,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -139,6 +142,12 @@ def rows_from_payload(data: Any) -> list[dict]:
                 f"Sharadar API error: {data.get('error') or data.get('message')}"
             )
     return []
+
+
+def _no_query(text: str) -> str:
+    """Drop every URL query string from ``text``. A pre-signed link's query is its
+    credentials plus noise; the host and path say which file failed."""
+    return re.sub(r"\?[^\s'\")]*", "", text)
 
 
 @dataclass(frozen=True)
@@ -397,8 +406,8 @@ class SharadarClient(BaseSource):
             resp.raise_for_status()
         except requests.RequestException as exc:
             raise SourceError(
-                f"GET {self._redact(url)} failed: "
-                f"{type(exc).__name__}: {self._redact(str(exc))}"
+                f"GET {_no_query(url)} failed: "
+                f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
             ) from None
         self.request_count += 1
         with resp:
@@ -409,6 +418,6 @@ class SharadarClient(BaseSource):
                         yield chunk
             except requests.RequestException as exc:
                 raise SourceError(
-                    f"GET {self._redact(url)} broke off: "
-                    f"{type(exc).__name__}: {self._redact(str(exc))}"
+                    f"GET {_no_query(url)} broke off: "
+                    f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
                 ) from None

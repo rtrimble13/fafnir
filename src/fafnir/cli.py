@@ -4170,6 +4170,77 @@ def source_ping(ctx, vendor, table, ticker, require_paid):
     click.echo(f"{vendor}: OK")
 
 
+@source.command("sharadar-bulk")
+@click.option(
+    "--tables",
+    default="tickers,actions,SEP,SFP,SF1",
+    show_default=True,
+    help="Comma-separated tables: modern names (stocks) or legacy codes (SEP)",
+)
+@click.option(
+    "--years",
+    type=click.Choice(["5", "10", "full"]),
+    default="full",
+    show_default=True,
+    help="History in each file (tickers is always a full snapshot)",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Download a table even when the ledger holds a current file of it",
+)
+@click.pass_context
+def source_sharadar_bulk(ctx, tables, years, force):
+    """Download Sharadar's whole-table files and record them in the ledger.
+
+    Each file lands in [sharadar] bulk_dir as <sha256>.csv.zip and gets one row in
+    landing.sharadar_file; nothing is loaded into core. A table the ledger already
+    holds is skipped unless --force, so a run that stopped part-way resumes; the
+    same content downloaded again is one file, not two. A file whose header lacks
+    expected columns fails its table, naming them. One ops.ingestion_run per
+    table (endpoint bulk:<table>). Exits non-zero if any table failed.
+    """
+    from fafnir.ingest import sharadar_bulk
+
+    cfg = ctx.obj["config"]
+    client = _sharadar_client(cfg)
+    names = [t.strip() for t in tables.split(",") if t.strip()]
+    with Database(cfg.dsn) as database:
+        results = sharadar_bulk.download_tables(
+            database, client, names, cfg.sharadar_bulk_dir, years=years, force=force
+        )
+    failed = []
+    for r in results:
+        if r.outcome == "skipped":
+            click.echo(f"{r.table:<13} skipped: file {r.file_id} is current ({r.path})")
+        elif r.outcome == "failed":
+            failed.append(r.table)
+            click.echo(f"{r.table:<13} FAILED: {r.error}")
+        else:
+            note = (
+                "new file"
+                if r.outcome == "recorded"
+                else "same content as file on record"
+            )
+            click.echo(
+                f"{r.table:<13} {r.rows:,} rows, {r.bytes:,} bytes -> {r.path} "
+                f"(file {r.file_id}, {note}"
+                + (f", {r.superseded} superseded" if r.superseded else "")
+                + ")"
+            )
+            if r.unmapped_columns:
+                click.echo(
+                    f"{'':<13} unknown columns, read as text: {r.unmapped_columns}"
+                )
+    click.echo(
+        f"Files are in {cfg.sharadar_bulk_dir}; bytes downloaded {client.bytes_downloaded:,}"
+    )
+    if failed:
+        raise click.ClickException(
+            f"{len(failed)} table(s) failed: {', '.join(failed)}"
+        )
+
+
 @source.command("probe-sharadar")
 @click.option(
     "--sample",

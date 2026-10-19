@@ -151,6 +151,7 @@ the evidence the switch was right, and until then it is only a reasonable bet.
 | Re-adjust | `fafnir adjust [--symbol X]` | **also after a price reload** — dividend factors are valued against the prior raw close, so new prices change them |
 | Reconciliation | `scripts/reconcile.sh AAPL,MSFT,SPY` | weekly, rotating sample; reports, never overwrites |
 | Backups | `scripts/backup_dump.sh`, `backup_offsite.sh` | dump **every** schema, not a subset |
+| Sharadar bulk files | `fafnir source sharadar-bulk [--tables …] [--force]` | operator-run, not nightly. Downloads whole tables to `[sharadar] bulk_dir` (`<sha256>.csv.zip`) and records each in `landing.sharadar_file`; loads nothing into core. A table already on record is skipped unless `--force`. Runs are `source = sharadar`, `endpoint = bulk:<table>`. The files are **not** backed up (re-downloadable while subscribed) |
 
 On backups, the trap worth knowing: skipping `mart` because it is derived and
 `meta` because it is "only bookkeeping" gives a restore that is not a working

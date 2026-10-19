@@ -483,6 +483,72 @@ them.
 
 ---
 
+## Sharadar initial population
+
+```bash
+fafnir source ping --require-paid                        # the key is the subscription's
+fafnir source sharadar-bulk                              # tickers, actions, SEP, SFP, SF1
+fafnir source sharadar-bulk --tables SEP --force         # re-download one table
+psql "${FAFNIR_DSN}" -X -f scripts/landing_sizes.sql     # what the ledger now holds
+```
+
+`sharadar-bulk` downloads each table's whole-history file and records it in
+`landing.sharadar_file`. It loads nothing into `core`; the loaders do that, reading
+the files (#55, #58, #75). For each table:
+
+- **Download.** It asks `api.sharadar.com` for the table with `years=full`
+  (`--years 5|10` for less). The answer is a 302 to a pre-signed zip on
+  `static-sharadar.nyc3.digitaloceanspaces.com`, which it fetches **without** the key.
+  It streams the zip to `[sharadar] bulk_dir/<sha256>.csv.zip` under a temporary name,
+  so a broken download leaves nothing behind.
+- **Check the header.** The header is checked against the table's schema:
+  - **A missing column** fails the table, naming the column and what the file has
+    instead. The file is kept for inspection and not recorded.
+  - **An unknown column** is a warning, kept in the run's `params.unmapped_columns`
+    and read as text.
+- **Record it.** It counts the rows and records the file, then marks the table's
+  older full files `superseded`.
+
+Its behaviour across runs:
+- **One run row per table.** `ops.ingestion_run` gets `source = sharadar`,
+  `endpoint = bulk:<table>`, with the bytes downloaded and, in `params`, the rows,
+  file and header findings.
+- **Resumable.** A table the ledger already holds is skipped (no request), so a run
+  that stopped part-way picks up at the first table it had not finished. One
+  table's failure does not undo the others; the command exits non-zero naming the
+  failures.
+- **Idempotent.** With `--force`, content identical to a file on record is that
+  file again: no second row, no second copy on disk.
+
+Before the first run:
+- **Egress.** The host's egress must allow **both** `api.sharadar.com` and the
+  download host. A blocked download host fails at the download with `Tunnel
+  connection failed` or a connection error.
+- **`bulk_dir`.** Set `[sharadar] bulk_dir` to an absolute path (a Volume if the
+  local disk is tight).
+
+**What to expect**, measured on 2026-10-19 (full history, the paid key, from a cloud
+session):
+
+| Table | Rows | Zip | CSV inside | Run (download + row count) |
+|---|---|---|---|---|
+| `tickers` | 74,420 | 4.8 MB | 25 MB `tickers.csv` | 2 s |
+| `actions` | 718,464 | 10 MB | 50 MB `actions.csv` | 3 s |
+| `stocks` (SEP) | 45,451,818 | 907 MB | 3.2 GB `stocks.csv` | 117 s |
+| `funds` (SFP) | 15,760,389 | 322 MB | 1.1 GB `funds.csv` | 38 s |
+| `fundamentals` (SF1) | 3,218,845 | 632 MB | 2.4 GB `fundamentals.csv` | 62 s |
+| **All five** | | **1.9 GB** | 6.8 GB | **under 4 minutes** |
+
+- **Zip contents:** each zip holds one CSV named for the table's modern name
+  (`stocks.csv`, even when `SEP` was asked for).
+- **Headers:** every header matched its schema, with no unknown column (SF1 has 112
+  columns).
+- **Time:** most of each run is counting rows, not the download. A host on a slower
+  link will differ.
+- **Reading:** every row of all five files reads back through
+  `sharadar_files.rows` with no parse error. A full `stocks` read takes 260 s
+  (about 175,000 rows a second); `funds` takes 95 s and `fundamentals` 180 s.
+
 ## Disk budget with Sharadar
 
 Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in
@@ -494,7 +560,10 @@ three things to the host's disk:
    replaces a bar, it does not add one.
 3. **The dumps,** which grow with `core`.
 
-Projected from the paid feed on 2026-10-19:
+Projected from the paid feed on 2026-10-19, and since confirmed by the first full
+download (the measured table above). The measured files total **1.9 GB**: the
+price files came in as projected, and SF1 came in smaller (632 MB, at 3.2M rows and
+3.65× compression):
 - **Row counts** come from TICKERS' first and last price dates.
 - **Bytes per row and compression** come from CSV slices of each table.
 - **Bytes per bar in `core.daily_price`** come from 260,800 synthetic bars on
@@ -506,10 +575,10 @@ Projected from the paid feed on 2026-10-19:
 | `funds` (SFP) | ~15.8M, 32% delisted | ~70 B/row → ~1.1 GB | **~0.35 GB** |
 | `fundamentals` (SF1) | ~3.5M (17,866 issuers × ~4.5 rows a quarter) | ~1 KB/row → ~3.5 GB | **~1.1 GB** |
 | `actions`, `tickers` | ~1M (estimated from the sample's events per issuer), ~50k | | **< 0.1 GB** |
-| **One full set** | | | **~2.4 GB** |
+| **One full set** | | | **~2.4 GB** projected; **1.9 GB** measured |
 
 - **Files.** A refresh downloads a new full set before the old one is
-  superseded, so allow **~5 GB** at peak. `daily` and `metrics` are not in that
+  superseded, so allow **~4 GB** at peak (two 1.9 GB sets). `daily` and `metrics` are not in that
   figure; they are not needed before the fundamentals phase (P4), and each is of
   the order of `stocks`.
 - **`core`.** At most ~30M bars of delisted issuers (stocks and funds) are new to
