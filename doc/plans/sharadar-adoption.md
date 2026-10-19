@@ -250,9 +250,19 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-18 | Sprint close-outs and the `docs-gate` requirement dropped; six phases | this revision |
 | 2026-10-18 | `duk`: `-S db` is the default; `-S fmp` and `-S sharadar` read a vendor directly; `live` kept as an alias | shipped, [duk.md](../duk.md) |
 | 2026-10-18 | dorq integration unchanged by this plan | this revision |
+| 2026-10-18 | **Subscribed**: Sharadar Bundle, max history, annual, from 2026-10-18 to 2027-10-18. Renewal reminder **2027-09-18** (30 days ahead: a lapse triggers the licence's 30-day deletion clause). Key in `/etc/fafnir/fafnir.env` on the host, never an rc file | #57 |
 
 ## [built] notes
 
+- **2026-10-19 · P0, #57: subscribed, key installed.** The Bundle (max history, annual) runs
+  2026-10-18 → 2027-10-18; the renewal reminder is 2027-09-18. The key went into the host's
+  `/etc/fafnir/fafnir.env`.
+  - **Cloud session check:** `fafnir source ping --require-paid` reports the paid tier, one request in
+    under a second (3.8 s with startup); `duk -S sharadar ph AAPL -n 5` returns the five sessions
+    2026-10-12..16.
+  - **Runbook:** [install_hetzner.md](../install_hetzner.md#adding-the-sharadar-key-to-a-running-host)
+    now has the step for a host installed before the subscription. The issue said `chmod 600`; the
+    file stays `640`, group `fafnir`, because the timers run as `fafnir` and source it.
 - **2026-10-19 · P1, #55: vendor identity.** Migration 0031 adds `core.vendor_security` (a vendor's own
   master), `core.security_vendor_xref` (security ↔ vendor key, dated, with evidence and `is_feed`) and
   `core.vendor_security_event` (lifecycle events). All three arrive empty. What #49 measured shaped them:

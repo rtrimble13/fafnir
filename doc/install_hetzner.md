@@ -757,6 +757,27 @@ Why each line matters:
 > | Embed `password=...` directly in `FAFNIR_DSN`, or use a `~/.pgpass` (`0600`) | ✅ |
 > | `FAFNIR_DSN` without a password + `FAFNIR_DB_PASSWORD=...` | ❌ |
 
+#### Adding the Sharadar key to a running host
+
+A host installed before the subscription already has the file. Add the one line,
+keep the mode, and prove the key as the user the timers run as:
+
+```bash
+sudoedit /etc/fafnir/fafnir.env          # add: SHARADAR_API_KEY="..."
+sudo chgrp fafnir /etc/fafnir/fafnir.env && sudo chmod 640 /etc/fafnir/fafnir.env
+sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a
+  fafnir source ping --require-paid && duk -S sharadar ph AAPL -n 5'
+```
+
+- **Use `640` with group `fafnir`, not `600`.** The timers run as `fafnir` and source
+  this file. A root-only `600` file locks them out, and every Sharadar command then
+  says it has no key.
+- **`--require-paid` is the check that matters.** Sharadar serves a missing or wrong
+  key as the free tier rather than refusing it, so a bare ping succeeds with the
+  wrong key; `--require-paid` fails it.
+- **The duk read prints five sessions.** It reads the API directly, the way a laptop
+  does, not the warehouse.
+
 ---
 
 ## 5. Create the schema
