@@ -253,6 +253,28 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P0, #49: the Sharadar probe.** `fafnir source probe-sharadar` lives in its own module,
+  `fafnir.sources.sharadar_probe`, not `probe.py`, which holds FMP's probes. Run on the paid key over 200
+  securities (seed 0, 427 requests, 108 MB), it found **no blocking verdict**. The table is in
+  [backfill.md](../backfill.md#confirming-the-sharadar-feed); what follows is what the loaders must
+  accommodate:
+  - **Prices: 3 decimal places.** Raw close (`closeunadj`) is exact to that. A recovered open/high/low is
+    off by up to 0.0005 × the cumulative split factor. This is the risk row "SEP precision too coarse",
+    now measured: #75 decides whether to flag it.
+  - **Splits and dividends.** A split's `value` is new shares per old, the direction core already reads.
+    Dividends are **split-adjusted**, so the loader multiplies by the later splits' product. Raw recovery
+    matched ACTIONS on every split-affected bar within rounding.
+  - **Identity.** History is keyed by the **current** ticker, and dead reused tickers carry a numeric
+    suffix. SEP and SF1 rows have no `permaticker`; TICKERS does, and it is consistent across tables. So
+    #55 keys on permaticker through TICKERS.
+  - **Updates.** `lastupdated` re-stamps the whole history on every split or dividend, so the nightly
+    delta (#58) cannot use it to find changed raw bars without comparing.
+  - **API.** An unknown parameter is ignored, not refused, so every loader asserts its filters. The JSON
+    row cap is 10,000. The rate limit is 5,000 requests (25,000 weighted) per window. Bulk redirects to
+    `static-sharadar.nyc3.digitaloceanspaces.com` as `<table>.csv.zip`, so the host's egress allows that
+    host too.
+  - **Unmeasured:** the zip's members, because the build session could not reach the download host. #52
+    measures them.
 - **2026-10-19 · P0, #47: the Sharadar client.** `fafnir.sources.sharadar.SharadarClient` on
   `BaseSource`: `ping`, `tables`, `query` and `bulk_export`. `fafnir source ping` makes one request and
   writes nothing.

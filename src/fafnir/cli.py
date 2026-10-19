@@ -4170,6 +4170,52 @@ def source_ping(ctx, vendor, table, ticker, require_paid):
     click.echo(f"{vendor}: OK")
 
 
+@source.command("probe-sharadar")
+@click.option(
+    "--sample",
+    "sample_size",
+    default=200,
+    show_default=True,
+    type=click.IntRange(10, 2000),
+    help="Securities to sample, across decades and listed/delisted (10% funds)",
+)
+@click.option("--seed", default=0, show_default=True, type=int, help="Sample seed")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print the full report, evidence rows included. It holds vendor data: "
+    "keep it on the host",
+)
+@click.pass_context
+def source_probe_sharadar(ctx, sample_size, seed, as_json):
+    """Measure the Sharadar feed before anything loads it (plan #49).
+
+    Asks the paid feed every question the loaders' design rests on -- API
+    mechanics, precision, raw recovery, split and dividend conventions, ticker
+    keys, permaticker, same-day values, update behaviour, nulls -- and gives each a
+    PASS, NOTE or BLOCK verdict. Read-only. About 2 requests per sampled security
+    plus 30. Exits non-zero on any BLOCK: nothing loads until each has a written
+    mitigation in doc/plans/sharadar-adoption.md.
+    """
+    import json
+
+    from fafnir.sources import sharadar_probe
+
+    client = _sharadar_client(ctx.obj["config"])
+    report = sharadar_probe.probe_sharadar(client, sample_size=sample_size, seed=seed)
+    if as_json:
+        click.echo(json.dumps(report, indent=2, default=str))
+    else:
+        click.echo(sharadar_probe.format_sharadar_report(report))
+    blocks = sharadar_probe.blocking(report)
+    if blocks:
+        raise click.ClickException(
+            f"{len(blocks)} blocking verdict(s): record a mitigation for each in the "
+            "plan's decision log before any Sharadar load."
+        )
+
+
 @source.command("probe-prices")
 @click.option("--symbol", default=None, help="Symbol to probe [default: AAPL]")
 @click.option(

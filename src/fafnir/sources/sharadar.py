@@ -41,29 +41,42 @@ key and corrects this docstring, the constants and ``duk.sharadar_api`` together
    ``tickers``, ``SEP`` and ``actions``: ``{"count": n, "data": [{...}, ...]}``,
    ``count`` the rows returned; an error is ``{"error": ..., "description": ...}``.
    :func:`rows_from_payload` also accepts a bare list and the datatable shape.
-5. **Slices** -- ``ticker``, ``from``, ``to`` (calendar dates, ``YYYY-MM-DD``) and
-   ``fields`` (the columns), plus ``sort``. DOCUMENTED. Whether ``ticker`` takes a
-   list, and which column ``from``/``to`` filter on a table with two dates
-   (fundamentals has ``calendardate`` and ``date``), is UNVERIFIED. So is a
-   ``lastupdated`` filter, which the nightly delta needs (#58).
+5. **Slices** -- ``ticker``, ``from``, ``to`` (calendar dates, ``YYYY-MM-DD``),
+   ``fields`` (the columns) and ``sort``. DOCUMENTED. MEASURED 2026-10-19 (paid key,
+   ``fafnir source probe-sharadar``): ``ticker`` takes a comma-separated list;
+   ``date``, ``lastupdated`` and ``lastupdated.gte`` filter too; on SF1, ``from`` /
+   ``to`` filter ``date`` (the filing date), not ``calendardate``. TICKERS' own
+   ``table`` filter takes the modern names (``stocks``, ``fundamentals``, ``funds``):
+   ``table=SEP`` matches nothing. **An unknown parameter is ignored, not refused**,
+   so a misspelt filter returns everything it should have narrowed; a loader
+   asserts its filters in the rows it gets back.
 6. **Paging** -- ``limit`` (default 10,000) and ``offset`` / ``skip``. DOCUMENTED.
-   The largest ``limit`` honoured is UNVERIFIED. MEASURED 2026-10-19 (free tier):
-   ``SEP`` answers newest date first by default, and ``sort=date`` reverses it --
-   offset paging is only stable under a fixed order, which the probe confirms.
-   The vendor says not to page a whole table: that is what bulk is for (item 8).
-7. **Rate limits** -- not documented. ``[sharadar] rate_per_min`` (default 60)
-   throttles proactively; a 429 is retried with backoff by the base class.
+   MEASURED: a JSON ``limit`` above 10,000 is an error (``limit too large``), not a
+   silent cap; ``offset`` is honoured; ``SEP`` answers newest date first by
+   default and ``sort=date`` reverses it. TICKERS has no useful default order, so
+   paging it sorts explicitly. The vendor says not to page a whole table: that is
+   what bulk is for (item 8).
+7. **Rate limits** -- not documented. MEASURED: ``X-Ratelimit-Limit: 5000`` requests
+   and ``X-Ratelimit-Weighted-Limit: 25000`` per window, with ``-Remaining``,
+   ``-Reset`` (epoch seconds) and ``-Cost`` (1 a request) headers. ``[sharadar]
+   rate_per_min`` (default 60) throttles proactively; a 429 is retried with backoff
+   by the base class.
 8. **Bulk** -- the same ``GET /data/{table}`` with ``years=5|10|full`` answers
-   HTTP 302 to a pre-signed zip, subscription-gated. DOCUMENTED. ``tickers`` and
-   ``descriptions`` publish a full snapshot only, whatever ``years`` says. The zip's
-   contents (one CSV? its name?) are UNVERIFIED.
+   HTTP 302 to a pre-signed zip, subscription-gated. DOCUMENTED. MEASURED: the link
+   is a DigitalOcean Spaces URL (``static-sharadar.nyc3.digitaloceanspaces.com``,
+   ``/bulk-sharadar/<table>.csv.zip``), so a host's egress must allow that host as
+   well as ``api.sharadar.com``. ``tickers`` and ``descriptions`` publish a full
+   snapshot only. The zip's members are UNVERIFIED: the build session's network
+   could not reach the download host.
 9. **Schemas** -- ``GET /schema/{table}?format=postgres`` serves a table's schema
-   without a key. DOCUMENTED; unused here, an input for the probe and the bulk
-   reader's header check (#52).
+   without a key. DOCUMENTED; an input for the bulk reader's header check (#52).
 
-The field contract duk relies on is unchanged: the price tables carry unadjusted
-(``closeunadj``), split-adjusted (``open/high/low/close/volume``) and fully
-adjusted (``closeadj``) series. Nothing here interprets rows: this client fetches
+The field contract, as measured (``probe-sharadar``, doc/ingestion.md): the price
+tables carry the raw close (``closeunadj``), split-adjusted ``open/high/low/close/
+volume`` and a split-and-dividend-adjusted ``closeadj``, all to **3 decimal
+places**; a split's ``value`` is new shares per old; a dividend's is
+split-adjusted; history is keyed by the *current* ticker; and SEP/SF1 rows carry no
+``permaticker`` (TICKERS does). Nothing here interprets rows: this client fetches
 them.
 """
 
@@ -226,21 +239,22 @@ class SharadarClient(BaseSource):
             "columns": sorted(rows[0]) if rows else [],
         }
 
-    def tier(self) -> str:
-        """``paid`` or ``free``: which tier Sharadar serves this key as, or
-        ``unknown (...)`` when the answer is neither.
-
-        One request, for a ticker the free sample does not hold. Needed because
-        an invalid key is not refused (item 2): only a refusal of what a
-        subscription would serve shows the key is not working.
-        """
-        url = self._url(self.TIER_PROBE_TABLE)
+    def response(
+        self, table: str, params: Optional[dict] = None, *, allow_redirects: bool = True
+    ) -> requests.Response:
+        """One throttled, metered GET of ``table``, returned as it came: any status,
+        headers included, redirects followed only if asked. For diagnostics (the
+        tier check, the probe, the bulk redirect), which need what :meth:`_get`
+        turns into an exception or discards. Only a transport failure raises, and
+        that redacted."""
+        url = self._url(table)
         self.limiter.acquire()
         try:
             resp = self._session.get(
                 url,
-                params={"ticker": self.TIER_PROBE_TICKER, "limit": 1, "format": "json"},
+                params=dict(params or {}),
                 headers=self._key_header,
+                allow_redirects=allow_redirects,
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
@@ -250,6 +264,20 @@ class SharadarClient(BaseSource):
             ) from None
         self.request_count += 1
         self.bytes_downloaded += len(resp.content or b"")
+        return resp
+
+    def tier(self) -> str:
+        """``paid`` or ``free``: which tier Sharadar serves this key as, or
+        ``unknown (...)`` when the answer is neither.
+
+        One request, for a ticker the free sample does not hold. Needed because
+        an invalid key is not refused (item 2): only a refusal of what a
+        subscription would serve shows the key is not working.
+        """
+        resp = self.response(
+            self.TIER_PROBE_TABLE,
+            {"ticker": self.TIER_PROBE_TICKER, "limit": 1, "format": "json"},
+        )
         body = self._redact(resp.text or "")
         if resp.status_code == 200:
             return "paid"
@@ -343,23 +371,7 @@ class SharadarClient(BaseSource):
 
     def _bulk_link(self, table: str, years: str) -> str:
         """The pre-signed link the bulk request redirects to."""
-        url = self._url(table)
-        self.limiter.acquire()
-        try:
-            resp = self._session.get(
-                url,
-                params={"years": years},
-                headers=self._key_header,
-                allow_redirects=False,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise SourceError(
-                f"GET {self._redact(url)} failed: "
-                f"{type(exc).__name__}: {self._redact(str(exc))}"
-            ) from None
-        self.request_count += 1
-        self.bytes_downloaded += len(resp.content or b"")
+        resp = self.response(table, {"years": years}, allow_redirects=False)
         location = resp.headers.get("Location")
         if resp.status_code in (301, 302, 303, 307, 308) and location:
             return location
