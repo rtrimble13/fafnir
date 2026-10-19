@@ -477,9 +477,9 @@ What the first run on the paid key found (2026-10-19, 200 securities, seed 0):
 
 No blocking verdict. The download host for bulk files is
 `static-sharadar.nyc3.digitaloceanspaces.com` (a 302 from `api.sharadar.com`), so
-the host's egress must allow both hosts. The zip's members were not measured on this
-run, because the session's network could not reach the download host. #52 measures
-them.
+the host's egress must allow both hosts. The probe did not measure the zips; #52
+did, and its sizes and timings are under
+[Sharadar initial population](#sharadar-initial-population).
 
 ---
 
