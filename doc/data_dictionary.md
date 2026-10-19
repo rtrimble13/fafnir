@@ -256,7 +256,7 @@ not built yet.
 | `vendor` / `vendor_key` | TEXT | |
 | `valid_from` / `valid_to` | DATE | Open = `valid_to IS NULL`; `valid_to ≥ valid_from`. |
 | `is_feed` | BOOLEAN | This vendor loads the security's new rows (ADR 0015 §2). Only on an open link. |
-| `match_method` | TEXT CHECK | `minted` (#71); `ticker_span_price`, written by `fafnir vendor link` (#62): a shared ticker over overlapping spans, confirmed by ≥ 4 of 5 sampled raw closes; `identifier` (a shared CUSIP/FIGI/CIK alone); `manual` (#63). |
+| `match_method` | TEXT CHECK | `minted` (#71); `ticker_span_price`, written by `fafnir vendor link` (#62): a shared ticker over overlapping spans, confirmed by ≥ 4 of 5 sampled raw closes; `identifier` (a shared CUSIP/FIGI/CIK alone); `manual`, written by `fafnir vendor link accept` (#63) with `created_by` the person and `confidence` NULL. |
 | `confidence` | NUMERIC(4,3) | 0–1. |
 | `evidence` | JSONB | What the match rests on, so a link can be reviewed without re-running the matcher. For `ticker_span_price`: `samples` (date, `fmp`, `sharadar`), `agreed` of `of`, `ticker`, `matched_on`, `identifier`, `name_similarity`, the `others` considered and the `run_id`. Vendor data: never posted. |
 | `created_by` / `created_at` / `note` | | `created_by` may not be blank. |
@@ -275,6 +275,25 @@ When a security goes away:
   deleting it.
 
 **Cadence:** written by #62, #63 and #71.
+
+#### `core.security_vendor_rejection` — "this security is not that key" (0032, #63). **Grain:** `(security_id, vendor, vendor_key)`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `security_id` | BIGINT FK → core.security, ON DELETE CASCADE | A rejection is about one security, and goes with it. |
+| `vendor` / `vendor_key` | TEXT | |
+| `rejected_by` / `rejected_at` / `note` | | Who, when and why; `rejected_by` and `note` may not be blank. |
+| `evidence` | JSONB | The link the rejection closed, if any. |
+
+**Population:**
+- **Written by** `fafnir vendor link reject`. Rejecting again restates the note
+  and owner.
+- **Removed by** `accept` of the same pair.
+- **The linking engine** never proposes a rejected pair.
+
+**Why not a row of `core.security_vendor_xref`:** a link means "this key was this
+security over this span". A rejection is not a span of identity, and kept there it
+would answer "who was this key on date D" wrongly.
 
 #### `core.vendor_security_event` — a vendor's lifecycle events. **Grain:** `(vendor, vendor_key, event_date, action, contra_ticker)`.
 

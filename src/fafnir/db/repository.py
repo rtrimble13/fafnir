@@ -6728,10 +6728,13 @@ def link_scope(
     *,
     security_ids: Optional[Sequence[int]] = None,
     first_seen_since: Optional[datetime] = None,
+    review: bool = False,
 ) -> list[dict]:
     """The FMP-minted securities with no open link to ``vendor``: identity, every
     ticker ``core.symbol_xref`` has held for it, and the span of its bars (None
-    when it has none). ``security_ids`` and ``first_seen_since`` narrow it."""
+    when it has none). ``security_ids`` and ``first_seen_since`` narrow it.
+    ``review`` returns the securities named whatever minted them and whatever links
+    they hold: what `vendor link show|accept|reject` (#63) look at."""
     return db.fetchall(
         """
         SELECT s.security_id, s.primary_symbol, s.company_name, s.asset_type,
@@ -6745,11 +6748,10 @@ def link_scope(
                        max(p.trade_date) AS last_trade_date
                   FROM core.daily_price p
                  WHERE p.security_id = s.security_id) span ON true
-         WHERE s.source = 'fmp'
-           AND NOT EXISTS (
+         WHERE (%(review)s OR (s.source = 'fmp' AND NOT EXISTS (
                 SELECT 1 FROM core.security_vendor_xref l
                  WHERE l.security_id = s.security_id AND l.vendor = %(vendor)s
-                   AND l.valid_to IS NULL)
+                   AND l.valid_to IS NULL)))
            AND (%(ids)s::bigint[] IS NULL OR s.security_id = ANY(%(ids)s::bigint[]))
            AND (%(since)s::timestamptz IS NULL OR s.first_seen_at >= %(since)s)
          ORDER BY s.security_id
@@ -6758,6 +6760,7 @@ def link_scope(
             "vendor": vendor,
             "ids": list(security_ids) if security_ids is not None else None,
             "since": first_seen_since,
+            "review": review,
         },
     )
 
@@ -6882,4 +6885,131 @@ def last_successful_run(db: Database, source: str, endpoint: str) -> Optional[di
          ORDER BY ingestion_run_id DESC LIMIT 1
         """,
         (source, endpoint),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Manual link review (#63)
+# ---------------------------------------------------------------------------
+
+
+def vendor_links_of(db: Database, security_id: int, vendor: str) -> list[dict]:
+    """Every link, open and closed, from a security to ``vendor``, newest first."""
+    return db.fetchall(
+        """
+        SELECT * FROM core.security_vendor_xref
+         WHERE security_id = %s AND vendor = %s
+         ORDER BY valid_from DESC
+        """,
+        (security_id, vendor),
+    )
+
+
+def open_vendor_link_by_key(
+    db: Database, vendor: str, vendor_key: str
+) -> Optional[dict]:
+    """The open link holding a vendor key, or None."""
+    return db.fetchone(
+        """
+        SELECT * FROM core.security_vendor_xref
+         WHERE vendor = %s AND vendor_key = %s AND valid_to IS NULL
+        """,
+        (vendor, vendor_key),
+    )
+
+
+def close_vendor_link(
+    db: Database, vendor: str, vendor_key: str, valid_from: date, valid_to: date
+) -> None:
+    """Close one link (``valid_to``), which ends it and its feed with it."""
+    db.execute(
+        """
+        UPDATE core.security_vendor_xref SET valid_to = %s
+         WHERE vendor = %s AND vendor_key = %s AND valid_from = %s
+        """,
+        (valid_to, vendor, vendor_key, valid_from),
+    )
+
+
+def vendor_security_rows(db: Database, vendor: str, vendor_key: str) -> list[dict]:
+    """A vendor key's master rows, one per vendor table."""
+    return db.fetchall(
+        """
+        SELECT * FROM core.vendor_security
+         WHERE vendor = %s AND vendor_key = %s
+         ORDER BY vendor_table
+        """,
+        (vendor, vendor_key),
+    )
+
+
+def vendor_rejections(
+    db: Database, vendor: str, security_id: Optional[int] = None
+) -> list[dict]:
+    """Recorded "not this key" decisions, for one security or all."""
+    return db.fetchall(
+        """
+        SELECT * FROM core.security_vendor_rejection
+         WHERE vendor = %s AND (%s::bigint IS NULL OR security_id = %s)
+         ORDER BY security_id, vendor_key
+        """,
+        (vendor, security_id, security_id),
+    )
+
+
+def record_vendor_rejection(
+    db: Database,
+    *,
+    security_id: int,
+    vendor: str,
+    vendor_key: str,
+    rejected_by: str,
+    note: str,
+    evidence: dict,
+) -> None:
+    """Record (or restate) that a security is not a vendor key."""
+    db.execute(
+        """
+        INSERT INTO core.security_vendor_rejection
+            (security_id, vendor, vendor_key, rejected_by, note, evidence)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (security_id, vendor, vendor_key) DO UPDATE
+           SET rejected_by = EXCLUDED.rejected_by, note = EXCLUDED.note,
+               evidence = EXCLUDED.evidence, rejected_at = now()
+        """,
+        (
+            security_id,
+            vendor,
+            vendor_key,
+            rejected_by,
+            note,
+            json.dumps(evidence, default=str, sort_keys=True),
+        ),
+    )
+
+
+def delete_vendor_rejection(
+    db: Database, security_id: int, vendor: str, vendor_key: str
+) -> int:
+    """Withdraw a rejection (an accept of the same pair). Returns rows removed."""
+    return db.execute(
+        """
+        DELETE FROM core.security_vendor_rejection
+         WHERE security_id = %s AND vendor = %s AND vendor_key = %s
+        """,
+        (security_id, vendor, vendor_key),
+    )
+
+
+def vendor_link_at(
+    db: Database, vendor: str, vendor_key: str, valid_from: date
+) -> Optional[dict]:
+    """The link, open or closed, that starts on ``valid_from`` for a key: the
+    table's primary key, so at most one."""
+    return db.fetchone(
+        """
+        SELECT * FROM core.security_vendor_xref
+         WHERE vendor = %s AND vendor_key = %s AND valid_from = %s
+        """,
+        (vendor, vendor_key, valid_from),
     )

@@ -14,7 +14,9 @@ For each FMP-minted security without an open Sharadar link:
    ``related_tickers`` entry (a dead issuer's ``CLA1`` lists ``CLA``), or the other
    side of a ticker change. They must also have a price history overlapping the
    security's own bars. A ticker is compared with ``.`` read as ``-`` (Sharadar's
-   ``BRK.B`` is FMP's ``BRK-B``). A key another open link already holds is not a candidate;
+   ``BRK.B`` is FMP's ``BRK-B``). A key a person rejected for this security
+   (``core.security_vendor_rejection``, #63) is never a candidate for it, and a key
+   another open link already holds is not a candidate;
    the engine never moves a link, manual or not.
 2. **The decisive test.** The overlap is cut into five equal windows, and the
    security's first stored bar in each is the sample. Its raw close must match
@@ -292,14 +294,47 @@ def _index(candidates: Iterable[dict]) -> tuple[dict, dict]:
     return free, taken
 
 
-def _candidates_for(security: dict, free: dict) -> list[dict]:
+def _candidates_for(security: dict, free: dict, rejected=frozenset()) -> list[dict]:
     seen, out = set(), []
+    sid = security["security_id"]
     for ticker in sorted(_keys(security["tickers"])):
         for c in free.get(ticker, ()):
-            if c["vendor_key"] not in seen and overlap(security, c):
-                seen.add(c["vendor_key"])
+            key = c["vendor_key"]
+            if key not in seen and (sid, key) not in rejected and overlap(security, c):
+                seen.add(key)
                 out.append(c)
     return out
+
+
+def ticker_matches(
+    security: dict,
+    candidates: Sequence[dict],
+    rejected=frozenset(),
+    linked_key: Optional[str] = None,
+) -> list[dict]:
+    """Every vendor row sharing a ticker with the security, with why it is or is
+    not a candidate: ``linked`` (the security's own open link), ``candidate``,
+    ``taken`` (another open link holds it), ``rejected`` (a person said no) or
+    ``no_overlap``. For `vendor link show`."""
+    keys = _keys(security["tickers"])
+    sid = security["security_id"]
+    out = []
+    for c in candidates:
+        if not keys & _keys(c["aliases"]):
+            continue
+        if c["vendor_key"] == linked_key:
+            status = "linked"
+        elif c["taken"]:
+            status = "taken"
+        elif (sid, c["vendor_key"]) in rejected:
+            status = "rejected"
+        elif not overlap(security, c):
+            status = "no_overlap"
+        else:
+            status = "candidate"
+        out.append(dict(c, status=status))
+    order = ("linked", "candidate", "rejected", "no_overlap", "taken")
+    return sorted(out, key=lambda c: (order.index(c["status"]), c["vendor_key"]))
 
 
 def evaluate(
@@ -307,6 +342,7 @@ def evaluate(
     securities: Sequence[dict],
     candidates: Sequence[dict],
     source_for,  # Callable[[int], CloseSource]: given the candidate count
+    rejected=frozenset(),  # {(security_id, vendor_key)} a person said no to
 ) -> tuple[list[Outcome], Optional[str]]:
     """Decide every security; writes nothing. Returns the outcomes and the name of
     the price source used (None when no price was needed)."""
@@ -318,18 +354,21 @@ def evaluate(
         if s["asset_type"] == "fund":
             outcomes[sid] = Outcome(sid, sym, "unmatched", "not_covered_asset_type")
             continue
-        cands = _candidates_for(s, free)
+        cands = _candidates_for(s, free, rejected)
         if not cands:
             held = sorted({k for t in _keys(s["tickers"]) for k in taken.get(t, ())})
-            apart = sorted(
-                {c["vendor_key"] for t in _keys(s["tickers"]) for c in free.get(t, ())}
-            )
+            matched = {
+                c["vendor_key"] for t in _keys(s["tickers"]) for c in free.get(t, ())
+            }
+            said_no = sorted(k for k in matched if (sid, k) in rejected)
+            apart = sorted(k for k in matched if (sid, k) not in rejected)
             outcomes[sid] = Outcome(
                 sid,
                 sym,
                 "unmatched",
                 "no_candidate",
                 candidates=[{"taken_key": k} for k in held]
+                + [{"rejected_key": k} for k in said_no]
                 + [{"no_overlap_key": k} for k in apart],
             )
             continue
@@ -546,7 +585,12 @@ def link(
     )
     result.already_linked = repo.count_linked(db, VENDOR)
 
-    outcomes, result.price_source = evaluate(db, securities, candidates, source_for)
+    rejected = {
+        (r["security_id"], r["vendor_key"]) for r in repo.vendor_rejections(db, VENDOR)
+    }
+    outcomes, result.price_source = evaluate(
+        db, securities, candidates, source_for, rejected
+    )
     result.outcomes = outcomes
     if dry_run:
         return result

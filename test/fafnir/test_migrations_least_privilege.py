@@ -220,6 +220,7 @@ FORBIDDEN_TO_APP = (
     "core.vendor_security",
     "core.security_vendor_xref",
     "core.vendor_security_event",
+    "core.security_vendor_rejection",
 )
 
 
@@ -320,6 +321,7 @@ OPS_READABLE = (
     "core.vendor_security",
     "core.security_vendor_xref",
     "core.vendor_security_event",
+    "core.security_vendor_rejection",
     "meta.schema_migration",
     # Everything fafnir_read reaches is included by design: triage starts from a
     # flag and ends in the bars and actions that explain it.
@@ -369,6 +371,7 @@ VENDOR_IDENTITY = (
     "core.vendor_security",
     "core.security_vendor_xref",
     "core.vendor_security_event",
+    "core.security_vendor_rejection",
 )
 
 

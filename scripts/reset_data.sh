@@ -43,8 +43,9 @@ Scopes:
 
   all           Every core/ops/landing table: prices, actions, factors, security
                 master, xrefs, applied renames, profiles, vendor identity (the
-                vendor masters, events and links -- the links are not rebuilt by
-                a reload), watermarks, DQ flags, ingestion runs, landing payloads
+                vendor masters, events, links and rejections -- links and
+                rejections are not rebuilt by a reload), watermarks, DQ flags,
+                ingestion runs, landing payloads
                 and the Sharadar file ledger (the files under [sharadar] bulk_dir
                 stay; the next download records them again). Identity sequences
                 restart. Reference data and migrations are kept.
@@ -126,8 +127,8 @@ case "${SCOPE}" in
     all)
         TABLES="core.daily_price, core.corporate_action, core.adjustment_factor,
                 core.symbol_xref, core.symbol_change, core.company_profile,
-                core.security_vendor_xref, core.vendor_security,
-                core.vendor_security_event, core.security, ops.data_quality_flag,
+                core.security_vendor_xref, core.security_vendor_rejection,
+                core.vendor_security, core.vendor_security_event, core.security, ops.data_quality_flag,
                 ops.load_watermark, ops.ingestion_run, landing.fmp_raw,
                 landing.sharadar_file"
         RESTART_IDENTITY="RESTART IDENTITY"

@@ -125,10 +125,11 @@ serves today — check that in #128 before scheduling it.
 | 0029 | #46 | `ops.vendor_correction` (the audit trail of replaced rows) — **built** |
 | 0030 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) — **built** |
 | 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` — **built** |
-| 0032 | #66 | `ops.vendor_bar_comparison` (per-session summary; divergences are rows in the correction queue, not a second table) |
-| 0033 | #79 | `mart.v_security_lifecycle` |
-| 0034–0037 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
-| 0038 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
+| 0032 | #63 | `core.security_vendor_rejection` (a person's "not this key"; not in v2's first list) — **built** |
+| 0033 | #66 | `ops.vendor_bar_comparison` (per-session summary; divergences are rows in the correction queue, not a second table) |
+| 0034 | #79 | `mart.v_security_lifecycle` |
+| 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
+| 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
 | (optional) | #114, #116 | fund distribution types; FRED economic series |
 
 ## Issue dispositions (applied 2026-10-18)
@@ -255,6 +256,24 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P1, #63: manual link review.** `fafnir vendor link show|accept|reject`, with `--dry-run`,
+  `--by` (default the OS user) and commit-before-output. The runbook is in
+  [operations.md › Resolving vendor links](../operations.md#resolving-vendor-links).
+  - **`accept`** opens a `manual` link and resolves the security's `vendor_xref_*` flags with the note.
+    It refuses a key another security holds, a feed, and a start date on which a closed link to the same
+    key starts.
+  - **`reject`** records the pair so the engine never proposes it again, and closes an open link to that
+    key.
+  - **`vendor link` is now a group.** Without a subcommand it is still the engine, so `fafnir vendor link
+    --dry-run` and the nightly `--new` are unchanged.
+  - **Departure: a table for rejections.** The issue said to record a rejection "in `evidence`". It is
+    migration 0032 instead: `core.security_vendor_rejection`, ON DELETE CASCADE with its security. A
+    link row would make a rejection read as a span of identity, and a link is the only thing with
+    `evidence`. The LP test, `reset_data.sh` and the test fixture's truncation list include the table.
+    #55's rollback test is made version-robust: it rolls back everything from 0031 on, as the 0028 test
+    already did.
+  - **Agent rule 12** (fafnir-dba `SKILL.md`): the agent may run `show --evaluate` and propose an
+    `accept` or `reject` with its evidence. It never runs either without `--dry-run`.
 - **2026-10-19 · P1, #62: the linking engine.** `fafnir vendor link --vendor sharadar [--dry-run]
   [--symbols …] [--new] [--prices auto|bulk|api]` links FMP-minted securities to their permaticker. It
   finds candidates by ticker over overlapping spans, decides on 5 sampled raw closes against `closeunadj`

@@ -709,6 +709,65 @@ The `declined` reasons are:
 - `precedes_first_bar` and `traded_after`: the security's own bars contradict the
   delisting.
 
+## Resolving vendor links
+
+`fafnir vendor link` (the engine, [ingestion.md](ingestion.md#linking-to-a-vendors-identity))
+links what it can prove from prices, and flags the rest `vendor_xref_unmatched` or
+`vendor_xref_ambiguous`. A person decides those, and the decision is recorded with who made it and
+why (#63). Every command takes `--symbol` or `--security-id`. `accept` and `reject` take `--by`
+(default: the OS user) and `--dry-run`, and they commit before they print.
+
+```bash
+fafnir vendor link show META                    # links, rejections, open flags, candidates
+fafnir vendor link show META --evaluate         # + what the engine decides today, with samples
+fafnir vendor link accept --security-id 1234 --vendor-key 199059 \
+    -m "B shares: CUSIP on the 10-K" --dry-run
+fafnir vendor link reject --security-id 1234 --vendor-key 199058 \
+    -m "the A shares" --dry-run
+```
+
+**`show`** writes nothing. Each candidate's status is one of:
+- `linked`: the security's own open link;
+- `candidate`;
+- `rejected`;
+- `no_overlap`: the ticker matches, but the dates never meet;
+- `taken`: another security's open link holds the key.
+
+`--evaluate` prints the sampled closes. They are vendor data: keep them on the host.
+
+**`accept`** opens a `match_method = manual` link:
+- **When it starts:** `--from`, defaulting to where the two price histories meet.
+- **What it resolves:** the security's open `vendor_xref_*` flags, with `--by` and the note.
+- **A rejection of the same pair** is withdrawn.
+- **What it refuses:**
+  - a key another security's open link holds (a key is one security at a time: reject or close
+    that link first);
+  - replacing the security's own link when that link is its feed (moving a feed is #98's);
+  - a start date on which a closed link to the same key already starts. Pass `--from` after it.
+- **Any other open link of the security** is closed the day before the new one starts.
+
+**`reject`** records the pair in `core.security_vendor_rejection`:
+- **The engine** never proposes the pair again.
+- **An open link to that key** is closed today, unless it is the security's feed.
+- **The security's flags stay open:** it is still undecided, and the next `fafnir vendor link`
+  looks again without the rejected key. Rejecting one of two `several_agree` candidates is
+  usually enough for it to link the other.
+
+Both decisions survive the engine:
+- A linked security is outside the engine's scope.
+- A rejected pair is never a candidate.
+- The engine never moves a link, manual or not.
+
+**Which to use for each flag:**
+
+| Flag reason | Usual decision |
+|---|---|
+| `several_agree` | Reject the share class or duplicate that is not this security; the engine links the other. Or `accept` the right one when the evidence is outside the prices (CUSIP on a filing). |
+| `key_claimed_twice` | Usually one issuer with two FMP rows: fold them (`security merge`, after its dry run). The next run links the survivor. |
+| `price_disagrees` | Compare `duk -S db ph <SYM>` with `duk -S sharadar ph <SYM>`. A constant ratio is a split on one side only: fix that, then rerun. Noise means a different issuer: `reject`. |
+| `no_candidate`, `insufficient_overlap` | Nothing to accept unless you know the key from elsewhere. Then `accept` with the evidence in `-m`. |
+| `not_covered_asset_type` | A mutual fund; Sharadar does not price them. `dq accept` it. |
+
 ## Reconciliation
 
 `scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the
