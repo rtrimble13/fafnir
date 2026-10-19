@@ -15,7 +15,7 @@ import random
 import re
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Sequence
 
 import requests
 
@@ -30,13 +30,35 @@ MAX_RETRY_AFTER_SECONDS = 120
 # traceback. requests renders the *full* URL -- key included -- into the string
 # form of HTTPError and of the connection errors, so anything derived from an
 # upstream exception has to be scrubbed before it is re-raised or logged.
-SECRET_QUERY_PARAMS = ("apikey", "api_key", "token", "access_key", "secret")
+#
+# The X-Amz-* parameters are a pre-signed download link's credentials: a bulk
+# export hands one back (Sharadar, UNVERIFIED -- see sources/sharadar.py), and
+# anyone holding the link can fetch the file until it expires.
+SECRET_QUERY_PARAMS = (
+    "apikey",
+    "api_key",
+    "token",
+    "access_key",
+    "secret",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+)
 _SECRET_RE = re.compile(r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)")
 
 
-def redact_secrets(text: str) -> str:
-    """Mask API keys in any text bound for a log or an exception message."""
-    return _SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
+def redact_secrets(text: str, secrets: Sequence[str] = ()) -> str:
+    """Mask API keys in any text bound for a log or an exception message.
+
+    ``secrets`` are literal values to mask wherever they appear, whatever surrounds
+    them: a key echoed in an error body, a header, or a dict's repr has no
+    ``param=`` in front of it for the pattern to find.
+    """
+    text = _SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 class SourceError(Exception):
@@ -76,6 +98,9 @@ class BaseSource:
     """Throttled, retrying HTTP source with bandwidth metering."""
 
     name = "base"
+    # Literal secret values a subclass holds (its API key), masked in everything
+    # this class logs or raises on top of the ``param=`` pattern.
+    _secrets: tuple[str, ...] = ()
 
     def __init__(
         self, rate_per_min: int = 280, timeout: int = 30, max_retries: int = 4
@@ -107,8 +132,8 @@ class BaseSource:
                     # renders the full URL -- API key and all -- into the
                     # traceback. The redacted detail is carried over instead.
                     raise SourceError(
-                        f"GET {redact_secrets(url)} failed: "
-                        f"{type(exc).__name__}: {redact_secrets(str(exc))}"
+                        f"GET {self._redact(url)} failed: "
+                        f"{type(exc).__name__}: {self._redact(str(exc))}"
                     ) from None
                 self._backoff(attempt)
                 continue
@@ -143,8 +168,8 @@ class BaseSource:
                 # Same reason as above -- HTTPError stringifies to
                 # "<code> ... for url: <full url with apikey>".
                 raise SourceError(
-                    f"GET {redact_secrets(url)} returned {resp.status_code}: "
-                    f"{redact_secrets(str(exc))}"
+                    f"GET {self._redact(url)} returned {resp.status_code}: "
+                    f"{self._redact(str(exc))}"
                 ) from None
 
             try:
@@ -152,17 +177,22 @@ class BaseSource:
             except ValueError as exc:
                 # Safe to chain: a JSON decode error carries no URL.
                 raise SourceError(
-                    f"GET {redact_secrets(url)} returned non-JSON body"
+                    f"GET {self._redact(url)} returned non-JSON body"
                 ) from exc
 
             if isinstance(data, dict) and "Error Message" in data:
-                raise SourceError(f"{self.name} error: {data['Error Message']}")
+                raise SourceError(
+                    self._redact(f"{self.name} error: {data['Error Message']}")
+                )
             return data, resp.status_code, nbytes
 
         raise SourceError(
-            f"GET {redact_secrets(url)} exhausted retries"
+            f"GET {self._redact(url)} exhausted retries"
             + (f" (last status {last_status})" if last_status else "")
         )
+
+    def _redact(self, text: str) -> str:
+        return redact_secrets(text, self._secrets)
 
     @staticmethod
     def _retry_after_seconds(value: str | None) -> int | None:

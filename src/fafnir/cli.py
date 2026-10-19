@@ -262,6 +262,27 @@ def _fmp_client(cfg):
     return FMPClient(key, rate_per_min=cfg.request_rate_per_min)
 
 
+def _sharadar_client(cfg):
+    from fafnir.config import SHARADAR_KEY_ENV_VAR
+    from fafnir.sources.sharadar import SharadarClient
+
+    key = cfg.sharadar_api_key
+    if not key:
+        hint = (
+            " [api].sharadar_key in the rc file is duk's; fafnir reads the key from "
+            "the environment only."
+            if cfg.sharadar_key_in_rc
+            else ""
+        )
+        raise click.ClickException(
+            f"No Sharadar API key. Set {SHARADAR_KEY_ENV_VAR} (on a host, in "
+            f"/etc/fafnir/fafnir.env).{hint}"
+        )
+    return SharadarClient(
+        key, base_url=cfg.sharadar_base_url, rate_per_min=cfg.sharadar_rate_per_min
+    )
+
+
 @ingest.command("securities")
 @click.option("--universe", default=None, help="Universe id (default from config)")
 @click.option("--no-etfs", is_flag=True, help="Exclude ETFs")
@@ -4081,6 +4102,47 @@ def vendor_corrections_revert(ctx, correction_ids, note, reverted_by, dry_run, y
 @main.group()
 def source():
     """Inspect the upstream data source."""
+
+
+@source.command("ping")
+@click.option(
+    "--vendor",
+    type=click.Choice(["sharadar"]),
+    default="sharadar",
+    show_default=True,
+    help="Vendor to reach",
+)
+@click.option("--table", default="TICKERS", show_default=True, help="Table to ask")
+@click.option("--ticker", default="AAPL", show_default=True, help="Ticker to ask for")
+@click.pass_context
+def source_ping(ctx, vendor, table, ticker):
+    """Make one small request to a vendor and show what came back.
+
+    Proves the key, the base URL and the payload parser work together. Costs one
+    request and writes nothing. Exits non-zero when the request fails or returns
+    no rows (an empty answer is not proof the key works).
+    """
+    from fafnir.sources.base import SourceError
+
+    client = _sharadar_client(ctx.obj["config"])
+    try:
+        r = client.ping(table=table.upper(), ticker=ticker)
+    except SourceError as exc:
+        raise click.ClickException(f"{vendor} ping FAILED: {exc}") from None
+    click.echo(f"GET {r['url']}  ticker={r['ticker']}")
+    click.echo(
+        f"  HTTP {r['status']}, {r['rows']} row(s), {r['bytes']} bytes, "
+        f"{r['elapsed_ms']} ms{', paged (cursor returned)' if r['paged'] else ''}"
+    )
+    if r["columns"]:
+        click.echo(f"  columns: {', '.join(r['columns'])}")
+    if not r["rows"]:
+        raise click.ClickException(
+            f"{vendor} answered with no rows for {r['ticker']} in {r['table']}: try "
+            "a ticker the subscription covers, or check the endpoint "
+            "(SHARADAR_BASE_URL)."
+        )
+    click.echo(f"{vendor}: OK")
 
 
 @source.command("probe-prices")

@@ -13,9 +13,12 @@ Config sections
     host, port, dbname, user, password  -- assembled into a DSN if dsn is unset
 ``[api]``
     fmp_key, fred_key, bls_key, bea_key
+    sharadar_base_url -- shared with duk; the Sharadar *key* is never read here
 ``[general]``
     log_level, log_dir, universe, request_rate_per_min, overlap_days,
-    exclude_instruments
+    exclude_instruments, primary_price_vendor
+``[sharadar]``
+    rate_per_min, bulk_dir -- see :mod:`fafnir.sources.sharadar`
 ``[prices]``
     restatement_max_ratio, restatement_max_volume_ratio -- see
     :mod:`fafnir.ingest.daily_price`
@@ -28,7 +31,8 @@ Environment overrides
 ---------------------
 ``FAFNIR_DSN``, ``FAFNIR_DB_PASSWORD``/``PGPASSWORD``, ``FMP_API_KEY``,
 ``FRED_API_KEY``, ``BLS_API_KEY``, ``BEA_API_KEY``, ``FAFNIR_LOG_DIR``,
-``FAFNIR_DORQ_PATH``.
+``FAFNIR_DORQ_PATH``, ``SHARADAR_API_KEY`` (the only source of that key),
+``SHARADAR_BASE_URL``.
 """
 
 from __future__ import annotations
@@ -46,6 +50,10 @@ DEFAULT_CONFIG_PATH = "~/.fafnirrc"
 #: hard-coding the variable it is describing.
 DSN_ENV_VAR = "FAFNIR_DSN"
 PASSWORD_ENV_VARS = ("FAFNIR_DB_PASSWORD", "PGPASSWORD")
+
+SHARADAR_KEY_ENV_VAR = "SHARADAR_API_KEY"
+#: The vendors `[general] primary_price_vendor` may name.
+PRICE_VENDORS = ("fmp", "sharadar")
 
 
 class FafnirConfig:
@@ -144,6 +152,73 @@ class FafnirConfig:
             os.environ.get("BEA_API_KEY", "").strip()
             or (self._get("api", "bea_key", "") or "").strip()
         )
+
+    # -- sharadar -----------------------------------------------------------
+    @property
+    def sharadar_api_key(self) -> str:
+        """The Sharadar key, from ``SHARADAR_API_KEY`` and nowhere else.
+
+        Not from the rc file, unlike the FMP key: the Sharadar subscription is the
+        warehouse's primary feed and its licence's, so it lives in the host's
+        root-owned env file (``/etc/fafnir/fafnir.env``), never in a file a
+        session or a backup might copy. ``[api].sharadar_key`` is duk's, for a
+        laptop, and fafnir ignores it.
+        """
+        return os.environ.get(SHARADAR_KEY_ENV_VAR, "").strip()
+
+    @property
+    def sharadar_key_in_rc(self) -> bool:
+        """Whether the rc file holds a Sharadar key fafnir will not use, so a
+        missing-key error can say why."""
+        return bool((self._get("api", "sharadar_key", "") or "").strip())
+
+    @property
+    def sharadar_base_url(self) -> str:
+        """Base of Sharadar's table API: ``SHARADAR_BASE_URL``, then
+        ``[api].sharadar_base_url`` (both shared with duk), then the client's
+        default. Configurable because the endpoint is UNVERIFIED until the probe
+        (#49) measures it."""
+        from fafnir.sources.sharadar import DEFAULT_BASE_URL
+
+        return (
+            os.environ.get("SHARADAR_BASE_URL", "").strip()
+            or (self._get("api", "sharadar_base_url", "") or "").strip()
+            or DEFAULT_BASE_URL
+        )
+
+    @property
+    def sharadar_rate_per_min(self) -> int:
+        """Proactive throttle on Sharadar requests. The vendor's limit is not yet
+        measured, so the default is cautious; a 429 is retried with backoff."""
+        value = int(self._get("sharadar", "rate_per_min", 60))
+        if value < 1:
+            raise ValueError(f"[sharadar] rate_per_min must be at least 1, not {value}")
+        return value
+
+    @property
+    def sharadar_bulk_dir(self) -> str:
+        """Where bulk export files land, named by content (``<sha256>.<ext>``).
+
+        Relative by default, like ``log_dir``, so a checkout writes inside the
+        tree; a host sets an absolute path (install_hetzner.md §4.3).
+        """
+        return str(
+            self._get("sharadar", "bulk_dir", "var/fafnir/landing/sharadar")
+            or "var/fafnir/landing/sharadar"
+        )
+
+    @property
+    def primary_price_vendor(self) -> str:
+        """The vendor whose bars a new security is fed from: ``fmp`` until the
+        Sharadar cutover (plan v2, P3), ``sharadar`` after. Nothing reads it
+        before the cutover; it is validated now so a typo fails on day one."""
+        value = str(self._get("general", "primary_price_vendor", "fmp")).strip().lower()
+        if value not in PRICE_VENDORS:
+            raise ValueError(
+                f"[general] primary_price_vendor: {value!r} is not one of "
+                f"{', '.join(repr(v) for v in PRICE_VENDORS)}"
+            )
+        return value
 
     # -- general ------------------------------------------------------------
     @property

@@ -44,15 +44,21 @@ import requests
 
 from duk.date_utils import get_api_date_range
 from duk.fmp_api import redact_secrets
+from fafnir.sources.base import SourceError
+from fafnir.sources.sharadar import (  # noqa: F401 -- re-exported
+    DEFAULT_BASE_URL,
+    PRICE_TABLES,
+    rows_from_payload,
+)
 
 logger = logging.getLogger(__name__)
 
-#: Default base of Sharadar's table API (UNVERIFIED -- see the module docstring).
-DEFAULT_BASE_URL = "https://api.sharadar.com/v1.0/data"
-#: The equity-price table. Funds (ETFs, CEFs) live in SFP; `duk` tries SEP first
-#: and falls back to SFP when SEP returns no rows, so one spelling of a ticker
-#: works for both.
-PRICE_TABLES = ("SEP", "SFP")
+# The base URL, the price tables and the payload parser are the warehouse
+# client's (fafnir.sources.sharadar), so the probe (#49) corrects them once for
+# both. SEP holds equities, SFP funds (ETFs, CEFs): `duk` tries SEP first and
+# falls back to SFP when SEP returns no rows, so one spelling of a ticker works
+# for both.
+
 #: Columns the price tables carry; the parser requires `date` and `close`.
 PRICE_COLUMNS = (
     "ticker",
@@ -74,21 +80,10 @@ class SharadarAPIError(Exception):
 
 def _rows_from_payload(data: Any) -> List[Dict[str, Any]]:
     """Normalise either payload shape to a list of row dicts."""
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    if isinstance(data, dict):
-        if "datatable" in data and isinstance(data["datatable"], dict):
-            table = data["datatable"]
-            names = [c.get("name") for c in table.get("columns", [])]
-            return [dict(zip(names, row)) for row in table.get("data", [])]
-        for key in ("data", "rows", "results"):
-            if isinstance(data.get(key), list):
-                return _rows_from_payload(data[key])
-        if "error" in data or "message" in data:
-            raise SharadarAPIError(
-                f"Sharadar API error: {data.get('error') or data.get('message')}"
-            )
-    return []
+    try:
+        return rows_from_payload(data)
+    except SourceError as exc:
+        raise SharadarAPIError(str(exc)) from None
 
 
 def price_table_api(

@@ -57,7 +57,9 @@ spelling of a ticker works for both. Sharadar has no mutual funds.
 > the vendor has used. If a request fails, the error names
 > `[api].sharadar_base_url` / `SHARADAR_BASE_URL`, which override the base URL. The
 > warehouse-side probe, `fafnir source probe-sharadar`, is where the shape is
-> measured and this module corrected ([plan](plans/sharadar-adoption.md)).
+> measured and corrected ([plan](plans/sharadar-adoption.md)). duk takes the default
+> base URL, the price tables and the payload parser from the warehouse's client
+> (`fafnir.sources.sharadar`), so one correction serves both.
 
 ## Configuration
 

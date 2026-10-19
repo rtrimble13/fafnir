@@ -17,9 +17,26 @@ patterns to add new sources, tables, and consumers.
 ## Adding a new data source (FRED / BLS / BEA)
 
 1. **Client.** Add `src/fafnir/sources/<name>.py` subclassing `BaseSource`
-   (`sources/base.py`) — you inherit throttling, retry/backoff, and bandwidth
-   metering. Implement domain methods returning parsed payloads. Add the API key to
-   `FafnirConfig` (already stubbed: `fred_key`, `bls_key`, `bea_key`).
+   (`sources/base.py`) — you inherit throttling, retry/backoff, bandwidth
+   metering and secret redaction. Implement domain methods returning parsed
+   payloads. Add the API key to `FafnirConfig` (already stubbed: `fred_key`,
+   `bls_key`, `bea_key`).
+
+   `sources/sharadar.py` is the worked example:
+   - **Endpoints as class constants** (`T_SEP`, `T_TICKERS`, ...), so a correction
+     is one line.
+   - **The key masked by value.** The client sets `self._secrets = (api_key,)`, and
+     `BaseSource` masks that value in everything it logs or raises, on top of the
+     `api_key=` pattern `redact_secrets` already knows. A key echoed in an error
+     body, a header or a dict's repr has no `param=` in front of it.
+   - **Unmeasured mechanics marked `UNVERIFIED`** in the module docstring (base
+     URL, auth, pagination, bulk export flow), each one a probe item, with the
+     base URL overridable from config. The repository adopts an endpoint on a
+     probe's evidence, not its documentation (ADR 0007).
+   - **A key that never touches the rc file** when it is the warehouse's primary
+     feed: `FafnirConfig.sharadar_api_key` reads `SHARADAR_API_KEY` only.
+   - **A `fafnir source ping --vendor <name>`** that makes one request and writes
+     nothing, so an operator can check the key and the endpoint before any load.
 2. **Schema.** Add a migration `sql/migrations/NNNN_<name>.up.sql` (+ `.down.sql`)
    for the new tables. Economic series fit a tidy shape:
    `core.economic_series(series_id, source, title, units, frequency, seasonal_adj)`

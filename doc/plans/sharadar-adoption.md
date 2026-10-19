@@ -253,6 +253,24 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-19 · P0, #47: the Sharadar client.** `fafnir.sources.sharadar.SharadarClient` on
+  `BaseSource`: `ping`, `tables`, `query` (cursor-paged) and `bulk_export` (streams to
+  `<sha256><suffix>` under `[sharadar] bulk_dir`, via a temporary name). `fafnir source ping` makes one
+  request and writes nothing.
+  - **Nothing measured.** `sharadar.com` could not be reached from the build host, so every API mechanic in
+    the module docstring is marked `UNVERIFIED`: base URL, `api_key` auth, `format=json`, filter and
+    `qopts.columns` syntax, `meta.next_cursor_id` paging and its row cap, the rate limit, and the
+    `qopts.export` bulk flow and file format. These eight items are #49's item 1. The ping against the free
+    sample is an operator step.
+  - **duk now shares this module's endpoint knowledge.** `duk.sharadar_api` imports the default base URL,
+    the price tables and the payload parser from it, so #49 corrects one module, not two.
+  - **The key.** `SHARADAR_API_KEY` is read from the environment and nowhere else. `[api].sharadar_key`
+    stays duk's, and fafnir ignores it, but names it when the env var is missing.
+  - **Redaction.** It now masks a client's key by value, as well as by the `api_key=` pattern, and also
+    masks a pre-signed link's `X-Amz-*` credentials.
+  - **Config placement.** `primary_price_vendor` lives in `[general]` (validated `fmp|sharadar`; nothing
+    reads it before P3). `rate_per_min` (default 60) and `bulk_dir` live in `[sharadar]`. `base_url`
+    stays `[api].sharadar_base_url`, shared with duk.
 - **2026-10-18 · P0, #46: the precedence write path.** Migration 0029 (not 0031: it merged before #50
   and #55) adds `ops.vendor_correction`. Both upserts keep their existing `source` parameter as the
   writer instead of gaining an `owner`, so no FMP call site changed. `upsert_daily_prices` now returns
