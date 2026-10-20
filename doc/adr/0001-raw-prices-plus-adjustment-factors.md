@@ -2,6 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-06-27
+- Note (2026-10): Sharadar's backfilled history is raw **recovered** from its adjusted
+  prices, not observed; see ADR 0004's amendment.
 
 ## Context
 

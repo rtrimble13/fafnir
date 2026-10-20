@@ -64,6 +64,8 @@ Sharadar (plan v2): files on disk and a ledger, read by the loaders still to com
 |---|---|---|---|
 | `source sharadar-bulk` | `GET /v1.0/data/<table>?years=full` → 302 → pre-signed `<table>.csv.zip` | the file under `[sharadar] bulk_dir`; `landing.sharadar_file` | sha256 (one row per content) |
 | `ingest sharadar-master` | none: reads the ledger's current `tickers` and `actions` files | `core.vendor_security`, `core.vendor_security_event` | `(vendor, vendor_table, vendor_key)`; the event grain |
+| `ingest sharadar-prices` | none: reads the current `stocks` and `funds` files (and `actions` for the splits) | `core.daily_price` (`source = 'sharadar'`), raw recovered | (security_id, trade_date) |
+| `ingest sharadar-actions` | none: reads the current `actions` file | `core.corporate_action` (`source = 'sharadar'`) | (security_id, action_type, ex_date) |
 | `source ping`, `source probe-sharadar` | slices of `tickers`, `SEP`, `actions`, `SF1` | nothing (read-only) | — |
 
 > **Verify before the first production backfill:** the `symbol-change` payload
@@ -469,6 +471,46 @@ candidates decline, and the row stays withdrawn. A match is deleted through
 `repository.delete_corporate_action` and the security's factors are recomputed
 inline — a delete leaves no row stamped with the run, so `adjust --changed` cannot
 see it.
+
+### Bars from Sharadar, and why raw is recovered (#75)
+
+`fafnir ingest sharadar-prices` writes Sharadar's daily bars to `core.daily_price` as
+`source = 'sharadar'`. Two modes, either or both:
+
+| Mode | For | What it writes |
+|---|---|---|
+| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71) | the whole history |
+| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: the dates the security does not hold, from the link's `valid_from` |
+
+A date the security already holds, whoever supplied it, is never read, so a re-run
+writes nothing new.
+
+**Why raw is recovered.** No observed raw source exists for a dead issuer's history:
+SEP's `open/high/low/close/volume` are split-adjusted, and only `closeunadj` is raw.
+So the loader recovers the rest (`sharadar_map.recover_raw`), the exception ADR 0004's
+amendment records:
+- **The factor** is the product of the ACTIONS splits after the bar's date: exact,
+  where `closeunadj / close` would carry the two closes' 3-dp rounding (up to 0.36%
+  on an old low-priced bar, #49).
+- **Where the two disagree** beyond that rounding, a split is missing from ACTIONS or
+  one is wrong. The bar is recovered with the vendor's own ratio, which is how its
+  other prices were scaled. It is still loaded, and the security is flagged
+  `sharadar_split_ratio_mismatch` once, with the count and the first and last such
+  dates.
+- **Volume** is divided by the same factor, rounded to a whole share.
+
+Each bar then passes the FMP loader's gates, unchanged: non-session and
+operator-edited dates set aside, validation failures quarantined as `price_*`.
+Rows are written under precedence, never as a correction: correcting FMP's bars is
+`fafnir vendor correct` (#75). The files are streamed once each. The watermark is
+`(sharadar, SEP|SFP, security_id)` for the securities Sharadar feeds, and the
+factors of the securities that gained bars and hold actions are recomputed.
+
+```bash
+fafnir ingest sharadar-prices --backfill --gap-fill --dry-run   # counts per reason
+fafnir ingest sharadar-prices --backfill --gap-fill
+fafnir ingest sharadar-actions --backfill --gap-fill            # then the actions
+```
 
 ### Splits and dividends from Sharadar (#73)
 

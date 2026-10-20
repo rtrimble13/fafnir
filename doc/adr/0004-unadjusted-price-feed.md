@@ -85,6 +85,28 @@ Pull daily OHLCV from **`historical-price-eod/non-split-adjusted`**.
   outside. `unadjustedVolume` is the tiebreaker where present; where it is absent the
   probe reports `volume_ambiguous` rather than guessing.
 
+## Amendment (2026-10): vendor-derived raw prices for Sharadar history (#74)
+
+The rejection of deriving raw from split-adjusted data, below, has one exception:
+history no source observed raw. A dead issuer's bars exist only in Sharadar's SEP and
+SFP, which serve split-adjusted prices and the raw close (`closeunadj`). So:
+
+- **Backfilled Sharadar rows are recovered raw.** `fafnir ingest sharadar-prices`
+  (#75) computes the raw open, high, low and volume from the adjusted ones with the
+  product of the ACTIONS splits after the date (`OpenUnadj = Open × factor`,
+  `VolumeUnadj = Volume / factor`), and stores them as `source = 'sharadar'`. The
+  close is `closeunadj` itself.
+- **The objection still holds, so it is guarded.** A raw price derived from the
+  actions table depends on it. Where SEP's own `closeunadj / close` disagrees with
+  the ACTIONS product beyond rounding, the bar is recovered with the vendor's ratio
+  instead and the security is flagged `sharadar_split_ratio_mismatch`.
+- **The precision verdict (#49):** prices are published to 3 decimal places, so the
+  raw close is exact to that, and a recovered open/high/low is off by up to
+  0.0005 × the cumulative split factor. Not blocking; it is why the factor comes
+  from ACTIONS, which is exact, rather than from the rounded ratio.
+- **Nightly Sharadar captures after cutover (#98) are observed raw.** On the capture
+  day there is no later split, the ratio is exactly 1, and nothing is derived.
+
 ## Alternatives considered
 
 - **Keep `.../full` and skip fafnir's split factor, applying only dividends.**

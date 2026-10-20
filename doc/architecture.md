@@ -65,7 +65,10 @@ pulled from **`historical-price-eod/non-split-adjusted`**, the one endpoint that
 returns prices as they actually traded. Feeding a pre-adjusted series into fafnir's
 own factors would adjust it twice: AAPL's 1990-01-02 close would enter as ~$0.35
 rather than its true ~$39.20, and the view would report ~$0.003. See
-[adr/0004-unadjusted-price-feed.md](adr/0004-unadjusted-price-feed.md). Adjusted series are computed **on read** in `mart.v_daily_price_adjusted`.
+[adr/0004-unadjusted-price-feed.md](adr/0004-unadjusted-price-feed.md). The one
+exception is Sharadar's backfilled history, which no source observed raw: it is
+recovered from the vendor's adjusted prices and its ACTIONS splits, and guarded by a
+DQ check (ADR 0004's amendment). Adjusted series are computed **on read** in `mart.v_daily_price_adjusted`.
 Because factors are derived deterministically from corporate actions, the adjusted
 series is **point-in-time stable and reproducible**. See
 [adr/0001-raw-prices-plus-adjustment-factors.md](adr/0001-raw-prices-plus-adjustment-factors.md).

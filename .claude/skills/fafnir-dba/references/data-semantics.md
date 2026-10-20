@@ -312,3 +312,19 @@ security. Neither says which vendor loads its next bar: that is the open link wi
 Precedence is `operator > sharadar > tiingo > fmp`. FMP never overwrites a Sharadar
 row, and no vendor overwrites an operator row. `mart` views do not expose `source`
 (ADR 0009); answer provenance questions on the ops tier.
+
+## 23. Sharadar-sourced raw history is derived; the split-ratio check guards it
+
+A `core.daily_price` row with `source = 'sharadar'` was not observed raw. SEP serves
+split-adjusted prices and a raw close (`closeunadj`); fafnir recovers the raw open,
+high, low and volume with the product of the ACTIONS splits after the date (#75,
+ADR 0004's amendment). The close is exact to SEP's 3 decimal places; the others are
+off by up to 0.0005 × the cumulative split factor (#49).
+
+> **Wrong answer:** treating a Sharadar bar's open/high/low on a split-heavy dead
+> issuer as exact to the cent, or ignoring `sharadar_split_ratio_mismatch`.
+
+Where the vendor's own `closeunadj / close` disagrees with ACTIONS, the bar was
+recovered with the vendor's ratio and the security carries
+`sharadar_split_ratio_mismatch`: a split is missing from ACTIONS or wrong there,
+so the security's adjustment factors (built from ACTIONS, #73) are suspect too.
