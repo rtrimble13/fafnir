@@ -253,9 +253,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-18 | dorq integration unchanged by this plan | this revision |
 | 2026-10-18 | **Subscribed**: Sharadar Bundle, max history, annual, from 2026-10-18 to 2027-10-18. Renewal reminder **2027-09-18** (30 days ahead: a lapse triggers the licence's 30-day deletion clause). Key in `/etc/fafnir/fafnir.env` on the host, never an rc file | #57 |
 | 2026-10-19 | **First production population** of the Sharadar files and the vendor master, on the host (#59). This date replaces plan v1's "parallel-run session 1" | #59 |
+| 2026-10-20 | **Sharadar is the more reliable vendor for identity linking.** FMP's history disagreeing with Sharadar's is a correction to make, not a reason to withhold a link: `vendor link` links on the latest sample or a shared identifier when the history disagrees, and flags the history `vendor_history_disagrees`. The identity evidence must still not rest on FMP's history | #62 |
 
 ## [built] notes
 
+- **2026-10-20 · P1, #62: link when FMP's history is wrong.** Two bases after `price_history` (≥ 4 of 5):
+  - `latest_price`: one candidate with four samples agrees on its latest. That is run 398's back-adjusted
+    candidates and about 324 of the 807 non-monotonic securities.
+  - `identifier`: no sample decides, and exactly one candidate shares a CIK or CUSIP (`match_method =
+    identifier`).
+  - **Confidence** keeps one formula, so a link on one agreeing sample scores about 0.2.
+  - **Every link with a disagreeing sample** gets `vendor_history_disagrees`, listing those samples: the
+    worklist for the correction from Sharadar (#66, #75). Links made before this change are not flagged;
+    the historical comparison (#69) covers every date of every link.
+  - **Next.** `fafnir vendor link --dry-run` on the host gives the counts per basis before a real run.
 - **2026-10-20 · P1, #62: run 398 lost the duplicates.** All 782 `duplicate_of_linked` flags of run 397 were
   replaced: 511 by `no_candidate` and 259 by `price_disagrees`.
   - **The cause.** Run 397 linked each key's live claimant, so on run 398 that key was held, and a held key
