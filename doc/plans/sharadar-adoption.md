@@ -260,6 +260,21 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P1, #71: dead issuers minted.** `fafnir vendor mint-delisted [--dry-run] [--permaticker K
+  [--allow-overlap]] [--limit N]` mints every dead Sharadar issuer ADR 0016 §3 admits
+  (`vendor_overlap.mintable`, no open link, no open `vendor_history_overlap` flag). Each row is
+  `source = 'sharadar'`, delisted, with closed ticker periods cut at its ticker-change events and a `minted`,
+  feeding link. A commit per 500; `RunLog(endpoint='mint-delisted')`.
+  - **Guard.** It refuses to run until `vendor overlap` (#68) has run since the master was last loaded.
+  - **Departures from the issue:**
+    - an unmapped sector or industry is left NULL and counted in the run, not flagged: the
+      `security_missing_classification` check and its recheck cover listed securities only, so a flag on a dead
+      row would be resolved on the next recheck;
+    - `cusip` is left NULL: Sharadar lists every CUSIP an issuer had, and none is "the" one;
+    - `--limit N` added, for a first run on the host;
+    - #70 (excision) is not a prerequisite: it is deferred, and a minted row is found by `source = 'sharadar'`.
+  - **Next.** On the host: `vendor overlap`, `mint-delisted --dry-run` (counts by category, venue and death
+    year for #71), then the real run. `duk -S db ph <dead ticker>` resolves; prices come with #75.
 - **2026-10-20 · P1, #68: overlap detection before minting.** `fafnir vendor overlap [--dry-run]` flags
   `vendor_history_overlap` on the FMP security, in two kinds:
   - **`dead_issuer`:** a dead issuer #71 would mint (`vendor_overlap.mintable`, ADR 0016 §3) shares a ticker

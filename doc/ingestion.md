@@ -711,6 +711,42 @@ straight after the security master as #62 first had it. The decision compares th
 security's own bars, and a security minted tonight has none until its history is
 pulled. Before the first full run, `--new` says so and does nothing.
 
+### Dead issuers minted from Sharadar (#71)
+
+The universe has a third half. Beside the screened securities and the declared
+funds, `fafnir vendor mint-delisted` mints the issuers that died before fafnir
+first ran, which no screener returns, from Sharadar's master
+([ADR 0016](adr/0016-sharadar-identity-and-survivorship-floor.md) §3):
+
+- **Which.** Priced in SEP/SFP, delisted on or after 1998-01-01, a stock, preferred,
+  ETF/ETN/ETD/ETMF or CEF category, last listed on NYSE, NASDAQ, AMEX (Sharadar's
+  NYSEMKT and NYSEARCA) or BATS, with no open link to its permaticker, and no open
+  `vendor_history_overlap` flag for it (#68).
+- **The row.** `source = 'sharadar'`, delisted, `is_actively_trading = false`, the
+  vendor's ticker as `primary_symbol`, its name, kind and venue through
+  `sharadar_map`, and its sector and industry where fafnir's vocabulary has them
+  (else NULL: the classification check covers listed securities only).
+  `delisted_date` is the `delisted` event (else the last price); `ipo_date` the
+  `listed` event.
+- **Tickers.** A closed `core.symbol_xref` period per ticker it traded under, cut at
+  its ticker-change events. Closed periods never take a live security's ticker.
+- **The link.** `match_method = 'minted'`, `is_feed`. Sharadar feeds it (#75), FMP
+  never does, and `vendor link` never evaluates it.
+
+The rows arrive empty; their prices come with the Sharadar backfill (#75). The order
+on the host:
+
+```bash
+fafnir vendor overlap                     # after every master load
+fafnir vendor mint-delisted --dry-run     # counts by category, venue, death year
+fafnir vendor mint-delisted
+```
+
+The mint refuses to run until `vendor overlap` has run since the master was last
+loaded. A re-run mints nothing new. `--permaticker K --allow-overlap` mints one
+flagged issuer on purpose, for the split-history playbook
+([operations.md](operations.md#separating-two-issuers-held-on-one-security)).
+
 ### Which vendor feeds a security (ADR 0015)
 
 Every FMP loader feeds the securities FMP minted (`core.security.source = 'fmp'`)
