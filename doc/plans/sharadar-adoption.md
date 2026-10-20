@@ -52,7 +52,7 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
 | Bars FMP never served (gaps, delisted-while-live, dead issuers 1998+) | absent | **Sharadar**, raw recovered from `closeunadj` (`source='sharadar'`) | Sharadar |
 | Nightly prices and actions | FMP | FMP; Sharadar reconciled against it nightly | **Sharadar**, observed raw (ratio exactly 1 on the capture day) |
 | Minting, renames, delistings | FMP screener and sweeps | FMP, plus a permaticker link for every security | **Sharadar TICKERS/ACTIONS** via the xref |
-| Identity | ticker-keyed (`security_id` surrogate) | `core.security_vendor_xref` → permaticker | permaticker authoritative (the identity ADR, #67) |
+| Identity | ticker-keyed (`security_id` surrogate) | `core.security_vendor_xref` → permaticker | permaticker authoritative ([ADR 0016](../adr/0016-sharadar-identity-and-survivorship-floor.md), #67) |
 | Fundamentals | none | — | **SF1**, bitemporal, 1998+ (phase 4) |
 | Mutual funds (8 tracked) | FMP, 3 of 8 | FMP 3 of 8 | **Tiingo** for all eight once FMP's tier drops them (phase 5) |
 | `duk -S …` | `db` / `live` | `db` default · `fmp` · `sharadar` | same |
@@ -60,7 +60,7 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
 | Subscriptions | FMP Premium | FMP Premium + Sharadar Bundle (max history, annual) | **Sharadar annual + FMP reduced tier** |
 
 **Survivorship floor: 1998-01-01.** Neither vendor has delistings before 1998, so cross-sectional work before
-that date is survivor-only under any plan. The identity ADR (#67) records it.
+that date is survivor-only under any plan. [ADR 0016](../adr/0016-sharadar-identity-and-survivorship-floor.md) (#67) records it.
 
 ## Working agreements
 
@@ -91,7 +91,7 @@ Phases are ordered by dependency, not by calendar week. Each closes with a short
 |---|---|---|---|
 | **P0** | Subscribe, client, probe, safety rails | #42, #43, #44, #45, #46, #47, #49, #50, #52, #57 | `probe-sharadar` passes on the paid key; FMP loaders cannot touch a non-FMP-fed security; precedence write path merged |
 | **P1** | Land, link, mint | #55, #56, #58, #59, #62, #63, #64, #67, #68, #71 | ≥ 99% of active non-fund securities linked or explained; dead issuers minted (empty) |
-| **P2** | Backfill, compare, correct | #66, #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** |
+| **P2** | Backfill, compare, correct | #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** |
 | **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** |
 | **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; release **v2.1.0** |
 | **P5** | Funds, FRED, close-out | #88, #97, #104, #114, #116, #117, #131 | Eight funds on one vendor; `duk yc -S db`; plan marked implemented |
@@ -102,21 +102,21 @@ serves today — check that in #128 before scheduling it.
 
 ### The verification that replaces the parallel run
 
-1. **Historical comparison** (#69, using #66): for every linked security and every date both vendors hold,
-   compare FMP's raw bar with Sharadar's recovered raw bar and FMP's actions with Sharadar's. Report
-   agreement by asset type, exchange, decade and price bucket; categorise every divergence (`scale`,
-   `date_shift`, `missing_bar`, `split_missing`, `dividend_value`, `volume_basis`, `other`).
-2. **Decide the correction policy from the categories**, not from a threshold set in advance: a category
-   where Sharadar is right by inspection (checked against an outside reference on a sample, the ADR 0004
-   level-check discipline) is corrected in bulk; a category that is a convention difference (consolidated
-   vs primary-exchange volume) is documented and left; anything unexplained stays flagged.
-3. **Nightly reconcile** during the overlap (the previous session, FMP vs Sharadar) reports the same
-   categories, so a feed-behaviour difference (first prints, late corrections, split-day handling) shows
-   up before cutover.
-4. **Cutover criteria** (#122): the comparison report's unexplained category is empty; the nightly
-   reconcile has been clean for ten sessions; < 1% of active non-fund securities unlinked; the Sharadar
-   nightly has run in dry-run mode on production for five sessions and proposed the same renames,
-   delistings and listings the FMP sweeps made (or each difference is explained).
+*Revised 2026-10-20: Sharadar wins on price, so the categories, the per-category policy and the nightly
+reconcile are dropped, and #66 is folded into #75.*
+
+1. **Historical comparison** (#69): a dry run of `fafnir vendor correct` (#75) over every linked security
+   and every date both vendors hold. Report the bars compared and the bars that would be replaced, by asset
+   type, exchange and decade.
+2. **One convention to settle first: volume.** If one vendor reports consolidated volume and the other
+   primary-exchange only, the difference is a definition, not an error: volume is then left alone. #69's
+   dry run decides it.
+3. **Corrections** (#75): `fafnir vendor correct` replaces each differing FMP bar with Sharadar's under
+   precedence, each replaced row audited in `ops.vendor_correction`.
+4. **Cutover criteria** (#122): the corrections applied; every unlinked active non-fund security explained
+   by a reason code (4.8% unlinked on 2026-10-20, #64); the Sharadar nightly has run in dry-run mode on
+   production for five sessions and proposed the same renames, delistings and listings the FMP sweeps made
+   (or each difference is explained).
 
 ### Migrations (expected numbers — take the next free number at merge time)
 
@@ -126,7 +126,7 @@ serves today — check that in #128 before scheduling it.
 | 0030 | #50 | `landing.sharadar_file` (file ledger only; no typed landing tables) — **built** |
 | 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` — **built** |
 | 0032 | #63 | `core.security_vendor_rejection` (a person's "not this key"; not in v2's first list) — **built** |
-| 0033 | #66 | `ops.vendor_bar_comparison` (per-session summary; divergences are rows in the correction queue, not a second table) |
+| ~~0033~~ | ~~#66~~ | ~~`ops.vendor_bar_comparison`~~: dropped on 2026-10-20 (#66 folded into #75); later migrations take the next free number |
 | 0034 | #79 | `mart.v_security_lifecycle` |
 | 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
 | 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
@@ -253,11 +253,24 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-18 | dorq integration unchanged by this plan | this revision |
 | 2026-10-18 | **Subscribed**: Sharadar Bundle, max history, annual, from 2026-10-18 to 2027-10-18. Renewal reminder **2027-09-18** (30 days ahead: a lapse triggers the licence's 30-day deletion clause). Key in `/etc/fafnir/fafnir.env` on the host, never an rc file | #57 |
 | 2026-10-19 | **First production population** of the Sharadar files and the vendor master, on the host (#59). This date replaces plan v1's "parallel-run session 1" | #59 |
+| 2026-10-20 | **#66 folded into #75; #69 narrowed to a dry run.** Sharadar wins on price, so `fafnir vendor correct` (#75) finds and replaces differing FMP bars in one pass, audited in `ops.vendor_correction`. Not built: the divergence categories, `ops.vendor_bar_comparison`, the nightly reconcile and its report section. #69 posts the dry run's counts and settles the volume convention. Cutover criteria amended to match | #66, #69, #75 |
+| 2026-10-20 | **Identity ADR is ADR 0016** (0013 was taken): permaticker is the identity authority from cutover, `security_id` stays the key; survivorship floor 1998-01-01; the inclusion rules for minting dead issuers | #67 |
 | 2026-10-20 | **#64's gate recorded as it stands: 4.8% of active non-fund securities unlinked**, against the issue's < 1%. Every one carries a reason code, so P1's own criterion (≥ 99% linked *or explained*) holds. Further triage is not worth the effort: the residue is immaterial, and half of it is duplicate rows of linked issuers. The 126 identifier links without price support are kept, at their low confidence | #64 |
 | 2026-10-20 | **Sharadar is the more reliable vendor for identity linking.** FMP's history disagreeing with Sharadar's is a correction to make, not a reason to withhold a link: `vendor link` links on the latest sample or a shared identifier when the history disagrees, and flags the history `vendor_history_disagrees`. The identity evidence must still not rest on FMP's history | #62 |
 
 ## [built] notes
 
+- **2026-10-20 · P1, #67: the identity ADR.** [ADR 0016](../adr/0016-sharadar-identity-and-survivorship-floor.md)
+  records three decisions:
+  - the permaticker is the identity authority from cutover, and `security_id` stays fafnir's key;
+  - cross-sections before 1998-01-01 are survivor-only under any vendor;
+  - #71 mints a dead Sharadar issuer when it has SEP/SFP prices, died on or after 1998-01-01, maps to an
+    asset type (common and preferred stock, ETF/ETN/ETD/ETMF, CEF), last listed on NYSE, NASDAQ, AMEX
+    (NYSEMKT, NYSEARCA) or BATS, holds no open link, and is not flagged by #68.
+
+  It cites #56's mappings, and #64's 4.8% unlinked residue as the price of not triaging further. ADR 0005
+  gains a status note pointing to it. The counts by category, exchange and death year come from #71's dry
+  run, not from the ADR.
 - **2026-10-20 · P1, #64: the hit rate.** After run 399 and 13 merges:
   - **Active, non-fund FMP securities:** 12,888; linked 12,265 (95.2%); unlinked 623 (4.8%).
   - **The unlinked, by reason:**

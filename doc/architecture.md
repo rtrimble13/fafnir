@@ -76,7 +76,16 @@ series is **point-in-time stable and reproducible**. See
   keys** — they are reused and renamed (FB→META). `core.symbol_xref` maps tickers
   to `security_id` over time.
 - Delisted/inactive securities are **retained** (`delisted_date` set, never
-  deleted), so backtests are free of survivorship bias.
+  deleted), so backtests are free of survivorship bias **from 1998-01-01**. Before
+  that date no vendor records delistings, so a cross-section is survivor-only. From
+  1998 the issuers that died before fafnir first ran are minted from Sharadar
+  (`source = 'sharadar'`).
+- **Sharadar's permaticker is the identity authority.** A security's open link in
+  `core.security_vendor_xref` names its permaticker, and from cutover Sharadar's
+  TICKERS and ACTIONS drive listings, renames and delistings; `security_id` stays
+  the key every table uses. A security with no link (mutual funds, and the few
+  `vendor link` could not place) keeps its FMP identity. See
+  [adr/0016-sharadar-identity-and-survivorship-floor.md](adr/0016-sharadar-identity-and-survivorship-floor.md).
 - The universe has two halves. The **discovered** one maintains itself: the nightly
   job re-reads the screener, so a security that lists today enters scope today (and,
   having no watermark, gets its full history on the same run). The **declared** one

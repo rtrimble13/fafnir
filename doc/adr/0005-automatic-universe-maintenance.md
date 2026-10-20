@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-08-27
 - Extends: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md)
+- Note (2026-10-20): the vendor-independent key this ADR names as the right
+  long-term answer is adopted by [ADR 0016](0016-sharadar-identity-and-survivorship-floor.md):
+  Sharadar's permaticker, through `core.security_vendor_xref`. The sweeps below stay
+  until cutover, and after it for rollback.
 
 ## Context
 
