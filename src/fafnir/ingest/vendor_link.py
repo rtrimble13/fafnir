@@ -23,11 +23,25 @@ For each FMP-minted security without an open Sharadar link:
    Sharadar's ``closeunadj`` on the same date within max($0.01, 1 bp).
 3. **Corroboration.** A shared CIK or CUSIP (an ISIN's CUSIP included), and the
    names' similarity (``company_name_similarity``).
-4. **Decision.**
-   - **One candidate agrees** on at least four samples: link it
-     (``ticker_span_price``, confidence 0.9 × agreement + 0.1 × corroboration).
-   - **Several agree:** the one with an identifier match is chosen if it is the
-     only one; otherwise ``vendor_xref_ambiguous`` (``several_agree``).
+4. **Decision.** Sharadar is the reliable vendor (plan decision of 2026-10-20):
+   FMP's history going wrong is a reason to correct its bars, not to withhold the
+   link. The first basis with a winner decides, recorded as the link's ``basis``:
+   - ``price_history``: one candidate agrees on at least four samples
+     (``ticker_span_price``).
+   - ``latest_price``: none does, and one candidate with four samples agrees on
+     its latest (``ticker_span_price``). FMP's history is back-adjusted, or
+     another instrument's, while today's close is right: about 324 of the 807
+     securities run 398 left with no monotonic candidate.
+   - ``identifier``: no sample decides, and one candidate shares a CIK or CUSIP
+     (``match_method = identifier``).
+   - The confidence is 0.9 × agreement + 0.1 × corroboration whatever the basis,
+     so a link resting on one agreeing sample scores about 0.2.
+   - **Several win on a price basis:** the one with an identifier match is chosen
+     if it is the only one; otherwise ``vendor_xref_ambiguous``
+     (``several_agree``).
+   - **A link whose samples disagree** anywhere also gets
+     ``vendor_history_disagrees``, naming those dates: the bars Sharadar's are to
+     replace (#66, #75), audited in ``ops.vendor_correction``.
    - **The one that agrees is held** by another security's open link: the
      security is another row of the holder's issuer (``duplicate_of_linked``,
      naming it).
@@ -38,7 +52,8 @@ For each FMP-minted security without an open Sharadar link:
    - **None agrees:** ``vendor_xref_unmatched``, with a reason:
      - ``no_candidate``;
      - ``no_bars``: the security has no bars, so no span (a re-mint shell);
-     - ``price_disagrees``: a candidate had four samples, and they did not agree;
+     - ``price_disagrees``: a candidate had four samples, neither they nor its
+       latest agreed, and no identifier decided;
      - ``insufficient_overlap``: no candidate had four sampled bars to compare;
      - ``not_covered_asset_type``: a mutual fund, ``asset_type = 'fund'`` or an
        ``is_fund`` non-ETF with no candidate. Sharadar does not price them.
@@ -89,6 +104,8 @@ ENDPOINT_FULL = "link"
 ENDPOINT_NEW = "link:new"
 UNMATCHED = "vendor_xref_unmatched"
 AMBIGUOUS = "vendor_xref_ambiguous"
+#: A link whose sampled history disagrees: the bars to correct (#66, #75).
+HISTORY = "vendor_history_disagrees"
 #: Above this many candidates, read the bulk files rather than the API.
 API_MAX_CANDIDATES = 200
 
@@ -267,7 +284,7 @@ class Outcome:
     security_id: int
     symbol: str
     outcome: str  # linked | ambiguous | unmatched
-    reason: Optional[str] = None
+    reason: Optional[str] = None  # a link's basis; else why not linked
     vendor_key: Optional[str] = None
     confidence: Optional[float] = None
     valid_from: Optional[date] = None
@@ -287,6 +304,18 @@ class LinkResult:
 
     def counts(self) -> Counter:
         return Counter((o.outcome, o.reason) for o in self.outcomes)
+
+    def linked(self) -> int:
+        return sum(1 for o in self.outcomes if o.outcome == "linked")
+
+    def to_correct(self) -> int:
+        """Links whose sampled history disagrees (a ``vendor_history_disagrees``
+        flag each)."""
+        return sum(
+            1
+            for o in self.outcomes
+            if o.outcome == "linked" and disagreeing(o.evidence["samples"])
+        )
 
 
 def _index(candidates: Iterable[dict]) -> dict:
@@ -502,31 +531,77 @@ def _summary(r: dict) -> dict:
     return out
 
 
+def latest_agrees(r: dict) -> bool:
+    """Whether the candidate's most recent sample with a vendor close agrees.
+
+    FMP's latest prints are its most reliable; its history is what goes wrong
+    (back-adjusted bars stored as raw, another instrument's prices). A history
+    back-adjusted after the last action agrees here and nowhere before it."""
+    dated = [x for x in r["samples"] if x["sharadar"] is not None]
+    if not dated:
+        return False
+    last = max(dated, key=lambda x: x["date"])
+    return agrees(last["fmp"], last["sharadar"])
+
+
+def disagreeing(samples: Sequence[dict]) -> list[dict]:
+    """The samples where both vendors have a close and they differ."""
+    return [
+        x
+        for x in samples
+        if x["sharadar"] is not None and not agrees(x["fmp"], x["sharadar"])
+    ]
+
+
 def _decide(s: dict, results: list[dict]) -> Outcome:
+    """The first basis with a winner decides; see the module docstring, step 4.
+
+    - ``price_history``: at least four samples agree;
+    - ``latest_price``: a candidate with four samples, its latest one agreeing;
+    - ``identifier``: the only candidate sharing a CIK or CUSIP.
+
+    Several winners on a price basis: an identifier picks one, else
+    ``several_agree``. Several on the identifier basis decide nothing.
+    """
     sid, sym = s["security_id"], s["primary_symbol"]
-    passing = [r for r in results if r["agreed"] >= MIN_AGREED]
-    if len(passing) > 1:
-        with_id = [r for r in passing if r["identifier"]]
-        if len(with_id) == 1:
+    tested = [r for r in results if r["of"] >= MIN_AGREED]
+    bases = (
+        ("price_history", [r for r in results if r["agreed"] >= MIN_AGREED]),
+        ("latest_price", [r for r in tested if latest_agrees(r)]),
+        ("identifier", [r for r in results if r["identifier"]]),
+    )
+    for basis, passing in bases:
+        if not passing:
+            continue
+        if basis == "identifier":
+            if len(passing) == 1:
+                return _won(s, passing[0], basis, results)
+            break
+        if len(passing) > 1:
+            with_id = [r for r in passing if r["identifier"]]
+            if len(with_id) != 1:
+                return Outcome(
+                    sid,
+                    sym,
+                    "ambiguous",
+                    "several_agree",
+                    candidates=[_summary(r) for r in passing],
+                )
             passing = with_id
-        else:
-            return Outcome(
-                sid,
-                sym,
-                "ambiguous",
-                "several_agree",
-                candidates=[_summary(r) for r in passing],
-            )
-    if not passing:
-        enough = any(r["of"] >= MIN_AGREED for r in results)
-        return Outcome(
-            sid,
-            sym,
-            "unmatched",
-            "price_disagrees" if enough else "insufficient_overlap",
-            candidates=[_summary(r) for r in results],
-        )
-    (r,) = passing
+        return _won(s, passing[0], basis, results)
+    return Outcome(
+        sid,
+        sym,
+        "unmatched",
+        "price_disagrees" if tested else "insufficient_overlap",
+        candidates=[_summary(r) for r in results],
+    )
+
+
+def _won(s: dict, r: dict, basis: str, results: list[dict]) -> Outcome:
+    """The candidate ``r`` won on ``basis``: link it, unless another security's
+    open link holds it (``duplicate_of_linked``, naming the holder)."""
+    sid, sym = s["security_id"], s["primary_symbol"]
     c = r["candidate"]
     if c["taken"]:
         return Outcome(
@@ -543,15 +618,19 @@ def _decide(s: dict, results: list[dict]) -> Outcome:
         if r["identifier"]
         else (r["name_similarity"] if r["name_similarity"] is not None else 0.0)
     )
-    confidence = round(0.9 * r["agreed"] / r["of"] + 0.1 * corroboration, 3)
+    # An identifier link may rest on no sampled bar at all (gaps in our history).
+    agreement = r["agreed"] / r["of"] if r["of"] else 0.0
+    confidence = round(0.9 * agreement + 0.1 * corroboration, 3)
     return Outcome(
         sid,
         sym,
         "linked",
+        basis,
         vendor_key=c["vendor_key"],
         confidence=min(confidence, 1.0),
         valid_from=overlap(s, c)[0],
         evidence={
+            "basis": basis,
             "vendor_table": c["vendor_table"],
             "ticker": c["ticker"],
             "matched_on": sorted(_keys(s["tickers"]) & _keys(c["aliases"])),
@@ -653,11 +732,31 @@ def _write(db: Database, outcomes: Sequence[Outcome], run: RunLog) -> None:
                 vendor=VENDOR,
                 vendor_key=o.vendor_key,
                 valid_from=o.valid_from,
-                match_method="ticker_span_price",
+                match_method=(
+                    "identifier" if o.reason == "identifier" else "ticker_span_price"
+                ),
                 confidence=o.confidence,
                 evidence=dict(o.evidence, run_id=run.run_id),
                 created_by=CREATED_BY,
             )
+            wrong = disagreeing(o.evidence["samples"])
+            if wrong:
+                repo.add_dq_flag_once(
+                    db,
+                    check_name=HISTORY,
+                    severity="warn",
+                    security_id=o.security_id,
+                    table_name="core.daily_price",
+                    record_key={"vendor": VENDOR, "vendor_key": o.vendor_key},
+                    detail={
+                        "vendor_key": o.vendor_key,
+                        "basis": o.reason,
+                        "agreed": o.evidence["agreed"],
+                        "of": o.evidence["of"],
+                        "samples": _sample_json(wrong),
+                    },
+                    ingestion_run_id=run.run_id,
+                )
         elif same:
             # The same condition, still open: keep the flag, refresh its evidence
             # (a flag written before samples were kept has none).
@@ -737,10 +836,11 @@ def link(
     with run:
         result.run_id = run.run_id
         _write(db, outcomes, run)
-        run.rows_inserted = counts[("linked", None)]
+        run.rows_inserted = result.linked()
         run.symbols_requested = len(outcomes)
         run.params.update(
             evaluated=len(outcomes),
+            to_correct=result.to_correct(),
             outcomes={f"{k[0]}:{k[1]}" if k[1] else k[0]: v for k, v in counts.items()},
         )
         db.commit()

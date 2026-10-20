@@ -636,13 +636,28 @@ manual or the engine's, is never moved.
    Sharadar's `closeunadj` on that date, within max($0.01, 1 bp).
 3. **Corroboration.** A shared CIK or CUSIP (an ISIN's CUSIP counts), and the
    similarity of the names.
-4. **Decision:**
+4. **Decision.** Sharadar is the reliable vendor (plan decision of 2026-10-20).
+   When FMP's history disagrees, its bars are corrected; the link is not
+   withheld. The first basis with a winner decides, and is kept as the link's
+   `evidence.basis`:
+   - `price_history`: one candidate agrees on ≥ 4 of 5 samples.
+   - `latest_price`: none does, and one candidate with ≥ 4 samples agrees on its
+     latest. This is FMP history back-adjusted and stored as raw, or another
+     instrument's, under a ticker whose close today is right. In run 398's
+     samples it covered about 324 of the 807 securities with no monotonic
+     candidate.
+   - `identifier`: no sample decides, and exactly one candidate shares a CIK or
+     CUSIP.
+
+   Several winners on a price basis: the one sharing an identifier, if only one
+   does; else `several_agree`. The confidence is the same formula on every basis,
+   so a link on one agreeing sample scores about 0.2 and says so.
 
 | Outcome | When | Written |
 |---|---|---|
-| linked | one candidate agrees on ≥ 4 of 5 samples; or several do and exactly one shares an identifier | a link: `match_method = ticker_span_price`, `valid_from` the overlap's start, confidence `0.9 × agreed/sampled + 0.1 × corroboration` (1 for an identifier, else the name similarity) |
+| linked | a basis above has one winner | a link: `match_method = ticker_span_price` (`identifier` on that basis), `valid_from` the overlap's start, confidence `0.9 × agreed/sampled + 0.1 × corroboration` (1 for an identifier, else the name similarity). A link with any disagreeing sample also gets `vendor_history_disagrees` (`warn`), listing those samples: the bars to correct |
 | ambiguous | several agree with no identifier to choose (`several_agree`); one permaticker wins for several securities: the live one on the vendor's current ticker is linked and the others are `duplicate_of_linked` (a missed rename's rows, for `security merge-rename`), and with no such claimant none is linked (`key_claimed_twice`); the one that agrees is already held by another security's open link (`duplicate_of_linked`, so a later run reaches the same verdict as the run that linked the holder) | `vendor_xref_ambiguous` |
-| unmatched | `no_candidate`; `no_bars` (no span to compare: a re-mint shell); `price_disagrees` (a candidate had 4+ samples); `insufficient_overlap` (none did); `not_covered_asset_type` at `info` (a mutual fund: `asset_type = 'fund'`, or `is_fund` and not an ETF with no candidate) | `vendor_xref_unmatched` |
+| unmatched | `no_candidate`; `no_bars` (no span to compare: a re-mint shell); `price_disagrees` (a candidate had 4+ samples, and no basis decided); `insufficient_overlap` (none did, and no identifier decided); `not_covered_asset_type` at `info` (a mutual fund: `asset_type = 'fund'`, or `is_fund` and not an ETF with no candidate) | `vendor_xref_unmatched` |
 
 **Evidence.** The sampled dates and both prices are kept in the link's `evidence`
 and in the flags' `detail`. They stay in the database: they are vendor data, and

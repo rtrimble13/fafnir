@@ -4056,9 +4056,12 @@ def vendor_link(ctx, vendor_name, dry_run, symbols, new, prices):
 
     A candidate shares a ticker with the security, and its price history overlaps
     the security's bars. Five sampled raw closes against Sharadar's closeunadj
-    decide it: one candidate agreeing on at least four is linked. Otherwise the
-    security gets vendor_xref_ambiguous or vendor_xref_unmatched, with a reason. An
-    existing link is never changed. One ops.ingestion_run per run (endpoint link or
+    decide it: one candidate agreeing on at least four is linked (price_history);
+    failing that, the one whose latest sample agrees (latest_price), or the one
+    sharing a CIK or CUSIP (identifier). A link whose samples disagree is flagged
+    vendor_history_disagrees, for correction. Otherwise the security gets
+    vendor_xref_ambiguous or vendor_xref_unmatched, with a reason. An existing link
+    is never changed. One ops.ingestion_run per run (endpoint link or
     link:new). See doc/ingestion.md, "Linking to a vendor's identity".
 
     \b
@@ -4116,6 +4119,11 @@ def vendor_link(ctx, vendor_name, dry_run, symbols, new, prices):
         counts.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))
     ):
         click.echo(f"  {outcome:<10} {reason or '':<24} {n}")
+    if result.to_correct():
+        click.echo(
+            f"  {result.to_correct()} of the links with history to correct "
+            "(vendor_history_disagrees)"
+        )
 
 
 def _link_closes(cfg, database, prices: str):

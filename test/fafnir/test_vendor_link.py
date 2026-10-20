@@ -110,6 +110,36 @@ def test_tolerance():
 # ---------------------------------------------------------------------------
 
 
+def test_an_identifier_link_on_no_sampled_bar_scores_its_identifier_only():
+    span = (date(2020, 1, 2), date(2020, 12, 31))
+    s = {
+        "security_id": 1,
+        "primary_symbol": "ZZ",
+        "tickers": ["ZZ"],
+        "first_trade_date": span[0],
+        "last_trade_date": span[1],
+    }
+    c = {
+        "vendor_key": "1",
+        "vendor_table": "stocks",
+        "ticker": "ZZ",
+        "aliases": ["ZZ"],
+        "taken": False,
+        "first_price_date": span[0],
+        "last_price_date": span[1],
+    }
+    r = {
+        "candidate": c,
+        "samples": [],
+        "agreed": 0,
+        "of": 0,
+        "identifier": "cik",
+        "name_similarity": None,
+    }
+    o = vl._decide(s, [r])
+    assert (o.outcome, o.reason, o.confidence) == ("linked", "identifier", 0.1)
+
+
 def close_of(d: date, level: float = 50.0) -> Decimal:
     """A price path that differs every day, so a wrong date never agrees."""
     return D(str(round(level + (d.toordinal() % 97) / 10, 3)))
@@ -548,6 +578,155 @@ def test_a_link_is_never_moved_and_a_held_key_is_tested_but_never_won(db):
 
 
 # ---------------------------------------------------------------------------
+# When FMP's history is wrong: the latest sample, an identifier
+# ---------------------------------------------------------------------------
+
+SPLIT = Y(2020, 10, 1)
+
+
+def back_adjusted(d: date) -> Decimal:
+    """Sharadar's raw closes where FMP's bars are back-adjusted for a 2:1 split on
+    ``SPLIT``: twice FMP's before it, FMP's from it on."""
+    return close_of(d) * 2 if d < SPLIT else close_of(d)
+
+
+def _history_flags(db):
+    return db.fetchall(
+        "SELECT security_id, severity, table_name, record_key, detail "
+        "FROM ops.data_quality_flag WHERE check_name = 'vendor_history_disagrees' "
+        "AND resolved_at IS NULL ORDER BY security_id"
+    )
+
+
+@pytestmark_integration
+def test_a_back_adjusted_history_links_on_its_latest_sample(db):
+    sid = _sec(db, "ZZBA", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900200", "ZZBA", Y(2020, 1, 2), Y(2020, 12, 31))
+    _, src = _source({"ZZBA": back_adjusted})
+    result = vl.link(db, src)
+    (o,) = result.outcomes
+    assert (o.outcome, o.reason, o.vendor_key) == ("linked", "latest_price", "900200")
+    link = _links(db)[sid]
+    assert link["match_method"] == "ticker_span_price"
+    ev = link["evidence"]
+    assert (ev["basis"], ev["agreed"], ev["of"]) == ("latest_price", 1, 5)
+    assert link["confidence"] == D("0.280")  # 0.9 x 1/5 + 0.1 x the same name
+    # The four older samples are the bars to correct.
+    (flag,) = _history_flags(db)
+    assert (flag["security_id"], flag["severity"], flag["table_name"]) == (
+        sid,
+        "warn",
+        "core.daily_price",
+    )
+    assert flag["record_key"] == {"vendor": "sharadar", "vendor_key": "900200"}
+    d = flag["detail"]
+    assert (d["basis"], d["agreed"], d["of"]) == ("latest_price", 1, 5)
+    assert len(d["samples"]) == 4
+    assert all(date.fromisoformat(x["date"]) < SPLIT for x in d["samples"])
+    assert all(D(x["sharadar"]) == 2 * D(x["fmp"]) for x in d["samples"])
+    assert result.to_correct() == 1
+
+
+@pytestmark_integration
+def test_a_full_agreement_writes_no_history_flag_and_one_miss_does(db):
+    clean = _sec(db, "ZZOK", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900210", "ZZOK", Y(2020, 1, 2), Y(2020, 12, 31))
+    one_off = _sec(db, "ZZONE", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900211", "ZZONE", Y(2020, 1, 2), Y(2020, 12, 31))
+    first = Y(2020, 1, 2)
+    _, src = _source(
+        {
+            "ZZOK": close_of,
+            "ZZONE": lambda d: close_of(d) + 1 if d == first else close_of(d),
+        }
+    )
+    by = _by_symbol(vl.link(db, src))
+    assert by["ZZOK"].reason == by["ZZONE"].reason == "price_history"
+    (flag,) = _history_flags(db)
+    assert flag["security_id"] == one_off != clean
+    assert [x["date"] for x in flag["detail"]["samples"]] == ["2020-01-02"]
+
+
+@pytestmark_integration
+def test_the_latest_sample_needs_one_winner(db):
+    # Two candidates agree on the latest sample only: no identifier, ambiguous.
+    _sec(db, "ZZTW", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900220", "ZZTW", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900221", "ZZTW2", Y(2020, 1, 2), Y(2020, 12, 31), related=["ZZTW"])
+    # One with the latest agreeing, one without: the first is linked.
+    _sec(db, "ZZTX", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900222", "ZZTX", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900223", "ZZTX2", Y(2020, 1, 2), Y(2020, 12, 31), related=["ZZTX"])
+    _, src = _source(
+        {
+            "ZZTW": back_adjusted,
+            "ZZTW2": back_adjusted,
+            "ZZTX": back_adjusted,
+            "ZZTX2": lambda d: close_of(d, 60.0),
+        }
+    )
+    by = _by_symbol(vl.link(db, src))
+    assert (by["ZZTW"].outcome, by["ZZTW"].reason) == ("ambiguous", "several_agree")
+    assert {c["vendor_key"] for c in by["ZZTW"].candidates} == {"900220", "900221"}
+    assert (by["ZZTX"].reason, by["ZZTX"].vendor_key) == ("latest_price", "900222")
+
+
+@pytestmark_integration
+def test_an_identifier_links_when_no_sample_agrees(db):
+    sid = _sec(db, "ZZID", Y(2020, 1, 2), Y(2020, 12, 31), cusip="999999AB1")
+    _vendor(db, "900230", "ZZID", Y(2020, 1, 2), Y(2020, 12, 31), cusips=["999999AB1"])
+    _vendor(db, "900231", "ZZID2", Y(2020, 1, 2), Y(2020, 12, 31), related=["ZZID"])
+    # Two candidates sharing one CIK decide nothing.
+    _sec(db, "ZZCK", Y(2020, 1, 2), Y(2020, 12, 31), cik="888")
+    _vendor(db, "900232", "ZZCK", Y(2020, 1, 2), Y(2020, 12, 31), cik="888")
+    _vendor(
+        db,
+        "900233",
+        "ZZCK2",
+        Y(2020, 1, 2),
+        Y(2020, 12, 31),
+        related=["ZZCK"],
+        cik="0000000888",
+    )
+    off = lambda d: close_of(d, 70.0)  # noqa: E731
+    _, src = _source({t: off for t in ("ZZID", "ZZID2", "ZZCK", "ZZCK2")})
+    by = _by_symbol(vl.link(db, src))
+    assert (by["ZZID"].reason, by["ZZID"].vendor_key) == ("identifier", "900230")
+    link = _links(db)[sid]
+    assert link["match_method"] == "identifier"
+    assert (link["evidence"]["agreed"], link["confidence"]) == (0, D("0.100"))
+    assert len(_history_flags(db)[0]["detail"]["samples"]) == 5
+    assert (by["ZZCK"].outcome, by["ZZCK"].reason) == ("unmatched", "price_disagrees")
+
+
+@pytestmark_integration
+def test_a_held_key_won_on_the_latest_sample_is_a_duplicate(db):
+    holder = _sec(db, "ZZHD", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900240", "ZZHD", Y(2020, 1, 2), Y(2020, 12, 31))
+    db.execute(
+        "INSERT INTO core.security_vendor_xref (security_id, vendor, vendor_key, "
+        "valid_from, match_method, created_by) VALUES (%s, 'sharadar', '900240', "
+        "'2020-01-02', 'manual', 'tester')",
+        (holder,),
+    )
+    dup = _sec(
+        db,
+        "ZZHD2",
+        Y(2020, 1, 2),
+        Y(2020, 12, 31),
+        tickers=[
+            ("ZZHD2", Y(2020, 1, 2), None),
+            ("ZZHD", Y(2019, 1, 2), Y(2019, 12, 31)),
+        ],
+    )
+    _, src = _source({"ZZHD": back_adjusted})
+    (o,) = vl.link(db, src).outcomes
+    assert (o.security_id, o.reason) == (dup, "duplicate_of_linked")
+    assert o.candidates == [{"vendor_key": "900240", "linked_security": holder}]
+    assert _history_flags(db) == []
+
+
+# ---------------------------------------------------------------------------
 # Runs: dry, repeated, incremental
 # ---------------------------------------------------------------------------
 
@@ -559,7 +738,10 @@ def test_a_dry_run_writes_nothing(db):
     _sec(db, "ZZU", Y(2020, 1, 2), Y(2020, 12, 31))
     _, src = _source({"ZZD": close_of})
     result = vl.link(db, src, dry_run=True)
-    assert result.counts() == {("linked", None): 1, ("unmatched", "no_candidate"): 1}
+    assert result.counts() == {
+        ("linked", "price_history"): 1,
+        ("unmatched", "no_candidate"): 1,
+    }
     assert result.run_id is None
     assert _links(db) == {} and _flags(db) == []
     assert db.fetchval("SELECT count(*) FROM ops.ingestion_run") == 0
@@ -580,7 +762,7 @@ def test_a_rerun_converges_and_a_new_outcome_resolves_the_old_flag(db):
     # closes the flag.
     prices["ZZR"] = close_of
     third = vl.link(db, src)
-    assert third.counts() == {("linked", None): 1}
+    assert third.counts() == {("linked", "price_history"): 1}
     assert _flags(db) == []
     (closed,) = _flags(db, "resolved")
     assert closed["resolved_by"] == "fafnir vendor link"
@@ -591,7 +773,7 @@ def test_a_rerun_converges_and_a_new_outcome_resolves_the_old_flag(db):
         "ORDER BY ingestion_run_id"
     )
     assert [r["rows_inserted"] for r in runs] == [0, 0, 1, 0]
-    assert runs[2]["params"]["outcomes"] == {"linked": 1}
+    assert runs[2]["params"]["outcomes"] == {"linked:price_history": 1}
 
 
 @pytestmark_integration

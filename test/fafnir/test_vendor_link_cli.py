@@ -306,7 +306,7 @@ def test_show_evaluates_a_link_with_its_samples(db, monkeypatch):
     fake = FakeCloses({"ZZH"})
     monkeypatch.setattr(cli, "_link_closes", lambda cfg, db_, prices: lambda n: fake)
     out = _run(db, monkeypatch, "show", "--security-id", str(sid), "--evaluate")
-    assert "Engine today: linked -> 900060" in out.output
+    assert "Engine today: linked (price_history) -> 900060" in out.output
     assert out.output.count(" fmp ") == 5
     monkeypatch.setattr(
         cli,

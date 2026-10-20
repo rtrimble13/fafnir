@@ -1033,6 +1033,36 @@ survivor), or a manual link (#63).
 
 ---
 
+## `vendor_history_disagrees` — a linked security's history to correct
+
+Warn. `fafnir vendor link` linked the security, and some of its sampled raw
+closes disagree with Sharadar's `closeunadj`. Sharadar is the reliable vendor
+(plan decision of 2026-10-20), so the disagreeing bars are what to correct. The
+record key is `{"vendor": "sharadar", "vendor_key": ...}`. `detail` has the link's
+`basis`, `agreed` of `of`, and the disagreeing `samples` (date, `fmp`, `sharadar`).
+Vendor data: never posted.
+
+- **`basis = price_history`** (4 of 5 agree): one old bar off, usually a split or a
+  bad print on one side.
+- **`basis = latest_price`:** only the latest sample agrees. A constant ratio
+  before some date is FMP history back-adjusted and stored as raw. Noise is
+  another instrument's prices under the ticker.
+- **`basis = identifier`:** no sample agrees, and a shared CIK or CUSIP made the
+  link.
+
+**Diagnose.** `fafnir vendor link show <SYM> --evaluate` prints the link, its
+basis and the samples. Before you trust a `latest_price` or `identifier` link,
+compare the names: the confidence is low on purpose.
+
+**Decide.** A wrong link is a `vendor link reject` (it closes the link): propose
+it, never run it. A right link with a wrong history waits for the correction from
+Sharadar (#66, #75), which replaces the bars under ADR 0015 and keeps each
+replaced bar in `ops.vendor_correction`.
+
+**Close with:** that correction, once the sampled dates agree, or the rejection.
+
+---
+
 ## The `dorq_*` family — dorq's judgement of a bar
 
 Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**
