@@ -615,6 +615,38 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.
 
+**The vendor-assisted path (#68).** When Sharadar knows the dead issuer, mint it from
+Sharadar rather than as an operator row, so it carries its permaticker and Sharadar
+can fill the dates FMP never had. `fafnir vendor overlap` finds these cases before
+anything is minted: it flags the FMP security `vendor_history_overlap` (`kind =
+dead_issuer`) with the dead issuer's permaticker, the overlapping range, its bar
+count and five sampled closes against Sharadar's.
+
+```bash
+fafnir vendor overlap --dry-run                       # counts; writes nothing
+fafnir vendor overlap                                 # flag, refresh, resolve
+fafnir dq list --check vendor_history_overlap --detail
+```
+
+Then, for a flag whose samples agree (the FMP row holds the dead issuer's bars):
+1. `fafnir vendor mint-delisted --permaticker K --allow-overlap` (#71) mints the dead
+   issuer's row, empty, with `source = sharadar` and its link.
+2. `fafnir security split-history --security-id <fmp> --from … --to …
+   --into-security-id <minted row> -m "..." --dry-run`, then without `--dry-run`, moves
+   FMP's bars for that era onto it. The destination is empty, so nothing conflicts,
+   and FMP's bars keep `source = fmp`.
+3. The Sharadar backfill (#75) then fills only the dates FMP never had.
+
+Do **not** use `--new-symbol` here: it mints an operator row, which no vendor feeds.
+
+Two other cases:
+- **The FMP row is the dead issuer** (it is delisted, unlinked, and the samples agree):
+  link it with `vendor link accept` instead of minting a second row.
+- **The samples disagree:** the bars are another issuer's. Mint the dead issuer with
+  `--allow-overlap` and move nothing.
+
+The next `vendor overlap` resolves a flag once its overlap is gone.
+
 ### Venue transfers
 
 A company that moves its listing to another exchange and keeps its ticker can
