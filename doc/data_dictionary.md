@@ -184,7 +184,7 @@ happened (ADR 0007).
 | `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. |
 | `currency` | TEXT | |
-| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the reconciliation does not compare it against the feed. |
+| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the reconciliation does not compare it against the feed. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 

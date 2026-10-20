@@ -470,6 +470,44 @@ candidates decline, and the row stays withdrawn. A match is deleted through
 inline — a delete leaves no row stamped with the run, so `adjust --changed` cannot
 see it.
 
+### Splits and dividends from Sharadar (#73)
+
+`fafnir ingest sharadar-actions` reads the ledger's current ACTIONS file and writes
+its `split` and `dividend` rows to `core.corporate_action` as `source = 'sharadar'`.
+Its other actions are lifecycle events, already in `core.vendor_security_event`
+(#58). Two modes, either or both:
+
+| Mode | For | What it writes |
+|---|---|---|
+| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71) | every split and dividend |
+| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: an action inside the link's span (its `valid_from` to the last bar), and never within 7 days of an action of the same type another source holds |
+
+- **The conversions** are #56's: a split's value is new shares per old
+  (`split_ratio`), and a dividend's is split-adjusted, so it is multiplied by the
+  product of the splits after its ex-date (`as_declared_dividend`). Two dividends on
+  one ex-date, a regular and a special, are summed; identical rows count once.
+- **Precedence, never a correction.** A key another party holds is left alone, an
+  operator's above all, and a key an operator deleted is set aside. An FMP dividend
+  dated a few days from Sharadar's is the same event: `--gap-fill` skips it
+  (`near_existing`) rather than store it twice. Correcting it is #75's
+  `vendor correct`.
+- **Never a future ex-date** (ADR 0007), the same guard as `ingest actions`.
+- **Spin-offs are not adjusted.** ACTIONS records them, and they are kept as events
+  in `core.vendor_security_event`; fafnir has never adjusted for them, and does not
+  start here.
+- **Factors.** It recomputes the factors of the securities it changed itself,
+  because `adjust --changed` reads FMP's actions runs. A security with no bars yet
+  (a dead issuer before #75 loads its prices) waits: `fafnir adjust` after the price
+  backfill covers it. `--no-adjust` skips the step.
+
+```bash
+fafnir ingest sharadar-actions --backfill --gap-fill --dry-run   # counts per reason
+fafnir ingest sharadar-actions --backfill --gap-fill
+```
+
+One `ops.ingestion_run` (`sharadar` / `actions`), a commit per 1,000 securities. A
+re-run writes nothing new.
+
 ## The adjustment step
 
 `fafnir adjust` recomputes `core.adjustment_factor` from `core.corporate_action`:

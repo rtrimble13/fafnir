@@ -542,6 +542,88 @@ def ingest_delisted(ctx, full):
     )
 
 
+@ingest.command("sharadar-actions")
+@click.option(
+    "--backfill",
+    is_flag=True,
+    help="Every split and dividend of the securities Sharadar feeds (minted).",
+)
+@click.option(
+    "--gap-fill",
+    is_flag=True,
+    help="Fill-only for the FMP securities linked to Sharadar.",
+)
+@click.option("--symbols", help="Comma-separated tickers: only these securities.")
+@click.option("--dry-run", is_flag=True, help="Plan and print counts; write nothing.")
+@click.option(
+    "--no-adjust",
+    is_flag=True,
+    help="Do not recompute the factors of the securities it changed.",
+)
+@click.pass_context
+def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust):
+    """Load Sharadar's splits and dividends into core.corporate_action (#73).
+
+    \b
+      fafnir ingest sharadar-actions --backfill --dry-run
+      fafnir ingest sharadar-actions --backfill --gap-fill
+
+    Reads the ledger's current ACTIONS file under [sharadar] bulk_dir. --backfill
+    loads every split and dividend of the securities Sharadar feeds (the minted
+    dead issuers); --gap-fill adds, fill-only, what an FMP security linked to
+    Sharadar lacks: inside the link's span, and never within 7 days of an action
+    of the same type another source holds. Written as source sharadar under
+    precedence, never as a correction; a future ex-date is never stored. One
+    ops.ingestion_run (sharadar/actions); the factors of the securities it changed
+    are recomputed, for those with bars.
+    """
+    from collections import Counter
+
+    from fafnir.db import repository as repo
+    from fafnir.ingest import sharadar_actions as sa
+
+    if not (backfill or gap_fill):
+        raise click.ClickException("Give --backfill, --gap-fill or both.")
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        ids = None
+        if symbols:
+            ids, missing = [], []
+            for sym in _split_symbols(symbols):
+                sid = repo.resolve_security_id(database, sym)
+                (ids.append(sid) if sid is not None else missing.append(sym))
+            if missing:
+                raise click.ClickException(f"No security for: {', '.join(missing)}")
+        try:
+            result = sa.load(
+                database,
+                cfg.sharadar_bulk_dir,
+                backfill=backfill,
+                gap_fill=gap_fill,
+                security_ids=ids,
+                dry_run=dry_run,
+                adjust=not no_adjust,
+            )
+        except (sa.ActionsError, FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    kinds = Counter(p.action_type for p in result.planned)
+    head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+    click.echo(
+        f"{head} {result.securities} securities in scope; "
+        f"{kinds['split']} splits and {kinds['dividend']} dividends to write"
+        + ("" if dry_run else f"; {result.written} new or changed")
+    )
+    for reason, n in sorted(result.skipped.items()):
+        if n:
+            click.echo(f"  skipped {reason:<16} {n}")
+    if not dry_run and result.changed_security_ids:
+        click.echo(
+            f"  factors recomputed for {result.adjusted} securities; "
+            f"{result.awaiting_prices} await their prices (#75)"
+        )
+
+
 @ingest.command("sharadar-master")
 @click.option(
     "--from-file",

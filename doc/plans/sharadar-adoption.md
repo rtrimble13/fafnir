@@ -260,6 +260,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P2, #73: Sharadar's splits and dividends.** `fafnir ingest sharadar-actions [--backfill]
+  [--gap-fill] [--symbols] [--dry-run] [--no-adjust]` writes ACTIONS' splits and dividends as `source =
+  'sharadar'`: every one for the securities Sharadar feeds (`--backfill`), and fill-only for the linked FMP
+  securities (`--gap-fill`), inside the link's span and never within 7 days of another source's action of the
+  same type. No future ex-date; a regular and a special on one date are summed.
+  - **Departures from the issue:**
+    - no `correct=True` path: the issue tied it to the reconcile queue, which is gone (#66 folded into #75). A
+      disagreeing FMP action is counted `near_existing`, for #75's `vendor correct`;
+    - the command recomputes the factors of what it changed itself, for securities with bars, because
+      `adjust --changed` reads FMP's actions runs only;
+    - `--gap-fill` added a guard the issue did not name: the 7-day window, so a date the vendors disagree on
+      cannot store one dividend twice (data-semantics §19 is the same failure within FMP).
+  - **Next.** On the host, after #75 loads the dead issuers' prices: `--backfill --gap-fill --dry-run`, then the
+    real run.
 - **2026-10-20 · #70 (optional): the excision report.** `scripts/reset_data.sh --scope vendor:sharadar [--bulk-dir P]`
   is plan v2's report, not the issue's v1 deletion. It counts the rows Sharadar supplied (`source =
   'sharadar'`) and the rows that hold its data (master, events, links and `vendor_*` flags, whose evidence
