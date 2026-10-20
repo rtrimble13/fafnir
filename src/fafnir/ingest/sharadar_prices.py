@@ -100,17 +100,28 @@ def ratio_agrees(close: Decimal, closeunadj: Decimal, expected: Decimal) -> bool
     return abs(closeunadj / close / expected - 1) <= tolerance
 
 
+def recovery_factor(row: dict, splits) -> tuple[Optional[Decimal], Optional[bool]]:
+    """The factor a bar is recovered with, and whether the vendor's ratio agreed
+    with ACTIONS: the ACTIONS split product where it does, else ``closeunadj /
+    close``. ``(None, None)`` when the row has no price to recover from."""
+    close, unadj = row.get("close"), row.get("closeunadj")
+    if close is None or unadj is None or close <= 0 or unadj <= 0:
+        return None, None
+    expected = sharadar_map.split_product_after(splits, row["date"])
+    if ratio_agrees(close, unadj, expected):
+        return expected, True
+    return unadj / close, False
+
+
 def recovered_bar(row: dict, splits) -> tuple[dict, Optional[bool]]:
     """The raw bar, shaped as the FMP loader's validator reads one, and whether the
     vendor's ratio agreed with ACTIONS (None when there was no close to test)."""
     day = row["date"]
-    close, unadj = row.get("close"), row.get("closeunadj")
-    if close is None or unadj is None or close <= 0 or unadj <= 0:
+    factor, agrees = recovery_factor(row, splits)
+    if factor is None:
         # No price to recover from: the validator quarantines it as such.
         return {"date": day.isoformat(), "close": None}, None
-    expected = sharadar_map.split_product_after(splits, day)
-    agrees = ratio_agrees(close, unadj, expected)
-    raw = sharadar_map.recover_raw(row, factor=expected if agrees else None)
+    raw = sharadar_map.recover_raw(row, factor=factor if agrees else None)
     return {
         "date": day.isoformat(),
         "open": raw["open"],
@@ -226,32 +237,18 @@ def _load_run(
     db.commit()
 
 
-def load(
-    db: Database,
-    bulk_dir: str | Path,
-    *,
-    backfill: bool,
-    gap_fill: bool,
-    security_ids: Optional[Sequence[int]] = None,
-    dry_run: bool = False,
-    adjust: bool = True,
-    as_of: Optional[date] = None,
-) -> PricesResult:
-    """Read the files once each and, unless ``dry_run``, write (one run)."""
-    as_of = as_of or date.today()
-    result = PricesResult(dry_run=dry_run)
-    targets = [
-        t
-        for t in repo.vendor_action_targets(db, VENDOR, security_ids)
-        if (backfill and t["is_feed"])
-        or (gap_fill and not t["is_feed"] and t["source"] == "fmp")
-    ]
-    result.securities = len(targets)
+def prepare(
+    db: Database, bulk_dir: str | Path, targets: Sequence[dict], counts: Counter
+) -> tuple[dict, dict, dict]:
+    """For linked securities (:func:`repo.vendor_action_targets` rows): which file
+    and ticker hold each one's prices (``{table: {ticker: _Target}}``), the current
+    file of each table needed (``{table: file_id}``), and every target by key, its
+    ACTIONS splits read. A key with no priced row is counted ``no_priced_row``."""
     where = repo.vendor_tickers(db, VENDOR, [t["vendor_key"] for t in targets])
     by_file: dict[str, dict[str, _Target]] = {table: {} for table in TABLES}
     for t in targets:
         if t["vendor_key"] not in where:
-            result.counts["no_priced_row"] += 1
+            counts["no_priced_row"] += 1
             continue
         table, ticker = where[t["vendor_key"]]
         by_file[table][ticker] = _Target(
@@ -285,6 +282,31 @@ def load(
                 (d, v) for d, v in found.get(key, {}).get("split", ()) if v and v > 0
             ]
             t.splits = list(dict(splits).items())  # one per ex-date
+    return by_file, files, keys
+
+
+def load(
+    db: Database,
+    bulk_dir: str | Path,
+    *,
+    backfill: bool,
+    gap_fill: bool,
+    security_ids: Optional[Sequence[int]] = None,
+    dry_run: bool = False,
+    adjust: bool = True,
+    as_of: Optional[date] = None,
+) -> PricesResult:
+    """Read the files once each and, unless ``dry_run``, write (one run)."""
+    as_of = as_of or date.today()
+    result = PricesResult(dry_run=dry_run)
+    targets = [
+        t
+        for t in repo.vendor_action_targets(db, VENDOR, security_ids)
+        if (backfill and t["is_feed"])
+        or (gap_fill and not t["is_feed"] and t["source"] == "fmp")
+    ]
+    result.securities = len(targets)
+    by_file, files, keys = prepare(db, bulk_dir, targets, result.counts)
 
     def scan(run: Optional[RunLog]) -> None:
         for table, file_id in files.items():

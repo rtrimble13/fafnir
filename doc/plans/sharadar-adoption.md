@@ -260,6 +260,19 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P2, #75 (part 2): `fafnir vendor correct`.** For every FMP security linked to Sharadar,
+  compares its bars with Sharadar's (recovered raw, from the link's `valid_from`) and replaces the ones whose
+  close differs by more than max($0.01, 1 bp), or whose open/high/low differ by more than that and the
+  recovery's rounding. Each replacement goes through the precedence correction path into
+  `ops.vendor_correction`, revertible; operator-edited bars are never touched. `vendor_history_disagrees`
+  flags resolve once their sampled dates agree.
+  - **`--dry-run` is #69's report:** compared and differing bars by asset type, exchange and decade, and the
+    FMP/Sharadar volume ratio on agreeing bars (exact shares within 1% and 5%; median and deciles from a
+    seeded 100,000-ratio sample, so memory stays bounded on the full warehouse).
+  - **Volume stays FMP's** (`--volume keep`) until the dry run decides the convention; `--volume sharadar`
+    is there for when it does. The decision goes in the decision log.
+  - **Next.** On the host: `vendor correct --dry-run`, post its counts on #75, decide volume, then the real
+    run.
 - **2026-10-20 · P2, #75 (part 1) and #74: Sharadar's bars.** `fafnir ingest sharadar-prices [--backfill]
   [--gap-fill] [--symbols] [--dry-run] [--no-adjust]` writes SEP/SFP bars as `source = 'sharadar'`, raw
   recovered: the whole history of the securities Sharadar feeds, and fill-only the dates a linked FMP security

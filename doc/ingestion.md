@@ -512,6 +512,37 @@ fafnir ingest sharadar-prices --backfill --gap-fill
 fafnir ingest sharadar-actions --backfill --gap-fill            # then the actions
 ```
 
+### Correcting FMP's bars from Sharadar (#75)
+
+Sharadar is the more reliable vendor (plan decision of 2026-10-20), so an FMP bar
+that disagrees with Sharadar's is corrected. `fafnir vendor correct` reads, for every
+FMP security linked to Sharadar, the vendor's bars, recovers them raw as above, and
+compares them with the FMP bars on the dates both hold, from the link's `valid_from`.
+
+- **A bar differs** when its close is off by more than max($0.01, 1 bp), or its
+  open, high or low by more than that and the recovery's own rounding
+  (0.0005 × the split factor).
+- **It is replaced through the correction path** (ADR 0015 §3): the FMP row goes to
+  `ops.vendor_correction` first, `reason = reconcile_divergence`, and `fafnir vendor
+  corrections revert` puts it back. An operator-edited bar is never corrected, and
+  a recovered bar that fails validation is not offered.
+- **Volume stays FMP's** by default (`--volume keep`). Whether the vendors count it
+  the same way (consolidated against primary-exchange) is a convention, and the dry
+  run measures it; `--volume sharadar` takes the vendor's once that is decided.
+- **`vendor_history_disagrees`** flags resolve once every date they sample agrees.
+- The factors of the corrected securities that hold actions are recomputed.
+
+`--dry-run` writes nothing and is the comparison report that replaced #69: bars
+compared and bars that differ, by asset type, exchange and decade, and the volume
+ratio (FMP over Sharadar) on the bars whose prices agree (median, deciles, share
+within 1% and 5%). Counts only: safe to post.
+
+```bash
+fafnir vendor correct --dry-run          # the report; post it on #75
+fafnir vendor correct                    # after the volume decision
+fafnir vendor corrections list --limit 20
+```
+
 ### Splits and dividends from Sharadar (#73)
 
 `fafnir ingest sharadar-actions` reads the ledger's current ACTIONS file and writes
