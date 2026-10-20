@@ -764,7 +764,7 @@ Both decisions survive the engine:
 | Flag reason | Usual decision |
 |---|---|
 | `several_agree` | Reject the share class or duplicate that is not this security; the engine links the other. Or `accept` the right one when the evidence is outside the prices (CUSIP on a filing). |
-| `duplicate_of_linked` | Another row of the linked security's issuer, usually a missed rename: fold it into `linked_security` with `security merge-rename` (dry run first). |
+| `duplicate_of_linked` | Another row of the linked security's issuer, usually a missed rename: fold it into `linked_security` with `security merge <security_id> <linked_security>` (dry run first). It moves the Sharadar link and any history the linked row lacks, and refuses when an identifier differs (a rename's new CUSIP) or the overlapping bars disagree: in #64 it merged 13 of 319 active duplicates and refused 306, which stay flagged. |
 | `key_claimed_twice` | The same, with no live claimant on the vendor's current ticker: fold the rows; the next run links the survivor. |
 | `price_disagrees` | Compare `duk -S db ph <SYM>` with `duk -S sharadar ph <SYM>`. A constant ratio is a split on one side only: fix that, then rerun. Noise means a different issuer: `reject`. |
 | `no_candidate`, `insufficient_overlap` | Nothing to accept unless you know the key from elsewhere. Then `accept` with the evidence in `-m`. |

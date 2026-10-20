@@ -253,10 +253,38 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-18 | dorq integration unchanged by this plan | this revision |
 | 2026-10-18 | **Subscribed**: Sharadar Bundle, max history, annual, from 2026-10-18 to 2027-10-18. Renewal reminder **2027-09-18** (30 days ahead: a lapse triggers the licence's 30-day deletion clause). Key in `/etc/fafnir/fafnir.env` on the host, never an rc file | #57 |
 | 2026-10-19 | **First production population** of the Sharadar files and the vendor master, on the host (#59). This date replaces plan v1's "parallel-run session 1" | #59 |
+| 2026-10-20 | **#64's gate recorded as it stands: 4.8% of active non-fund securities unlinked**, against the issue's < 1%. Every one carries a reason code, so P1's own criterion (≥ 99% linked *or explained*) holds. Further triage is not worth the effort: the residue is immaterial, and half of it is duplicate rows of linked issuers. The 126 identifier links without price support are kept, at their low confidence | #64 |
 | 2026-10-20 | **Sharadar is the more reliable vendor for identity linking.** FMP's history disagreeing with Sharadar's is a correction to make, not a reason to withhold a link: `vendor link` links on the latest sample or a shared identifier when the history disagrees, and flags the history `vendor_history_disagrees`. The identity evidence must still not rest on FMP's history | #62 |
 
 ## [built] notes
 
+- **2026-10-20 · P1, #64: the hit rate.** After run 399 and 13 merges:
+  - **Active, non-fund FMP securities:** 12,888; linked 12,265 (95.2%); unlinked 623 (4.8%).
+  - **The unlinked, by reason:**
+
+    | Reason | Securities | What it is |
+    |---|---|---|
+    | `duplicate_of_linked` | 302 | 315 before the merges: a second active row of a linked issuer. `security merge` refused 306 of 319 (an identifier or the overlapping bars differ) |
+    | `price_disagrees` | 92 | No basis decided |
+    | `no_candidate` | 75 | No Sharadar row shares a ticker over the span |
+    | `key_claimed_twice` | 64 | Rows of one issuer, none live on the vendor's ticker |
+    | `no_bars` | 48 | Shells with no history (`security dedupe`) |
+    | `insufficient_overlap` | 24 | Too short a shared span to sample |
+    | `several_agree` | 18 | Share classes or a vendor duplicate |
+
+  - **By asset type and exchange** (before the 13 merges), the linked share:
+
+    | | NASDAQ | AMEX | NYSE | CBOE | TXSE |
+    |---|---|---|---|---|---|
+    | equity | 92.4% of 3,922 | 89.8% of 294 | 96.7% of 2,123 | 1 of 1 | 7 of 7 |
+    | ETF | 97.2% of 1,437 | 96.2% of 3,244 | 98.8% of 80 | 95.8% of 1,792 | 1 of 1 |
+
+  - **Structural misses.** Mutual funds: 4,588 `not_covered_asset_type`, which Sharadar does not price.
+    CBOE ETFs are covered (95.8%): the BATS/CBOE gap the issue anticipated is not there. Delisted rows: 2,798
+    linked; the rest are mostly duplicates (667) and claimed keys (264).
+  - **The nightly `vendor link --new`** ran on 2026-10-20 (run 394).
+  - **Runbook correction.** `duplicate_of_linked` is folded with `security merge <id> <linked_security>`,
+    not `merge-rename`, which needs the old ticker live and keeps the old row.
 - **2026-10-20 · P1, #62: link when FMP's history is wrong.** Two bases after `price_history` (≥ 4 of 5):
   - `latest_price`: one candidate with four samples agrees on its latest. That is run 398's back-adjusted
     candidates and about 324 of the 807 non-monotonic securities.

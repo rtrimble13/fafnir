@@ -652,7 +652,7 @@ def _settle_double_claims(outcomes: dict[int, Outcome], securities: dict) -> Non
     serves under either. When exactly one claimant is live and trades under the
     vendor's current ticker (742 of 905 keys), it is the security: it is linked,
     and every other claimant is ``duplicate_of_linked``, naming it, for `security
-    merge-rename`. Otherwise no claimant is linked (``key_claimed_twice``).
+    merge`. Otherwise no claimant is linked (``key_claimed_twice``).
     """
     by_key: dict[str, list[Outcome]] = defaultdict(list)
     for o in outcomes.values():

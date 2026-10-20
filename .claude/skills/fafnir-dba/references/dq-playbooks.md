@@ -1022,7 +1022,11 @@ Warn. `fafnir vendor link` could not choose. `detail.reason`:
   vendor's current ticker). This row is another `security_id` for the same issuer,
   almost always a rename the loader missed: the old ticker's row and the new
   one's, each holding the history FMP serves under both. Fold it into the linked
-  security with `security merge-rename`, after a dry run and an explicit yes.
+  security with `security merge <security_id> <linked_security>`, after a dry run
+  and an explicit yes. The merge moves the link and the history the linked row
+  lacks. It refuses when an identifier differs (a rename's new CUSIP) or the
+  overlapping bars disagree, which it did for 306 of 319 in #64: propose `--force`
+  only with the blockers read and the operator's yes, never as a batch.
 - **`key_claimed_twice`:** as above, but no claimant is live on the current ticker
   (a chain of delisted rows, usually), so none was linked. `candidates` names the
   key and `also_claimed_by`. Fold the rows, then the next `vendor link` links the
