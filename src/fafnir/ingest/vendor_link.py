@@ -594,19 +594,20 @@ def _write(db: Database, outcomes: Sequence[Outcome], run: RunLog) -> None:
         )
         # Retire what no longer holds before writing what does: an open flag of
         # the other check, and one of the same check with another reason (it would
-        # otherwise keep its slot, and the new reason would never be written).
-        stale = [
-            f["dq_flag_id"]
-            for f in repo.list_dq_flags(
-                db,
-                repo.DqFilter(
-                    checks=(UNMATCHED, AMBIGUOUS), security_ids=(o.security_id,)
-                ),
-                limit=100,
+        # otherwise keep its slot, and the new reason would never be written). An
+        # open flag with the same check and reason is kept, its detail refreshed.
+        open_flags = repo.list_dq_flags(
+            db,
+            repo.DqFilter(checks=(UNMATCHED, AMBIGUOUS), security_ids=(o.security_id,)),
+            limit=100,
+        )
+        stale, same = [], []
+        for f in open_flags:
+            kept = (
+                f["check_name"] == current
+                and (f.get("detail") or {}).get("reason") == o.reason
             )
-            if f["check_name"] != current
-            or (f.get("detail") or {}).get("reason") != o.reason
-        ]
+            (same if kept else stale).append(f["dq_flag_id"])
         if stale:
             repo.resolve_dq_flags(
                 db,
@@ -625,6 +626,15 @@ def _write(db: Database, outcomes: Sequence[Outcome], run: RunLog) -> None:
                 confidence=o.confidence,
                 evidence=dict(o.evidence, run_id=run.run_id),
                 created_by=CREATED_BY,
+            )
+        elif same:
+            # The same condition, still open: keep the flag, refresh its evidence
+            # (a flag written before samples were kept has none).
+            repo.refresh_open_flag_detail(
+                db,
+                same[0],
+                {"reason": o.reason, "candidates": o.candidates},
+                run.run_id,
             )
         else:
             repo.add_dq_flag_once(

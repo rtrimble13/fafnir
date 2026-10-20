@@ -7013,3 +7013,21 @@ def vendor_link_at(
         """,
         (vendor, vendor_key, valid_from),
     )
+
+
+def refresh_open_flag_detail(
+    db: Database, dq_flag_id: int, detail: dict, ingestion_run_id: Optional[int]
+) -> int:
+    """Replace an OPEN flag's ``detail`` with fresher evidence for the same
+    condition, and point it at the run that found it. ``detected_at`` stays: the
+    condition is the same one, first seen then. Returns rows changed (0 when the
+    detail is already this, or the flag has been resolved meanwhile)."""
+    return db.execute(
+        """
+        UPDATE ops.data_quality_flag
+           SET detail = %s::jsonb, ingestion_run_id = %s
+         WHERE dq_flag_id = %s AND resolved_at IS NULL
+           AND detail IS DISTINCT FROM %s::jsonb
+        """,
+        (json.dumps(detail), ingestion_run_id, dq_flag_id, json.dumps(detail)),
+    )

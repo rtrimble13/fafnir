@@ -765,3 +765,38 @@ def test_a_new_reason_in_the_same_check_replaces_the_old_flag(db):
     assert old["resolved_by"] == "fafnir vendor link"
     vl.link(db, src)  # same reason again: nothing new, nothing closed
     assert len(_flags(db)) == 1 and len(_flags(db, "resolved")) == 1
+
+
+@pytestmark_integration
+def test_the_same_reason_refreshes_the_open_flags_evidence(db):
+    # Production, 2026-10-20: the first run's price_disagrees flags had no samples,
+    # and the next run, reaching the same reason, left them as they were.
+    sid = _sec(db, "ZZP", Y(2020, 1, 2), Y(2020, 12, 31))
+    _vendor(db, "900210", "ZZP", Y(2020, 1, 2), Y(2020, 12, 31))
+    repo.add_dq_flag_once(
+        db,
+        check_name="vendor_xref_unmatched",
+        severity="warn",
+        security_id=sid,
+        table_name="core.security_vendor_xref",
+        record_key={"vendor": "sharadar"},
+        detail={
+            "reason": "price_disagrees",
+            "candidates": [{"vendor_key": "900210", "agreed": 0, "of": 5}],
+        },
+    )
+    before = db.fetchone("SELECT dq_flag_id, detected_at FROM ops.data_quality_flag")
+    _, src = _source({"ZZP": lambda d: close_of(d, 90.0)})
+    result = vl.link(db, src)
+    (flag,) = _flags(db)
+    assert flag["detail"]["reason"] == "price_disagrees"
+    assert len(flag["detail"]["candidates"][0]["samples"]) == 5
+    after = db.fetchone(
+        "SELECT dq_flag_id, detected_at, ingestion_run_id FROM ops.data_quality_flag"
+    )
+    assert (after["dq_flag_id"], after["detected_at"]) == (
+        before["dq_flag_id"],
+        before["detected_at"],
+    )
+    assert after["ingestion_run_id"] == result.run_id
+    assert _flags(db, "resolved") == []

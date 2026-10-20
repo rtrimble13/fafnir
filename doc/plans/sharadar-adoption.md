@@ -256,6 +256,14 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P1, #62: run 397, and refreshed evidence.** The follow-up engine linked 746 more (14,683 in
+  all, 67%), with 4,590 mutual funds `not_covered_asset_type`, 782 `duplicate_of_linked`, 328
+  `key_claimed_twice`, 1,088 `price_disagrees`, 268 `no_candidate` and 108 `no_bars`.
+  - **The gap.** The split check on the samples returned nothing. The first run's `price_disagrees` flags
+    had no samples, and a run that reaches the same reason left the open flag untouched.
+  - **The fix.** It now refreshes that flag's `detail` in place: same id, same `detected_at`, this run's
+    evidence.
+  - **Next.** Re-run `fafnir vendor link`, then the split check.
 - **2026-10-19 · P1, #62 follow-up: what the first production run taught the engine.**
   - **The dry run** (21,903 securities): linked 13,937, `no_candidate` 4,826, `key_claimed_twice`
     1,852, `price_disagrees` 1,213, `insufficient_overlap` 47, `several_agree` 28.
