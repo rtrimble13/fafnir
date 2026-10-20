@@ -75,6 +75,7 @@ has nothing behind it.
 | `mart.security_latest` | the screening contract | **materialized, lagged** |
 | `mart.v_security_price_coverage` | span, bar count, close range, zero-volume bars | live — **use this, not a per-security probe** |
 | `mart.v_security_action_summary` | split/dividend counts and boundaries, factor state | live |
+| `mart.v_corporate_action` | splits and dividends, one row per event (passthrough of `corporate_action`, no lineage) | live |
 | `mart.v_security_dq_open` | open flags: counts, keys, dates — **never `detail`** | live |
 
 **`core.daily_price` is partitioned by year.** A per-security probe of it —

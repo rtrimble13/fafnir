@@ -410,6 +410,23 @@ References no *numeric* column of `core.adjustment_factor` (only `COUNT(*)` and
 would double that cost next time. A client wanting back-adjustment depth reads
 `price_factor` from `mart.v_daily_price_adjusted`.
 
+### `mart.v_corporate_action` — corporate actions, one row per event (VIEW)
+**Grain:** `(security_id, action_type, ex_date)`. **Source:** `core.corporate_action`
+(passthrough). Added by migration 0033 (#174).
+
+Columns: `corporate_action_id, security_id, action_type, ex_date, record_date,
+payment_date, declaration_date, split_numerator, split_denominator, dividend_amount,
+currency, source`. `action_type` is `split` or `dividend`; the ratios and the amount
+are `NUMERIC(20,6)`, as stored. `source` says which vendor supplied the row, or
+`operator` for one written by `fafnir actions add|redate` (ADR 0015 precedence).
+Lineage (`ingestion_run_id`, `loaded_at`) is left out, as in `mart.v_daily_price_raw`.
+
+The event-level counterpart of `mart.v_security_action_summary`, which aggregates and
+cannot say which dividends went ex between two dates. It is how a mart-only reader
+lists corporate actions: portable's `pt ca sync` reads it to compare its ledger with
+the warehouse. Like every `mart` view it is a grant to every reader (ADR 0009), and
+it depends on the three numeric columns, so re-typing them means recreating it too.
+
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
 
