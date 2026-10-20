@@ -6791,7 +6791,8 @@ def vendor_link_candidates(
     return db.fetchall(
         """
         SELECT v.vendor_key, v.vendor_table, v.ticker, v.name, v.cik, v.cusips,
-               v.first_price_date, v.last_price_date,
+               v.first_price_date, v.last_price_date, v.is_delisted, v.category,
+               v.exchange,
                ARRAY(
                    SELECT DISTINCT t FROM unnest(
                        ARRAY[v.ticker] || COALESCE(v.related_tickers, '{}')
@@ -6816,6 +6817,57 @@ def vendor_link_candidates(
         """,
         (vendor, list(tables)),
     )
+
+
+def overlap_scope(db: Database, vendor: str) -> list[dict]:
+    """Every FMP-minted security, linked or not: every ticker ``core.symbol_xref``
+    has held for it, the span of its bars, and the key of its open link to
+    ``vendor`` (None without one). What `vendor overlap` (#68) compares the vendor's
+    dead issuers with."""
+    return db.fetchall(
+        """
+        SELECT s.security_id, s.primary_symbol, s.company_name, s.delisted_date,
+               ARRAY(SELECT DISTINCT x.symbol FROM core.symbol_xref x
+                      WHERE x.security_id = s.security_id) AS tickers,
+               span.first_trade_date, span.last_trade_date,
+               (SELECT l.vendor_key FROM core.security_vendor_xref l
+                 WHERE l.security_id = s.security_id AND l.vendor = %s
+                   AND l.valid_to IS NULL
+                 ORDER BY l.valid_from DESC LIMIT 1) AS linked_key
+          FROM core.security s
+          LEFT JOIN LATERAL (
+                SELECT min(p.trade_date) AS first_trade_date,
+                       max(p.trade_date) AS last_trade_date
+                  FROM core.daily_price p
+                 WHERE p.security_id = s.security_id) span ON true
+         WHERE s.source = 'fmp'
+         ORDER BY s.security_id
+        """,
+        (vendor,),
+    )
+
+
+def count_bars_between(
+    db: Database, probes: Sequence[tuple[int, int, date, date]]
+) -> dict[int, int]:
+    """For each probe ``(id, security_id, lo, hi)``, how many bars the security
+    holds in ``lo..hi``: ``{id: count}``, every probe present."""
+    out: dict[int, int] = {}
+    for i in range(0, len(probes), 5000):
+        chunk = probes[i : i + 5000]
+        rows = db.fetchall(
+            """
+            SELECT t.probe,
+                   (SELECT count(*) FROM core.daily_price p
+                     WHERE p.security_id = t.sid
+                       AND p.trade_date BETWEEN t.lo AND t.hi) AS bars
+              FROM unnest(%s::int[], %s::bigint[], %s::date[], %s::date[])
+                   AS t(probe, sid, lo, hi)
+            """,
+            [list(c) for c in zip(*chunk)],
+        )
+        out.update({r["probe"]: int(r["bars"]) for r in rows})
+    return out
 
 
 def first_bars_on_or_after(

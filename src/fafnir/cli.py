@@ -4386,6 +4386,66 @@ def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
     click.echo(f"{head} {verb}: {sym} (security {sid}) is not {vendor_key}, by {by}.")
 
 
+@vendor.command("overlap")
+@click.option("--dry-run", is_flag=True, help="Find and print counts; write nothing.")
+@click.option(
+    "--prices",
+    type=click.Choice(["auto", "bulk", "api"]),
+    default="auto",
+    show_default=True,
+    help="Where Sharadar's closes come from, as for `vendor link`",
+)
+@click.pass_context
+def vendor_overlap(ctx, dry_run, prices):
+    """Flag the history a reused ticker glued onto an FMP security (#68).
+
+    \b
+      fafnir vendor overlap --dry-run       # counts; writes nothing
+      fafnir vendor overlap                 # flag, refresh, resolve
+
+    Run it before `vendor mint-delisted` (#71), which does not mint a permaticker
+    with an open vendor_history_overlap flag. Two kinds, on the FMP security:
+
+    \b
+      dead_issuer      it holds bars inside the span of a dead Sharadar issuer
+                       that shares one of its tickers; five sampled closes say
+                       whether they are that issuer's
+      earlier_history  it is linked, and its bars start over 30 days before
+                       its permaticker's
+
+    A run resolves the open flags whose overlap is gone. The samples are vendor
+    data: keep them on the host. See the vendor_history_overlap playbook and
+    doc/operations.md, "Separating two issuers held on one security".
+    """
+    from fafnir.ingest import vendor_link as vl
+    from fafnir.ingest import vendor_overlap as vo
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        try:
+            result = vo.scan(
+                database, _link_closes(cfg, database, prices), dry_run=dry_run
+            )
+        except vl.LinkError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+    click.echo(
+        f"{head} {result.dead_issuers} dead issuers evaluated"
+        + (
+            f"; Sharadar closes from {result.price_source}"
+            if result.price_source
+            else ""
+        )
+    )
+    for (kind, agreement), n in sorted(result.counts().items()):
+        click.echo(f"  {kind:<16} {agreement:<9} {n}")
+    click.echo(
+        f"  {result.flagged_keys()} permatickers held back from minting"
+        + ("" if dry_run else f"; {result.resolved} flags resolved")
+    )
+
+
 @vendor.group("corrections")
 def vendor_corrections():
     """Rows one vendor replaced in place of another's (ops.vendor_correction)."""

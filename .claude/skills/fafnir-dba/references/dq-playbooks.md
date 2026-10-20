@@ -1067,6 +1067,41 @@ replaced bar in `ops.vendor_correction`.
 
 ---
 
+## `vendor_history_overlap` — one FMP row holds another issuer's era
+
+Warn. `fafnir vendor overlap` (#68) found history a reused ticker glued onto an FMP
+security. FMP files every issuer of a ticker on the row that holds it today, so BID
+held Sotheby's 2003–2019 as well as its current issuer. The flag is on the FMP
+security. Its record key is `{"vendor": "sharadar", "vendor_key": K, "kind": ...}`,
+and `detail` has the range (`from`, `to`), its `bars`, and the security's own
+`linked_key`:
+
+| `kind` | Meaning | Extra `detail` |
+|---|---|---|
+| `dead_issuer` | A dead Sharadar issuer that #71 would mint (ADR 0016 §3) shares a ticker with this security, which holds bars inside its price span. #71 will not mint `K` while this is open | `agreed` of `of`, and the `samples` (date, `fmp`, `sharadar`) |
+| `earlier_history` | The security is linked to `K`, and its bars start over 30 days before `K`'s first price (where that is after Sharadar's December 1997 start) | none |
+
+**Diagnose.** Vendor data stays on the host; post counts only.
+- **`dead_issuer` with agreeing samples:** this row holds the dead issuer's bars.
+  - If the row is itself delisted and unlinked, it *is* the dead issuer: propose
+    `vendor link accept --vendor-key K` (rule 12: propose, never run).
+  - Otherwise propose the vendor-assisted path in
+    [operations.md](../../../../doc/operations.md#separating-two-issuers-held-on-one-security):
+    `vendor mint-delisted --permaticker K --allow-overlap`, then `security
+    split-history … --into-security-id <minted row>`, each with `--dry-run` first.
+- **`dead_issuer` with disagreeing samples:** the bars are another issuer's. Minting
+  `K` with `--allow-overlap` moves nothing.
+- **`earlier_history`:** compare the bars just before `to` with those after it
+  (`duk -S db ph <SYM>`). A level jump where `K` begins is an earlier issuer: the
+  same split, into a row minted for that issuer (if Sharadar knows it, it shows up
+  as a `dead_issuer` flag too). A smooth history means FMP has more of this
+  issuer than Sharadar does: `dq accept` with the evidence.
+
+**Close with:** the repair, after which the next `vendor overlap` resolves the flag
+(it resolves every open flag whose overlap is gone); or `dq accept` with a note.
+
+---
+
 ## The `dorq_*` family — dorq's judgement of a bar
 
 Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**

@@ -260,6 +260,22 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P1, #68: overlap detection before minting.** `fafnir vendor overlap [--dry-run]` flags
+  `vendor_history_overlap` on the FMP security, in two kinds:
+  - **`dead_issuer`:** a dead issuer #71 would mint (`vendor_overlap.mintable`, ADR 0016 §3) shares a ticker
+    with an FMP security, linked or not, that holds bars inside its price span. The flag has the range, the
+    bar count and five sampled closes, so an agreeing row (holds the dead issuer's bars) is told from a
+    disagreeing one (another issuer's). #71 must not mint a permaticker with an open flag.
+  - **`earlier_history`:** a linked security whose bars start over 30 days before its permaticker's first
+    price, where that is after Sharadar's December 1997 start.
+  - **Departures from the issue:**
+    - the check runs on every FMP security, not only the live ones, since a delisted row carries the same
+      glue;
+    - a full run also resolves the flags whose overlap is gone, so the queue follows the repairs;
+    - a dead issuer whose FMP row *is* that issuer (delisted, unlinked, agreeing) is a `vendor link accept`,
+      not a mint; the playbook says so.
+  - **Not done:** the issue's "playbook dry-run on a staging copy". There is no staging database (plan v2),
+    and the playbook's first step is #71's. The flags' counts come from the first host run.
 - **2026-10-20 · P1, #67: the identity ADR.** [ADR 0016](../adr/0016-sharadar-identity-and-survivorship-floor.md)
   records three decisions:
   - the permaticker is the identity authority from cutover, and `security_id` stays fafnir's key;
