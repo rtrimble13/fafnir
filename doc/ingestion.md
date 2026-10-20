@@ -661,6 +661,10 @@ What it could not link shaped three rules:
 - When a security's outcome changes, its open flag of the other kind, or of the
   same kind with another reason, is resolved (`resolved_by = fafnir vendor
   link`), and the new one written. A link resolves both kinds.
+- When the outcome is the same, the open flag is kept (same id, same
+  `detected_at`) and its `detail` is refreshed with this run's evidence and run
+  id. That is how flags written before the samples were kept (the first production
+  run's) come to hold them.
 
 **Sharadar's closes.**
 - **A full run** reads the ledger's current SEP and SFP files, one filtered pass
