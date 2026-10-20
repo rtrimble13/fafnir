@@ -1060,7 +1060,7 @@ compare the names: the confidence is low on purpose.
 
 **Decide.** A wrong link is a `vendor link reject` (it closes the link): propose
 it, never run it. A right link with a wrong history waits for the correction from
-Sharadar (#66, #75), which replaces the bars under ADR 0015 and keeps each
+Sharadar (#75), which replaces the bars under ADR 0015 and keeps each
 replaced bar in `ops.vendor_correction`.
 
 **Close with:** that correction, once the sampled dates agree, or the rejection.

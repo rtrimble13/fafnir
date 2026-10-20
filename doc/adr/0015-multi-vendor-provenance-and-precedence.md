@@ -118,6 +118,11 @@ comparison (#69) sorts every divergence into a category. It checks a sample of e
 category against an outside reference and states, per category, whether to correct it
 in bulk, document it as a convention, or leave it flagged.
 
+*Amended 2026-10-20 (plan decision log):* Sharadar wins on price, so there is no
+per-category policy and no separate reconciliation. `fafnir vendor correct` (#75)
+finds the differing FMP bars of linked securities and corrects them; the one
+convention checked first is volume (#69). #66 is folded into #75.
+
 ### 4. Vendor attributes stay in vendor tables
 
 Sharadar's names, sectors, identifiers, category and delisting reasons live in

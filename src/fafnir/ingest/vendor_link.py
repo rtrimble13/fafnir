@@ -41,7 +41,7 @@ For each FMP-minted security without an open Sharadar link:
      (``several_agree``).
    - **A link whose samples disagree** anywhere also gets
      ``vendor_history_disagrees``, naming those dates: the bars Sharadar's are to
-     replace (#66, #75), audited in ``ops.vendor_correction``.
+     replace (#75), audited in ``ops.vendor_correction``.
    - **The one that agrees is held** by another security's open link: the
      security is another row of the holder's issuer (``duplicate_of_linked``,
      naming it).
@@ -104,7 +104,7 @@ ENDPOINT_FULL = "link"
 ENDPOINT_NEW = "link:new"
 UNMATCHED = "vendor_xref_unmatched"
 AMBIGUOUS = "vendor_xref_ambiguous"
-#: A link whose sampled history disagrees: the bars to correct (#66, #75).
+#: A link whose sampled history disagrees: the bars to correct (#75).
 HISTORY = "vendor_history_disagrees"
 #: Above this many candidates, read the bulk files rather than the API.
 API_MAX_CANDIDATES = 200
