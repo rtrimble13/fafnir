@@ -6786,7 +6786,8 @@ def vendor_link_candidates(
 ) -> list[dict]:
     """The vendor's master rows in ``tables``, each with every ticker it is known
     by (its own, ``related_tickers``, and the other side of its ticker changes)
-    and whether an open link already holds its key."""
+    and whether an open link already holds its key (``taken``, and ``held_by``:
+    the holding security)."""
     return db.fetchall(
         """
         SELECT v.vendor_key, v.vendor_table, v.ticker, v.name, v.cik, v.cusips,
@@ -6802,10 +6803,15 @@ def vendor_link_candidates(
                                                     'tickerchangeto')
                                    AND e.contra_ticker IS NOT NULL)) AS t
                ) AS aliases,
-               EXISTS (SELECT 1 FROM core.security_vendor_xref l
-                        WHERE l.vendor = v.vendor AND l.vendor_key = v.vendor_key
-                          AND l.valid_to IS NULL) AS taken
+               h.security_id IS NOT NULL AS taken,
+               h.security_id AS held_by
           FROM core.vendor_security v
+          LEFT JOIN LATERAL (
+                SELECT l.security_id FROM core.security_vendor_xref l
+                 WHERE l.vendor = v.vendor AND l.vendor_key = v.vendor_key
+                   AND l.valid_to IS NULL
+                 ORDER BY l.security_id
+                 LIMIT 1) h ON TRUE
          WHERE v.vendor = %s AND v.vendor_table = ANY(%s)
         """,
         (vendor, list(tables)),

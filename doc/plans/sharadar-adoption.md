@@ -256,6 +256,22 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P1, #62: run 398 lost the duplicates.** All 782 `duplicate_of_linked` flags of run 397 were
+  replaced: 511 by `no_candidate` and 259 by `price_disagrees`.
+  - **The cause.** Run 397 linked each key's live claimant, so on run 398 that key was held, and a held key
+    was no candidate for anything. The duplicate row lost the only key that agreed with it.
+  - **The fix.** A held key is now price-tested like any other but never won. When it is the one that
+    agrees, the security is `duplicate_of_linked`, naming the holder, which is the verdict run 397 reached.
+  - **Next.** Re-run `fafnir vendor link`: the 782 should come back as `duplicate_of_linked`.
+  - **The adjust check on run 398's samples** (aggregates):
+    - 544 candidates are FMP history back-adjusted against Sharadar's raw closes, on the right issuer.
+    - Of the 807 securities whose every candidate is non-monotonic:
+      - one candidate whose latest sample agrees: 269;
+      - several candidates, exactly one agreeing on the latest sample: 55;
+      - nothing agreeing on the latest sample: 480.
+    - Sharadar is the more reliable vendor (decision of 2026-10-20), so these are mostly FMP history
+      errors, not other issuers. The next change links on the latest sample or an identifier and puts the
+      disagreeing history on a correction worklist.
 - **2026-10-20 · P1, #62: run 397, and refreshed evidence.** The follow-up engine linked 746 more (14,683 in
   all, 67%), with 4,590 mutual funds `not_covered_asset_type`, 782 `duplicate_of_linked`, 328
   `key_claimed_twice`, 1,088 `price_disagrees`, 268 `no_candidate` and 108 `no_bars`.

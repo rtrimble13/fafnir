@@ -624,7 +624,9 @@ manual or the engine's, is never moved.
    - A dead issuer's reused ticker is found through `related_tickers`: its history
      is filed under `CLA1`, and 3,304 of the 3,331 suffixed TICKERS rows list the
      root.
-   - A permaticker another open link holds is not a candidate.
+   - A permaticker another open link holds is tested like any other, but never
+     won: when it is the one that agrees, the security is another row of the
+     holder's issuer (`duplicate_of_linked`, naming the holder).
    - A permaticker a person rejected for the security (`vendor link reject`, #63) is
      never a candidate for it.
    - A ticker is compared with `.` read as `-`. Sharadar writes 505 share classes
@@ -639,7 +641,7 @@ manual or the engine's, is never moved.
 | Outcome | When | Written |
 |---|---|---|
 | linked | one candidate agrees on ≥ 4 of 5 samples; or several do and exactly one shares an identifier | a link: `match_method = ticker_span_price`, `valid_from` the overlap's start, confidence `0.9 × agreed/sampled + 0.1 × corroboration` (1 for an identifier, else the name similarity) |
-| ambiguous | several agree with no identifier to choose (`several_agree`); one permaticker wins for several securities: the live one on the vendor's current ticker is linked and the others are `duplicate_of_linked` (a missed rename's rows, for `security merge-rename`), and with no such claimant none is linked (`key_claimed_twice`) | `vendor_xref_ambiguous` |
+| ambiguous | several agree with no identifier to choose (`several_agree`); one permaticker wins for several securities: the live one on the vendor's current ticker is linked and the others are `duplicate_of_linked` (a missed rename's rows, for `security merge-rename`), and with no such claimant none is linked (`key_claimed_twice`); the one that agrees is already held by another security's open link (`duplicate_of_linked`, so a later run reaches the same verdict as the run that linked the holder) | `vendor_xref_ambiguous` |
 | unmatched | `no_candidate`; `no_bars` (no span to compare: a re-mint shell); `price_disagrees` (a candidate had 4+ samples); `insufficient_overlap` (none did); `not_covered_asset_type` at `info` (a mutual fund: `asset_type = 'fund'`, or `is_fund` and not an ETF with no candidate) | `vendor_xref_unmatched` |
 
 **Evidence.** The sampled dates and both prices are kept in the link's `evidence`

@@ -731,7 +731,8 @@ fafnir vendor link reject --security-id 1234 --vendor-key 199058 \
 - `candidate`;
 - `rejected`;
 - `no_overlap`: the ticker matches, but the dates never meet;
-- `taken`: another security's open link holds the key.
+- `taken`: another security's open link holds the key. The engine still tests it: if it
+  agrees, the security is `duplicate_of_linked`, naming the holder.
 
 `--evaluate` prints the sampled closes. They are vendor data: keep them on the host.
 
