@@ -4446,6 +4446,69 @@ def vendor_overlap(ctx, dry_run, prices):
     )
 
 
+@vendor.command("mint-delisted")
+@click.option("--dry-run", is_flag=True, help="Plan and print counts; write nothing.")
+@click.option("--permaticker", help="Mint this one dead issuer only.")
+@click.option(
+    "--allow-overlap",
+    is_flag=True,
+    help="With --permaticker: mint it despite an open vendor_history_overlap flag.",
+)
+@click.option("--limit", type=int, default=0, help="Mint at most this many (0 = all).")
+@click.pass_context
+def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit):
+    """Mint the issuers that died before fafnir first ran, from Sharadar (#71).
+
+    \b
+      fafnir vendor overlap                          # first, after a master load
+      fafnir vendor mint-delisted --dry-run          # counts; writes nothing
+      fafnir vendor mint-delisted
+      fafnir vendor mint-delisted --permaticker 199057 --allow-overlap
+
+    Mints a core.security row (source sharadar, delisted, no prices yet) for each
+    dead Sharadar issuer ADR 0016 admits, with a closed ticker period per ticker it
+    traded under and a minted, feeding link to its permaticker. A permaticker with
+    an open vendor_history_overlap flag is held back: its history is already on an
+    FMP security (the split-history playbook in doc/operations.md). A re-run mints
+    nothing new. Refuses to run until `vendor overlap` has run since the master
+    was last loaded.
+    """
+    from fafnir.ingest import vendor_mint as vm
+
+    if allow_overlap and not permaticker:
+        raise click.ClickException("--allow-overlap needs --permaticker.")
+    with Database(ctx.obj["config"].dsn) as database:
+        try:
+            result = vm.mint(
+                database,
+                permaticker=permaticker,
+                allow_overlap=allow_overlap,
+                limit=limit,
+                dry_run=dry_run,
+            )
+        except vm.MintError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    if dry_run:
+        click.echo(
+            f"Dry run: nothing written. {len(result.mints)} to mint; "
+            f"{result.held_back} held back by vendor_history_overlap."
+        )
+    else:
+        click.echo(
+            f"Run {result.run_id}. Minted {result.minted}; {result.held_back} held "
+            f"back by vendor_history_overlap; {result.unclassified} without a sector "
+            f"or industry fafnir knows; {result.periods_skipped} ticker periods "
+            "skipped (another row starts that ticker on that date)."
+        )
+    for what in ("category", "exchange", "death year"):
+        counts = result.by(what)
+        if counts:
+            click.echo(f"By {what}:")
+            for key, n in sorted(counts.items(), key=lambda kv: str(kv[0])):
+                click.echo(f"  {str(key):<40} {n}")
+
+
 @vendor.group("corrections")
 def vendor_corrections():
     """Rows one vendor replaced in place of another's (ops.vendor_correction)."""

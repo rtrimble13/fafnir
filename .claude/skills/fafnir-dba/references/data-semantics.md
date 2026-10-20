@@ -53,6 +53,16 @@ companies that stopped trading, with every bar.
 Filter `is_actively_trading` unless you specifically want the historical
 universe. When you do include them, say so.
 
+**Issuers that died before fafnir first ran** are minted from Sharadar
+(`core.security.source = 'sharadar'`, #71) when they last traded on or after
+1998-01-01. Until the Sharadar backfill (#75) loads them, those rows hold **no
+bars**: a count of delisted securities is larger than the set with history. Before
+1998 no vendor records delistings, so a cross-section is survivor-only there
+(ADR 0016).
+
+> **Wrong answer:** "the warehouse has no survivorship bias" for a pre-1998 date,
+> or a delisted universe whose bars are assumed to exist because the row does.
+
 ## 5. One `security_id` survives a rename
 
 FB → META keeps one `security_id` and one continuous price history. The ticker

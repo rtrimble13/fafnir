@@ -67,6 +67,17 @@ def get_or_create_sector(db: Database, name: Optional[str]) -> Optional[int]:
     )
 
 
+def classification_names(db: Database) -> tuple[list[str], list[str]]:
+    """Every sector and industry name fafnir's vocabulary holds."""
+    return (
+        [r["sector_name"] for r in db.fetchall("SELECT sector_name FROM ref.sector")],
+        [
+            r["industry_name"]
+            for r in db.fetchall("SELECT industry_name FROM ref.industry")
+        ],
+    )
+
+
 def get_or_create_industry(db: Database, name: Optional[str]) -> Optional[int]:
     if not name:
         return None
@@ -6792,7 +6803,7 @@ def vendor_link_candidates(
         """
         SELECT v.vendor_key, v.vendor_table, v.ticker, v.name, v.cik, v.cusips,
                v.first_price_date, v.last_price_date, v.is_delisted, v.category,
-               v.exchange,
+               v.exchange, v.sector, v.industry,
                ARRAY(
                    SELECT DISTINCT t FROM unnest(
                        ARRAY[v.ticker] || COALESCE(v.related_tickers, '{}')
@@ -6910,15 +6921,16 @@ def insert_vendor_link(
     evidence: dict,
     created_by: str,
     note: Optional[str] = None,
+    is_feed: bool = False,
 ) -> None:
-    """Open a link from a security to a vendor key (never a feed: #98 assigns
-    feeds)."""
+    """Open a link from a security to a vendor key. Only a security the vendor
+    minted (#71) is fed from the start; #98 assigns every other feed."""
     db.execute(
         """
         INSERT INTO core.security_vendor_xref
             (security_id, vendor, vendor_key, valid_from, match_method, confidence,
-             evidence, created_by, note)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+             evidence, created_by, note, is_feed)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
         """,
         (
             security_id,
@@ -6930,7 +6942,48 @@ def insert_vendor_link(
             json.dumps(evidence, default=str, sort_keys=True),
             created_by,
             note,
+            is_feed,
         ),
+    )
+
+
+def vendor_events(
+    db: Database, vendor: str, keys: Sequence[str], actions: Sequence[str]
+) -> list[dict]:
+    """The vendor's ``actions`` events for ``keys``, oldest first."""
+    return db.fetchall(
+        """
+        SELECT vendor_key, event_date, action, ticker, contra_ticker
+          FROM core.vendor_security_event
+         WHERE vendor = %s AND vendor_key = ANY(%s) AND action = ANY(%s)
+         ORDER BY vendor_key, event_date, action
+        """,
+        (vendor, list(keys), list(actions)),
+    )
+
+
+def insert_symbol_period(
+    db: Database,
+    *,
+    security_id: int,
+    symbol: str,
+    valid_from: date,
+    valid_to: Optional[date],
+    source: str,
+) -> bool:
+    """One ticker period in ``core.symbol_xref``; False when another security's
+    period already starts on that ticker and date (the primary key). A closed
+    period never meets the open-period index."""
+    return bool(
+        db.execute(
+            """
+            INSERT INTO core.symbol_xref
+                (security_id, symbol, valid_from, valid_to, source)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, valid_from) DO NOTHING
+            """,
+            (security_id, symbol, valid_from, valid_to, source),
+        )
     )
 
 
