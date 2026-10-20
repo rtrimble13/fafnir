@@ -342,6 +342,18 @@ def test_two_rows_of_one_issuer_link_the_live_one_and_name_the_duplicate(db):
     assert flag["detail"]["candidates"] == [
         {"vendor_key": "900020", "linked_security": new}
     ]
+    # The next run finds the key held by the live row, tests it all the same, and
+    # reaches the same verdict: the flag stays open (run 398 lost all 782).
+    (o,) = vl.link(db, src).outcomes
+    assert (o.security_id, o.outcome, o.reason) == (
+        old,
+        "ambiguous",
+        "duplicate_of_linked",
+    )
+    assert o.candidates == [{"vendor_key": "900020", "linked_security": new}]
+    (again,) = _flags(db)
+    assert again["detail"] == flag["detail"]
+    assert _flags(db, "resolved") == []
 
 
 @pytestmark_integration
@@ -469,7 +481,7 @@ def test_several_agree_an_identifier_decides_else_ambiguous(db):
 
 
 @pytestmark_integration
-def test_a_link_is_never_moved_and_a_held_key_is_no_candidate(db):
+def test_a_link_is_never_moved_and_a_held_key_is_tested_but_never_won(db):
     manual = _sec(db, "ZZM", Y(2020, 1, 2), Y(2020, 12, 31))
     other = _sec(
         db,
@@ -503,20 +515,36 @@ def test_a_link_is_never_moved_and_a_held_key_is_no_candidate(db):
     result = vl.link(db, src)
     assert result.outcomes == [] and result.already_linked == 2
     assert {r["vendor_key"] for r in _links(db).values()} == {"999999", "900050"}
-    # A third security on the held key's ticker: that key is not a candidate.
+    # A third security on the held key's ticker, another issuer's prices: the key
+    # is tested, disagrees, and the flag names its holder.
     third = _sec(
         db,
         "ZZM3",
         Y(2020, 1, 2),
         Y(2020, 12, 31),
+        level=70.0,
         tickers=[
             ("ZZM3", Y(2020, 1, 2), None),
             ("ZZM", Y(2018, 1, 2), Y(2018, 12, 31)),
         ],
     )
     (o,) = vl.link(db, src).outcomes
-    assert (o.security_id, o.reason) == (third, "no_candidate")
-    assert o.candidates == [{"taken_key": "900050"}]
+    assert (o.security_id, o.reason) == (third, "price_disagrees")
+    (c,) = o.candidates
+    assert (c["vendor_key"], c["held_by"], c["agreed"]) == ("900050", other, 0)
+    # One whose bars never meet the held key's: no candidate, the key named.
+    fourth = _sec(
+        db,
+        "ZZM4",
+        Y(2022, 1, 3),
+        Y(2022, 12, 30),
+        tickers=[
+            ("ZZM4", Y(2022, 1, 3), None),
+            ("ZZM", Y(2017, 1, 3), Y(2017, 12, 29)),
+        ],
+    )
+    (o,) = [o for o in vl.link(db, src).outcomes if o.security_id == fourth]
+    assert (o.reason, o.candidates) == ("no_candidate", [{"taken_key": "900050"}])
 
 
 # ---------------------------------------------------------------------------

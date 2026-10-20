@@ -15,9 +15,9 @@ For each FMP-minted security without an open Sharadar link:
    side of a ticker change. They must also have a price history overlapping the
    security's own bars. A ticker is compared with ``.`` read as ``-`` (Sharadar's
    ``BRK.B`` is FMP's ``BRK-B``). A key a person rejected for this security
-   (``core.security_vendor_rejection``, #63) is never a candidate for it, and a key
-   another open link already holds is not a candidate;
-   the engine never moves a link, manual or not.
+   (``core.security_vendor_rejection``, #63) is never a candidate for it. A key
+   another open link already holds is tested like any other, but never won: the
+   engine never moves a link, manual or not.
 2. **The decisive test.** The overlap is cut into five equal windows, and the
    security's first stored bar in each is the sample. Its raw close must match
    Sharadar's ``closeunadj`` on the same date within max($0.01, 1 bp).
@@ -26,8 +26,11 @@ For each FMP-minted security without an open Sharadar link:
 4. **Decision.**
    - **One candidate agrees** on at least four samples: link it
      (``ticker_span_price``, confidence 0.9 × agreement + 0.1 × corroboration).
-   - **Several agree:** the one with an identifier match is linked if it is the
+   - **Several agree:** the one with an identifier match is chosen if it is the
      only one; otherwise ``vendor_xref_ambiguous`` (``several_agree``).
+   - **The one that agrees is held** by another security's open link: the
+     security is another row of the holder's issuer (``duplicate_of_linked``,
+     naming it).
    - **One key, several securities:** the claimant that is live and trades under
      the vendor's current ticker is linked, and the others are
      ``duplicate_of_linked`` (a missed rename's two rows); with no such claimant
@@ -286,29 +289,36 @@ class LinkResult:
         return Counter((o.outcome, o.reason) for o in self.outcomes)
 
 
-def _index(candidates: Iterable[dict]) -> tuple[dict, dict]:
-    """``alias -> [candidate]`` for open keys, and ``alias -> [key]`` for taken."""
-    free, taken = defaultdict(list), defaultdict(list)
+def _index(candidates: Iterable[dict]) -> dict:
+    """``alias -> [candidate]``, held keys included."""
+    by_alias = defaultdict(list)
     for c in candidates:
         for alias in _keys(c["aliases"]):
-            (
-                taken[alias].append(c["vendor_key"])
-                if c["taken"]
-                else free[alias].append(c)
-            )
-    return free, taken
+            by_alias[alias].append(c)
+    return by_alias
 
 
-def _candidates_for(security: dict, free: dict, rejected=frozenset()) -> list[dict]:
+def _matched(security: dict, by_alias: dict) -> list[dict]:
+    """Every vendor row sharing a ticker with the security, once each."""
     seen, out = set(), []
-    sid = security["security_id"]
     for ticker in sorted(_keys(security["tickers"])):
-        for c in free.get(ticker, ()):
-            key = c["vendor_key"]
-            if key not in seen and (sid, key) not in rejected and overlap(security, c):
-                seen.add(key)
+        for c in by_alias.get(ticker, ()):
+            if c["vendor_key"] not in seen:
+                seen.add(c["vendor_key"])
                 out.append(c)
     return out
+
+
+def _candidates_for(security: dict, by_alias: dict, rejected=frozenset()) -> list[dict]:
+    """The rows to price-test: not rejected for it, and overlapping its bars. A
+    held key is one of them, so a second row of its holder's issuer is named as
+    such (``duplicate_of_linked``) rather than left with no candidate."""
+    sid = security["security_id"]
+    return [
+        c
+        for c in _matched(security, by_alias)
+        if (sid, c["vendor_key"]) not in rejected and overlap(security, c)
+    ]
 
 
 def ticker_matches(
@@ -351,7 +361,7 @@ def evaluate(
 ) -> tuple[list[Outcome], Optional[str]]:
     """Decide every security; writes nothing. Returns the outcomes and the name of
     the price source used (None when no price was needed)."""
-    free, taken = _index(candidates)
+    by_alias = _index(candidates)
     outcomes: dict[int, Outcome] = {}
     pairs: list[tuple[dict, dict, list[tuple[date, date]]]] = []
     for s in securities:
@@ -359,14 +369,22 @@ def evaluate(
         if s["asset_type"] == "fund":
             outcomes[sid] = Outcome(sid, sym, "unmatched", "not_covered_asset_type")
             continue
-        cands = _candidates_for(s, free, rejected)
+        cands = _candidates_for(s, by_alias, rejected)
         if not cands:
-            held = sorted({k for t in _keys(s["tickers"]) for k in taken.get(t, ())})
-            matched = {
-                c["vendor_key"] for t in _keys(s["tickers"]) for c in free.get(t, ())
-            }
-            said_no = sorted(k for k in matched if (sid, k) in rejected)
-            apart = sorted(k for k in matched if (sid, k) not in rejected)
+            matched = _matched(s, by_alias)
+            said_no = sorted(
+                c["vendor_key"] for c in matched if (sid, c["vendor_key"]) in rejected
+            )
+            held = sorted(
+                c["vendor_key"]
+                for c in matched
+                if c["taken"] and (sid, c["vendor_key"]) not in rejected
+            )
+            apart = sorted(
+                c["vendor_key"]
+                for c in matched
+                if not c["taken"] and (sid, c["vendor_key"]) not in rejected
+            )
             outcomes[sid] = Outcome(
                 sid,
                 sym,
@@ -470,7 +488,7 @@ def _summary(r: dict) -> dict:
     database (vendor data, never posted) and are what tells a split on one side
     (a constant ratio) from a different issuer (noise)."""
     c = r["candidate"]
-    return {
+    out = {
         "vendor_key": c["vendor_key"],
         "vendor_table": c["vendor_table"],
         "ticker": c["ticker"],
@@ -479,6 +497,9 @@ def _summary(r: dict) -> dict:
         "identifier": r["identifier"],
         "samples": _sample_json(r["samples"]),
     }
+    if c["taken"]:
+        out["held_by"] = c.get("held_by")
+    return out
 
 
 def _decide(s: dict, results: list[dict]) -> Outcome:
@@ -507,6 +528,16 @@ def _decide(s: dict, results: list[dict]) -> Outcome:
         )
     (r,) = passing
     c = r["candidate"]
+    if c["taken"]:
+        return Outcome(
+            sid,
+            sym,
+            "ambiguous",
+            "duplicate_of_linked",
+            candidates=[
+                {"vendor_key": c["vendor_key"], "linked_security": c.get("held_by")}
+            ],
+        )
     corroboration = (
         1.0
         if r["identifier"]
