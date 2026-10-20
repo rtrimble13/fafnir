@@ -1059,11 +1059,14 @@ basis and the samples. Before you trust a `latest_price` or `identifier` link,
 compare the names: the confidence is low on purpose.
 
 **Decide.** A wrong link is a `vendor link reject` (it closes the link): propose
-it, never run it. A right link with a wrong history waits for the correction from
-Sharadar (#75), which replaces the bars under ADR 0015 and keeps each
-replaced bar in `ops.vendor_correction`.
+it, never run it. A right link with a wrong history is `fafnir vendor correct`
+(#75), which replaces the disagreeing bars under ADR 0015 and keeps each replaced
+bar in `ops.vendor_correction`. It is a bulk write: propose the operator's run,
+with `--dry-run` first; do not run it yourself.
 
-**Close with:** that correction, once the sampled dates agree, or the rejection.
+**Close with:** `vendor correct`, which resolves the flag itself once every sampled
+date agrees; or the rejection. A sampled date it did not correct is an
+operator-edited bar or a bar Sharadar's own data fails validation on: report it.
 
 ---
 

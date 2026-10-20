@@ -801,7 +801,7 @@ Both decisions survive the engine:
 | `price_disagrees` | Compare `duk -S db ph <SYM>` with `duk -S sharadar ph <SYM>`. A constant ratio is a split on one side only: fix that, then rerun. Noise means a different issuer: `reject`. |
 | `no_candidate`, `insufficient_overlap` | Nothing to accept unless you know the key from elsewhere. Then `accept` with the evidence in `-m`. |
 | `no_bars` | A shell with no history: `security dedupe`. |
-| `vendor_history_disagrees` | Not a link question: the security is linked, and its samples listed in `detail.samples` disagree with Sharadar. The bars are corrected from Sharadar under ADR 0015 (#75), each replaced bar kept in `ops.vendor_correction`. If the link itself looks wrong (`basis` `latest_price` or `identifier`, the confidence low, and the name differs), `reject` the key. |
+| `vendor_history_disagrees` | Not a link question: the security is linked, and its samples listed in `detail.samples` disagree with Sharadar. `fafnir vendor correct` replaces them from Sharadar under ADR 0015, each replaced bar kept in `ops.vendor_correction`, and resolves the flag once every sampled date agrees ([ingestion.md](ingestion.md#correcting-fmps-bars-from-sharadar-75)). If the link itself looks wrong (`basis` `latest_price` or `identifier`, the confidence low, and the name differs), `reject` the key. |
 | `not_covered_asset_type` | A mutual fund (about 4,600 in production); Sharadar does not price them. `dq accept` them, with a note. |
 
 ## Reconciliation

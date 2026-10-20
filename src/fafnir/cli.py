@@ -4551,6 +4551,105 @@ def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
     click.echo(f"{head} {verb}: {sym} (security {sid}) is not {vendor_key}, by {by}.")
 
 
+@vendor.command("correct")
+@click.option("--symbols", help="Comma-separated tickers: only these securities.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Compare and print the report; write nothing. Counts only: safe to post.",
+)
+@click.option(
+    "--volume",
+    type=click.Choice(["keep", "sharadar"]),
+    default="keep",
+    show_default=True,
+    help="A corrected bar's volume: FMP's, or Sharadar's",
+)
+@click.option(
+    "--no-adjust",
+    is_flag=True,
+    help="Do not recompute the factors of the corrected securities.",
+)
+@click.pass_context
+def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
+    """Replace the FMP bars that disagree with Sharadar's, audited (#75).
+
+    \b
+      fafnir vendor correct --dry-run       # the comparison report (#69's)
+      fafnir vendor correct
+      fafnir vendor corrections list        # what it replaced; `revert` undoes one
+
+    For every FMP security linked to Sharadar, compares its bars with Sharadar's,
+    recovered raw as `ingest sharadar-prices` does, on the dates both hold from the
+    link's start. A bar whose close differs by more than max($0.01, 1 bp), or whose
+    open, high or low differs by more than that and the recovery's rounding, is
+    replaced through the correction path: the FMP row is kept in
+    ops.vendor_correction. Operator-edited bars are never corrected. Volume stays
+    FMP's unless --volume sharadar. Resolves a vendor_history_disagrees flag once
+    every date it samples agrees. One ops.ingestion_run (sharadar/correct).
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import sharadar_prices as sp
+    from fafnir.ingest import vendor_correct as vc
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        ids = None
+        if symbols:
+            ids, missing = [], []
+            for sym in _split_symbols(symbols):
+                sid = repo.resolve_security_id(database, sym)
+                (ids.append(sid) if sid is not None else missing.append(sym))
+            if missing:
+                raise click.ClickException(f"No security for: {', '.join(missing)}")
+        try:
+            result = vc.correct(
+                database,
+                cfg.sharadar_bulk_dir,
+                security_ids=ids,
+                dry_run=dry_run,
+                volume=volume,
+                adjust=not no_adjust,
+            )
+        except (sp.PricesError, FileNotFoundError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+    click.echo(
+        f"{head} {result.securities} linked securities; {result.read} vendor rows "
+        f"read; {result.counts['differ']} bars differ"
+        + (
+            ""
+            if dry_run
+            else f"; {result.corrected} corrected, {result.flags_resolved} "
+            "vendor_history_disagrees flags resolved"
+        )
+    )
+    for reason, n in sorted(result.counts.items()):
+        if n and reason != "differ":
+            click.echo(f"  {reason:<40} {n}")
+    for what in ("asset_type", "exchange", "decade"):
+        cells = result.by.get(what) or {}
+        if not cells:
+            continue
+        click.echo(f"By {what.replace('_', ' ')}:  compared  differ")
+        for key in sorted(cells):
+            b = cells[key]
+            share = f"{100 * b.differ / b.compared:.2f}%" if b.compared else "-"
+            click.echo(f"  {key:<12} {b.compared:>10} {b.differ:>8}  {share}")
+    summary = result.volume_summary()
+    if summary:
+        click.echo(
+            "Volume, FMP / Sharadar, on agreeing-price bars: "
+            f"{summary['bars']} bars, median {summary['median']}, "
+            f"p10 {summary['p10']}, p90 {summary['p90']}, "
+            f"{100 * summary['within_1pct']:.1f}% within 1%, "
+            f"{100 * summary['within_5pct']:.1f}% within 5%"
+        )
+    if not dry_run and result.corrected_security_ids:
+        click.echo(f"  factors recomputed for {result.adjusted} securities")
+
+
 @vendor.command("overlap")
 @click.option("--dry-run", is_flag=True, help="Find and print counts; write nothing.")
 @click.option(

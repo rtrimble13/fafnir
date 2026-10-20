@@ -612,7 +612,7 @@ deleted under that vendor's licence, like `landing.fmp_raw`.
 | `old_source` / `new_source` | TEXT CHECK | The party replaced and the one that replaced it. They differ, and `old_source` is never `operator`. |
 | `old_row` | JSONB | The replaced row's value columns, `ingestion_run_id` and `loaded_at`: what a revert writes back. |
 | `new_row` | JSONB | The values the correction wrote. A revert refuses when the row no longer holds them. |
-| `reason` | TEXT CHECK | `reconcile_divergence`; `gap_fill` and `restatement` are reserved for the loaders that will use them. |
+| `reason` | TEXT CHECK | `reconcile_divergence`, written by `fafnir vendor correct` (#75) for an FMP bar Sharadar's disagreed with; `gap_fill` and `restatement` are reserved for the loaders that will use them. |
 | `ingestion_run_id` | BIGINT | The correcting run, when it has one. |
 | `corrected_at` | TIMESTAMPTZ | |
 | `reverted_at` / `reverted_by` / `revert_note` | | Set by `vendor corrections revert`; `reverted_at` and `reverted_by` are set together. |
