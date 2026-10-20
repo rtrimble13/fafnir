@@ -6947,6 +6947,53 @@ def insert_vendor_link(
     )
 
 
+def vendor_action_targets(
+    db: Database, vendor: str, security_ids: Optional[Sequence[int]] = None
+) -> list[dict]:
+    """Every security with an open link to ``vendor``: the key, the link's start,
+    whether the vendor feeds it, who minted it, and the span of its bars (None
+    without bars). What `ingest sharadar-actions` (#73) loads actions for."""
+    return db.fetchall(
+        """
+        SELECT l.security_id, l.vendor_key, l.valid_from, l.is_feed, s.source,
+               s.primary_symbol, span.first_trade_date, span.last_trade_date
+          FROM core.security_vendor_xref l
+          JOIN core.security s USING (security_id)
+          LEFT JOIN LATERAL (
+                SELECT min(p.trade_date) AS first_trade_date,
+                       max(p.trade_date) AS last_trade_date
+                  FROM core.daily_price p
+                 WHERE p.security_id = l.security_id) span ON true
+         WHERE l.vendor = %s AND l.valid_to IS NULL
+           AND (%s::bigint[] IS NULL OR l.security_id = ANY(%s::bigint[]))
+         ORDER BY l.security_id
+        """,
+        (
+            vendor,
+            list(security_ids) if security_ids is not None else None,
+            list(security_ids) if security_ids is not None else None,
+        ),
+    )
+
+
+def action_dates(db: Database, security_ids: Sequence[int]) -> list[dict]:
+    """``(security_id, action_type, ex_date, source)`` of every stored action of
+    these securities."""
+    out: list[dict] = []
+    ids = list(security_ids)
+    for i in range(0, len(ids), 5000):
+        out.extend(
+            db.fetchall(
+                """
+                SELECT security_id, action_type, ex_date, source
+                  FROM core.corporate_action WHERE security_id = ANY(%s)
+                """,
+                (ids[i : i + 5000],),
+            )
+        )
+    return out
+
+
 def vendor_events(
     db: Database, vendor: str, keys: Sequence[str], actions: Sequence[str]
 ) -> list[dict]:
