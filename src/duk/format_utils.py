@@ -20,6 +20,8 @@ float on the way in -- which would erase any scale the database applied anyway.
 from __future__ import annotations
 
 import math
+import numbers
+from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 import pandas as pd
@@ -140,3 +142,34 @@ def round_price_columns(
             lambda v: round_price(v, decimals=decimals, fallback_sig=fallback_sig)
         )
     return out
+
+
+def exact_records(frame: pd.DataFrame) -> list[dict[str, Optional[str]]]:
+    """Rows of a ``price_history(exact=True)`` frame as exact text. `ph --exact`.
+
+    Every value is the text of what the warehouse stored: a NUMERIC price as
+    ``format(value, "f")``, so ``189.120000`` keeps its six places and never
+    takes a scientific form; a volume as its integer; the date as
+    ``YYYY-MM-DD``. A missing value is ``None``. A float here is refused, not
+    printed: it would mean the frame came through the float path, and printing
+    it as if it were exact is the thing ``--exact`` exists to rule out.
+    """
+    records: list[dict[str, Optional[str]]] = []
+    for row in frame.to_dict(orient="records"):
+        out: dict[str, Optional[str]] = {}
+        for column, value in row.items():
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                out[column] = None
+            elif column == "date":
+                out[column] = pd.Timestamp(value).date().isoformat()
+            elif isinstance(value, Decimal):
+                out[column] = format(value, "f")
+            elif isinstance(value, numbers.Integral) and not isinstance(value, bool):
+                out[column] = str(int(value))
+            else:
+                raise TypeError(
+                    f"{column}={value!r} ({type(value).__name__}) is not an exact "
+                    "decimal; --exact will not print it"
+                )
+        records.append(out)
+    return records

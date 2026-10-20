@@ -154,6 +154,32 @@ precision, `--json` stays numeric, and `-o` files are written unrounded unless y
 pass `-p` explicitly -- they feed the `ti`/`rc` compute path, where quantizing a
 sub-dollar series would introduce real error.
 
+### Exact prices: `--exact`
+
+The DataFrame behind `ph` is floating point, so `--json` prints a stored
+`13247980.736555` as `13247980.7365550008`. That is fine for a chart and wrong
+for a program that keeps money exact, which then has to round the noise back
+off at a scale it has to know.
+
+`--exact` prints every value as the text the warehouse stores. Prices keep their
+scale (`189.120000`), volume is an integer, and dates are `YYYY-MM-DD`. In
+`--json` the numbers are strings, so a reader that parses JSON numbers as floats
+cannot round one by accident:
+
+```bash
+duk -S db ph isin:US0378331005 --close --json --exact -s 2024-01-02 -e 2024-01-03
+[{"date": "2024-01-02", "close": "185.640000"}, {"date": "2024-01-03", "close": "184.250000"}]
+```
+
+It is refused (exit 2) wherever it cannot be kept, rather than printing something
+rounded under its name:
+- with a vendor source (FMP and Sharadar send floats);
+- with any `--frequency` but `day` (resampling computes new bars);
+- with `--summary`;
+- with `-p` (every stored digit is printed).
+
+portable reads prices this way (its ADR 0029).
+
 ## Naming a security by identifier
 
 Anywhere `duk` takes a ticker, it also takes a **CIK, ISIN or CUSIP**, written
