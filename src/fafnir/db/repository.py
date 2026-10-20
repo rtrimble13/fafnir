@@ -6976,6 +6976,33 @@ def vendor_action_targets(
     )
 
 
+def vendor_tickers(
+    db: Database, vendor: str, keys: Sequence[str]
+) -> dict[str, tuple[str, str]]:
+    """``vendor_key -> (vendor_table, ticker)`` for the vendor's priced rows
+    (``stocks``, ``funds``): which file and which ticker hold a key's prices."""
+    rows = db.fetchall(
+        """
+        SELECT vendor_key, vendor_table, ticker FROM core.vendor_security
+         WHERE vendor = %s AND vendor_key = ANY(%s)
+           AND vendor_table IN ('stocks', 'funds')
+        """,
+        (vendor, list(keys)),
+    )
+    return {r["vendor_key"]: (r["vendor_table"], r["ticker"]) for r in rows}
+
+
+def price_dates(db: Database, security_id: int) -> set[date]:
+    """Every date the security holds a bar for, whoever supplied it."""
+    return {
+        r["trade_date"]
+        for r in db.fetchall(
+            "SELECT trade_date FROM core.daily_price WHERE security_id = %s",
+            (security_id,),
+        )
+    }
+
+
 def action_dates(db: Database, security_ids: Sequence[int]) -> list[dict]:
     """``(security_id, action_type, ex_date, source)`` of every stored action of
     these securities."""

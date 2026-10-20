@@ -260,6 +260,23 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · P2, #75 (part 1) and #74: Sharadar's bars.** `fafnir ingest sharadar-prices [--backfill]
+  [--gap-fill] [--symbols] [--dry-run] [--no-adjust]` writes SEP/SFP bars as `source = 'sharadar'`, raw
+  recovered: the whole history of the securities Sharadar feeds, and fill-only the dates a linked FMP security
+  lacks, from the link's `valid_from`. ADR 0004 gains the amendment #74 asked for.
+  - **The factor:** the ACTIONS split product where SEP's `closeunadj / close` agrees within the two closes'
+    rounding; the vendor's ratio otherwise, with `sharadar_split_ratio_mismatch` once per security.
+  - **Departures from the issue:**
+    - the issue's move of the FMP validators into `ingest/bars.py` is not done: the loader imports
+      `daily_price`'s gates as they are, so FMP's code and tests are untouched;
+    - a date the security already holds is never re-read, in both modes, so a re-run of a 20k-security
+      backfill is a no-op; Sharadar's later revisions come with the nightly (#98);
+    - the files are streamed once each and written per run of a ticker's rows, not loaded whole;
+    - the mismatch tolerance is the two closes' 3-dp rounding, not the issue's 1e-6, which every old
+      low-priced bar would fail (#49).
+  - **Part 2** is `fafnir vendor correct`, with its dry-run report and the volume summary.
+  - **Next.** On the host, after `vendor mint-delisted`: `sharadar-prices --backfill --gap-fill --dry-run`,
+    the real run, then `sharadar-actions --backfill --gap-fill`.
 - **2026-10-20 · P2, #73: Sharadar's splits and dividends.** `fafnir ingest sharadar-actions [--backfill]
   [--gap-fill] [--symbols] [--dry-run] [--no-adjust]` writes ACTIONS' splits and dividends as `source =
   'sharadar'`: every one for the securities Sharadar feeds (`--backfill`), and fill-only for the linked FMP

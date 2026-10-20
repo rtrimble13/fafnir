@@ -311,6 +311,17 @@ def rows(db, file_id: int, bulk_dir: str | Path) -> Iterator[dict]:
     return iter_rows(path, entry["vendor_table"], member=entry["member"])
 
 
+class _AllDates:
+    """A date collection holding every date: :func:`select` a ticker's whole
+    history with ``{ticker: ALL_DATES}``."""
+
+    def __contains__(self, _date: object) -> bool:
+        return True
+
+
+ALL_DATES = _AllDates()
+
+
 def select(
     db, file_id: int, bulk_dir: str | Path, wanted: Mapping[str, Collection[str]]
 ) -> Iterator[dict]:

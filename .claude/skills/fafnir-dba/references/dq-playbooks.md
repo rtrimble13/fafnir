@@ -1067,6 +1067,29 @@ replaced bar in `ops.vendor_correction`.
 
 ---
 
+## `sharadar_split_ratio_mismatch` — Sharadar's ratio and its ACTIONS disagree
+
+Warn, once per security. `fafnir ingest sharadar-prices` (#75) recovers raw bars with
+the product of the ACTIONS splits after each date. On some bars SEP's own
+`closeunadj / close` disagreed with that product beyond the two closes' 3-dp
+rounding, so those bars were recovered with the vendor's ratio instead and still
+loaded. Record key `{"vendor": "sharadar", "vendor_key": K}`; `detail` has the bar
+count and the first and last such dates.
+
+**Diagnose.** A constant ratio over a date range that ends at a date is a split
+ACTIONS lacks (or records on another date): the stored raw bars are right, and the
+adjustment factors, built from ACTIONS (#73), are missing that split. Compare
+`duk -S db ph <SYM>` across the range's end with the security's actions
+(`fafnir actions list`).
+
+**Decide.** A missing split is an `actions add` (operator row), proposed with the
+evidence, then `fafnir adjust` for the security. A ratio that varies bar to bar is
+the vendor's own noise: `dq accept` with the note.
+
+**Close with:** the action added and the factors recomputed, or `dq accept`.
+
+---
+
 ## `vendor_history_overlap` — one FMP row holds another issuer's era
 
 Warn. `fafnir vendor overlap` (#68) found history a reused ticker glued onto an FMP
