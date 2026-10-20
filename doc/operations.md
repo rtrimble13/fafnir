@@ -925,6 +925,46 @@ $F db refresh-marts                                   # 4. drop them from the ma
 - **Schema rollback** — `fafnir db rollback --steps N` (uses the `.down.sql`).
   Never roll back in a way that drops `core.daily_price` history without a backup.
 
+## Ending a vendor subscription
+
+Sharadar's licence (§10) gives 30 days from termination to delete every copy of
+its data, and an affidavit if asked ([ADR 0015](adr/0015-multi-vendor-provenance-and-precedence.md) quotes it). The subscription runs
+to 2027-10-18; the renewal reminder is 2027-09-18. What ending it would take is
+known in advance from one report:
+
+```bash
+scripts/reset_data.sh --scope vendor:sharadar --bulk-dir /var/lib/fafnir/landing/sharadar
+```
+
+It writes nothing and refuses `--yes`. It prints counts only, so its output can be
+kept or posted. It lists:
+- the rows Sharadar supplied (`source = 'sharadar'`: bars, actions, the securities it
+  minted, their ticker periods);
+- the rows that hold its data: its master and events, the links (their `evidence`
+  holds sampled closes), the `vendor_*` DQ flags (their `detail` does too), the
+  corrections it made, its watermarks, and the file ledger;
+- the operator edits on securities it minted, which a person has to decide about;
+- the files under `[sharadar] bulk_dir`, and the dumps under `$FAFNIR_BACKUP_DIR`.
+
+**The 30-day checklist,** if the day comes:
+1. **Run the report** and keep its output.
+2. **Restore FMP's rows.** List the active corrections with `fafnir vendor corrections
+   list` and revert them with `fafnir vendor corrections revert ID... -m "..."`. Each
+   revert puts back the FMP row Sharadar replaced (ADR 0015 §5).
+3. **Delete Sharadar's rows.** There is no command for this yet: #70 built the report
+   only, because plan v2 made deletion a licence-event job. Write and review it then,
+   in the report's order: the rows it supplied (minted securities last, after the
+   operator edits on them are decided), then its master, events, links, rejections,
+   flags and watermarks.
+4. **Delete the files** under `[sharadar] bulk_dir`. The ledger's rows can go with
+   them.
+5. **Let the dumps expire, or delete them.** `backup_dump.sh` keeps 14 days by
+   default, inside the 30. The off-site copy follows only when
+   `FAFNIR_BACKUP_MIRROR=yes` (the default); otherwise delete it there by hand.
+6. **Refresh the marts** (`fafnir db refresh-marts`), and delete anything exported
+   by hand: CSVs, notebooks, saved `duk` output.
+7. **Run the report again.** Every count should read 0.
+
 ## Backups
 
 The whole warehouse is rebuildable from `landing` + the sources, but rebuilding

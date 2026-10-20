@@ -147,6 +147,11 @@ vendor supplied, per table and outside the database (dumps, off-site copies, bul
 files), so the work a licence event would require is known in advance. It is built
 only if a licence event makes it necessary.
 
+*Built 2026-10-20 for Sharadar:* `scripts/reset_data.sh --scope vendor:sharadar` is the
+report (it refuses `--yes`); the checklist that uses it is
+[operations.md › Ending a vendor subscription](../operations.md#ending-a-vendor-subscription).
+The deletion itself is still not built.
+
 ### 6. Licence hygiene
 
 The repository is public, and every vendor licence forbids redistribution. No vendor

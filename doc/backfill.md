@@ -672,6 +672,7 @@ scripts/reset_data.sh --scope all --yes --vacuum
 | `landing` | `landing.fmp_raw` | everything else — reclaims disk, loses the payload audit trail |
 | `dq-flags` | `ops.data_quality_flag` | everything else |
 | `all` | every core/ops/landing table (applied renames and the Sharadar file ledger included), identities restarted | reference data, partitions, migrations, the Sharadar files on disk |
+| `vendor:sharadar` | **nothing: a report** (#70). Rows Sharadar supplied or that hold its data, per table; minted securities and the operator edits on them; active corrections; the files under `--bulk-dir`; dumps under `$FAFNIR_BACKUP_DIR`. Refuses `--yes` | everything. See [operations.md › Ending a vendor subscription](operations.md#ending-a-vendor-subscription) |
 
 Each scope prints the exact reload sequence to run next. Three design notes worth
 knowing:
