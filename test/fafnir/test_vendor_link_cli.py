@@ -474,15 +474,18 @@ def test_0032_leaves_existing_rows_byte_identical(db):
             """)
 
     before = fingerprint()
+    # Every migration from 0032 on, as test_0031 does: a later one (0033) is above
+    # it, and rolling back one step would roll back that one instead.
+    later = [v for v, _, state in m.status(db.dsn) if v >= "0032"]
     try:
-        assert m.rollback(db.dsn, steps=1) == ["0032"]
+        assert m.rollback(db.dsn, steps=len(later))[-1] == "0032"
         assert (
             db.fetchval("SELECT to_regclass('core.security_vendor_rejection')") is None
         )
         assert fingerprint() == before
     finally:
         applied = m.migrate(db.dsn)
-    assert applied == ["0032"] and fingerprint() == before
+    assert applied == later and fingerprint() == before
     assert [r["vendor_key"] for r in _links(db, sid)] == ["900080"]
 
 

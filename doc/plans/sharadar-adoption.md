@@ -127,6 +127,7 @@ reconcile are dropped, and #66 is folded into #75.*
 | 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` — **built** |
 | 0032 | #63 | `core.security_vendor_rejection` (a person's "not this key"; not in v2's first list) — **built** |
 | ~~0033~~ | ~~#66~~ | ~~`ops.vendor_bar_comparison`~~: dropped on 2026-10-20 (#66 folded into #75); later migrations take the next free number |
+| 0033 | #174 | `mart.v_corporate_action`, outside this plan (a mart-only reader's corporate actions) — so #79's view takes the next free number after it |
 | 0034 | #79 | `mart.v_security_lifecycle` |
 | 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
 | 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
