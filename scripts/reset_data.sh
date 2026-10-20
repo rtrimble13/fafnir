@@ -12,6 +12,7 @@
 #
 #   scripts/reset_data.sh --scope prices              # preview (default)
 #   scripts/reset_data.sh --scope prices --yes        # actually do it
+#   scripts/reset_data.sh --scope vendor:sharadar     # report only (#70)
 #
 # DRY RUN IS THE DEFAULT. Nothing is deleted until you pass --yes.
 set -euo pipefail
@@ -19,6 +20,8 @@ set -euo pipefail
 SCOPE=""
 CONFIRM="no"
 VACUUM="no"
+BULK_DIR="${FAFNIR_SHARADAR_BULK_DIR:-/var/lib/fafnir/landing/sharadar}"
+BACKUP_DIR="${FAFNIR_BACKUP_DIR:-/var/backups/fafnir}"
 
 usage() {
     cat <<'USAGE'
@@ -50,10 +53,21 @@ Scopes:
                 stay; the next download records them again). Identity sequences
                 restart. Reference data and migrations are kept.
 
+  vendor:sharadar
+                A REPORT, never a deletion (#70, ADR 0015): what Sharadar
+                supplied or what holds its data -- rows per table, minted
+                securities and the operator edits on them, active corrections,
+                the files under [sharadar] bulk_dir, and the copies outside the
+                database (dumps, off-site) that its licence's 30-day deletion
+                clause also reaches. Refuses --yes.
+
 Options:
   --yes         Execute. Without it this only reports what would be deleted.
   --vacuum      VACUUM ANALYZE the affected tables afterwards (returns disk to
                 the OS after a large truncate).
+  --bulk-dir P  vendor:sharadar only: the [sharadar] bulk_dir to measure
+                (default $FAFNIR_SHARADAR_BULK_DIR, else
+                /var/lib/fafnir/landing/sharadar).
   -h, --help    This message.
 
 Requires FAFNIR_DSN.
@@ -66,6 +80,8 @@ while [[ $# -gt 0 ]]; do
         --scope=*) SCOPE="${1#*=}"; shift ;;
         --yes|-y) CONFIRM="yes"; shift ;;
         --vacuum) VACUUM="yes"; shift ;;
+        --bulk-dir) BULK_DIR="${2:?--bulk-dir needs a value}"; shift 2 ;;
+        --bulk-dir=*) BULK_DIR="${1#*=}"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -76,6 +92,23 @@ if [[ -z "${SCOPE}" ]]; then
     usage >&2
     exit 2
 fi
+
+case "${SCOPE}" in
+    vendor:sharadar)
+        if [[ "${CONFIRM}" == "yes" ]]; then
+            echo "ERROR: vendor:sharadar is a report; it never deletes (#70)." >&2
+            echo "       Under precedence a vendor's rows cannot be removed without" >&2
+            echo "       rebuilding the series from the other vendor (ADR 0015):" >&2
+            echo "       see doc/operations.md, 'Ending a vendor subscription'." >&2
+            exit 2
+        fi
+        ;;
+    vendor:*)
+        echo "ERROR: unknown vendor scope '${SCOPE}': only vendor:sharadar is reported." >&2
+        echo "       (vendor:fmp was dropped in plan v2: FMP's rows are the warehouse's base.)" >&2
+        exit 2
+        ;;
+esac
 
 DSN="${FAFNIR_DSN:?set FAFNIR_DSN}"
 
@@ -123,6 +156,9 @@ case "${SCOPE}" in
     dq-flags)
         TABLES="ops.data_quality_flag"
         NEXT="fafnir dq run"
+        ;;
+    vendor:sharadar)
+        TABLES=""
         ;;
     all)
         TABLES="core.daily_price, core.corporate_action, core.adjustment_factor,
@@ -184,6 +220,81 @@ describe_dsn() {
 echo "==> reset_data.sh  scope=${SCOPE}"
 echo "    Target: $(describe_dsn "${DSN}")"
 echo
+
+# What a vendor supplied, and where its data is held: a report for the day its
+# licence ends (Sharadar §10: delete everything within 30 days). Nothing here
+# deletes. The counts are not vendor data, so the output can be shared.
+if [[ "${SCOPE}" == "vendor:sharadar" ]]; then
+    q() { psql "${DSN}" -tAc "$1" 2>/dev/null || echo '(unreadable)'; }
+    row() { printf '    %-52s %s\n' "$1" "$(q "$2")"; }
+
+    echo "==> Rows Sharadar supplied (source = 'sharadar'):"
+    row "core.daily_price" "SELECT count(*) FROM core.daily_price WHERE source = 'sharadar'"
+    row "core.corporate_action" \
+        "SELECT count(*) FROM core.corporate_action WHERE source = 'sharadar'"
+    row "core.security (minted by Sharadar)" \
+        "SELECT count(*) FROM core.security WHERE source = 'sharadar'"
+    row "core.symbol_xref" "SELECT count(*) FROM core.symbol_xref WHERE source = 'sharadar'"
+    row "core.symbol_change" \
+        "SELECT count(*) FROM core.symbol_change WHERE source = 'sharadar'"
+    row "core.company_profile" \
+        "SELECT count(*) FROM core.company_profile WHERE source = 'sharadar'"
+    echo
+    echo "==> Rows that hold Sharadar's data (vendor = 'sharadar'):"
+    row "core.vendor_security (its master)" \
+        "SELECT count(*) FROM core.vendor_security WHERE vendor = 'sharadar'"
+    row "core.vendor_security_event (its events)" \
+        "SELECT count(*) FROM core.vendor_security_event WHERE vendor = 'sharadar'"
+    row "core.security_vendor_xref (links; evidence: closes)" \
+        "SELECT count(*) FROM core.security_vendor_xref WHERE vendor = 'sharadar'"
+    row "core.security_vendor_rejection" \
+        "SELECT count(*) FROM core.security_vendor_rejection WHERE vendor = 'sharadar'"
+    row "ops.data_quality_flag (vendor_*; detail: closes)" \
+        "SELECT count(*) FROM ops.data_quality_flag WHERE check_name LIKE 'vendor%'"
+    row "ops.vendor_correction (Sharadar replaced; active)" \
+        "SELECT count(*) || ' (' || count(*) FILTER (WHERE reverted_at IS NULL) || ' active)'
+           FROM ops.vendor_correction WHERE new_source = 'sharadar'"
+    row "ops.load_watermark" "SELECT count(*) FROM ops.load_watermark WHERE source = 'sharadar'"
+    row "ops.ingestion_run (bookkeeping, no data)" \
+        "SELECT count(*) FROM ops.ingestion_run WHERE source = 'sharadar'"
+    row "landing.sharadar_file (files on disk, as recorded)" \
+        "SELECT count(*) || ' files, ' || pg_size_pretty(coalesce(sum(bytes), 0))
+           FROM landing.sharadar_file WHERE status <> 'deleted'"
+    echo
+    echo "==> Needs a person before anything is removed:"
+    row "operator edits on Sharadar-minted securities" \
+        "SELECT count(*) FROM ops.operator_override o
+           JOIN core.security s USING (security_id) WHERE s.source = 'sharadar'"
+    echo
+    echo "==> Files on disk:"
+    if [[ -d "${BULK_DIR}" && -r "${BULK_DIR}" ]]; then
+        printf '    %-52s %s files, %s\n' "${BULK_DIR}" \
+            "$(find "${BULK_DIR}" -type f | wc -l | xargs)" \
+            "$(du -sh "${BULK_DIR}" 2>/dev/null | cut -f1)"
+    else
+        echo "    ${BULK_DIR}: not found or not readable (pass --bulk-dir <[sharadar] bulk_dir>)"
+    fi
+    echo
+    echo "==> Copies outside the database (the 30-day clause reaches these too):"
+    if [[ -d "${BACKUP_DIR}" && -r "${BACKUP_DIR}" ]]; then
+        printf '    %-52s %s dumps, oldest %s\n' "logical dumps in ${BACKUP_DIR}" \
+            "$(find "${BACKUP_DIR}" -maxdepth 1 -name 'fafnir_*.dump' | wc -l | xargs)" \
+            "$(find "${BACKUP_DIR}" -maxdepth 1 -name 'fafnir_*.dump' -printf '%TY-%Tm-%Td\n' \
+               2>/dev/null | sort | head -1)"
+    else
+        echo "    logical dumps: ${BACKUP_DIR} not found or not readable (set FAFNIR_BACKUP_DIR)"
+    fi
+    echo "    off-site copies: whatever scripts/backup_offsite.sh pushed to \$FAFNIR_BACKUP_REMOTE"
+    echo "    the marts: mart.security_latest and the other materialized views, until refreshed"
+    echo "    anything exported by hand (CSV, notebooks, saved duk output)"
+    echo
+    cat <<'EOF'
+==> REPORT ONLY -- nothing was deleted, and this scope never deletes.
+    What ending the subscription takes is in doc/operations.md,
+    "Ending a vendor subscription".
+EOF
+    exit 0
+fi
 
 echo "==> Rows that would be removed:"
 IFS=',' read -ra TABLE_ARR <<< "${TABLES}"

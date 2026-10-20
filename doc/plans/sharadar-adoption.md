@@ -260,6 +260,14 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-20 · #70 (optional): the excision report.** `scripts/reset_data.sh --scope vendor:sharadar [--bulk-dir P]`
+  is plan v2's report, not the issue's v1 deletion. It counts the rows Sharadar supplied (`source =
+  'sharadar'`) and the rows that hold its data (master, events, links and `vendor_*` flags, whose evidence
+  holds sampled closes, corrections, watermarks, the file ledger). It also counts the operator edits on minted
+  securities, the files under `bulk_dir`, and the dumps. It refuses `--yes`. `vendor:fmp` is refused, as
+  v2 dropped it. The 30-day checklist that uses it is in
+  [operations.md](../operations.md#ending-a-vendor-subscription). The deletion is still not built: it is
+  written and reviewed if a licence event comes.
 - **2026-10-20 · P1, #71: dead issuers minted.** `fafnir vendor mint-delisted [--dry-run] [--permaticker K
   [--allow-overlap]] [--limit N]` mints every dead Sharadar issuer ADR 0016 §3 admits
   (`vendor_overlap.mintable`, no open link, no open `vendor_history_overlap` flag). Each row is
