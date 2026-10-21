@@ -102,16 +102,18 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
     # -- read profile: mart + ref, via duk.datasource.db -------------------
     @server.tool()
     @_surfaced
-    def resolve_symbol(symbol: str) -> dict:
+    def resolve_symbol(symbol: str, as_of: Optional[str] = None) -> dict:
         """Resolve a ticker, an identifier or a company name to a security.
 
         Tries the live ticker, then the primary symbol, then a ticker the security
         used to trade under before a rename -- so a former ticker resolves, and
         says that it did. A security may also be named by identifier instead of
-        ticker: cik:51143, isin:US4592001014, cusip:459200101. Every tool below
-        that takes a `symbol` accepts those too.
+        ticker: cik:51143, isin:US4592001014, cusip:459200101. Tickers are reused:
+        as_of (YYYY-MM-DD) asks who traded under the ticker on that date, and
+        symbol='CC@2008-06-30' says the same. Every tool below that takes a
+        `symbol` accepts those forms too.
         """
-        return T.resolve_symbol(dsn=dsn, symbol=symbol)
+        return T.resolve_symbol(dsn=dsn, symbol=symbol, as_of=as_of)
 
     @server.tool()
     @_surfaced

@@ -148,6 +148,11 @@ def _one_candidate(identifier, candidates: list[dict]) -> dict:
     under one CIK is the ordinary case; picking one would answer about GOOG when
     the caller meant GOOGL, and an agent has no way to notice.
     """
+    if not candidates and identifier.scheme == "ticker_at":
+        raise ToolError(
+            f"no security traded as {identifier.value} on "
+            f"{identifier.as_of.isoformat()}. The plain ticker means its holder now."
+        )
     if not candidates:
         raise ToolError(
             f"no security carries {identifier.describe()}. The warehouse loads "
@@ -221,16 +226,32 @@ def _dataframe_rows(df) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_symbol(*, dsn: str, symbol: str) -> dict:
-    """Resolve a ticker to a security, reporting a rename when that is the hit."""
+def resolve_symbol(*, dsn: str, symbol: str, as_of: Optional[str] = None) -> dict:
+    """Resolve a ticker to a security, reporting a rename when that is the hit.
+
+    With ``as_of``, the security that traded under the ticker on that date (#80):
+    a ticker is reused across issuers, and the bare ticker means its holder now.
+    Spelled ``symbol="CC@2008-06-30"`` it means the same, and every tool that takes
+    a symbol accepts that form.
+    """
+    from duk import identifiers
     from duk.datasource.db import resolve_company
 
     symbol = _require_symbol(symbol)
+    if as_of:
+        day = _parse_date(as_of, "as_of")
+        if "@" in symbol or ":" in symbol:
+            raise ToolError("as_of takes a plain ticker, e.g. symbol='CC'")
+        symbol = f"{symbol}@{day.isoformat()}"
     try:
         candidates = resolve_company(dsn=dsn, query=symbol)
+    except identifiers.IdentifierError as exc:
+        raise ToolError(str(exc)) from None
     except Exception as exc:  # noqa: BLE001
         raise connection_error(exc, dsn) from None
     if not candidates:
+        if "@" in symbol:
+            raise ToolError(f"no security traded as {symbol.replace('@', ' on ')}")
         raise ToolError(f"no security matches '{symbol}'")
     return envelope(candidates, matched=symbol)
 

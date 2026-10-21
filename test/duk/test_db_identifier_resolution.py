@@ -9,6 +9,7 @@ reports a security missing, and an index mismatch just gets slower.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 
 import pytest
@@ -187,3 +188,100 @@ def test_the_expression_indexes_exist_and_serve_their_predicate(db, identifier, 
     db.execute("SET enable_seqscan = off")
     plan = "\n".join(str(row) for row in db.fetchall("EXPLAIN " + sql, (ident.value,)))
     assert column in plan, plan
+
+
+# A ticker two issuers traded under (#80), the way Circuit City and Chemours were
+# both CC: one dead, minted from Sharadar with a dated period, and one live, from
+# FMP, whose period starts at the "first seen" 1900 fallback. Synthetic.
+DEAD_DAY, LIVE_DAY, NOBODY_DAY = (
+    dt.date(2008, 6, 30),
+    dt.date(2020, 6, 30),
+    dt.date(2012, 1, 3),
+)
+
+
+def _reused_ticker(db):
+    live = _company(db, "ZZCC", "ZZ Live Chemicals")
+    dead = repo.upsert_security(
+        db,
+        primary_symbol="ZZCC",
+        company_name="ZZ Dead Stores",
+        asset_type="equity",
+        exchange_code="NYSE",
+        is_actively_trading=False,
+        delisted_date=dt.date(2009, 3, 6),
+        source="sharadar",
+    )
+    repo.insert_symbol_period(
+        db,
+        security_id=dead,
+        symbol="ZZCC",
+        valid_from=dt.date(1998, 1, 2),
+        valid_to=dt.date(2009, 3, 6),
+        source="sharadar",
+    )
+
+    def bar(sid, day, close):
+        return {
+            "security_id": sid,
+            "trade_date": day,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 10,
+        }
+
+    repo.upsert_daily_prices(
+        db, [bar(dead, DEAD_DAY, 7), bar(dead, dt.date(2009, 3, 6), 1)]
+    )
+    repo.upsert_daily_prices(
+        db, [bar(live, dt.date(2015, 7, 1), 20), bar(live, LIVE_DAY, 50)]
+    )
+    return dead, live
+
+
+def test_a_dated_ticker_names_who_traded_under_it_then(db):
+    dead, live = _reused_ticker(db)
+    expected = {DEAD_DAY: dead, LIVE_DAY: live, NOBODY_DAY: None, None: live}
+    for day, sid in expected.items():
+        with ds_db._connect(DSN) as conn, conn.cursor() as cur:
+            via_mart = ds_db._resolve_security_id(cur, "ZZCC", as_of=day)
+        assert via_mart == sid, day
+        # The two copies of the ladder agree, the date rung included.
+        assert repo.resolve_security_id(db, "ZZCC", as_of=day) == sid, day
+
+    assert _resolve("ZZCC@2008-06-30") == [dead]
+    assert _resolve("ZZCC@2012-01-03") == []
+    assert _resolve("ZZCC") == [live]  # the bare ticker is unchanged
+    periods = ds_db.ticker_periods(dsn=DSN, symbol="zzcc")
+    assert [p["security_id"] for p in periods] == [live, dead]
+    assert periods[1]["last_day"] == dt.date(2009, 3, 6)
+
+
+def test_duk_ph_reads_the_dated_ticker(db, tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from duk.cli import main
+
+    _reused_ticker(db)
+    monkeypatch.setenv("FAFNIR_DSN", DSN)
+    cfg = tmp_path / "dukrc.toml"
+    cfg.write_text("")
+
+    def ph(argument):
+        return CliRunner().invoke(
+            main,
+            ["-c", str(cfg), "-S", "db", "ph", argument, "--close"]
+            + ["-s", "2008-01-01", "-e", "2020-12-31"],
+        )
+
+    dated = ph("ZZCC@2008-06-30")
+    assert dated.exit_code == 0, dated.output
+    assert "2008-06-30" in dated.output and "2020-06-30" not in dated.output
+    bare = ph("ZZCC")
+    assert bare.exit_code == 0, bare.output
+    assert "2020-06-30" in bare.output
+    # The bare ticker still answers, and says what else it has named.
+    assert "ZZCC has named 2 securities" in bare.output
+    assert "ZZCC@2009-03-06" in bare.output

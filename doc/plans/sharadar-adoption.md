@@ -262,6 +262,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-21 · P2, #80: point-in-time ticker resolution.** `resolve_security_id(db, symbol, as_of=…)`,
+  `duk -S db ph CC@2008-06-30` / `ls CC@…`, and MCP `resolve_symbol(as_of=…)` name the security that traded
+  under a ticker on a date. Every MCP tool that takes a symbol also accepts the `TICKER@date` form. A period
+  counts when it contains the date (`valid_to` is its last day). The 1900-01-01 "first seen" start counts
+  only from the security's first bar. Of several, the latest start wins. Loaders never pass a date. The duk
+  copy of the ladder carries the same rung on the mart seam, and a test asserts the two agree.
+  - **Departures from the issue:**
+    - the issue's tie-break (`is_primary`, then lowest id) would hand a reused ticker's old dates to the live
+      holder, whose period starts at the 1900 fallback. The latest start goes first, and the 1900 start is
+      bounded by the first bar;
+    - a bare ticker that has named several securities still answers as before. `duk` lists the others on
+      stderr with their dated form instead of refusing, so no script changes meaning;
+    - `-S fmp` / `-S sharadar` refuse the dated form: the vendors have no ticker history to read it against.
+  - **Next.** On the host, after #77 and deploy: `duk -S db ph CC@2008-06-30` and `CC@2020-06-30` (acceptance).
 - **2026-10-21 · P2, #79: survivorship QA and `mart.v_security_lifecycle`.** Migration 0034 adds the view:
   per security, the trading span, `minted_by`, and for one that stopped trading, the vendor's terminal
   event and acquirer, with `survivorship_complete_from = 1998-01-01`. It uses definer rights, and

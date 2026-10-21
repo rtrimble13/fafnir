@@ -132,3 +132,31 @@ class TestIdentifierSqlAndIndexesAgree:
         ):
             assert "mart.v_security_profile" in sql
             assert "core." not in sql and "ops." not in sql
+
+
+class TestDatedTicker:
+    """`TICKER@YYYY-MM-DD`: the security that traded under a ticker on a day (#80)."""
+
+    def test_a_dated_ticker(self):
+        ident = ids.parse("cc@2008-06-30")
+        assert (ident.scheme, ident.value, ident.explicit) == (
+            ids.TICKER_AT,
+            "CC",
+            True,
+        )
+        assert ident.as_of.isoformat() == "2008-06-30"
+        assert not ident.is_ticker
+        assert ident.describe() == "ticker CC on 2008-06-30"
+
+    def test_the_explicit_prefix_may_carry_a_date(self):
+        ident = ids.parse("ticker:cc@2020-06-30")
+        assert (ident.scheme, ident.value) == (ids.TICKER_AT, "CC")
+
+    def test_an_at_without_a_date_is_still_a_ticker_or_a_name(self):
+        for text in ("Foo@Bar", "AT&T"):
+            assert ids.parse(text).is_ticker
+
+    @pytest.mark.parametrize("text", ["CC@2008-13-01", "@2008-06-30", "CC@2008"])
+    def test_a_bad_date_is_refused(self, text):
+        with pytest.raises(ids.IdentifierError, match="TICKER@YYYY-MM-DD"):
+            ids.parse(text)

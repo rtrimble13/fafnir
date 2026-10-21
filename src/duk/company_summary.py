@@ -767,6 +767,21 @@ def _listing_status(candidate: dict) -> str:
     return "active" if trading else "delisted"
 
 
+def render_ticker_periods(symbol: str, periods: Sequence[dict]) -> str:
+    """The securities a reused ticker has named, each with the dated form that
+    reaches it (#80)."""
+    rows = [
+        [
+            f"{symbol}@{fmt_date(p.get('last_day'))}",
+            p.get("company_name") or MISSING,
+            p.get("exchange_code") or MISSING,
+            _listing_status(p),
+        ]
+        for p in periods
+    ]
+    return "\n".join(_table(["NAME IT AS", "NAME", "EXCHANGE", "STATUS"], rows))
+
+
 def render_candidates(candidates: Sequence[dict]) -> str:
     """The did-you-mean table shown when a query matches several companies."""
     rows = [

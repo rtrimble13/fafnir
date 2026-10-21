@@ -154,6 +154,14 @@ def resolve_security_identifier(ctx, identifier):
     cfg = ctx.obj["config"]
     source = ctx.obj.get("source", "db")
 
+    if identifier.scheme == identifiers.TICKER_AT and source != "db":
+        click.echo(
+            f"Error: {identifier.describe()} resolves through the warehouse's "
+            "ticker history; use -S db.",
+            err=True,
+        )
+        sys.exit(1)
+
     if source == "sharadar":
         # Sharadar's TICKERS carries CUSIPs and the CIK, but duk does not read it
         # yet; the warehouse (which will hold the permaticker link) and FMP's
@@ -192,6 +200,37 @@ def resolve_security_identifier(ctx, identifier):
     matched = candidates[0]
     logger.info(f"Resolved {identifier.describe()} to {matched['symbol']}")
     return matched["symbol"], matched.get("security_id")
+
+
+def hint_reused_ticker(ctx, identifier):
+    """On stderr, when a bare ticker has named more than one security: which, and
+    the ``TICKER@YYYY-MM-DD`` form that reaches each (#80).
+
+    The bare ticker still answers as it always has -- the security holding it now,
+    or that held it last -- so a script's output is unchanged. Best effort: a
+    failed lookup here never fails the command.
+    """
+    if not identifier.is_ticker or ctx.obj.get("source", "db") != "db":
+        return
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    try:
+        periods = ds_db.ticker_periods(
+            dsn=ctx.obj["config"].dsn, symbol=identifier.value
+        )
+    except Exception as exc:  # noqa: BLE001 -- a hint, never a failure
+        logger.debug(f"Ticker history lookup failed: {exc}")
+        return
+    if len(periods) < 2:
+        return
+    click.echo(
+        f"Note: {identifier.value} has named {len(periods)} securities. The bare "
+        "ticker reads the one holding it now, or last; for another, name a day "
+        "it traded:",
+        err=True,
+    )
+    click.echo(
+        company_summary.render_ticker_periods(identifier.value, periods), err=True
+    )
 
 
 @click.group()
@@ -397,6 +436,8 @@ def ph(
     security_id = None
     if not identifier.is_ticker:
         symbol, security_id = resolve_security_identifier(ctx, identifier)
+    else:
+        hint_reused_ticker(ctx, identifier)
 
     logger.info(f"Requesting price history for {symbol}")
 
@@ -1456,6 +1497,7 @@ def _ls_company_summary(
         sys.exit(1)
 
     matched = candidates[0]
+    hint_reused_ticker(ctx, identifier)
     try:
         raw = ds_db.company_summary(dsn=cfg.dsn, security_id=matched["security_id"])
     except Exception as exc:
