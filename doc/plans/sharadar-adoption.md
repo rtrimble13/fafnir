@@ -261,6 +261,13 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-21 · #75 follow-up: `vendor correct` memory.** The first full `vendor correct --dry-run` on
+  the host reached 1.6 GB in 50 minutes and pushed the 3.8 GB machine into swap. It was stopped.
+  - **The cause:** every agreeing date of every linked security was kept for `_resolve_history_flags`,
+    which reads only the dates an open `vendor_history_disagrees` flag sampled. Only those are kept now.
+  - **Measured on 600,000 agreeing bars:** peak RSS 122 MB before and 95 MB after, the difference
+    growing with every bar compared.
+
 - **2026-10-21 · #73 follow-up: deep reverse splits.** The first `sharadar-actions --backfill --gap-fill
   --dry-run` stopped on `a split ratio must be positive, not Decimal('0.0002')`. `split_ratio` snapped every
   value to a denominator of at most 1,000:
