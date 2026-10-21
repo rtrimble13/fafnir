@@ -309,6 +309,46 @@ gaps), then `db refresh-marts`.
 - **Bars on MLK Day 1990–1997.** `ref.trading_calendar` marks them closed; NYSE was
   open until 1998. They are real bars.
 
+### 2k. Dead Sharadar histories: the moves that end a company's life (#76)
+
+A dead issuer minted from Sharadar (`source = 'sharadar'`) holds its whole life,
+and its last months carry most of its outliers. Most are market facts. Take §2b–2d
+first, as for any security: a misdated reverse split in the raw series looks like a
+collapse. Then test on the bars, not on the name:
+
+- **A collapse into failure.** A fall of 50% or more in one session, often after a
+  halt (a gap before the flagged bar), that never recovers. No later bar is back
+  within 25% of the level before the fall, and the history ends within months,
+  usually in sub-dollar trading. A ticker period in `core.symbol_xref` that names a
+  bankruptcy corroborates it; it is not the test. **Accept**, naming the fall,
+  the level it held, and the last bar.
+- **A cash acquisition.** A jump to a level that then holds nearly flat, with
+  daily moves of a percent or two, until the last bar, weeks or months later. The
+  flat tail at the deal price is the test. A 50% jump is a large premium, so it is
+  more often a small or distressed name. **Accept**, naming the level and the
+  tail's length.
+- **A liquidating distribution.** A drop on a date with a cash dividend on file
+  that explains it (`prev_close − dividend ≈ close`). **Accept**, naming the
+  dividend.
+- **Ticks at the end.** Sub-dollar prices moving one or two ticks in the final
+  months: §2g.
+
+What does not apply, or applies differently:
+
+- **§2h does not apply.** A Sharadar history is one permaticker's (ADR 0016), and no
+  vendor writes another ticker's bars into it. A level change across a long gap
+  is that issuer's own: a halt, or a spell off the exchanges Sharadar covers. The
+  history may also be the warehouse's only copy of the company. Do not delete a
+  segment of it as someone else's history.
+- **§3's probe is Sharadar's, not FMP's.** FMP never feeds these rows. Before
+  deleting a print that reverts (§2f), read what Sharadar serves now with
+  `duk -S sharadar ph <TICKER> -s <d> -e <d>`, using the vendor's ticker from
+  `core.vendor_security`. A re-run of the backfill does not re-read a date the
+  security already holds.
+- **Nothing reverts on its own.** No load will restate a dead history, so a flag
+  §2j would leave open "to recheck tomorrow" stays as it is. Decide it, or leave
+  it open with the reason.
+
 ## 3. Before any delete: probe the vendor
 
 `source probe-prices --symbol S --date D` (3 requests) shows what FMP serves *now*.

@@ -25,9 +25,10 @@ preconditions.
 A `stale` flag on a name `fafnir source vendor-gaps` lists is **report only**: the
 security trades and the vendor stopped serving it (see the `stale` playbook).
 
-`sparse_coverage` is not yet placed in a tier. Until it is, treat it as **report
-only**: nothing about it has been repaired, so closing one frees its slot and the
-next `fafnir dq run` writes it again. See its playbook entry for why.
+`sparse_coverage` is not yet placed in a tier, except on a dead Sharadar history
+([below](#dead-sharadar-histories-76)). Elsewhere, treat it as **report only**:
+nothing about it has been repaired, so closing one frees its slot and the next
+`fafnir dq run` writes it again. See its playbook entry for why.
 
 The **Never** tier is also `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and
 `dq_triage` returns `never_auto_resolve` per row so it is in front of you at the
@@ -141,6 +142,84 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 
 ### `tracked_symbol_unknown_to_source`
 - The fund closed, and `track rm <SYM> --closed <date>` has been run.
+
+---
+
+## Dead Sharadar histories (#76)
+
+The dead issuers `vendor mint-delisted` mints (ADR 0016, `source = 'sharadar'`,
+delisted) arrive with whole histories, which the SQL checks judge on their first
+night. Bankrupt and thin names flag heavily. Two facts decide what a flag on one
+can lead to:
+
+- **Nothing re-fetches them.** FMP never feeds a security it did not mint
+  (ADR 0015), so `ingest prices` and `source probe-prices` say nothing about these
+  rows. `ingest sharadar-prices --backfill` has already read every row Sharadar's
+  file holds for them, and a re-run reads only the dates a security lacks. A
+  session missing from the history is missing from the vendor's record.
+  `duk -S sharadar ph <TICKER> -s <d> -e <d>`, with the vendor's ticker
+  (`core.vendor_security.ticker`), shows what Sharadar serves now.
+- **The history is final.** A delisted issuer gets no new bars, so its density and
+  its gaps never change.
+
+The decisions, per check:
+
+| Check | Decision |
+|---|---|
+| `gap` | Check unchanged. **Accept**, by rule, when the precondition below holds. |
+| `sparse_coverage` | Check unchanged. **Accept**, by rule: the density is final. Its playbook's escalation still applies (a liquid name near 0.80). |
+| `outlier`, `dorq_*` | Unchanged. Classify by `outlier-classification.md`, starting at §2k for the moves that end a company's life. |
+| `stale`, `security_missing_classification` | Not written on these rows: both checks cover listed securities only. |
+| `price_*`, `sharadar_split_ratio_mismatch` | Unchanged, repair-first. A quarantined bar also leaves a `gap` on its date: work the quarantine, not the gap. |
+| Severity | No check drops to `info` for these rows. Acceptance keeps the record and stops the re-detection; a lower severity would hide the condition without a decision. |
+
+### Precondition: `gap` on a dead Sharadar history
+- The security is `source = 'sharadar'` with a `delisted_date`.
+- No `price_*` flag on that security and date: the bar was offered and refused,
+  which is the defect to work.
+- **Not a calendar question.** The cohort test above (`cohort_size == 1`) does not
+  fit here: thousands of dead histories share many dates by chance. The test is
+  instead that the date is not missing from most of the dead histories spanning it.
+  A date that most of them lack is a session the calendar marks open and the market
+  was not, or a hole in the vendor's file. Report it; accept nothing on that date.
+
+```sql
+-- The dates most dead Sharadar histories lack. A share near 1 is a calendar question.
+WITH dead AS (
+  SELECT p.security_id, min(p.trade_date) AS dmin, max(p.trade_date) AS dmax
+    FROM core.daily_price p JOIN core.security s USING (security_id)
+   WHERE s.source = 'sharadar' GROUP BY 1),
+g AS (
+  SELECT (f.record_key->>'trade_date')::date AS d, count(*) AS missing
+    FROM ops.data_quality_flag f JOIN dead USING (security_id)
+   WHERE f.check_name = 'gap' AND f.resolved_at IS NULL AND f.accepted_at IS NULL
+   GROUP BY 1)
+SELECT g.d, g.missing, s.spanning, round(g.missing::numeric / s.spanning, 3) AS share
+  FROM g CROSS JOIN LATERAL (
+       SELECT count(*) AS spanning FROM dead WHERE g.d BETWEEN dmin AND dmax) s
+ ORDER BY share DESC LIMIT 20;
+```
+
+### Working them in bulk
+These flags can run to thousands, past every cap in this file and the 1% stop
+condition, and the class is one decision. So they are worked only in
+**operator-directed bulk mode**, one batch per check, accepted `--by-rule` with no
+label. Build the ids from SQL into a file, show the dry run, and run the same
+command on a yes:
+
+```bash
+psql "$FAFNIR_DSN" -Atc "SELECT f.dq_flag_id FROM ops.data_quality_flag f
+  JOIN core.security s USING (security_id)
+ WHERE s.source = 'sharadar' AND s.delisted_date IS NOT NULL
+   AND f.check_name = 'sparse_coverage'
+   AND f.resolved_at IS NULL AND f.accepted_at IS NULL" > /tmp/dead_sparse_ids
+fafnir dq accept $(cat /tmp/dead_sparse_ids) --by claude --by-rule \
+  -m "Accepted at operator direction <date>: dead Sharadar history (#76); its bars are final and no vendor re-fetches them" \
+  --dry-run
+```
+
+For `gap`, the query also leaves out the dates the calendar query reported and any
+security and date with a `price_*` flag.
 
 ---
 
