@@ -158,6 +158,9 @@ the bound the query walks every partition and times out.
 - **`accept`** — a thin name with scattered gaps, a fund's coverage gaps, or an old
   block of missing history. These are permanent and true; a resolve returns on the
   next `dq run`.
+- **`accept`** — a dead Sharadar history (`source = 'sharadar'`, delisted): its bars
+  are final, and the re-ingest above does not apply (FMP never feeds it). In bulk,
+  by rule: see `sweep-policy.md`, "Dead Sharadar histories".
 - **Leave open** — an **active** security with a gap of more than 180 days ending
   in the last 18 months, *especially* when the price level jumps across the gap.
   That is two issuers sharing one row: the security master let a new listing take

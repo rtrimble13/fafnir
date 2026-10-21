@@ -261,6 +261,22 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-21 · P2, #76 (part 2): the policy for dead histories.** The policy was decided from what can
+  repair a dead Sharadar history, before the counts. The counts confirm or revise it.
+  - **The host had already minted the whole population** before part 1 merged: run 403 wrote dead issuers'
+    bars. A sample was no longer possible, so the measurement is all of it. The SQL checks judge every
+    history nightly. dorq needs one `dq run --engine dorq --full` once the backfill is complete, as its
+    backfill pass skipped a mint of that size.
+  - **Decisions** (fafnir-dba `sweep-policy.md`, "Dead Sharadar histories"):
+    - no check changes, and none drops to `info`;
+    - `gap` and `sparse_coverage` on a dead history are accepted by rule, in operator-directed bulk mode,
+      because nothing re-fetches these rows and their bars are final;
+    - `gap` keeps a calendar test in place of `cohort_size == 1`: a date most dead histories lack is
+      reported, not accepted;
+    - outliers are classified by `outlier-classification.md` §2k: collapse into failure, cash acquisition,
+      liquidating distribution.
+  - **Not done:** the measured counts. They go on #76 when the backfill and the dorq run are done, and the
+    issue closes on them.
 - **2026-10-21 · P2, #76 (part 1): the sample and the procedure.** `fafnir vendor mint-delisted --sample N
   [--seed S]` mints N dead issuers picked at random, the same N for the same seed; the run records both.
   `--limit` takes the first N by permaticker, the oldest keys, not a fair sample.
