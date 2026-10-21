@@ -184,7 +184,7 @@ happened (ADR 0007).
 | `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. |
 | `currency` | TEXT | |
-| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the reconciliation does not compare it against the feed. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
+| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 
@@ -410,6 +410,23 @@ References no *numeric* column of `core.adjustment_factor` (only `COUNT(*)` and
 would double that cost next time. A client wanting back-adjustment depth reads
 `price_factor` from `mart.v_daily_price_adjusted`.
 
+### `mart.v_corporate_action` — corporate actions, one row per event (VIEW)
+**Grain:** `(security_id, action_type, ex_date)`. **Source:** `core.corporate_action`
+(passthrough). Added by migration 0033 (#174).
+
+Columns: `corporate_action_id, security_id, action_type, ex_date, record_date,
+payment_date, declaration_date, split_numerator, split_denominator, dividend_amount,
+currency, source`. `action_type` is `split` or `dividend`; the ratios and the amount
+are `NUMERIC(20,6)`, as stored. `source` says which vendor supplied the row, or
+`operator` for one written by `fafnir actions add|redate` (ADR 0015 precedence).
+Lineage (`ingestion_run_id`, `loaded_at`) is left out, as in `mart.v_daily_price_raw`.
+
+The event-level counterpart of `mart.v_security_action_summary`, which aggregates and
+cannot say which dividends went ex between two dates. It is how a mart-only reader
+lists corporate actions: portable's `pt ca sync` reads it to compare its ledger with
+the warehouse. Like every `mart` view it is a grant to every reader (ADR 0009), and
+it depends on the three numeric columns, so re-typing them means recreating it too.
+
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
 
@@ -478,7 +495,10 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 `source`, `endpoint`, `params` (JSONB), `window_from/to`, `symbols_requested`,
 `rows_inserted/updated/quarantined`, `bytes_downloaded` (vs 50 GB/mo budget),
 `response_hash`, `status` (`started`/`success`/`partial`/`failed`), `error_message`,
-`started_at`, `finished_at`.
+`started_at`, `finished_at`. A long load can write its counts so far to its open run
+(`RunLog.checkpoint`); the Sharadar scans do every minute, with `params.progress`.
+A `started` row with no `finished_at` and no live process was killed outright: its
+counts are as of the last checkpoint.
 
 ### `ops.data_quality_flag` — quarantine/anomaly queue. **Grain:** `dq_flag_id`.
 `ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),
@@ -528,8 +548,10 @@ per nightly overlap) and `repository.count_price_quarantines` excludes it by nam
 the watermark budget of a *rejected* bar on the same date and release ingestion past
 one nobody had looked at. `price_restatement_conflict` (v1.5.0) is the second such
 check: the nightly load kept the stored bar and the vendor's re-read disagrees with it
-beyond `[prices] restatement_max_ratio` / `restatement_max_volume_ratio`; it is
-written once per open `(symbol, date)` and listed in `NON_QUARANTINE_PRICE_CHECKS`.
+beyond `[prices] restatement_max_ratio` / `restatement_max_volume_ratio` (a volume
+difference with both sides at or below `restatement_min_volume`, a round lot, is not
+one); it is written once per open `(symbol, date)` and listed in
+`NON_QUARANTINE_PRICE_CHECKS`.
 `price_split_scale_mismatch` is a real quarantine (a new bar at a split-adjusted scale
 was not stored) and repeats like the others. Anything added to that family later has
 to make the same choice explicitly.

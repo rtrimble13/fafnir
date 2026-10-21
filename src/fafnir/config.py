@@ -20,8 +20,8 @@ Config sections
 ``[sharadar]``
     rate_per_min, bulk_dir -- see :mod:`fafnir.sources.sharadar`
 ``[prices]``
-    restatement_max_ratio, restatement_max_volume_ratio -- see
-    :mod:`fafnir.ingest.daily_price`
+    restatement_max_ratio, restatement_max_volume_ratio, restatement_min_volume --
+    see :mod:`fafnir.ingest.daily_price`
 ``[dq]``
     engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir,
     dorq_lookback_sessions, dorq_threads, dorq_backfill_max -- see
@@ -273,6 +273,17 @@ class FafnirConfig:
     def restatement_max_volume_ratio(self) -> float:
         """The same, for volume."""
         return self._ratio_setting("restatement_max_volume_ratio", 3.0)
+
+    @property
+    def restatement_min_volume(self) -> int:
+        """Volumes at or below this on both sides differ only as a round lot's
+        rounding, never a restatement: FMP re-reads an odd-lot day as 100 shares."""
+        value = int(self._get("prices", "restatement_min_volume", 100))
+        if value < 0:
+            raise ValueError(
+                f"[prices] restatement_min_volume must be 0 or more, not {value}"
+            )
+        return value
 
     def _ratio_setting(self, key: str, default: float) -> float:
         value = float(self._get("prices", key, default))

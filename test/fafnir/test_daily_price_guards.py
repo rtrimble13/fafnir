@@ -144,3 +144,56 @@ def test_incremental_run_is_allowed_once_the_new_feed_has_watermarks(outcomes):
 def test_fresh_warehouse_is_not_blocked(outcomes):
     outcomes({"AAPL": "empty"})
     assert load_prices(_DB(), _FMP(), ["AAPL"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# G7: a round lot's rounding is not a restatement
+# ---------------------------------------------------------------------------
+
+
+def _bar(close, volume):
+    return {
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "volume": volume,
+    }
+
+
+def test_an_odd_lot_read_back_as_a_round_lot_is_no_restatement():
+    # WSGE 2026-10-16: 9 shares on the first print, exactly 100 on the re-read.
+    guard = dp.RestatementGuard()
+    stored, incoming = _bar("10.25", 9), _bar("10.25", 100)
+    assert dp.odd_lot_rounding(stored, incoming, guard)
+    assert dp.restatement_detail(stored, incoming, guard) is None
+    # Either way round, it is the rounding.
+    assert dp.restatement_detail(incoming, stored, guard) is None
+
+
+def test_a_volume_revision_above_a_round_lot_is_still_one():
+    guard = dp.RestatementGuard()
+    for stored, incoming in (
+        (2_123_830, 6_888_543),  # RCT
+        (109, 21),  # MAYS: the larger side is above the floor
+        (11, 331),  # 2026-10-20: not a round lot
+    ):
+        old, new = _bar("5", stored), _bar("5", incoming)
+        assert not dp.odd_lot_rounding(old, new, guard)
+        assert dp.restatement_detail(old, new, guard)["over"] == ["volume"]
+
+
+def test_a_close_conflict_at_odd_lot_volume_is_still_flagged():
+    detail = dp.restatement_detail(
+        _bar("11.39", 9), _bar("67.03", 100), dp.RestatementGuard()
+    )
+    assert detail["over"] == ["close"]
+
+
+def test_the_round_lot_is_a_setting():
+    stored, incoming = _bar("10.25", 9), _bar("10.25", 100)
+    off = dp.RestatementGuard(min_volume=0)
+    assert not dp.odd_lot_rounding(stored, incoming, off)
+    assert dp.restatement_detail(stored, incoming, off)["over"] == ["volume"]
+    # Within the volume ratio there is nothing to round.
+    assert not dp.odd_lot_rounding(_bar("1", 40), _bar("1", 100), dp.RestatementGuard())

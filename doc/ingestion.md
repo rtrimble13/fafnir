@@ -232,7 +232,10 @@ Two limits follow from the data:
 4, and a 1-for-4 reverse split is 0.25. That is the direction
 `core.corporate_action` reads (a 2-for-1 is 2 / 1), so `value` maps to
 `split_numerator / split_denominator` unchanged, a reverse split as its rational (1 /
-4). Across the sample, `closeunadj /
+4). A rounded value is snapped to the nearest fraction with a denominator up to 1,000
+(0.3333 -> 1/3) only when that is within the value's own rounding; a deep reverse
+split is read as written (0.0002 -> 1/5000, 0.0008 -> 1/1250), where the snap made
+0/1 and refused the load, or 1/1000 and stored the wrong split. Across the sample, `closeunadj /
 close` matched the cumulative split product after each date on all 127,726
 split-affected bars, within the 3-decimal rounding.
 
@@ -280,7 +283,7 @@ full TICKERS file used (#52, 2026-10-19).
 | `category` `MF` | `fund`, `is_fund` | NAV-priced |
 | `category` `UNIT`, `IDX` | none, silently | units are out of scope (ADR 0012); an index is not a security |
 | `sector`, `industry` | a name already in `ref.sector` / `ref.industry` | `map_classification`: case, commas and spacing ignored; two reviewed industry aliases (`Drug Manufacturers - Major`, `Furnishings`); anything else is none, and `missing_classification` flags the security |
-| split `value` | `split_numerator / split_denominator` | `split_ratio`: `Fraction(str(value)).limit_denominator(1000)`, 4 → 4/1, 0.25 → 1/4; non-positive refused |
+| split `value` | `split_numerator / split_denominator` | `split_ratio`: the value's fraction, snapped to a denominator up to 1,000 only within its own rounding (4 → 4/1, 0.25 → 1/4, 0.3333 → 1/3, 0.0002 → 1/5000); non-positive refused |
 | dividend `value` | `dividend_amount`, as declared | `as_declared_dividend(value, split_product_after(splits, ex_date))`, quantized to 6 dp half-up; non-positive refused |
 | SEP/SFP `closeunadj` | raw `close` | `recover_raw` |
 | SEP/SFP `open`, `high`, `low` | raw, × factor | factor = `closeunadj / close`, or the ACTIONS split product when the caller passes it (exact, where the ratio carries the close's 3-dp rounding; #75 chooses) |
@@ -330,6 +333,16 @@ date)`, with the stored OHLCV and the run that stored it, the incoming OHLCV, bo
 ratios and any split on file within 30 days. The date still counts as loaded, so the
 watermark moves past it. A zero volume on either side is no ratio and restates
 nothing.
+
+**A round lot is not a restatement** (G7). FMP re-reads an odd-lot-only day as 100
+shares: on 2026-10-16, 87 of the guard's 103 conflicts were a first print of 3 to 33
+shares re-read as exactly 100 at the same OHLC, and outside sources agree with the
+first print. So a volume difference where both sides are at or below `[prices]
+restatement_min_volume` (default 100) is never a conflict, on a nightly load or a
+re-fetch. The re-read's prices are judged as usual, and the bar is written with the
+stored volume; the run counts each in `params.restatement_odd_lot_kept`. A revision
+where either side is above the floor (109 -> 21, 11 -> 331) is judged by the ratio as
+before.
 
 An **explicit** re-fetch (`--from`) overwrites FMP's own bars, as before, and:
 - prints every bar it restated beyond the thresholds, close and volume, old -> new
@@ -457,6 +470,13 @@ events too, and a loader that deleted on every disagreement would be trusting th
 vendor on its worst day. TLT's July distribution vanished from its per-symbol payload
 while the warehouse held it correctly.
 
+Only FMP's own rows are compared. A row another party wrote is left out of both
+sides: an `operator` row exists because the feed has that event wrong or missing,
+and a `sharadar` row because the feed never carried it (the gap-fill adds an action
+only where no other source has one within 7 days). Comparing either would report it
+as withdrawn on every rotation, in a check no sweep may close, and could pair a
+Sharadar dividend with an FMP date and delete it as a re-dated copy.
+
 `redated` is the one exception, and the only place the reconciliation deletes.
 When the calendar sweep and the per-symbol feed date one distribution differently,
 the upsert stores the feed's date and keeps the sweep's, so the dividend sits in
@@ -498,13 +518,46 @@ amendment records:
   `sharadar_split_ratio_mismatch` once, with the count and the first and last such
   dates.
 - **Volume** is divided by the same factor, rounded to a whole share.
+- **A high below the close, or a low above it,** by no more than the recovery's own
+  rounding (0.0005 × (factor + 1)) is set to the close, and counted
+  `rounding_clamped` in the run's `params.counts`. The close is `closeunadj`, exact,
+  while the high is SEP's 3-dp adjusted high times the factor, so on a bar that
+  closed at its high the two land a fraction of a cent apart either way. The
+  validator used to quarantine about half of those bars as `cross_field_violation`,
+  and run 403's 146,710 include them. A larger violation is the vendor's, and is
+  still quarantined.
 
 Each bar then passes the FMP loader's gates, unchanged: non-session and
 operator-edited dates set aside, validation failures quarantined as `price_*`.
 Rows are written under precedence, never as a correction: correcting FMP's bars is
-`fafnir vendor correct` (#75). The files are streamed once each. The watermark is
-`(sharadar, SEP|SFP, security_id)` for the securities Sharadar feeds, and the
-factors of the securities that gained bars and hold actions are recomputed.
+`fafnir vendor correct` (#75). The watermark is `(sharadar, SEP|SFP, security_id)`
+for the securities Sharadar feeds, and the factors of the securities that gained
+bars and hold actions are recomputed.
+
+**The files are grouped by ticker first** (`sharadar_files.select_by_ticker`). SEP
+is largely date-major, one row per ticker per date, so batching rows in file order
+made a batch, with its lookups and commit, of nearly every row. Run 403 got through
+about a quarter of SEP in 13 hours. The loader now writes the rows it wants to 256
+bucket files, each a range of tickers, then loads one security at a time.
+
+- **Disk:** about four times the zip's size free under `[sharadar] bulk_dir`. For
+  SEP that is about 4 GB. A dry run sorts too.
+- **Memory:** one bucket, about 180k of SEP's rows.
+- **Leftovers:** the bucket directory is removed at the end or on an error. A
+  process killed outright leaves `.sharadar-sort-*` in `bulk_dir` to delete.
+- **Progress:** every 60 seconds the counts so far and the ticker reached go to
+  the open run (`params.progress`, `rows_inserted`, `rows_quarantined`). A killed
+  run still shows how far it got, and the final counts replace it. Read it with:
+
+```sql
+SELECT ingestion_run_id, status, rows_inserted, rows_quarantined, params->'progress'
+  FROM ops.ingestion_run
+ WHERE source = 'sharadar' AND endpoint IN ('prices', 'correct')
+ ORDER BY ingestion_run_id DESC LIMIT 1;
+```
+
+A re-run after a killed one resumes in effect: every date already held is skipped.
+Run it where a closed terminal does not kill it (`tmux`, or `systemd-run`).
 
 ```bash
 fafnir ingest sharadar-prices --backfill --gap-fill --dry-run   # counts per reason
@@ -530,6 +583,9 @@ compares them with the FMP bars on the dates both hold, from the link's `valid_f
   the same way (consolidated against primary-exchange) is a convention, and the dry
   run measures it; `--volume sharadar` takes the vendor's once that is decided.
 - **`vendor_history_disagrees`** flags resolve once every date they sample agrees.
+  Only those sampled dates are remembered during the scan, so memory is one
+  bucket of rows whatever the universe: the first full dry run on the host kept
+  every agreeing date of 15,567 securities and was stopped at 1.6 GB.
 - The factors of the corrected securities that hold actions are recomputed.
 
 `--dry-run` writes nothing and is the comparison report that replaced #69: bars

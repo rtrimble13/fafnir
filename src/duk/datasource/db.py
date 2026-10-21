@@ -211,8 +211,14 @@ def price_history(
     fields: Optional[list[str]] = None,
     adjusted: bool = False,
     security_id: Optional[int] = None,
+    exact: bool = False,
 ) -> pd.DataFrame:
     """Return a date-indexed OHLCV DataFrame from fafnir, shaped like the live path.
+
+    With ``exact`` the prices stay the ``Decimal`` values the warehouse stores
+    (object columns) instead of becoming floats, for a caller that must not
+    read a price through one (`ph --exact`). Daily frequency only: resampling
+    is arithmetic, and the float path is the one that does it.
 
     Give ``symbol`` to resolve a ticker through the ladder, or ``security_id`` when
     the caller already holds the identity -- which is not merely a saved query. A
@@ -259,6 +265,19 @@ def price_history(
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
+    if exact:
+        if frequency.lower() != "day":
+            raise DataSourceError(
+                "exact prices are daily bars; frequency must be 'day'"
+            )
+        return shape_price_dataframe(
+            df,
+            frequency="day",
+            limit=limit,
+            fields=fields,
+            start_date=start_date,
+            end_date=end_date,
+        )
     # Prices: exact decimals -> float for downstream numeric ops (matches live).
     for col in ("open", "high", "low", "close"):
         if col in df.columns:

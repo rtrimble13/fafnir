@@ -164,10 +164,25 @@ def split_ratio(value) -> tuple[int, int]:
     The value is new shares per old (#49, item 4): a 4-for-1 is 4 -> (4, 1), a
     1-for-4 is 0.25 -> (1, 4), and a 3-for-2 is 1.5 -> (3, 2). Read from the text so
     a float's binary noise cannot leak into the fraction.
+
+    A rounded value is snapped to the nearest fraction with a denominator up to
+    1,000 (0.3333 -> 1/3), but only when that fraction is within half a unit of the
+    text's last decimal. A deep reverse split is not snapped: the nearest such
+    fraction to 0.0002 (a 1-for-5,000) is 0/1, which refused the whole ACTIONS load
+    on 2026-10-21, and to 0.0008 (a 1-for-1,250) it is 1/1000, a wrong split stored
+    silently. Those are read as written, to a denominator of at most 1,000,000.
     """
-    ratio = Fraction(str(value)).limit_denominator(1000)
-    if ratio <= 0:
+    text = Decimal(str(value))
+    exact = Fraction(text)
+    if exact <= 0:
         raise ValueError(f"a split ratio must be positive, not {value!r}")
+    snapped = exact.limit_denominator(1000)
+    half_unit = Fraction(1, 2) * Fraction(10) ** text.as_tuple().exponent
+    ratio = (
+        snapped
+        if abs(snapped - exact) <= half_unit
+        else exact.limit_denominator(1_000_000)
+    )
     return ratio.numerator, ratio.denominator
 
 

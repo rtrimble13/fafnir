@@ -29,8 +29,10 @@ from __future__ import annotations
 import csv
 import gzip
 import io
+import tempfile
 import zipfile
-from contextlib import contextmanager
+from collections import defaultdict
+from contextlib import ExitStack, contextmanager
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -321,27 +323,24 @@ class _AllDates:
 
 ALL_DATES = _AllDates()
 
+#: The bucket files :func:`group_by_ticker` spreads a file's rows over. Memory holds
+#: one bucket, so about 1/256 of the rows wanted: some 180k of SEP's 45M.
+SORT_BUCKETS = 256
 
-def select(
-    db, file_id: int, bulk_dir: str | Path, wanted: Mapping[str, Collection[str]]
-) -> Iterator[dict]:
-    """The typed rows of a ledger file whose ``ticker`` is a key of ``wanted`` and
-    whose ``date`` (``YYYY-MM-DD``) is in that key's collection.
 
-    Both are tested on the raw text, and only a row that passes is converted. A
-    price table is 45M rows, and a caller that wants a few dates for each of
-    thousands of tickers would otherwise parse most of them.
-    """
-    entry, path = checked_path(db, file_id, bulk_dir)
-    table, name = entry["vendor_table"], path.name
-    with open_text(path, entry["member"]) as fh:
-        reader = csv.reader(fh)
-        cols = [c.strip() for c in next(reader, [])]
-        if "ticker" not in cols or "date" not in cols:
-            raise SharadarFileError(f"{name}: needs ticker and date columns")
-        t, d = cols.index("ticker"), cols.index("date")
-        width = len(cols)
-        convert = [_CONVERTERS.get(column_type(table, c) or "text", str) for c in cols]
+def _matching(
+    reader, name: str, wanted: Mapping[str, Collection[str]]
+) -> tuple[list[str], int, int, Iterator[tuple[int, list[str]]]]:
+    """The header of a price-shaped CSV, the positions of its ticker and date, and
+    ``(line, fields)`` for each data row whose ticker is a key of ``wanted`` and
+    whose date is in that key's collection, both tested on the raw text."""
+    cols = [c.strip() for c in next(reader, [])]
+    if "ticker" not in cols or "date" not in cols:
+        raise SharadarFileError(f"{name}: needs ticker and date columns")
+    t, d = cols.index("ticker"), cols.index("date")
+    width = len(cols)
+
+    def rows() -> Iterator[tuple[int, list[str]]]:
         for line, fields in enumerate(reader, start=2):
             if len(fields) != width:
                 if fields:
@@ -353,13 +352,122 @@ def select(
             dates = wanted.get(fields[t])
             if dates is None or fields[d] not in dates:
                 continue
-            row = {}
-            for col, conv, text in zip(cols, convert, fields):
-                try:
-                    row[col] = None if text == "" else conv(text)
-                except (ValueError, InvalidOperation) as exc:
-                    raise SharadarFileError(
-                        f"{name} line {line}, column {col}: {text!r} is not a "
-                        f"{column_type(table, col)} ({exc})"
-                    ) from None
-            yield row
+            yield line, fields
+
+    return cols, t, d, rows()
+
+
+def _typer(table: str, cols: list[str], name: str) -> Callable[[int, list], dict]:
+    """Converts one row's text fields to typed values, naming the file's line on a
+    value that does not parse."""
+    convert = [_CONVERTERS.get(column_type(table, c) or "text", str) for c in cols]
+
+    def typed(line: int, fields: list[str]) -> dict:
+        row = {}
+        for col, conv, text in zip(cols, convert, fields):
+            try:
+                row[col] = None if text == "" else conv(text)
+            except (ValueError, InvalidOperation) as exc:
+                raise SharadarFileError(
+                    f"{name} line {line}, column {col}: {text!r} is not a "
+                    f"{column_type(table, col)} ({exc})"
+                ) from None
+        return row
+
+    return typed
+
+
+def select(
+    db, file_id: int, bulk_dir: str | Path, wanted: Mapping[str, Collection[str]]
+) -> Iterator[dict]:
+    """The typed rows of a ledger file whose ``ticker`` is a key of ``wanted`` and
+    whose ``date`` (``YYYY-MM-DD``) is in that key's collection, in file order.
+
+    Both are tested on the raw text, and only a row that passes is converted. A
+    price table is 45M rows, and a caller that wants a few dates for each of
+    thousands of tickers would otherwise parse most of them.
+    """
+    entry, path = checked_path(db, file_id, bulk_dir)
+    with open_text(path, entry["member"]) as fh:
+        cols, _, _, rows = _matching(csv.reader(fh), path.name, wanted)
+        typed = _typer(entry["vendor_table"], cols, path.name)
+        for line, fields in rows:
+            yield typed(line, fields)
+
+
+def select_by_ticker(
+    db,
+    file_id: int,
+    bulk_dir: str | Path,
+    wanted: Mapping[str, Collection[str]],
+    *,
+    scratch_dir: Optional[str | Path] = None,
+) -> Iterator[tuple[str, list[dict]]]:
+    """:func:`select`'s rows grouped: ``(ticker, rows)`` once per ticker. The file
+    is checked first, and the buckets go under ``scratch_dir``, by default
+    ``bulk_dir`` (see :func:`group_by_ticker`)."""
+    entry, path = checked_path(db, file_id, bulk_dir)
+    return group_by_ticker(
+        path,
+        entry["vendor_table"],
+        wanted,
+        member=entry["member"],
+        scratch_dir=scratch_dir or bulk_dir,
+    )
+
+
+def group_by_ticker(
+    path: str | Path,
+    table: str,
+    wanted: Mapping[str, Collection[str]],
+    *,
+    member: Optional[str] = None,
+    scratch_dir: Optional[str | Path] = None,
+    buckets: int = SORT_BUCKETS,
+) -> Iterator[tuple[str, list[dict]]]:
+    """The rows :func:`select` would yield, as ``(ticker, rows)`` once per ticker, in
+    ticker order, each ticker's rows in date order, whatever order the file holds
+    them in.
+
+    A bulk file is not sorted by ticker. SEP is largely date-major, one row per
+    ticker per date (run 403, 2026-10-21), so a loader that wrote each run of one
+    ticker's rows as a batch made a batch of nearly every row, and needed days. Here
+    the rows wanted are first written, as read, to ``buckets`` files under a new
+    directory in ``scratch_dir``, each bucket a contiguous range of the sorted
+    tickers. Each bucket is then read back alone, grouped, typed and deleted.
+
+    Memory holds one bucket. Disk holds every row wanted once, as uncompressed
+    CSV: about 4 GB for SEP, so ``scratch_dir`` needs about four times the zip's
+    size free. The directory is removed when the rows run out, the caller stops
+    early, or either fails. A process killed outright leaves it, named
+    ``.sharadar-sort-*``, to delete. A value that does not parse still names the
+    file's own line.
+    """
+    name = Path(path).name
+    tickers = sorted(wanted)
+    if not tickers:
+        return
+    n = min(buckets, len(tickers))
+    bucket_of = {ticker: i * n // len(tickers) for i, ticker in enumerate(tickers)}
+    with tempfile.TemporaryDirectory(prefix=".sharadar-sort-", dir=scratch_dir) as tmp:
+        parts = [Path(tmp) / f"{i:04d}.csv" for i in range(n)]
+        with open_text(path, member) as fh, ExitStack() as stack:
+            cols, t, d, rows = _matching(csv.reader(fh), name, wanted)
+            writers = [
+                csv.writer(
+                    stack.enter_context(p.open("w", newline="", encoding="utf-8"))
+                )
+                for p in parts
+            ]
+            for line, fields in rows:
+                writers[bucket_of[fields[t]]].writerow([line, *fields])
+        typed = _typer(table, cols, name)
+        for part in parts:
+            runs: dict[str, list[tuple[int, list[str]]]] = defaultdict(list)
+            with part.open(newline="", encoding="utf-8") as fh:
+                for line, *fields in csv.reader(fh):
+                    runs[fields[t]].append((int(line), fields))
+            part.unlink()
+            for ticker in sorted(runs):
+                ordered = sorted(runs.pop(ticker), key=lambda r: r[1][d])
+                yield ticker, [typed(line, fields) for line, fields in ordered]

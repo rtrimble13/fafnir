@@ -137,6 +137,73 @@ def test_a_member_named_for_a_plain_file_is_refused(tmp_path):
         sf.header(path, member="stocks.csv")
 
 
+# Date-major, as SEP largely is: one row per ticker per date (run 403).
+DATE_MAJOR = (
+    "ticker,date,open,high,low,close,volume,closeadj,closeunadj,lastupdated\n"
+    "ZZA,2024-01-02,1,1,1,1.5,10,1,1,2024-01-03\n"
+    "ZZB,2024-01-02,2,2,2,2,20,2,2,2024-01-03\n"
+    "ZZC,2024-01-02,3,3,3,3,30,3,3,2024-01-03\n"
+    "ZZA,2024-01-03,1,1,1,1.25,11,1,1,2024-01-04\n"
+    "ZZB,2024-01-03,2,2,2,2,21,2,2,2024-01-04\n"
+    "ZZC,2024-01-03,3,3,3,3,31,3,3,2024-01-04\n"
+    "ZZA,2024-01-01,1,1,1,1,9,1,1,2024-01-04\n"  # a late revision, out of order
+)
+
+
+def test_group_by_ticker_yields_each_ticker_once_in_date_order(tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    wanted = {"ZZA": sf.ALL_DATES, "ZZC": {"2024-01-03"}}
+    groups = list(
+        sf.group_by_ticker(
+            _zip(tmp_path, DATE_MAJOR), "stocks", wanted, scratch_dir=scratch, buckets=2
+        )
+    )
+    assert [(t, [r["date"] for r in rows]) for t, rows in groups] == [
+        ("ZZA", [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)]),
+        ("ZZC", [date(2024, 1, 3)]),
+    ]
+    assert groups[0][1][1]["close"] == Decimal("1.5")  # typed, as select types it
+    assert list(scratch.iterdir()) == []  # the buckets are gone
+
+
+def test_group_by_ticker_with_more_buckets_than_tickers(tmp_path):
+    wanted = {t: sf.ALL_DATES for t in ("ZZA", "ZZB", "ZZC")}
+    groups = sf.group_by_ticker(
+        _zip(tmp_path, DATE_MAJOR), "stocks", wanted, scratch_dir=tmp_path
+    )
+    assert [(t, len(rows)) for t, rows in groups] == [
+        ("ZZA", 3),
+        ("ZZB", 2),
+        ("ZZC", 2),
+    ]
+
+
+def test_group_by_ticker_names_the_files_own_line(tmp_path):
+    bad = DATE_MAJOR + "ZZB,2024-01-04,2,2,2,2,x,2,2,2024-01-05\n"
+    with pytest.raises(sf.SharadarFileError, match=r"line 9, column volume: 'x'"):
+        list(
+            sf.group_by_ticker(
+                _zip(tmp_path, bad),
+                "stocks",
+                {"ZZB": sf.ALL_DATES},
+                scratch_dir=tmp_path,
+            )
+        )
+    assert not list(tmp_path.glob(".sharadar-sort-*"))
+
+
+def test_group_by_ticker_cleans_up_when_the_caller_stops_early(tmp_path):
+    wanted = {t: sf.ALL_DATES for t in ("ZZA", "ZZB")}
+    groups = sf.group_by_ticker(
+        _zip(tmp_path, DATE_MAJOR), "stocks", wanted, scratch_dir=tmp_path
+    )
+    assert next(groups)[0] == "ZZA"
+    assert len(list(tmp_path.glob(".sharadar-sort-*"))) == 1
+    groups.close()
+    assert not list(tmp_path.glob(".sharadar-sort-*"))
+
+
 def test_legacy_names_map_to_the_modern_ones():
     assert [
         sf.canonical_table(t) for t in ("SEP", "sfp", "SF1", "stocks", "tickers")

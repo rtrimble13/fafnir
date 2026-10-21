@@ -484,6 +484,12 @@ quarantine: it spends no watermark budget, and the watermark moved past the date
 `close_ratio`, `volume_ratio`, `over` (which tripped) and `splits_near` (any split
 on file within 30 days).
 
+**Odd lots are no longer flagged** (G7, `[prices] restatement_min_volume`, 100). A
+first print under 100 shares re-read as exactly 100 at the same OHLC was ~85 flags a
+night until then; 353 were accepted by class on 2026-10-19 and 10-21. On a warehouse
+running G7, any such flag predates it. A volume-only conflict that is still raised
+has a side above 100: a real revision or a vendor error, judged like any other.
+
 **Which side is right?** FMP's first print usually is. What it restated from
 2026-09-16 to 10-14:
 - **another instrument's level** (OUSL ~11 -> ~58, QCJL ~26 -> 0.07, KEO, MILK,
@@ -667,7 +673,8 @@ latest `corporate-actions` run's `params.mode` — do not trust `automations.md`
   moved it: look for a feed row within ±5 days at about the same amount. If there
   is one, it is a duplicate to delete. If there is not, **the warehouse is usually
   right and the feed glitched** (TLT, JEPQ and SKOR all had a real distribution
-  vanish from a payload). Leave it open and say so.
+  vanish from a payload). Leave it open and say so. Only FMP's own rows are
+  compared: an `operator` or `sharadar` row is never reported here.
 
 **Never `accept` this check unless you mean the whole symbol.** Acceptance is keyed
 on `record_key = {"symbol": …}`, so it hides *every* future drift for that symbol —

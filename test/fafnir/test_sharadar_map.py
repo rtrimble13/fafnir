@@ -157,6 +157,14 @@ def test_anything_else_is_none_never_a_new_row():
         ("0.3333", (1, 3)),
         (0.1, (1, 10)),  # no float noise: Fraction(0.1) alone is 3602879701896397/...
         (112, (112, 1)),
+        # Deep reverse splits: snapped to a denominator of 1,000 these were 0/1 (the
+        # whole ACTIONS load refused, 2026-10-21) and 1/1000 (a wrong split, silently).
+        ("0.0002", (1, 5000)),
+        (D("0.0002"), (1, 5000)),  # as the file reader types it
+        ("2E-4", (1, 5000)),
+        ("0.0008", (1, 1250)),
+        ("0.000666667", (1, 1500)),  # rounded, and still read as the round ratio
+        ("0.00005", (1, 20000)),
     ],
 )
 def test_split_ratio(value, expected):

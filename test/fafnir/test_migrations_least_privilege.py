@@ -207,6 +207,14 @@ DUK_MART_RELATIONS = (
     "ref.industry",
 )
 
+# Relations a fafnir_app client other than duk reads. Each is a mart view added
+# for that client; if one is dropped or renamed, the client breaks on a mart-only
+# role exactly as `ph` once did.
+CLIENT_MART_RELATIONS = (
+    # portable's `pt ca sync`: corporate actions at event grain (#174).
+    "mart.v_corporate_action",
+)
+
 # What the seam must NOT reach. core.daily_price is the one that matters most: it
 # is readable through mart.v_daily_price_raw and must not be readable directly, or
 # the view is decoration rather than a boundary.
@@ -214,6 +222,7 @@ FORBIDDEN_TO_APP = (
     "core.daily_price",
     "core.symbol_xref",
     "core.security",
+    "core.corporate_action",
     "ops.data_quality_flag",
     "landing.fmp_raw",
     "landing.sharadar_file",
@@ -251,6 +260,20 @@ def test_fafnir_app_can_read_every_relation_duk_uses(least_privilege_dsn):
     failures = []
     with _migrate_and_open_as_app(least_privilege_dsn) as app:
         for relation in DUK_MART_RELATIONS:
+            try:
+                app.fetchval(f"SELECT count(*) FROM {relation}")
+            except Exception as exc:  # noqa: BLE001 -- the message is the report
+                failures.append(f"{relation}: {type(exc).__name__}: {exc}")
+    assert not failures, "fafnir_app cannot read:\n  " + "\n  ".join(failures)
+
+
+def test_fafnir_app_can_read_every_relation_other_clients_use(least_privilege_dsn):
+    """The same promise as above, for the views added for clients that are not duk
+    -- mart.v_corporate_action for portable (#174). The table beneath it is in
+    FORBIDDEN_TO_APP, so the two together say the view is the only way in."""
+    failures = []
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        for relation in CLIENT_MART_RELATIONS:
             try:
                 app.fetchval(f"SELECT count(*) FROM {relation}")
             except Exception as exc:  # noqa: BLE001 -- the message is the report

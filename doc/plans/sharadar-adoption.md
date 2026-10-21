@@ -127,6 +127,7 @@ reconcile are dropped, and #66 is folded into #75.*
 | 0031 | #55 | `core.vendor_security`, `core.security_vendor_xref`, `core.vendor_security_event` — **built** |
 | 0032 | #63 | `core.security_vendor_rejection` (a person's "not this key"; not in v2's first list) — **built** |
 | ~~0033~~ | ~~#66~~ | ~~`ops.vendor_bar_comparison`~~: dropped on 2026-10-20 (#66 folded into #75); later migrations take the next free number |
+| 0033 | #174 | `mart.v_corporate_action`, outside this plan (a mart-only reader's corporate actions) — so #79's view takes the next free number after it |
 | 0034 | #79 | `mart.v_security_lifecycle` |
 | 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
 | 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
@@ -275,6 +276,45 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
     ([dorq.md](../dorq.md#what-a-run-does)).
   - **Next.** The measurement; then part 2: the per-check decisions in `sweep-policy.md`, and the dead-issuer
     patterns in `outlier-classification.md`.
+
+- **2026-10-21 · #75 follow-up: `vendor correct` memory.** The first full `vendor correct --dry-run` on
+  the host reached 1.6 GB in 50 minutes and pushed the 3.8 GB machine into swap. It was stopped.
+  - **The cause:** every agreeing date of every linked security was kept for `_resolve_history_flags`,
+    which reads only the dates an open `vendor_history_disagrees` flag sampled. Only those are kept now.
+  - **Measured on 600,000 agreeing bars:** peak RSS 122 MB before and 95 MB after, the difference
+    growing with every bar compared.
+
+- **2026-10-21 · #73 follow-up: deep reverse splits.** The first `sharadar-actions --backfill --gap-fill
+  --dry-run` stopped on `a split ratio must be positive, not Decimal('0.0002')`. `split_ratio` snapped every
+  value to a denominator of at most 1,000:
+  - a 1-for-5,000 became 0/1 and refused the whole load;
+  - a 1-for-1,001 to 1-for-1,999 became 1/1000, a wrong split stored silently.
+
+  The snap is now kept only within the value's own rounding (0.3333 -> 1/3). Otherwise the value is read as
+  written, to a denominator of at most 1,000,000 (0.0002 -> 1/5000, 0.0008 -> 1/1250). No Sharadar split had
+  been stored, so nothing needs repair.
+
+- **2026-10-21 · #75 follow-up: Sharadar's files grouped by ticker; rounding no
+  longer quarantines.** Run 403 (`sharadar-prices --backfill --gap-fill`) was killed
+  after 13 hours. It had written 3.74M bars, about a quarter of SEP, and no funds.
+  - **The cause:** SEP is largely date-major, and the loader batched consecutive
+    rows of one ticker, so nearly every row was a batch with its own lookups and
+    commit. `sharadar_files.select_by_ticker` now groups a file's wanted rows by
+    ticker in 256 bucket files under `bulk_dir` (about 4 GB for SEP). Both
+    `sharadar-prices` and `vendor correct` read through it, one batch per security.
+  - **Measured:** the same 600k-bar date-major fixture loaded at about 6,200 bars/s,
+    against about 510 for the old code. The bucket pass ran at about 69k rows/s.
+  - **Progress:** both scans write it to the open run every minute
+    (`RunLog.checkpoint`, `params.progress`). Run 403 left only `started` and zeros.
+  - **Rounding:** 146,710 bars were quarantined as `cross_field_violation`. On
+    PFFBQ (factor 2.1), 20 7/8 recovered as 20.874 against an exact close of
+    20.875: 55 of its 210 bars on the wrong side, 45 just on the right one. A high
+    below the close, or a low above it, within 0.0005 × (factor + 1) is now set to
+    the close. A larger violation is still quarantined.
+  - **Next.** On the host: deploy, `sharadar-prices --backfill --gap-fill --dry-run`
+    (the `rounding_clamped` and `quarantined:*` counts say how much of the 146,710
+    was rounding), then the real run, kept alive with `tmux` or `systemd-run`.
+
 - **2026-10-20 · P2, #75 (part 2): `fafnir vendor correct`.** For every FMP security linked to Sharadar,
   compares its bars with Sharadar's (recovered raw, from the link's `valid_from`) and replaces the ones whose
   close differs by more than max($0.01, 1 bp), or whose open/high/low differ by more than that and the
