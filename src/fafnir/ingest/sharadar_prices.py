@@ -18,7 +18,9 @@ after the bar's date, exact, where it agrees with ``closeunadj / close`` within 
 two closes' 3-dp rounding (#49). Where it does not, a split is missing from ACTIONS
 or one is wrong: the bar is recovered with the vendor's own ratio, still loaded, and
 the security is flagged ``sharadar_split_ratio_mismatch`` once, with the count and
-the first and last such dates.
+the first and last such dates. Recovered with ACTIONS, a high can land below the
+exact close, or a low above it, by the recovery's own rounding; within that bound it
+is set to the close (:func:`clamp_to_close`), and beyond it the validator decides.
 
 Each bar then goes through the FMP loader's own gates, unchanged: dates the venue
 was closed and dates an operator edited are set aside, and a bar that fails
@@ -26,10 +28,14 @@ validation is quarantined under the same ``price_*`` checks. Rows are written un
 ADR 0015's precedence as ``source = 'sharadar'``, never as a correction (#75's
 ``vendor correct`` does that). A future date is never read.
 
-The files are read once each, streaming: the rows of one ticker that arrive
-together are one batch, written and committed before the next, so memory holds one
-ticker's run of rows, not 45M. A file not sorted by ticker only makes more batches:
-the writes are fill-only, so a second batch of a security adds its own dates.
+The files are read once each and grouped by ticker on disk first
+(:func:`sharadar_files.select_by_ticker`): SEP is largely date-major, and batching
+the rows in file order made a batch, with its lookups and commit, of nearly every
+row (run 403 managed about a quarter of SEP in 13 hours). Each security's rows are
+then one batch, written and committed before the next, so memory holds one bucket
+of tickers, not 45M rows, and a run killed part-way keeps every security it
+finished. Every ``PROGRESS_SECONDS`` the counts so far and the ticker reached are
+written to the open run (``params.progress``).
 
 A date the security already holds, whoever supplied it, is not read again, so a
 re-run writes nothing new; the vendor's later revisions of its own history come
@@ -40,12 +46,13 @@ hold actions are recomputed at the end.
 
 from __future__ import annotations
 
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Sequence
+from typing import Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
@@ -74,6 +81,10 @@ TABLES = ("stocks", "funds")
 RATIO_CHECK = "sharadar_split_ratio_mismatch"
 #: Half a unit in the third decimal place: SEP's precision (#49).
 ROUNDING = Decimal("0.0005")
+#: Half a unit of NUMERIC(20, 6), the quantum a recovered price is rounded to.
+QUANTUM = Decimal("0.0000005")
+#: How often a scan writes its progress to the open run, in seconds.
+PROGRESS_SECONDS = 60
 
 
 class PricesError(RuntimeError):
@@ -113,15 +124,49 @@ def recovery_factor(row: dict, splits) -> tuple[Optional[Decimal], Optional[bool
     return unadj / close, False
 
 
-def recovered_bar(row: dict, splits) -> tuple[dict, Optional[bool]]:
+def clamp_to_close(raw: dict, slack: Decimal) -> tuple[dict, bool]:
+    """``raw`` with a high below its close, or a low above it, by at most ``slack``
+    set to the close, and whether either was.
+
+    Recovered with the ACTIONS factor ``f``, the close is ``closeunadj``, within
+    0.0005 of the price traded, while the high and low are SEP's 3-dp adjusted
+    prices times ``f``, each within 0.0005 x ``f`` of it. On a bar that closed at its
+    high, the recovered high therefore lands below the close about half the time,
+    and the validator quarantined a bar the vendor had right (PFFBQ, 1998, ``f`` =
+    2.1: 20 7/8 recovered as 20.874 against a close of 20.875; 55 of its 210 bars).
+    A shortfall within ``slack``, 0.0005 x (``f`` + 1) and the quantum, is the
+    recovery's: the traded high was at least the close. A larger one is the
+    vendor's, and is left for the validator to quarantine.
+    """
+    close, out, clamped = raw["close"], dict(raw), False
+    if out.get("high") is not None and close - slack <= out["high"] < close:
+        out["high"], clamped = close, True
+    if out.get("low") is not None and close < out["low"] <= close + slack:
+        out["low"], clamped = close, True
+    return out, clamped
+
+
+def recovered_bar(
+    row: dict, splits, counts: Optional[Counter] = None
+) -> tuple[dict, Optional[bool]]:
     """The raw bar, shaped as the FMP loader's validator reads one, and whether the
-    vendor's ratio agreed with ACTIONS (None when there was no close to test)."""
+    vendor's ratio agreed with ACTIONS (None when there was no close to test).
+
+    Recovered with ACTIONS, a high or low on the wrong side of the close by the
+    recovery's rounding is set to the close (:func:`clamp_to_close`), counted
+    ``rounding_clamped`` in ``counts`` when given. Recovered with the vendor's ratio,
+    the close and the rest are scaled alike, so no such rounding arises.
+    """
     day = row["date"]
     factor, agrees = recovery_factor(row, splits)
     if factor is None:
         # No price to recover from: the validator quarantines it as such.
         return {"date": day.isoformat(), "close": None}, None
     raw = sharadar_map.recover_raw(row, factor=factor if agrees else None)
+    if agrees:
+        raw, clamped = clamp_to_close(raw, ROUNDING * (factor + 1) + QUANTUM)
+        if clamped and counts is not None:
+            counts["rounding_clamped"] += 1
     return {
         "date": day.isoformat(),
         "open": raw["open"],
@@ -132,17 +177,15 @@ def recovered_bar(row: dict, splits) -> tuple[dict, Optional[bool]]:
     }, agrees
 
 
-def _runs(rows: Iterable[dict]) -> Iterator[tuple[str, list[dict]]]:
-    """``(ticker, rows)`` for each run of consecutive rows of one ticker."""
-    ticker, run = None, []
-    for r in rows:
-        if r["ticker"] != ticker and run:
-            yield ticker, run
-            run = []
-        ticker = r["ticker"]
-        run.append(r)
-    if run:
-        yield ticker, run
+def report_progress(run: Optional[RunLog], last: float, **progress) -> float:
+    """Write ``progress`` to the open run (``params.progress``, with the run's counts)
+    once ``PROGRESS_SECONDS`` have passed since ``last``; the time it last wrote."""
+    now = time.monotonic()
+    if run is None or now - last < PROGRESS_SECONDS:
+        return last
+    run.params["progress"] = progress
+    run.checkpoint()
+    return now
 
 
 @dataclass
@@ -180,7 +223,7 @@ def _load_run(
         return
     bars = []
     for r in sorted(wanted, key=lambda r: r["date"]):
-        bar, agrees = recovered_bar(r, t.splits)
+        bar, agrees = recovered_bar(r, t.splits, result.counts)
         if agrees is False:
             t.mismatched.append(r["date"])
         bars.append(bar)
@@ -309,9 +352,11 @@ def load(
     by_file, files, keys = prepare(db, bulk_dir, targets, result.counts)
 
     def scan(run: Optional[RunLog]) -> None:
+        last = time.monotonic()
         for table, file_id in files.items():
             wanted = {ticker: sf.ALL_DATES for ticker in by_file[table]}
-            for ticker, rows in _runs(sf.select(db, file_id, bulk_dir, wanted)):
+            groups = sf.select_by_ticker(db, file_id, bulk_dir, wanted)
+            for done, (ticker, rows) in enumerate(groups, start=1):
                 result.read += len(rows)
                 _load_run(
                     db,
@@ -321,6 +366,18 @@ def load(
                     as_of=as_of,
                     run=run,
                     result=result,
+                )
+                if run is not None:
+                    run.rows_inserted = result.written
+                last = report_progress(
+                    run,
+                    last,
+                    table=table,
+                    ticker=ticker,
+                    tickers_done=done,
+                    tickers=len(wanted),
+                    read=result.read,
+                    written=result.written,
                 )
         mismatched = [t for t in keys.values() if t.mismatched]
         result.mismatched_securities = len(mismatched)
@@ -345,6 +402,7 @@ def load(
                 ingestion_run_id=run.run_id,
             )
         run.rows_inserted = result.written
+        run.params.pop("progress", None)  # the counts below are the final word
         run.params.update(
             securities=result.securities,
             read=result.read,

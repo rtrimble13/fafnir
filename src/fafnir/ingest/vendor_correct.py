@@ -24,13 +24,16 @@ them with the FMP bars on the dates both hold, from the link's ``valid_from``:
 bars that would be replaced, by asset type, exchange and decade, and the volume
 ratio (FMP over Sharadar) on the bars whose prices agree. Counts only, safe to post.
 
-One ``ops.ingestion_run`` (``sharadar`` / ``correct``), a commit per security run;
-the factors of the corrected securities that hold actions are recomputed.
+One ``ops.ingestion_run`` (``sharadar`` / ``correct``), a commit per security: the
+files are grouped by ticker on disk first, as ``ingest sharadar-prices`` reads them,
+and the progress is written to the open run as it goes. The factors of the
+corrected securities that hold actions are recomputed.
 """
 
 from __future__ import annotations
 
 import random
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date
@@ -159,7 +162,7 @@ def _compare_run(
         if factor is None:
             result.counts["no_vendor_price"] += 1
             continue
-        bar, _ = sp.recovered_bar(r, t.splits)
+        bar, _ = sp.recovered_bar(r, t.splits, result.counts)
         new, reason = _validate_bar(bar, nav_only=nav_only)
         if reason:
             result.counts[f"vendor_invalid:{reason}"] += 1
@@ -254,9 +257,11 @@ def correct(
     agreed: dict[int, set] = defaultdict(set)
 
     def scan(run: Optional[RunLog]) -> None:
+        last = time.monotonic()
         for table, file_id in files.items():
             wanted = {ticker: sf.ALL_DATES for ticker in by_file[table]}
-            for ticker, rows in sp._runs(sf.select(db, file_id, bulk_dir, wanted)):
+            groups = sf.select_by_ticker(db, file_id, bulk_dir, wanted)
+            for done, (ticker, rows) in enumerate(groups, start=1):
                 result.read += len(rows)
                 _compare_run(
                     db,
@@ -267,6 +272,18 @@ def correct(
                     run=run,
                     result=result,
                     agreed=agreed,
+                )
+                if run is not None:
+                    run.rows_inserted = result.corrected
+                last = sp.report_progress(
+                    run,
+                    last,
+                    table=table,
+                    ticker=ticker,
+                    tickers_done=done,
+                    tickers=len(wanted),
+                    read=result.read,
+                    corrected=result.corrected,
                 )
 
     if dry_run:
@@ -285,6 +302,7 @@ def correct(
             db, list(keys.values()), agreed, run
         )
         run.rows_inserted = result.corrected
+        run.params.pop("progress", None)  # the counts below are the final word
         run.params.update(
             securities=result.securities,
             read=result.read,

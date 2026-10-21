@@ -261,6 +261,27 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-21 · #75 follow-up: Sharadar's files grouped by ticker; rounding no
+  longer quarantines.** Run 403 (`sharadar-prices --backfill --gap-fill`) was killed
+  after 13 hours. It had written 3.74M bars, about a quarter of SEP, and no funds.
+  - **The cause:** SEP is largely date-major, and the loader batched consecutive
+    rows of one ticker, so nearly every row was a batch with its own lookups and
+    commit. `sharadar_files.select_by_ticker` now groups a file's wanted rows by
+    ticker in 256 bucket files under `bulk_dir` (about 4 GB for SEP). Both
+    `sharadar-prices` and `vendor correct` read through it, one batch per security.
+  - **Measured:** the same 600k-bar date-major fixture loaded at about 6,200 bars/s,
+    against about 510 for the old code. The bucket pass ran at about 69k rows/s.
+  - **Progress:** both scans write it to the open run every minute
+    (`RunLog.checkpoint`, `params.progress`). Run 403 left only `started` and zeros.
+  - **Rounding:** 146,710 bars were quarantined as `cross_field_violation`. On
+    PFFBQ (factor 2.1), 20 7/8 recovered as 20.874 against an exact close of
+    20.875: 55 of its 210 bars on the wrong side, 45 just on the right one. A high
+    below the close, or a low above it, within 0.0005 × (factor + 1) is now set to
+    the close. A larger violation is still quarantined.
+  - **Next.** On the host: deploy, `sharadar-prices --backfill --gap-fill --dry-run`
+    (the `rounding_clamped` and `quarantined:*` counts say how much of the 146,710
+    was rounding), then the real run, kept alive with `tmux` or `systemd-run`.
+
 - **2026-10-20 · P2, #75 (part 2): `fafnir vendor correct`.** For every FMP security linked to Sharadar,
   compares its bars with Sharadar's (recovered raw, from the link's `valid_from`) and replaces the ones whose
   close differs by more than max($0.01, 1 bp), or whose open/high/low differ by more than that and the

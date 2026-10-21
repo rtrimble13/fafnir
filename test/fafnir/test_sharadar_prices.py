@@ -10,6 +10,7 @@ synthetic (ADR 0012 §8).
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from datetime import date
 from decimal import Decimal
 
@@ -18,6 +19,8 @@ from click.testing import CliRunner
 
 from fafnir import cli
 from fafnir.db import repository as repo
+from fafnir.ingest import daily_price as dp
+from fafnir.ingest import sharadar_map
 from fafnir.ingest import sharadar_prices as sp
 
 D = Decimal
@@ -67,6 +70,59 @@ def test_recovered_bar_uses_actions_where_it_agrees():
     # No close to recover from.
     bar, agrees = sp.recovered_bar(dict(row, close=None), splits)
     assert (bar["close"], agrees) == (None, None)
+
+
+# PFFBQ's shape (1998, a 2.1 split product): 20 7/8 adjusted is 9.940, and 9.940 x
+# 2.1 is 20.874, a tenth of a cent under the exact close of 20.875.
+PFFBQ = {
+    "ticker": "ZZP",
+    "date": Y(1998, 3, 2),
+    "open": D("9.900"),
+    "high": D("9.940"),
+    "low": D("9.900"),
+    "close": D("9.940"),
+    "volume": D("100"),
+    "closeunadj": D("20.875"),
+}
+SPLIT_2_1 = [(Y(2001, 6, 1), D("2.1"))]
+
+
+def test_a_high_rounded_below_the_close_is_set_to_it():
+    counts = Counter()
+    bar, agrees = sp.recovered_bar(PFFBQ, SPLIT_2_1, counts)
+    assert agrees is True
+    assert (bar["high"], bar["close"], bar["low"]) == (
+        D("20.875"),
+        D("20.875000"),
+        D("20.790000"),
+    )
+    assert counts["rounding_clamped"] == 1
+    # Without the clamp the validator refused it: a bar the vendor had right.
+    raw = sharadar_map.recover_raw(PFFBQ, factor=D("2.1"))
+    assert dp._validate_bar(dict(raw, date="1998-03-02"))[1] == "cross_field_violation"
+    assert dp._validate_bar(bar)[1] is None
+
+
+def test_a_low_rounded_above_the_close_is_set_to_it():
+    row = dict(PFFBQ, high=D("10.000"), low=D("9.940"), closeunadj=D("20.873"))
+    bar, agrees = sp.recovered_bar(row, SPLIT_2_1)
+    assert agrees is True and bar["low"] == bar["close"] == D("20.873000")
+
+
+def test_a_violation_beyond_the_rounding_is_left_for_the_validator():
+    # The vendor's own high is 4 cents under its close: not the recovery's doing.
+    counts = Counter()
+    bar, _ = sp.recovered_bar(dict(PFFBQ, high=D("9.920")), SPLIT_2_1, counts)
+    assert bar["high"] == D("20.832000") and counts["rounding_clamped"] == 0
+    assert dp._validate_bar(bar)[1] == "cross_field_violation"
+
+
+def test_the_vendors_ratio_scales_the_close_and_high_alike():
+    # No split in ACTIONS: the ratio is used, and a high at the close stays there.
+    counts = Counter()
+    bar, agrees = sp.recovered_bar(PFFBQ, [], counts)
+    assert agrees is False and bar["high"] == bar["close"]
+    assert counts["rounding_clamped"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +332,88 @@ def test_gap_fill_adds_only_the_dates_fmp_lacks_from_the_link(db, tmp_path):
     assert bars[Y(2010, 1, 5)]["close"] == D("20")  # FMP's, untouched
     assert result.adjusted == 1  # it holds a dividend: factors recomputed
     assert repo.get_watermark(db, "sharadar", "SEP", fmp) is None  # FMP feeds it
+
+
+def _date_major(db, tmp_path):
+    """Two dead issuers whose rows the file interleaves by date, as SEP does."""
+    sids = []
+    for symbol, key in (("ZZDA", "900011"), ("ZZDB", "900012")):
+        sid = _security(db, symbol, source="sharadar")
+        _vendor(db, key, symbol)
+        _link(db, sid, key, Y(2005, 1, 3), feed=True)
+        sids.append(sid)
+    body = "".join(
+        _bar(symbol, day, close, close)
+        for day in ("2005-03-01", "2005-03-02", "2005-03-03")
+        for symbol, close in (("ZZDA", "10"), ("ZZDB", "20"))
+    )
+    _file(db, tmp_path, "stocks", PRICES + body)
+    _file(db, tmp_path, "actions", ACTIONS)
+    return sids
+
+
+def _spy_batches(monkeypatch, on_call=None):
+    calls = []
+    real = sp._load_run
+
+    def spy(db, t, table, rows, **kw):
+        if on_call is not None:
+            on_call(db, kw["run"])
+        calls.append((t.symbol, len(rows)))
+        return real(db, t, table, rows, **kw)
+
+    monkeypatch.setattr(sp, "_load_run", spy)
+    return calls
+
+
+@integration
+def test_a_date_major_file_is_one_batch_per_security(db, tmp_path, monkeypatch):
+    a, b = _date_major(db, tmp_path)
+    batches = _spy_batches(monkeypatch)
+    result = sp.load(db, tmp_path, backfill=True, gap_fill=False, as_of=Y(2026, 1, 2))
+    # In file order this was six batches of one row each.
+    assert batches == [("ZZDA", 3), ("ZZDB", 3)]
+    assert result.written == 6
+    assert len(_bars(db, a)) == len(_bars(db, b)) == 3
+    assert repo.get_watermark(db, "sharadar", "SEP", b) == Y(2005, 3, 3)
+    assert not list(tmp_path.glob(".sharadar-sort-*"))  # the buckets are gone
+
+
+@integration
+def test_progress_is_written_to_the_open_run(db, tmp_path, monkeypatch):
+    _date_major(db, tmp_path)
+    monkeypatch.setattr(sp, "PROGRESS_SECONDS", 0)
+    seen = []
+
+    def look(db, run):
+        seen.append(
+            db.fetchone(
+                "SELECT status, rows_inserted, params FROM ops.ingestion_run "
+                "WHERE ingestion_run_id = %s",
+                (run.run_id,),
+            )
+        )
+
+    _spy_batches(monkeypatch, look)
+    result = sp.load(db, tmp_path, backfill=True, gap_fill=False, as_of=Y(2026, 1, 2))
+    # Before the second security, the first one's work is on the open run.
+    assert "progress" not in seen[0]["params"]
+    assert (seen[1]["status"], seen[1]["rows_inserted"]) == ("started", 3)
+    assert seen[1]["params"]["progress"] == {
+        "table": "stocks",
+        "ticker": "ZZDA",
+        "tickers_done": 1,
+        "tickers": 2,
+        "read": 3,
+        "written": 3,
+    }
+    final = db.fetchone(
+        "SELECT status, rows_inserted, params FROM ops.ingestion_run "
+        "WHERE ingestion_run_id = %s",
+        (result.run_id,),
+    )
+    assert (final["status"], final["rows_inserted"]) == ("success", 6)
+    assert "progress" not in final["params"]  # the final counts replace it
 
 
 @integration

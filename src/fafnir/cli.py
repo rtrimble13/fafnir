@@ -576,8 +576,11 @@ def ingest_sharadar_prices(ctx, backfill, gap_fill, symbols, dry_run, no_adjust)
     where they disagree, flagged sharadar_split_ratio_mismatch). Non-session and
     operator-edited dates are set aside, and bad bars quarantined, as for FMP.
     Written as source sharadar under precedence, never as a correction. One
-    ops.ingestion_run (sharadar/prices); factors recomputed for the securities
-    that gained bars and hold actions.
+    ops.ingestion_run (sharadar/prices), its progress written every minute;
+    factors recomputed for the securities that gained bars and hold actions.
+
+    The files are grouped by ticker on disk first, a dry run included: allow
+    about four times the zip's size free under bulk_dir (about 4 GB for SEP).
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_prices as sp
@@ -4586,7 +4589,9 @@ def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
     replaced through the correction path: the FMP row is kept in
     ops.vendor_correction. Operator-edited bars are never corrected. Volume stays
     FMP's unless --volume sharadar. Resolves a vendor_history_disagrees flag once
-    every date it samples agrees. One ops.ingestion_run (sharadar/correct).
+    every date it samples agrees. One ops.ingestion_run (sharadar/correct), its
+    progress written every minute. The files are grouped by ticker on disk first,
+    as for `ingest sharadar-prices`: allow about 4 GB free under bulk_dir.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_prices as sp

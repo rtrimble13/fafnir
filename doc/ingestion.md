@@ -498,13 +498,46 @@ amendment records:
   `sharadar_split_ratio_mismatch` once, with the count and the first and last such
   dates.
 - **Volume** is divided by the same factor, rounded to a whole share.
+- **A high below the close, or a low above it,** by no more than the recovery's own
+  rounding (0.0005 × (factor + 1)) is set to the close, and counted
+  `rounding_clamped` in the run's `params.counts`. The close is `closeunadj`, exact,
+  while the high is SEP's 3-dp adjusted high times the factor, so on a bar that
+  closed at its high the two land a fraction of a cent apart either way. The
+  validator used to quarantine about half of those bars as `cross_field_violation`,
+  and run 403's 146,710 include them. A larger violation is the vendor's, and is
+  still quarantined.
 
 Each bar then passes the FMP loader's gates, unchanged: non-session and
 operator-edited dates set aside, validation failures quarantined as `price_*`.
 Rows are written under precedence, never as a correction: correcting FMP's bars is
-`fafnir vendor correct` (#75). The files are streamed once each. The watermark is
-`(sharadar, SEP|SFP, security_id)` for the securities Sharadar feeds, and the
-factors of the securities that gained bars and hold actions are recomputed.
+`fafnir vendor correct` (#75). The watermark is `(sharadar, SEP|SFP, security_id)`
+for the securities Sharadar feeds, and the factors of the securities that gained
+bars and hold actions are recomputed.
+
+**The files are grouped by ticker first** (`sharadar_files.select_by_ticker`). SEP
+is largely date-major, one row per ticker per date, so batching rows in file order
+made a batch, with its lookups and commit, of nearly every row. Run 403 got through
+about a quarter of SEP in 13 hours. The loader now writes the rows it wants to 256
+bucket files, each a range of tickers, then loads one security at a time.
+
+- **Disk:** about four times the zip's size free under `[sharadar] bulk_dir`. For
+  SEP that is about 4 GB. A dry run sorts too.
+- **Memory:** one bucket, about 180k of SEP's rows.
+- **Leftovers:** the bucket directory is removed at the end or on an error. A
+  process killed outright leaves `.sharadar-sort-*` in `bulk_dir` to delete.
+- **Progress:** every 60 seconds the counts so far and the ticker reached go to
+  the open run (`params.progress`, `rows_inserted`, `rows_quarantined`). A killed
+  run still shows how far it got, and the final counts replace it. Read it with:
+
+```sql
+SELECT ingestion_run_id, status, rows_inserted, rows_quarantined, params->'progress'
+  FROM ops.ingestion_run
+ WHERE source = 'sharadar' AND endpoint IN ('prices', 'correct')
+ ORDER BY ingestion_run_id DESC LIMIT 1;
+```
+
+A re-run after a killed one resumes in effect: every date already held is skipped.
+Run it where a closed terminal does not kill it (`tmux`, or `systemd-run`).
 
 ```bash
 fafnir ingest sharadar-prices --backfill --gap-fill --dry-run   # counts per reason
