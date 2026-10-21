@@ -495,7 +495,10 @@ Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
 `source`, `endpoint`, `params` (JSONB), `window_from/to`, `symbols_requested`,
 `rows_inserted/updated/quarantined`, `bytes_downloaded` (vs 50 GB/mo budget),
 `response_hash`, `status` (`started`/`success`/`partial`/`failed`), `error_message`,
-`started_at`, `finished_at`.
+`started_at`, `finished_at`. A long load can write its counts so far to its open run
+(`RunLog.checkpoint`); the Sharadar scans do every minute, with `params.progress`.
+A `started` row with no `finished_at` and no live process was killed outright: its
+counts are as of the last checkpoint.
 
 ### `ops.data_quality_flag` — quarantine/anomaly queue. **Grain:** `dq_flag_id`.
 `ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),

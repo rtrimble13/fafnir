@@ -319,7 +319,10 @@ A `core.daily_price` row with `source = 'sharadar'` was not observed raw. SEP se
 split-adjusted prices and a raw close (`closeunadj`); fafnir recovers the raw open,
 high, low and volume with the product of the ACTIONS splits after the date (#75,
 ADR 0004's amendment). The close is exact to SEP's 3 decimal places; the others are
-off by up to 0.0005 × the cumulative split factor (#49).
+off by up to 0.0005 × the cumulative split factor (#49). A recovered high that fell
+below the close, or a low above it, within that rounding was set to the close
+(counted `rounding_clamped` on the run); before that fix, run 403 quarantined such
+bars as `price_cross_field_violation` instead.
 
 > **Wrong answer:** treating a Sharadar bar's open/high/low on a split-heavy dead
 > issuer as exact to the cent, or ignoring `sharadar_split_ratio_mismatch`.

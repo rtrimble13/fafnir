@@ -56,6 +56,33 @@ class RunLog:
         )
         return self
 
+    def checkpoint(self) -> None:
+        """Write the counts and params so far to the open run, and commit.
+
+        A long load calls this at a unit boundary, where everything before it is
+        meant to be durable anyway. A monitor then sees how far the load has got, and
+        a process killed outright, which never reaches :meth:`__exit__`, still leaves
+        that record: run 403 (2026-10-20) left only ``started`` and zeros after 13
+        hours of committed work.
+        """
+        self.db.execute(
+            """
+            UPDATE ops.ingestion_run SET
+                rows_inserted = %s, rows_quarantined = %s, symbols_requested = %s,
+                bytes_downloaded = %s, params = %s::jsonb
+            WHERE ingestion_run_id = %s
+            """,
+            (
+                self.rows_inserted,
+                self.rows_quarantined,
+                self.symbols_requested,
+                self.bytes_downloaded,
+                json.dumps(self.params, default=str),
+                self.run_id,
+            ),
+        )
+        self.db.commit()
+
     def __exit__(self, exc_type, exc, tb) -> bool:
         status = "success"
         error_message = None
