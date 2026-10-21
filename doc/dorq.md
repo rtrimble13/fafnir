@@ -158,6 +158,11 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    security's bars onto another and leaves no dated record; and a history
    re-pulled for a security that already had one. Run `--full` after either if it
    matters.
+
+   The Sharadar backfill (#77) is both cases at once. `vendor mint-delisted` mints
+   thousands of dead issuers in one night, over the limit; `ingest sharadar-prices
+   --gap-fill` and `vendor correct` write bars behind the window of securities that
+   already had a history. Run `fafnir dq run --engine dorq --full` once after them.
 3. **Run.** `dorq check --format fafnir --exit-zero`. Each line is an
    `ops.data_quality_flag` row: `check_name` is `dorq_<check>` (`dorq_bad_print`,
    `dorq_scale_shift` …), `record_key` is `{"trade_date": …}`, and `detail` is

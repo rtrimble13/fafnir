@@ -326,3 +326,25 @@ def test_limit_and_the_command(db, tmp_path, monkeypatch):
     assert out.exit_code == 0, out.output
     assert "Minted 1;" in out.output
     assert len(_minted(db)) == 3
+
+
+@integration
+def test_a_seeded_sample_is_random_and_repeatable(db):
+    for i in range(10):
+        _vendor(db, f"9002{i:02d}", f"ZZS{i}")
+    _scan(db)
+    one = {m.vendor_key for m in vm.mint(db, sample=3, seed=7, dry_run=True).mints}
+    two = {m.vendor_key for m in vm.mint(db, sample=3, seed=7, dry_run=True).mints}
+    other = {m.vendor_key for m in vm.mint(db, sample=3, seed=8, dry_run=True).mints}
+    assert len(one) == 3 and one == two and one != other
+    # Not the first three by key, which is what --limit takes.
+    first = {m.vendor_key for m in vm.mint(db, limit=3, dry_run=True).mints}
+    assert first == {"900200", "900201", "900202"}
+    result = vm.mint(db, sample=3, seed=7)
+    assert result.minted == 3
+    assert set(_minted(db)) == one
+    (params,) = db.fetchall(
+        "SELECT params FROM ops.ingestion_run WHERE ingestion_run_id = %s",
+        (result.run_id,),
+    )
+    assert (params["params"]["sample"], params["params"]["seed"]) == (3, 7)

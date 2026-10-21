@@ -4719,8 +4719,17 @@ def vendor_overlap(ctx, dry_run, prices):
     help="With --permaticker: mint it despite an open vendor_history_overlap flag.",
 )
 @click.option("--limit", type=int, default=0, help="Mint at most this many (0 = all).")
+@click.option(
+    "--sample",
+    type=int,
+    default=0,
+    help="Mint this many, picked at random (#76's DQ measurement).",
+)
+@click.option(
+    "--seed", type=int, default=0, show_default=True, help="The --sample pick's seed."
+)
 @click.pass_context
-def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit):
+def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit, sample, seed):
     """Mint the issuers that died before fafnir first ran, from Sharadar (#71).
 
     \b
@@ -4728,6 +4737,7 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit):
       fafnir vendor mint-delisted --dry-run          # counts; writes nothing
       fafnir vendor mint-delisted
       fafnir vendor mint-delisted --permaticker 199057 --allow-overlap
+      fafnir vendor mint-delisted --sample 200 --seed 1   # a random 200
 
     Mints a core.security row (source sharadar, delisted, no prices yet) for each
     dead Sharadar issuer ADR 0016 admits, with a closed ticker period per ticker it
@@ -4741,6 +4751,8 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit):
 
     if allow_overlap and not permaticker:
         raise click.ClickException("--allow-overlap needs --permaticker.")
+    if sample and permaticker:
+        raise click.ClickException("Give --sample or --permaticker, not both.")
     with Database(ctx.obj["config"].dsn) as database:
         try:
             result = vm.mint(
@@ -4748,6 +4760,8 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit):
                 permaticker=permaticker,
                 allow_overlap=allow_overlap,
                 limit=limit,
+                sample=sample,
+                seed=seed,
                 dry_run=dry_run,
             )
         except vm.MintError as exc:
