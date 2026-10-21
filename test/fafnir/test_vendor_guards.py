@@ -163,6 +163,37 @@ def test_a_restatement_within_the_guard_is_written(db):
     assert _conflicts(db, sid) == {}
 
 
+def _params(db, run_id):
+    return db.fetchval(
+        "SELECT params FROM ops.ingestion_run WHERE ingestion_run_id = %s", (run_id,)
+    )
+
+
+def test_an_odd_lot_read_back_as_a_round_lot_keeps_the_first_print(db):
+    """G7, WSGE 2026-10-16: 9 shares on the first print, exactly 100 on every
+    re-read. Not a conflict, and the 9 stays."""
+    d = _sessions(db, 2)
+    sid = _mk(db, "RSOL")
+    fmp = _FMP()
+    _night(db, fmp, "RSOL", [_bar(d[0], 10.25, 9)])
+    second = _night(db, fmp, "RSOL", [_bar(d[0], 10.26, 100), _bar(d[1], 10.3, 40)])
+    # The prices are revised as any re-read within the guard is; the count is not.
+    assert _stored(db, sid, d[0]) == (10.26, 9)
+    assert _conflicts(db, sid) == {}
+    assert _params(db, second)["restatement_odd_lot_kept"] == 1
+
+
+def test_a_refetch_that_restates_the_close_keeps_an_odd_lot_count(db):
+    d = _sessions(db, 1)
+    sid = _mk(db, "RSOR")
+    fmp = _FMP()
+    _night(db, fmp, "RSOR", [_bar(d[0], 11.39, 9)])
+    restated: list = []
+    _night(db, fmp, "RSOR", [_bar(d[0], 67.03, 100)], explicit=True, restated=restated)
+    assert _stored(db, sid, d[0]) == (67.03, 9)
+    assert [(r["over"], r["volume"]) for r in restated] == [(["close"], [9, 9])]
+
+
 def test_split_scale_restatements_are_held_until_an_operator_refetch(db):
     """GCDT: run 296 re-served four first prints x6, the 1:6 of the next day
     applied backwards. Later nights served the first prints again, except for the

@@ -96,6 +96,9 @@ log_dir = "var/fafnir/log"
 # and prints what it restated.
 # restatement_max_ratio = 1.25
 # restatement_max_volume_ratio = 3
+# Volumes at or below this on both sides differ only as a round lot's rounding (FMP
+# re-reads an odd-lot day as 100 shares): never a conflict; the stored volume is kept.
+# restatement_min_volume = 100
 
 # --- Sharadar (doc/plans/sharadar-adoption.md) ------------------------------
 # The key is SHARADAR_API_KEY in the environment (on a host, /etc/fafnir/fafnir.env)

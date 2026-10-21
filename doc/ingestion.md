@@ -331,6 +331,16 @@ ratios and any split on file within 30 days. The date still counts as loaded, so
 watermark moves past it. A zero volume on either side is no ratio and restates
 nothing.
 
+**A round lot is not a restatement** (G7). FMP re-reads an odd-lot-only day as 100
+shares: on 2026-10-16, 87 of the guard's 103 conflicts were a first print of 3 to 33
+shares re-read as exactly 100 at the same OHLC, and outside sources agree with the
+first print. So a volume difference where both sides are at or below `[prices]
+restatement_min_volume` (default 100) is never a conflict, on a nightly load or a
+re-fetch. The re-read's prices are judged as usual, and the bar is written with the
+stored volume; the run counts each in `params.restatement_odd_lot_kept`. A revision
+where either side is above the floor (109 -> 21, 11 -> 331) is judged by the ratio as
+before.
+
 An **explicit** re-fetch (`--from`) overwrites FMP's own bars, as before, and:
 - prints every bar it restated beyond the thresholds, close and volume, old -> new
   (the table that would have shown the x50 volume on the spot);

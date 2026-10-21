@@ -408,7 +408,9 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
     restatement_max_ratio (close) or restatement_max_volume_ratio (volume): it
     keeps the stored bar and flags price_restatement_conflict. With --from it is an
     explicit re-fetch: it overwrites, prints every bar it restated beyond those
-    ratios, and resolves the conflicts on the dates it covered.
+    ratios, and resolves the conflicts on the dates it covered. Volumes at or below
+    restatement_min_volume (100) on both sides are a round lot's rounding: never a
+    conflict, and the stored volume is kept.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import daily_price
@@ -418,6 +420,7 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
         guard = daily_price.RestatementGuard(
             max_ratio=cfg.restatement_max_ratio,
             max_volume_ratio=cfg.restatement_max_volume_ratio,
+            min_volume=cfg.restatement_min_volume,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

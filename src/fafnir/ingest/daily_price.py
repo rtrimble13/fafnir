@@ -37,6 +37,12 @@ one. So a nightly load never overwrites a stored bar by more than
 re-fetch (``ingest prices --from``) overwrites as before, and reports every bar it
 restated beyond those ratios. A split-scaled bar with no stored copy to protect is
 quarantined instead (:func:`split_scale_detail`).
+
+A volume difference where both sides are at or below a round lot
+(``[prices] restatement_min_volume``, 100) is not a restatement: FMP rounds an
+odd-lot day up to 100 shares when it re-reads it (WSGE 9 -> 100, CCRP 3 -> 100;
+outside sources show the first print's count). The re-read's prices are judged as
+usual, and the stored volume is kept (:func:`odd_lot_rounding`).
 """
 
 from __future__ import annotations
@@ -138,10 +144,13 @@ SPLIT_SCALE_MEDIAN_SESSIONS = 20
 
 @dataclass(frozen=True)
 class RestatementGuard:
-    """How far a nightly re-read may move a stored bar, either way."""
+    """How far a nightly re-read may move a stored bar, either way. Volumes at or
+    below ``min_volume`` on both sides are a round lot's rounding, never a
+    restatement (:func:`odd_lot_rounding`)."""
 
     max_ratio: float = 1.25
     max_volume_ratio: float = 3.0
+    min_volume: int = 100
 
 
 # FMP's unadjusted (and dividend-adjusted) endpoints prefix the OHLC field names
@@ -535,6 +544,21 @@ def _bar_json(row: dict) -> dict:
     }
 
 
+def odd_lot_rounding(stored: dict, row: dict, guard: RestatementGuard) -> bool:
+    """Whether the two volumes differ beyond the guard only as a round lot's
+    rounding: both at or below ``guard.min_volume``.
+
+    FMP's re-read of an odd-lot-only day reports 100 shares, where its first print
+    had the count (2026-10-16 nightly: 87 of 103 conflicts, stored 3 to 33, re-read
+    exactly 100, the same OHLC; 179 more on 10-20 and 10-21). The first print is the
+    one outside sources agree with, so the stored volume is kept.
+    """
+    volume = _fold(row["volume"], stored["volume"])
+    if volume is None or volume <= guard.max_volume_ratio:
+        return False
+    return max(float(row["volume"]), float(stored["volume"])) <= guard.min_volume
+
+
 def restatement_detail(
     stored: dict, row: dict, guard: RestatementGuard
 ) -> Optional[dict]:
@@ -549,7 +573,11 @@ def restatement_detail(
     over = []
     if close is not None and close > guard.max_ratio:
         over.append("close")
-    if volume is not None and volume > guard.max_volume_ratio:
+    if (
+        volume is not None
+        and volume > guard.max_volume_ratio
+        and not odd_lot_rounding(stored, row, guard)
+    ):
         over.append("volume")
     if not over:
         return None
@@ -945,6 +973,9 @@ def _guard_bars(
       the stored bar stays and ``price_restatement_conflict`` is flagged (the date is
       held, not quarantined); on an explicit re-fetch it is written, reported in
       ``restated`` and the run's params, and the date's open conflict is resolved.
+    * A bar written over a stored copy whose volume differs only as a round lot's
+      rounding (:func:`odd_lot_rounding`): written with the stored volume, on either
+      load, and counted ``restatement_odd_lot_kept`` in the run's params.
     * A bar with no stored copy at a split-adjusted scale: quarantined
       (``price_split_scale_mismatch``), on any load.
     """
@@ -958,11 +989,17 @@ def _guard_bars(
             to_write.append(row)
             continue
         detail = restatement_detail(old, row, guard)
+        if detail is not None and not explicit:
+            conflicts.append((row, old, detail))
+            held.append(row["trade_date"])
+            continue
+        if odd_lot_rounding(old, row, guard):
+            # The vendor's round lot is not a revision of the first print's count.
+            row = {**row, "volume": old["volume"]}
+            kept = run.params.get("restatement_odd_lot_kept", 0)
+            run.params["restatement_odd_lot_kept"] = kept + 1
         if detail is not None:
             conflicts.append((row, old, detail))
-            if not explicit:
-                held.append(row["trade_date"])
-                continue
         to_write.append(row)
 
     if conflicts:
