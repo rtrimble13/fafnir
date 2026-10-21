@@ -945,7 +945,12 @@ def yc(
 @click.option(
     "--is-actively-trading",
     is_flag=True,
-    help="Filter for actively trading securities only",
+    help="Filter for actively trading securities only (the db default)",
+)
+@click.option(
+    "--include-delisted",
+    is_flag=True,
+    help="Screen the warehouse's delisted securities too (-S db only)",
 )
 @click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
@@ -981,6 +986,7 @@ def ls(
     is_etf,
     is_fund,
     is_actively_trading,
+    include_delisted,
     output_csv,
     output_json,
     summary,
@@ -1046,9 +1052,23 @@ def ls(
                 is_etf,
                 is_fund,
                 is_actively_trading,
+                include_delisted,
             ),
         )
         return
+
+    if include_delisted and source != "db":
+        click.echo(
+            "Error: --include-delisted screens the warehouse; use -S db.", err=True
+        )
+        sys.exit(1)
+    if include_delisted and is_actively_trading:
+        click.echo(
+            "Error: --include-delisted and --is-actively-trading contradict each "
+            "other.",
+            err=True,
+        )
+        sys.exit(1)
 
     if source == "sharadar":
         # Listing and screening read the warehouse snapshot or FMP's screener;
@@ -1127,6 +1147,7 @@ def ls(
         is_etf,
         is_fund,
         is_actively_trading,
+        include_delisted,
     ]
     has_screening_params = any(param for param in screening_params)
 
@@ -1223,7 +1244,9 @@ def ls(
                 limit=limit,
             )
             if source == "db":
-                df = ds_db.screen(dsn=cfg.dsn, **screen_kwargs)
+                df = ds_db.screen(
+                    dsn=cfg.dsn, includeDelisted=include_delisted, **screen_kwargs
+                )
             else:
                 df = ds_live.screen(api_key=api_key, **screen_kwargs)
 

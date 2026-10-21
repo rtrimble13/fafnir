@@ -186,3 +186,30 @@ def test_db_price_history_exact_keeps_the_stored_decimals(db):
             frequency="week",
             exact=True,
         )
+
+
+def test_db_screen_is_active_only_unless_asked(db):
+    """#79: the warehouse keeps every delisted security, the dead issuers minted
+    from Sharadar among them, so a screen returns the actively trading ones unless
+    told otherwise."""
+    repo.ensure_exchange(db, "NASDAQ", "Nasdaq", "US")
+    for symbol, active in (("ZZLIVE", True), ("ZZDEAD", False)):
+        repo.upsert_security(
+            db,
+            primary_symbol=symbol,
+            company_name=f"{symbol} Inc",
+            exchange_code="NASDAQ",
+            is_actively_trading=active,
+            delisted_date=None if active else dt.date(2005, 1, 3),
+            source="fmp" if active else "sharadar",
+        )
+    db.execute("REFRESH MATERIALIZED VIEW mart.security_latest")
+
+    def symbols(**kw):
+        df = ds_db.screen(dsn=DSN, exchange="NASDAQ", **kw)
+        return sorted(df["symbol"]) if not df.empty else []
+
+    assert symbols() == ["ZZLIVE"]
+    assert symbols(includeDelisted=True) == ["ZZDEAD", "ZZLIVE"]
+    assert symbols(isActivelyTrading=False) == ["ZZDEAD"]
+    assert symbols(isActivelyTrading=True, includeDelisted=True) == ["ZZLIVE"]

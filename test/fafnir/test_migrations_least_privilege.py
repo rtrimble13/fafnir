@@ -213,6 +213,9 @@ DUK_MART_RELATIONS = (
 CLIENT_MART_RELATIONS = (
     # portable's `pt ca sync`: corporate actions at event grain (#174).
     "mart.v_corporate_action",
+    # research readers (MCP `sql_read`, notebooks): why a security stopped trading
+    # and who acquired it, without core.vendor_* (#79).
+    "mart.v_security_lifecycle",
 )
 
 # What the seam must NOT reach. core.daily_price is the one that matters most: it

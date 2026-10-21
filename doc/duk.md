@@ -130,8 +130,11 @@ duk ph AAPL --start-date 1990-01-01 -n 5
 # Prices print at 2dp by default; -p widens it
 duk ph AAPL --adj -p 4
 
-# Screen tech names by market cap (warehouse snapshot)
+# Screen tech names by market cap (warehouse snapshot, actively trading)
 duk ls --sector Technology --market-cap ">1000000000"
+
+# The same sector with the companies that stopped trading
+duk ls --sector Technology --include-delisted
 
 # Export to CSV, then compute a 20-day SMA (pure compute, no source needed)
 duk ph AAPL --close -o prices.csv
@@ -314,6 +317,28 @@ that cannot be spotted from the output.
 records. That divergence is deliberate: flattening the report into a record array
 would destroy the DQ breakdown. `--csv` gives a single flat row of scalars, in which
 the DQ table collapses to an `open_dq_flags` count.
+
+## Reading dead issuers
+
+The warehouse keeps every security that stopped trading. Since #71 that includes
+the issuers that died before fafnir first ran, minted from Sharadar
+(`source = 'sharadar'`), so from 1998 it is free of survivorship bias
+([ADR 0016](adr/0016-sharadar-identity-and-survivorship-floor.md)). With `-S db`:
+
+- **A screen is actively trading only** (#79). There are thousands of dead issuers,
+  and a screen that forgot the filter would return several times the market as it
+  trades now. `--include-delisted` adds them back; it reads the warehouse only, and
+  contradicts `--is-actively-trading`. The MCP `screen_securities` tool works the
+  same way, with `include_delisted=true`. Plain `duk ls` lists actively trading
+  names, as it always has.
+- **One company resolves whether it lives or not.** `duk ls <ticker>` and
+  `duk ph <ticker>` reach a dead issuer by the ticker it traded under, if no live
+  security has since taken it; listed securities come first in a did-you-mean
+  table.
+- **Why it stopped** is in `mart.v_security_lifecycle`: the vendor's terminal event
+  (acquired, merged away, liquidated, delisted), the acquirer, and the trading
+  span ([data dictionary](data_dictionary.md)). A mart-only role reads it, through
+  the MCP server's SQL tool or `psql`.
 
 ## Library use
 

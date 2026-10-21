@@ -72,10 +72,11 @@ has nothing behind it.
 | `mart.v_daily_price_adjusted` | split/dividend adjusted, point-in-time stable | live |
 | `mart.v_symbol_lookup` | ticker → `security_id` over time (passthrough of `symbol_xref`) | live |
 | `mart.v_security_profile` | descriptive facts, one row per security | **live** |
-| `mart.security_latest` | the screening contract | **materialized, lagged** |
+| `mart.security_latest` | the screening contract; `duk ls` and `screen_securities` filter it to actively trading unless asked (#79) | **materialized, lagged** |
 | `mart.v_security_price_coverage` | span, bar count, close range, zero-volume bars | live — **use this, not a per-security probe** |
 | `mart.v_security_action_summary` | split/dividend counts and boundaries, factor state | live |
 | `mart.v_corporate_action` | splits and dividends, one row per event (passthrough of `corporate_action`, no lineage) | live |
+| `mart.v_security_lifecycle` | first/last trade date, who minted it, and for a dead security the vendor's terminal event and acquirer (#79) | live |
 | `mart.v_security_dq_open` | open flags: counts, keys, dates — **never `detail`** | live |
 
 **`core.daily_price` is partitioned by year.** A per-security probe of it —

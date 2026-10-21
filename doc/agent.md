@@ -182,6 +182,15 @@ absent, for exactly this reason.
 | **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename`/`split-history`, `actions add`/`delete`/`redate`, `prices delete`/`shift`/`rescale`, `override revoke`, `vendor corrections revert` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `security descope`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
+### Screens and dead issuers
+
+`screen_securities` returns actively trading securities unless the agent passes
+`include_delisted=true`, or `is_actively_trading=false` for only those that
+stopped (#79). The warehouse holds thousands of dead issuers minted from Sharadar,
+and a screen without the filter would be mostly companies that no longer trade. A
+question about why one stopped, or who acquired it, reads
+`mart.v_security_lifecycle`. [duk.md](duk.md#reading-dead-issuers) has the rest.
+
 ### The nightly report
 
 The agent can also run unattended on a timer, emailing a summary of the night's
@@ -279,3 +288,4 @@ Neither disturbs the nightly job, any other person's access, or the other tier.
 | `sql_read`: *refused: that statement writes* | a `SELECT … INTO`, or a data-modifying CTE | intended — changes go through the CLI |
 | `sql_read`: *exceeded the role's statement_timeout* | an unbounded query | narrow it: a date range, a `security_id`, or an aggregate |
 | Agent reports a screen that looks stale | `mart.security_latest` is materialized | `fafnir db refresh-marts`; or read `mart.v_security_profile`, which is live |
+| Agent's screen leaves out a company that stopped trading | screens are actively trading only (#79) | `include_delisted=true` (`duk ls --include-delisted`) |
