@@ -943,6 +943,64 @@ def test_reconciliation_does_not_call_an_operator_row_withdrawn(stub_repo):
     assert stub_repo["deleted"] == []
 
 
+def test_reconciliation_does_not_call_another_vendors_row_withdrawn(stub_repo):
+    """A dividend Sharadar's gap-fill added because FMP never carried it (ADR 0015).
+    FMP not carrying it is why it is there; reporting that would flag every linked
+    security Sharadar filled, once a month, in a check no sweep may close."""
+    stub_repo["resolve"]["KO"] = 41
+    stub_repo["actions"][41] = {
+        ("dividend", date(2026, 6, 15)): {
+            **_stored_dividend(0.48),
+            "source": "sharadar",
+        }
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(dividends={"KO": []}),
+        [{"security_id": 41, "symbol": "KO"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert result.drift == 0
+    assert stub_repo["flags"] == []
+    assert ("dividend", date(2026, 6, 15)) in stub_repo["actions"][41]
+
+
+def test_another_vendors_dividend_is_never_deleted_as_a_re_dated_copy(stub_repo):
+    """The one inference that deletes must not pair FMP's feed with a row FMP did
+    not write: the same amount four days away is FMP's own copy, not evidence that
+    Sharadar's is a stale duplicate of it."""
+    stub_repo["resolve"]["PRGMX"] = 42
+    stub_repo["actions"][42] = {
+        ("dividend", date(2026, 6, 30)): {
+            **_stored_dividend(0.023823),
+            "source": "sharadar",
+        }
+    }
+    result = ca.ActionsResult()
+
+    ca.reconcile(
+        _FakeDB(),
+        _FakeFMP(dividends={"PRGMX": [{"date": "2026-06-26", "dividend": 0.0238}]}),
+        [{"security_id": 42, "symbol": "PRGMX"}],
+        run=_FakeRun(),
+        as_of=TODAY,
+        settle_days=7,
+        result=result,
+    )
+
+    assert stub_repo["deleted"] == []
+    assert ("dividend", date(2026, 6, 30)) in stub_repo["actions"][42]
+    (flag,) = stub_repo["flags"]
+    assert flag["detail"]["withdrawn_by_source"] == []
+    assert flag["detail"]["redated"] == []
+
+
 def test_reconciliation_does_not_call_an_operator_key_the_feed_also_carries_missing(
     stub_repo,
 ):

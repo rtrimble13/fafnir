@@ -673,7 +673,8 @@ latest `corporate-actions` run's `params.mode` — do not trust `automations.md`
   moved it: look for a feed row within ±5 days at about the same amount. If there
   is one, it is a duplicate to delete. If there is not, **the warehouse is usually
   right and the feed glitched** (TLT, JEPQ and SKOR all had a real distribution
-  vanish from a payload). Leave it open and say so.
+  vanish from a payload). Leave it open and say so. Only FMP's own rows are
+  compared: an `operator` or `sharadar` row is never reported here.
 
 **Never `accept` this check unless you mean the whole symbol.** Acceptance is keyed
 on `record_key = {"symbol": …}`, so it hides *every* future drift for that symbol —
