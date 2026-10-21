@@ -95,7 +95,10 @@ From v1.5.0 the nightly price load never overwrites a stored bar by more than
 it keeps the bar and flags `price_restatement_conflict`. A night with many is the
 vendor restating, not the load failing; `ops.ingestion_run` stays `success`. An
 explicit `ingest prices --from` re-fetch overwrites, records `params.restated` and
-`restated_count`, and resolves the conflicts on its dates.
+`restated_count`, and resolves the conflicts on its dates. A volume difference with
+both sides at or below `restatement_min_volume` (100) is FMP rounding an odd lot to
+a round lot: never a conflict; the stored volume is kept and counted in
+`params.restatement_odd_lot_kept` (G7).
 
 ## The two budgets
 

@@ -548,8 +548,10 @@ per nightly overlap) and `repository.count_price_quarantines` excludes it by nam
 the watermark budget of a *rejected* bar on the same date and release ingestion past
 one nobody had looked at. `price_restatement_conflict` (v1.5.0) is the second such
 check: the nightly load kept the stored bar and the vendor's re-read disagrees with it
-beyond `[prices] restatement_max_ratio` / `restatement_max_volume_ratio`; it is
-written once per open `(symbol, date)` and listed in `NON_QUARANTINE_PRICE_CHECKS`.
+beyond `[prices] restatement_max_ratio` / `restatement_max_volume_ratio` (a volume
+difference with both sides at or below `restatement_min_volume`, a round lot, is not
+one); it is written once per open `(symbol, date)` and listed in
+`NON_QUARANTINE_PRICE_CHECKS`.
 `price_split_scale_mismatch` is a real quarantine (a new bar at a split-adjusted scale
 was not stored) and repeats like the others. Anything added to that family later has
 to make the same choice explicitly.

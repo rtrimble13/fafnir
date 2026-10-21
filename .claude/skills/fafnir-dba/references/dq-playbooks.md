@@ -484,6 +484,12 @@ quarantine: it spends no watermark budget, and the watermark moved past the date
 `close_ratio`, `volume_ratio`, `over` (which tripped) and `splits_near` (any split
 on file within 30 days).
 
+**Odd lots are no longer flagged** (G7, `[prices] restatement_min_volume`, 100). A
+first print under 100 shares re-read as exactly 100 at the same OHLC was ~85 flags a
+night until then; 353 were accepted by class on 2026-10-19 and 10-21. On a warehouse
+running G7, any such flag predates it. A volume-only conflict that is still raised
+has a side above 100: a real revision or a vendor error, judged like any other.
+
 **Which side is right?** FMP's first print usually is. What it restated from
 2026-09-16 to 10-14:
 - **another instrument's level** (OUSL ~11 -> ~58, QCJL ~26 -> 0.07, KEO, MILK,
