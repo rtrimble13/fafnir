@@ -128,7 +128,7 @@ reconcile are dropped, and #66 is folded into #75.*
 | 0032 | #63 | `core.security_vendor_rejection` (a person's "not this key"; not in v2's first list) — **built** |
 | ~~0033~~ | ~~#66~~ | ~~`ops.vendor_bar_comparison`~~: dropped on 2026-10-20 (#66 folded into #75); later migrations take the next free number |
 | 0033 | #174 | `mart.v_corporate_action`, outside this plan (a mart-only reader's corporate actions) — so #79's view takes the next free number after it |
-| 0034 | #79 | `mart.v_security_lifecycle` |
+| 0034 | #79 | `mart.v_security_lifecycle` — **built** |
 | 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
 | 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
 | (optional) | #114, #116 | fund distribution types; FRED economic series |
@@ -258,9 +258,29 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-20 | **Identity ADR is ADR 0016** (0013 was taken): permaticker is the identity authority from cutover, `security_id` stays the key; survivorship floor 1998-01-01; the inclusion rules for minting dead issuers | #67 |
 | 2026-10-20 | **#64's gate recorded as it stands: 4.8% of active non-fund securities unlinked**, against the issue's < 1%. Every one carries a reason code, so P1's own criterion (≥ 99% linked *or explained*) holds. Further triage is not worth the effort: the residue is immaterial, and half of it is duplicate rows of linked issuers. The 126 identifier links without price support are kept, at their low confidence | #64 |
 | 2026-10-20 | **Sharadar is the more reliable vendor for identity linking.** FMP's history disagreeing with Sharadar's is a correction to make, not a reason to withhold a link: `vendor link` links on the latest sample or a shared identifier when the history disagrees, and flags the history `vendor_history_disagrees`. The identity evidence must still not rest on FMP's history | #62 |
+| 2026-10-21 | **Screens are actively trading only by default.** With thousands of dead issuers in `mart.security_latest`, `duk ls` screens and the MCP `screen_securities` tool return actively trading securities unless `--include-delisted` / `include_delisted=true` (or `is_actively_trading=false`, only delisted). The warehouse still retains every one; plain `duk ls` and single-company reads are unchanged | #79 |
 
 ## [built] notes
 
+- **2026-10-21 · P2, #79: survivorship QA and `mart.v_security_lifecycle`.** Migration 0034 adds the view:
+  per security, the trading span, `minted_by`, and for one that stopped trading, the vendor's terminal
+  event and acquirer, with `survivorship_complete_from = 1998-01-01`. It uses definer rights, and
+  `fafnir_app` reads it but still cannot reach `core.vendor_*` (tested). `scripts/survivorship_check.sql`
+  gives, per year, the Sharadar securities in scope against those fafnir holds. Each missing one gets a
+  reason (`no_link`, `no_bars`, `outside_span`); the script also counts deaths and the 20 largest gaps.
+  - **Departures from the issue:**
+    - the issue's `mergerfrom` is the survivor's event. Sharadar's ACTIONS, read on 2026-10-21, give the
+      merged-away side `mergerto`, so the view reads `mergerto` and `acquisitionby` for the acquirer;
+    - the vendor writes `N/A` for no other party, which the view reads as NULL;
+    - a specific reason wins over a bare `delisted` within 30 days of the last terminal event, and the
+      reason is given only for a security that has stopped trading;
+    - `acquirer_security_id` and `delist_event_date` were added.
+  - **Mart views on dead issuers:** `v_security_profile`, `v_security_price_coverage` and
+    `v_security_action_summary` key on `security_id` and LEFT JOIN the master, so dead Sharadar rows read
+    through them unchanged (tested).
+  - **Reader default** (decision log): screens are actively trading only unless asked.
+  - **Next.** On the host, after #77: `psql "$FAFNIR_DSN" -X -f scripts/survivorship_check.sql`; the counts
+    go on #79.
 - **2026-10-21 · P2, #76 (part 2): the policy for dead histories.** The policy was decided from what can
   repair a dead Sharadar history, before the counts. The counts confirm or revise it.
   - **The host had already minted the whole population** before part 1 merged: run 403 wrote dead issuers'

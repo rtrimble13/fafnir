@@ -34,9 +34,9 @@ Two facts that make answers wrong if forgotten:
   a 4:1 split shows as a 75% drop because that is what the tape says.
   `adjusted=true` is the split/dividend-adjusted series. Always say which you used.
 * `screen_securities` reads a materialized view refreshed by
-  `fafnir db refresh-marts`, so it lags the last load, and delisted securities are
-  retained on purpose (no survivorship bias). Filter `is_actively_trading` unless
-  you want them.
+  `fafnir db refresh-marts`, so it lags the last load. It returns actively trading
+  securities unless `include_delisted=true`: the warehouse retains every delisted
+  security on purpose (no survivorship bias), thousands of them.
 
 Before reasoning over a series, check `dq_summary` for that security: open flags
 mean the warehouse itself is unsure about some of those bars.
@@ -149,11 +149,13 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         is_etf: Optional[bool] = None,
         is_fund: Optional[bool] = None,
         is_actively_trading: Optional[bool] = None,
+        include_delisted: bool = False,
         limit: Optional[int] = None,
     ) -> dict:
         """Screen securities by sector, industry, venue, country or market cap.
 
-        Reads a refresh-lagged materialized view that retains delisted securities.
+        Reads a refresh-lagged materialized view. Actively trading securities only,
+        unless include_delisted=true (or is_actively_trading=false: only delisted).
         """
         return T.screen_securities(
             dsn=dsn,
@@ -166,6 +168,7 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
             is_etf=is_etf,
             is_fund=is_fund,
             is_actively_trading=is_actively_trading,
+            include_delisted=include_delisted,
             limit=limit,
         )
 

@@ -251,3 +251,188 @@ def test_no_mart_view_runs_with_the_invokers_rights(db):
         and option.split("=", 1)[1].lower() not in ("false", "off", "no", "0")
     ]
     assert not invoker, f"mart views with security_invoker set: {invoker}"
+
+
+def _lifecycle_security(db, symbol, *, dead=True, source="sharadar", key=None):
+    sid = repo.upsert_security(
+        db,
+        primary_symbol=symbol,
+        company_name=f"{symbol} Inc",
+        exchange_code="NYSE",
+        is_actively_trading=not dead,
+        delisted_date=dt.date(2001, 1, 2) if dead else None,
+        source=source,
+    )
+    if key:
+        db.execute(
+            "INSERT INTO core.vendor_security (vendor, vendor_table, vendor_key, "
+            "ticker) VALUES ('sharadar', 'stocks', %s, %s)",
+            (key, symbol),
+        )
+        repo.insert_vendor_link(
+            db,
+            security_id=sid,
+            vendor="sharadar",
+            vendor_key=key,
+            valid_from=dt.date(1998, 1, 2),
+            match_method="minted" if source == "sharadar" else "manual",
+            confidence=None,
+            evidence={},
+            created_by="tester",
+        )
+    return sid
+
+
+def _event(db, key, day, action, contra="N/A", name="N/A", contra_key=None):
+    db.execute(
+        "INSERT INTO core.vendor_security_event (vendor, vendor_key, event_date, "
+        "action, contra_ticker, contra_name, contra_vendor_key) "
+        "VALUES ('sharadar', %s, %s, %s, %s, %s, %s)",
+        (key, day, action, contra, name, contra_key),
+    )
+
+
+@pytest.mark.integration
+def test_mart_security_lifecycle_names_why_a_security_stopped(db):
+    """#79: the vendor's terminal event, the acquirer, and the trading span.
+
+    An acquisition is recorded as `acquisitionby` and `delisted` on one date, and the
+    specific reason wins; `mergerto` is the merged-away side. A reason older than 30
+    days before the last terminal event belongs to an earlier listing. A live
+    security has no reason, whatever events its key carries. Synthetic keys and
+    tickers (ADR 0012 §8).
+    """
+    D = dt.date
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    acquirer = _lifecycle_security(db, "ZZACQ", dead=False, source="fmp", key="900199")
+    acquired = _lifecycle_security(db, "ZZA", key="900101")
+    merged = _lifecycle_security(db, "ZZM", key="900102")
+    bankrupt = _lifecycle_security(db, "ZZB", key="900103")
+    relisted = _lifecycle_security(db, "ZZR", key="900104")
+    live = _lifecycle_security(db, "ZZL", dead=False, source="fmp", key="900105")
+    closed = _lifecycle_security(db, "ZZC", source="fmp", key="900106")
+    unlinked = _lifecycle_security(db, "ZZO", source="fmp")
+    db.execute(
+        "UPDATE core.security_vendor_xref SET valid_to = '2020-01-01' "
+        "WHERE vendor_key = '900106'"
+    )
+
+    _event(
+        db, "900101", D(2018, 6, 15), "acquisitionby", "ZZACQ", "ZZACQ CORP", "900199"
+    )
+    _event(db, "900101", D(2018, 6, 15), "acquisitioncash", "ZZACQ", "ZZACQ CORP")
+    _event(db, "900101", D(2018, 6, 15), "delisted")
+    _event(db, "900102", D(2019, 3, 1), "mergerto", "ZZACQ", "ZZACQ CORP", "900199")
+    _event(db, "900102", D(2019, 3, 1), "delisted")
+    _event(db, "900103", D(2010, 1, 5), "bankruptcyliquidation")
+    _event(db, "900103", D(2010, 1, 6), "delisted")
+    _event(db, "900104", D(2005, 3, 1), "regulatorydelisting")
+    _event(db, "900104", D(2015, 7, 1), "delisted")
+    _event(db, "900105", D(2003, 1, 2), "delisted")
+    _event(db, "900106", D(2012, 4, 2), "voluntarydelisting")
+    _event(db, "900199", D(2019, 3, 1), "mergerfrom", "ZZM", "ZZM INC", "900102")
+
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": acquired,
+                "trade_date": day,
+                "open": Decimal("10"),
+                "high": Decimal("10"),
+                "low": Decimal("10"),
+                "close": Decimal("10"),
+                "volume": 100,
+            }
+            for day in (D(2018, 6, 13), D(2018, 6, 14))
+        ],
+    )
+
+    rows = {
+        r["security_id"]: r
+        for r in db.fetchall("SELECT * FROM mart.v_security_lifecycle")
+    }
+
+    def reason(sid):
+        r = rows[sid]
+        return (r["delist_reason"], r["delist_event_date"], r["acquirer_ticker"])
+
+    assert reason(acquired) == ("acquisitionby", D(2018, 6, 15), "ZZACQ")
+    assert rows[acquired]["acquirer_name"] == "ZZACQ CORP"
+    assert rows[acquired]["acquirer_security_id"] == acquirer
+    assert (rows[acquired]["first_trade_date"], rows[acquired]["last_trade_date"]) == (
+        D(2018, 6, 13),
+        D(2018, 6, 14),
+    )
+    assert reason(merged) == ("mergerto", D(2019, 3, 1), "ZZACQ")
+    assert reason(bankrupt) == ("bankruptcyliquidation", D(2010, 1, 5), None)
+    assert rows[bankrupt]["acquirer_name"] is None  # the vendor's 'N/A'
+    assert reason(relisted) == ("delisted", D(2015, 7, 1), None)
+    assert reason(live) == (None, None, None)
+    assert reason(acquirer) == (None, None, None)  # its mergerfrom is no reason
+    assert reason(closed) == ("voluntarydelisting", D(2012, 4, 2), None)
+    assert reason(unlinked) == (None, None, None)
+    assert rows[unlinked]["first_trade_date"] is None
+    assert (rows[acquired]["minted_by"], rows[unlinked]["minted_by"]) == (
+        "sharadar",
+        "fmp",
+    )
+    assert {r["survivorship_complete_from"] for r in rows.values()} == {D(1998, 1, 1)}
+    assert not {"vendor_key", "contra_vendor_key", "evidence"} & set(
+        rows[acquired]
+    ), "the vendor's keys stay in core"
+
+
+@pytest.mark.integration
+def test_the_company_marts_carry_a_dead_sharadar_issuer(db):
+    """#79: a security Sharadar minted reads through the summary marts like any
+    other. They key on security_id and LEFT JOIN the master, so nothing about the
+    row's source, missing sector or missing profile drops it."""
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    sid = _lifecycle_security(db, "ZZD", key="900201")
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": sid,
+                "trade_date": dt.date(2000, 3, d),
+                "open": Decimal("4"),
+                "high": Decimal("4"),
+                "low": Decimal("4"),
+                "close": Decimal("4"),
+                "volume": 10,
+            }
+            for d in (1, 2)
+        ],
+        source="sharadar",
+    )
+    repo.upsert_corporate_action(
+        db,
+        security_id=sid,
+        action_type="dividend",
+        ex_date=dt.date(2000, 3, 2),
+        dividend_amount=Decimal("0.1"),
+        source="sharadar",
+    )
+
+    profile = db.fetchone(
+        "SELECT source, is_actively_trading, delisted_date "
+        "FROM mart.v_security_profile WHERE security_id = %s",
+        (sid,),
+    )
+    assert (profile["source"], profile["is_actively_trading"]) == ("sharadar", False)
+    coverage = db.fetchone(
+        "SELECT first_trade_date, last_trade_date, bar_count "
+        "FROM mart.v_security_price_coverage WHERE security_id = %s",
+        (sid,),
+    )
+    assert (coverage["first_trade_date"], coverage["bar_count"]) == (
+        dt.date(2000, 3, 1),
+        2,
+    )
+    actions = db.fetchone(
+        "SELECT dividend_count FROM mart.v_security_action_summary "
+        "WHERE security_id = %s",
+        (sid,),
+    )
+    assert actions["dividend_count"] == 1

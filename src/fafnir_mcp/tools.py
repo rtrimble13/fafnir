@@ -346,6 +346,7 @@ def screen_securities(
     is_etf: Optional[bool] = None,
     is_fund: Optional[bool] = None,
     is_actively_trading: Optional[bool] = None,
+    include_delisted: bool = False,
     limit: Optional[int] = None,
 ) -> dict:
     """Screen securities from ``mart.security_latest``.
@@ -353,8 +354,9 @@ def screen_securities(
     Two properties of that relation an agent has to know, so they are in the
     envelope rather than only in the docs: it is a MATERIALIZED view refreshed by
     ``fafnir db refresh-marts``, so it lags the last load; and delisted securities
-    are retained by design (no survivorship bias), so a screen without
-    ``is_actively_trading`` includes companies that stopped trading years ago.
+    are retained by design (no survivorship bias). The screen returns actively
+    trading securities unless ``include_delisted`` (both) or ``is_actively_trading``
+    (false: only those that stopped) says otherwise (#79).
     """
     from duk.datasource.db import screen
 
@@ -371,6 +373,7 @@ def screen_securities(
             isEtf=is_etf,
             isFund=is_fund,
             isActivelyTrading=is_actively_trading,
+            includeDelisted=include_delisted,
             limit=cap + 1,
         )
     except Exception as exc:  # noqa: BLE001
@@ -382,8 +385,8 @@ def screen_securities(
         source="mart.security_latest",
         note=(
             "Refresh-lagged (materialized; refreshed by `fafnir db refresh-marts`). "
-            "Delisted securities are retained -- filter is_actively_trading to "
-            "exclude them."
+            "Actively trading securities only unless include_delisted=true; the "
+            "warehouse retains every delisted security."
         ),
     )
 

@@ -320,10 +320,17 @@ def screen(
     isEtf: Optional[bool] = None,
     isFund: Optional[bool] = None,
     isActivelyTrading: Optional[bool] = None,
+    includeDelisted: bool = False,
     limit: Optional[int] = None,
     **_ignored,
 ) -> pd.DataFrame:
-    """Screen securities from mart.security_latest. Mirrors the live screener columns."""
+    """Screen securities from mart.security_latest. Mirrors the live screener columns.
+
+    Actively trading securities only, unless ``includeDelisted`` or an explicit
+    ``isActivelyTrading``: the warehouse keeps every security that stopped trading,
+    the dead issuers minted from Sharadar among them (#79), and a screen without
+    the filter returns several times the rows of the market as it trades now.
+    """
     clauses: list[str] = ["1=1"]
     params: list[Any] = []
 
@@ -361,6 +368,8 @@ def screen(
         add("is_fund = %s", isFund)
     if isActivelyTrading is not None:
         add("is_actively_trading = %s", isActivelyTrading)
+    elif not includeDelisted:
+        clauses.append("is_actively_trading")
 
     sql = (
         'SELECT symbol, company_name AS "companyName", market_cap_usd AS "marketCap", '

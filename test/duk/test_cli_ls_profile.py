@@ -216,3 +216,53 @@ class TestListAndScreenAreUnaffected:
         result = _run(runner, ["-S", "db", "ls", "--summary"])
         assert result.exit_code == 0
         assert "Number of results: 1" in result.output
+
+
+class TestIncludeDelisted:
+    """#79: a db screen is actively trading only unless --include-delisted."""
+
+    @pytest.fixture()
+    def calls(self, monkeypatch):
+        seen = []
+
+        def screen(**kw):
+            seen.append(kw)
+            return pd.DataFrame([{"symbol": "AAPL", "sector": "Technology"}])
+
+        monkeypatch.setattr(ds_db, "screen", screen)
+        return seen
+
+    def test_a_screen_excludes_delisted_by_default(self, runner, calls):
+        result = _run(runner, ["-S", "db", "ls", "--sector", "Technology"])
+        assert result.exit_code == 0, result.output
+        assert calls[0]["includeDelisted"] is False
+
+    def test_include_delisted_is_passed_through(self, runner, calls):
+        result = _run(
+            runner, ["-S", "db", "ls", "--sector", "Technology", "--include-delisted"]
+        )
+        assert result.exit_code == 0, result.output
+        assert calls[0]["includeDelisted"] is True
+
+    def test_include_delisted_alone_screens_everything(self, runner, calls):
+        result = _run(runner, ["-S", "db", "ls", "--include-delisted"])
+        assert result.exit_code == 0, result.output
+        assert calls and calls[0]["includeDelisted"] is True
+
+    def test_it_reads_the_warehouse_only(self, runner, calls):
+        result = _run(runner, ["-S", "fmp", "ls", "--include-delisted"])
+        assert result.exit_code == 1
+        assert "use -S db" in result.output and not calls
+
+    def test_it_contradicts_is_actively_trading(self, runner, calls):
+        result = _run(
+            runner,
+            ["-S", "db", "ls", "--include-delisted", "--is-actively-trading"],
+        )
+        assert result.exit_code == 1
+        assert "contradict" in result.output and not calls
+
+    def test_it_is_refused_with_a_query(self, runner, calls):
+        result = _run(runner, ["-S", "db", "ls", "AAPL", "--include-delisted"])
+        assert result.exit_code == 1
+        assert "selects one company" in result.output

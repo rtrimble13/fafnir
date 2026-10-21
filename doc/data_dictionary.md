@@ -427,6 +427,40 @@ lists corporate actions: portable's `pt ca sync` reads it to compare its ledger 
 the warehouse. Like every `mart` view it is a grant to every reader (ADR 0009), and
 it depends on the three numeric columns, so re-typing them means recreating it too.
 
+### `mart.v_security_lifecycle` — when a security traded, and why it stopped (VIEW)
+**Grain:** one row per `security_id`. **Source:** `core.security`, `core.daily_price`,
+`core.security_vendor_xref`, `core.vendor_security_event`. Added by migration 0034
+(#79).
+
+Columns: `security_id, symbol, company_name, minted_by, is_actively_trading,
+first_trade_date, last_trade_date, delisted_date, delist_reason, delist_event_date,
+acquirer_ticker, acquirer_name, acquirer_security_id, survivorship_complete_from`.
+
+- `minted_by` is `core.security.source`: `fmp`, or `sharadar` for a dead issuer
+  minted from Sharadar (#71).
+- `delist_reason` is the vendor's terminal event, for a security that stopped
+  trading (a `delisted_date`, or not actively trading). The values are
+  `acquisitionby`, `mergerto`, `bankruptcyliquidation`, `regulatorydelisting`,
+  `voluntarydelisting`, or a bare `delisted` when the vendor gives no reason. It
+  is NULL for a live security, or one with no Sharadar link.
+  - It is read from the security's Sharadar link: the open one, else the most
+    recent.
+  - A specific reason wins over `delisted` within 30 days of the last terminal
+    event. An acquisition is recorded as both, on one date.
+  - `mergerto` is the merged-away side; the survivor carries `mergerfrom`, which is
+    not a reason.
+- `acquirer_*` comes from an `acquisitionby` or `mergerto` event: the other party's
+  ticker and name as the vendor spells them. `acquirer_security_id` is filled when
+  fafnir holds the acquirer under an open Sharadar link. The vendor's `N/A` is NULL.
+- `first_trade_date`, `last_trade_date` are per-security index probes, cheap on a
+  `security_id` filter.
+- `survivorship_complete_from` is `1998-01-01`
+  ([ADR 0016](adr/0016-sharadar-identity-and-survivorship-floor.md)): from then on
+  the universe holds the issuers that died as well as those that live.
+
+The vendor keys, the link evidence and the other lifecycle events stay in `core`.
+Like every `mart` view it is a grant to every reader (ADR 0009).
+
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
 
