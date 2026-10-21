@@ -691,23 +691,26 @@ def reconcile(
     for sec in securities:
         symbol, sec_id = sec["symbol"], sec["security_id"]
         before = repo.corporate_actions_for(db, sec_id)
-        # An operator's row is not the feed's to confirm or withdraw: it exists
-        # because the feed has that event wrong or missing, so comparing it against
-        # the feed would report the correction as drift every time this security's
-        # turn comes round. Leave its key out of both sides.
-        operator_keys = {
+        # A row FMP did not write is not the feed's to confirm or withdraw. An
+        # operator's exists because the feed has that event wrong or missing; another
+        # vendor's (Sharadar's gap-fill, ADR 0015) because the feed never carried it.
+        # Comparing either against the feed would report it as drift every time this
+        # security's turn comes round, and could pair a dividend with a feed date and
+        # delete it as a re-dated copy. Leave its key out of both sides. A row with no
+        # source predates the column and is FMP's.
+        foreign_keys = {
             (r["action_type"], r["ex_date"])
             for r in before
-            if r.get("source") == repo.OPERATOR_SOURCE
+            if r.get("source") not in (None, repo.FMP_SOURCE)
         }
         stored_before = {
             (r["action_type"], r["ex_date"]) for r in before
-        } - operator_keys
+        } - foreign_keys
         stored_amounts = {
             r["ex_date"]: r["dividend_amount"]
             for r in before
             if r["action_type"] == "dividend"
-            and (r["action_type"], r["ex_date"]) not in operator_keys
+            and (r["action_type"], r["ex_date"]) not in foreign_keys
         }
         on_feed: dict = {}
         feed_amounts: dict = {}
@@ -726,7 +729,7 @@ def reconcile(
         result.absorb(marker)
         result.reconciled += 1
 
-        settled_feed = {k for k in on_feed if k[1] <= cutoff and k not in operator_keys}
+        settled_feed = {k for k in on_feed if k[1] <= cutoff and k not in foreign_keys}
         settled_stored = {k for k in stored_before if k[1] <= cutoff}
         # On the feed and not in the warehouse: an event the sweep missed. This is the
         # coverage gap the rotation exists to find.

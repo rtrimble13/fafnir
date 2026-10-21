@@ -470,6 +470,13 @@ events too, and a loader that deleted on every disagreement would be trusting th
 vendor on its worst day. TLT's July distribution vanished from its per-symbol payload
 while the warehouse held it correctly.
 
+Only FMP's own rows are compared. A row another party wrote is left out of both
+sides: an `operator` row exists because the feed has that event wrong or missing,
+and a `sharadar` row because the feed never carried it (the gap-fill adds an action
+only where no other source has one within 7 days). Comparing either would report it
+as withdrawn on every rotation, in a check no sweep may close, and could pair a
+Sharadar dividend with an FMP date and delete it as a re-dated copy.
+
 `redated` is the one exception, and the only place the reconciliation deletes.
 When the calendar sweep and the per-symbol feed date one distribution differently,
 the upsert stores the feed's date and keeps the sweep's, so the dividend sits in
