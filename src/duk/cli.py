@@ -4,6 +4,9 @@ CLI entry point for duk.
 This module provides the main command-line interface using Click.
 """
 
+import csv
+import io
+import json
 import logging
 import sys
 from pathlib import Path
@@ -26,6 +29,7 @@ from duk.fmp_api import (
 )
 from duk.format_utils import (
     DEFAULT_DECIMALS,
+    exact_records,
     format_price_columns,
     round_price_columns,
 )
@@ -280,6 +284,15 @@ def main(ctx, config, source):
 @click.option("--cv", is_flag=True, help="Return Date, Close, Volume fields")
 @click.option("--adj", is_flag=True, help="Retrieve dividend-adjusted price history")
 @click.option(
+    "--exact",
+    is_flag=True,
+    help=(
+        "Print prices exactly as the warehouse stores them, as decimal text, never "
+        "through a float. Daily bars from the warehouse (-S db) only; --precision "
+        "does not apply."
+    ),
+)
+@click.option(
     "-p",
     "--precision",
     type=int,
@@ -322,6 +335,7 @@ def ph(
     hlcv,
     cv,
     adj,
+    exact,
     precision,
     output_csv,
     output_json,
@@ -350,6 +364,29 @@ def ph(
     # Resolve data source and credentials
     cfg = ctx.obj["config"]
     source = ctx.obj.get("source", "db")
+    precision_requested = (
+        ctx.get_parameter_source("precision") == ParameterSource.COMMANDLINE
+    )
+    # --exact is a contract with a program that will not read a price through a
+    # float: refused outright wherever it cannot be kept, rather than quietly
+    # printing something rounded.
+    if exact:
+        if source != "db":
+            raise click.UsageError(
+                "--exact prints the warehouse's stored decimals; a vendor API sends "
+                "floats, so there is nothing exact to print. Use it with -S db."
+            )
+        if frequency.lower() != "day":
+            raise click.UsageError(
+                "--exact prints stored daily bars; resampling to --frequency "
+                f"{frequency} would compute new ones."
+            )
+        if summary:
+            raise click.UsageError("--exact prints bars, not --summary statistics.")
+        if precision_requested:
+            raise click.UsageError(
+                "--exact prints every stored digit; --precision does not apply."
+            )
     api_key = require_source_credentials(ctx, source)
 
     # An identifier is resolved to ONE security up front, so everything downstream
@@ -410,6 +447,7 @@ def ph(
                 limit=limit,
                 fields=fields,
                 adjusted=adj,
+                exact=exact,
             )
         elif source == "sharadar":
             df = ds_sharadar.price_history(
@@ -451,14 +489,24 @@ def ph(
     # Reset index to include date as a column in output
     output_df = df.reset_index()
 
+    if exact:
+        _print_exact(
+            exact_records(output_df),
+            output_format=output_format,
+            output=output,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            quiet=quiet,
+            logger=logger,
+        )
+        return
+
     # Display precision is applied at the output boundary only: `df` itself keeps
     # full precision, so the library contract and the db/live parity guarantee are
     # untouched. --output files are left alone unless --precision was given
     # explicitly, because -o feeds the `ti`/`rc` compute pipeline and rounding a
     # sub-dollar adjusted series to 2dp there is a real quantization error.
-    precision_requested = (
-        ctx.get_parameter_source("precision") == ParameterSource.COMMANDLINE
-    )
 
     def _as_text(frame):
         return format_price_columns(frame, decimals=precision)
@@ -509,6 +557,40 @@ def ph(
                 )
             else:
                 click.echo(_as_text(output_df).to_csv(index=False))
+
+
+def _print_exact(
+    records, *, output_format, output, symbol, start_date, end_date, quiet, logger
+):
+    """`ph --exact` output: every value as the text the warehouse stores.
+
+    JSON is a list of objects whose numbers are strings, so a reader that parses
+    JSON numbers as floats cannot round one by accident; CSV is the same text.
+    """
+    if output_format == "json":
+        text = json.dumps(records)
+    else:
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer, fieldnames=list(records[0]) if records else [], lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(records)
+        text = buffer.getvalue()
+
+    if output:
+        output_path = Path(output)
+        if output_path.is_dir():
+            ext = "json" if output_format == "json" else "csv"
+            name = f"{symbol}_{start_date or 'earliest'}_{end_date or 'latest'}.{ext}"
+            output_path = output_path / name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text, encoding="utf-8")
+        logger.info(f"Data written to {output_path}")
+        if not quiet:
+            click.echo(f"Data written to {output_path}")
+    if not quiet:
+        click.echo(text.rstrip("\n"))
 
 
 @main.command()

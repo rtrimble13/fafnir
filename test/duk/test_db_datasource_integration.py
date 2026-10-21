@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -160,3 +161,28 @@ def test_db_price_history_unknown_symbol_returns_empty(db):
         adjusted=False,
     )
     assert out.empty
+
+
+def test_db_price_history_exact_keeps_the_stored_decimals(db):
+    """`ph --exact`: the NUMERIC as stored, at its scale, never a float."""
+    _seed(db, symbol="EXCT")
+
+    raw = ds_db.price_history(
+        dsn=DSN,
+        symbol="EXCT",
+        start_date="2023-05-31",
+        end_date="2023-06-02",
+        fields=["close"],
+        exact=True,
+    )
+
+    assert list(raw["close"]) == [Decimal("100.000000"), Decimal("50.000000")]
+    with pytest.raises(ds_db.DataSourceError, match="frequency must be 'day'"):
+        ds_db.price_history(
+            dsn=DSN,
+            symbol="EXCT",
+            start_date="2023-05-31",
+            end_date="2023-06-02",
+            frequency="week",
+            exact=True,
+        )
