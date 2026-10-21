@@ -261,6 +261,16 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-21 · #73 follow-up: deep reverse splits.** The first `sharadar-actions --backfill --gap-fill
+  --dry-run` stopped on `a split ratio must be positive, not Decimal('0.0002')`. `split_ratio` snapped every
+  value to a denominator of at most 1,000:
+  - a 1-for-5,000 became 0/1 and refused the whole load;
+  - a 1-for-1,001 to 1-for-1,999 became 1/1000, a wrong split stored silently.
+
+  The snap is now kept only within the value's own rounding (0.3333 -> 1/3). Otherwise the value is read as
+  written, to a denominator of at most 1,000,000 (0.0002 -> 1/5000, 0.0008 -> 1/1250). No Sharadar split had
+  been stored, so nothing needs repair.
+
 - **2026-10-21 · #75 follow-up: Sharadar's files grouped by ticker; rounding no
   longer quarantines.** Run 403 (`sharadar-prices --backfill --gap-fill`) was killed
   after 13 hours. It had written 3.74M bars, about a quarter of SEP, and no funds.

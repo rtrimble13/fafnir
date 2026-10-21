@@ -57,6 +57,22 @@ def test_planned_converts_splits_and_as_declared_dividends():
     assert skipped == {"duplicate": 2, "invalid": 2, "summed": 1}
 
 
+def test_a_deep_reverse_split_is_planned_not_refused():
+    """2026-10-21: one 1-for-5,000 (0.0002) refused the whole ACTIONS dry run."""
+    skipped: Counter = Counter()
+    actions = {
+        "split": [(Y(2015, 3, 2), D("0.0002"))],
+        # Before the reverse split, ACTIONS carries a dividend x5,000 larger.
+        "dividend": [(Y(2014, 12, 1), D("0.5"))],
+    }
+    split, dividend = sorted(
+        sa.planned_for(7, actions, skipped), key=lambda p: p.ex_date, reverse=True
+    )
+    assert (split.split_numerator, split.split_denominator) == (1, 5000)
+    assert dividend.dividend_amount == D("0.000100")
+    assert not skipped
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
