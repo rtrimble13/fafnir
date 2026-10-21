@@ -914,6 +914,21 @@ loaded. A re-run mints nothing new. `--permaticker K --allow-overlap` mints one
 flagged issuer on purpose, for the split-history playbook
 ([operations.md](operations.md#separating-two-issuers-held-on-one-security)).
 
+**A sample first (#76).** `--sample N [--seed S]` mints N of them picked at random,
+the same N for the same seed. `--limit N` takes the first N by permaticker, the
+oldest keys, which is not a fair sample. #76 measures what the DQ checks make of
+dead histories on a sample before the whole population is minted:
+
+```bash
+fafnir vendor mint-delisted --sample 200 --seed 1
+fafnir ingest sharadar-prices --backfill     # the sample's bars: it is all Sharadar feeds
+fafnir ingest sharadar-actions --backfill
+```
+
+Run the three before the night's `fafnir-dq`, so its run judges the sample
+([dorq.md](dorq.md#what-a-run-does): its backfill pass takes the whole history of a
+security minted since the previous night). A later `mint-delisted` mints the rest.
+
 ### Which vendor feeds a security (ADR 0015)
 
 Every FMP loader feeds the securities FMP minted (`core.security.source = 'fmp'`)

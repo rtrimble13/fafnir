@@ -177,7 +177,7 @@ blocks still name `docs-gate` and a status row; read those two lines as "lint, b
 | [#70](https://github.com/rtrimble13/fafnir/issues/70) vendor excision | **Defer** (`optional`): a dry-run report of what each vendor supplied; `vendor:fmp` semantics dropped |
 | [#73](https://github.com/rtrimble13/fafnir/issues/73) actions loader | Also fills missing actions on live names and corrects disagreeing ones under precedence |
 | [#75](https://github.com/rtrimble13/fafnir/issues/75) price loader (backfill) | Three modes: dead issuers; gap-fill on live names; corrections from the queue |
-| [#76](https://github.com/rtrimble13/fafnir/issues/76) DQ pre-measure | On production with `--limit`, not staging; dorq's backfill path judges the history, no new policy |
+| [#76](https://github.com/rtrimble13/fafnir/issues/76) DQ pre-measure | On production with a random `--sample`, not staging; dorq's backfill path judges the history, no new policy |
 | [#77](https://github.com/rtrimble13/fafnir/issues/77) production backfill | Steps without staging; corrections applied after the report is reviewed |
 | [#90](https://github.com/rtrimble13/fafnir/issues/90) SF1 loader | Reads the SF1 file / nightly delta file, not typed landing |
 | [#98](https://github.com/rtrimble13/fafnir/issues/98) nightly loaders | Absorbs #53's delta fetch; acceptance is five production dry-runs, not a staging run |
@@ -260,6 +260,22 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-20 | **Sharadar is the more reliable vendor for identity linking.** FMP's history disagreeing with Sharadar's is a correction to make, not a reason to withhold a link: `vendor link` links on the latest sample or a shared identifier when the history disagrees, and flags the history `vendor_history_disagrees`. The identity evidence must still not rest on FMP's history | #62 |
 
 ## [built] notes
+
+- **2026-10-21 · P2, #76 (part 1): the sample and the procedure.** `fafnir vendor mint-delisted --sample N
+  [--seed S]` mints N dead issuers picked at random, the same N for the same seed; the run records both.
+  `--limit` takes the first N by permaticker, the oldest keys, not a fair sample.
+  - **No DQ code change.** The SQL checks rescan every history each night, and dorq's backfill pass judges
+    the whole history of a security minted since the previous night that has bars. So a sample minted and
+    loaded before the night's `fafnir-dq` is judged by that run, up to `dorq_backfill_max` (500).
+  - **The procedure, on the host:** `vendor overlap`, `mint-delisted --sample 200 --seed 1`,
+    `sharadar-prices --backfill`, `sharadar-actions --backfill`, all before `fafnir-dq`. The next morning,
+    count the open flags on `source = 'sharadar'` securities by check and severity, and the night's shadow
+    file's dorq rows on them by check. Counts only go on #76.
+  - **For #77.** The full mint is over `dorq_backfill_max`, and `--gap-fill` and `vendor correct` rewrite
+    history the backfill pass does not catch, so `fafnir dq run --engine dorq --full` once after them
+    ([dorq.md](../dorq.md#what-a-run-does)).
+  - **Next.** The measurement; then part 2: the per-check decisions in `sweep-policy.md`, and the dead-issuer
+    patterns in `outlier-classification.md`.
 
 - **2026-10-21 · #75 follow-up: `vendor correct` memory.** The first full `vendor correct --dry-run` on
   the host reached 1.6 GB in 50 minutes and pushed the 3.8 GB machine into swap. It was stopped.
@@ -362,7 +378,7 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
       `security_missing_classification` check and its recheck cover listed securities only, so a flag on a dead
       row would be resolved on the next recheck;
     - `cusip` is left NULL: Sharadar lists every CUSIP an issuer had, and none is "the" one;
-    - `--limit N` added, for a first run on the host;
+    - `--limit N` added, for a first run on the host (and `--sample N`, for #76);
     - #70 (excision) is not a prerequisite: it is deferred, and a minted row is found by `source = 'sharadar'`.
   - **Next.** On the host: `vendor overlap`, `mint-delisted --dry-run` (counts by category, venue and death
     year for #71), then the real run. `duk -S db ph <dead ticker>` resolves; prices come with #75.

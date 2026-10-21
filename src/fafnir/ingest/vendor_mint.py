@@ -33,6 +33,7 @@ already holds.
 
 from __future__ import annotations
 
+import random
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -145,8 +146,12 @@ def plan(
     permaticker: Optional[str] = None,
     allow_overlap: bool = False,
     limit: int = 0,
+    sample: int = 0,
+    seed: int = 0,
 ) -> MintResult:
-    """What would be minted; writes nothing."""
+    """What would be minted; writes nothing. ``sample`` picks that many at random
+    (``seed`` makes the pick repeatable): #76 measures DQ on a sample, minted,
+    loaded and checked on one day."""
     _guard(db)
     candidates = repo.vendor_link_candidates(db, vl.VENDOR, vl.PRICED_TABLES)
     flags = repo.list_dq_flags(db, repo.DqFilter(checks=(vo.CHECK,)), limit=1_000_000)
@@ -177,6 +182,10 @@ def plan(
         chosen = [c for c in eligible if c["vendor_key"] not in flagged]
         held_back = len(eligible) - len(chosen)
     chosen.sort(key=lambda c: c["vendor_key"])
+    if sample and sample < len(chosen):
+        chosen = sorted(
+            random.Random(seed).sample(chosen, sample), key=lambda c: c["vendor_key"]
+        )
     if limit:
         chosen = chosen[:limit]
 
@@ -273,10 +282,19 @@ def mint(
     permaticker: Optional[str] = None,
     allow_overlap: bool = False,
     limit: int = 0,
+    sample: int = 0,
+    seed: int = 0,
     dry_run: bool = False,
 ) -> MintResult:
     """Plan and, unless ``dry_run``, mint (one run, a commit per 500)."""
-    result = plan(db, permaticker=permaticker, allow_overlap=allow_overlap, limit=limit)
+    result = plan(
+        db,
+        permaticker=permaticker,
+        allow_overlap=allow_overlap,
+        limit=limit,
+        sample=sample,
+        seed=seed,
+    )
     result.dry_run = dry_run
     if dry_run:
         return result
@@ -284,7 +302,13 @@ def mint(
         db,
         source=vl.VENDOR,
         endpoint=ENDPOINT,
-        params={"permaticker": permaticker, "allow_overlap": allow_overlap},
+        params={
+            "permaticker": permaticker,
+            "allow_overlap": allow_overlap,
+            "limit": limit,
+            "sample": sample,
+            "seed": seed,
+        },
     )
     with run:
         result.run_id = run.run_id
