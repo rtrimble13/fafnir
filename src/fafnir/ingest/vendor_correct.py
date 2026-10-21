@@ -40,7 +40,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from statistics import median, quantiles
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
@@ -144,9 +144,12 @@ def _compare_run(
     run: Optional[RunLog],
     result: CorrectResult,
     agreed: dict,
+    sampled: Mapping[int, frozenset],
 ) -> None:
     """Compare one run of a security's rows with its FMP bars; correct the ones
-    that differ."""
+    that differ. Records in ``agreed`` the dates that agree or were corrected,
+    of those in ``sampled`` only."""
+    samples = sampled.get(t.security_id, frozenset())
     rows = [r for r in rows if t.valid_from <= r["date"] <= as_of]
     stored = repo.stored_bars_on(db, t.security_id, [r["date"] for r in rows])
     profile = repo.security_price_profile(db, t.security_id) or {}
@@ -173,7 +176,8 @@ def _compare_run(
         for b in cells:
             b.compared += 1
         if not differs(old, new, factor):
-            agreed[t.security_id].add(r["date"])
+            if r["date"] in samples:
+                agreed[t.security_id].add(r["date"])
             if old["volume"] and new["volume"]:
                 result.add_volume_ratio(old["volume"] / new["volume"])
             continue
@@ -198,9 +202,42 @@ def _compare_run(
     result.corrected += written.corrected
     if written.corrected:
         result.corrected_security_ids.add(t.security_id)
-        corrected = {f["trade_date"] for f in fixes}
+        corrected = {f["trade_date"] for f in fixes} & samples
         agreed[t.security_id] |= corrected
     db.commit()
+
+
+def _history_flags(db: Database, targets: Sequence[sp._Target]) -> list[dict]:
+    """The open ``vendor_history_disagrees`` flags of these securities."""
+    ids = tuple(t.security_id for t in targets)
+    if not ids:
+        return []
+    return repo.list_dq_flags(
+        db, repo.DqFilter(checks=(HISTORY,), security_ids=ids), limit=1_000_000
+    )
+
+
+def _samples(flag: dict) -> set[date]:
+    """The dates a ``vendor_history_disagrees`` flag sampled."""
+    return {
+        date.fromisoformat(s["date"])
+        for s in (flag.get("detail") or {}).get("samples", ())
+    }
+
+
+def _sampled_dates(db: Database, targets: Sequence[sp._Target]) -> dict[int, frozenset]:
+    """Every date an open ``vendor_history_disagrees`` flag sampled, by security:
+    the only agreeing dates :func:`_resolve_history_flags` ever reads.
+
+    Recording every agreeing date instead held one per compared bar, of every
+    linked security, until the end of the run: the first full dry run on the host
+    (2026-10-21) reached 1.6 GB and pushed a 3.8 GB machine into swap within 50
+    minutes, and was stopped.
+    """
+    out: dict[int, set] = defaultdict(set)
+    for f in _history_flags(db, targets):
+        out[f["security_id"]] |= _samples(f)
+    return {sid: frozenset(dates) for sid, dates in out.items()}
 
 
 def _resolve_history_flags(
@@ -208,18 +245,9 @@ def _resolve_history_flags(
 ) -> int:
     """Resolve each open ``vendor_history_disagrees`` flag whose sampled dates now
     all agree."""
-    ids = tuple(t.security_id for t in targets)
-    if not ids:
-        return 0
-    flags = repo.list_dq_flags(
-        db, repo.DqFilter(checks=(HISTORY,), security_ids=ids), limit=1_000_000
-    )
     done = []
-    for f in flags:
-        dates = {
-            date.fromisoformat(s["date"])
-            for s in (f.get("detail") or {}).get("samples", ())
-        }
+    for f in _history_flags(db, targets):
+        dates = _samples(f)
         if dates and dates <= agreed.get(f["security_id"], set()):
             done.append(f["dq_flag_id"])
     if done:
@@ -254,6 +282,7 @@ def correct(
     ]
     result.securities = len(targets)
     by_file, files, keys = sp.prepare(db, bulk_dir, targets, result.counts)
+    sampled = _sampled_dates(db, list(keys.values()))
     agreed: dict[int, set] = defaultdict(set)
 
     def scan(run: Optional[RunLog]) -> None:
@@ -272,6 +301,7 @@ def correct(
                     run=run,
                     result=result,
                     agreed=agreed,
+                    sampled=sampled,
                 )
                 if run is not None:
                     run.rows_inserted = result.corrected

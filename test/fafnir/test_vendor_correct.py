@@ -190,6 +190,26 @@ def test_a_differing_bar_is_corrected_audited_and_the_flag_resolved(db, tmp_path
 
 
 @integration
+def test_only_the_sampled_dates_are_remembered(db, tmp_path, monkeypatch):
+    """The first full dry run on the host held every agreeing date of 15,567
+    securities and was stopped at 1.6 GB. Only the dates an open flag sampled are
+    ever read: 01-05 agreed and 01-06 was corrected, both sampled; 01-08 agreed and
+    was not, so it is not kept."""
+    sid = _setup(db, tmp_path)
+    seen = {}
+    real = vc._resolve_history_flags
+
+    def spy(db_, targets, agreed, run):
+        seen.update({k: set(v) for k, v in agreed.items()})
+        return real(db_, targets, agreed, run)
+
+    monkeypatch.setattr(vc, "_resolve_history_flags", spy)
+    result = vc.correct(db, tmp_path, as_of=Y(2026, 1, 2))
+    assert seen == {sid: {Y(2010, 1, 5), Y(2010, 1, 6)}}
+    assert result.flags_resolved == 1
+
+
+@integration
 def test_volume_sharadar_takes_the_vendors_volume(db, tmp_path):
     sid = _setup(db, tmp_path)
     vc.correct(db, tmp_path, volume="sharadar", as_of=Y(2026, 1, 2))

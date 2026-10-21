@@ -576,6 +576,9 @@ compares them with the FMP bars on the dates both hold, from the link's `valid_f
   the same way (consolidated against primary-exchange) is a convention, and the dry
   run measures it; `--volume sharadar` takes the vendor's once that is decided.
 - **`vendor_history_disagrees`** flags resolve once every date they sample agrees.
+  Only those sampled dates are remembered during the scan, so memory is one
+  bucket of rows whatever the universe: the first full dry run on the host kept
+  every agreeing date of 15,567 securities and was stopped at 1.6 GB.
 - The factors of the corrected securities that hold actions are recomputed.
 
 `--dry-run` writes nothing and is the comparison report that replaced #69: bars
