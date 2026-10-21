@@ -262,6 +262,14 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-21 · P2, #81 (part 1): the playbook for Sharadar's quarantines.** Preparing the bulk triage
+  turned up a gap. `sharadar-prices` quarantines through `add_dq_flag` (no dedupe), and a quarantined date is
+  not held, so every run re-reads it. A bar a later run loads leaves its flag open, because nothing re-checks a
+  `price_*` flag. Run 403's 146,710 rounding quarantines, which v1.8.1 now loads, are that case. dq-playbooks.md
+  gains "Quarantines from the Sharadar loader": resolve by rule the flags whose bar has since loaded, then the
+  older duplicates. Both queries are tested against a fixture, with batched `dq resolve` runs whose dry runs are
+  summed against the prediction. The sweep policy's dead-history table points there first.
+  - **Next.** The triage itself, on the host after #77 and #76's counts.
 - **2026-10-21 · P2, #80: point-in-time ticker resolution.** `resolve_security_id(db, symbol, as_of=…)`,
   `duk -S db ph CC@2008-06-30` / `ls CC@…`, and MCP `resolve_symbol(as_of=…)` name the security that traded
   under a ticker on a date. Every MCP tool that takes a symbol also accepts the `TICKER@date` form. A period

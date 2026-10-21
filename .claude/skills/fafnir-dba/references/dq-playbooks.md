@@ -409,6 +409,59 @@ check, in four ways:
   rejected as cross-field violations. On a warehouse running code that predates
   those fixes, expect both to keep coming back.
 
+### Quarantines from the Sharadar loader (#75)
+
+`ingest sharadar-prices` quarantines through the same checks. Its flags carry
+`detail.source = 'sharadar'` and the vendor's ticker in `record_key.symbol`. Three
+things differ from FMP's:
+
+- **A later run may have loaded the bar.** A quarantined date is not held, so every
+  `sharadar-prices` run reads it again, and a fix to the loader can let it in. Run
+  403 (2026-10-20) quarantined 146,710 bars as `price_cross_field_violation` that
+  the rounding clamp (v1.8.1) loads, and their flags stayed open: nothing re-checks
+  a `price_*` flag. The condition is gone when the security holds a bar on the
+  date. Resolve those by rule, first: it is bookkeeping, and it is most of the
+  queue.
+- **Every re-run flags the rest again.** The loader writes through `add_dq_flag`,
+  so a second `--backfill` run adds a second open flag for each bar it still
+  refuses. Work them after the last backfill run. Several open flags on one
+  security, check and date are one condition: close all but the newest by rule.
+- **There is no other vendor to re-fetch from** on a dead history: FMP never feeds
+  it. A bar Sharadar's own data fails validation on stays absent, and leaves a
+  `gap` on its date that belongs to the quarantine. Decide it by its reason's
+  entry below, and say in the note that a later backfill run flags it again.
+
+Both cleanups take thousands of ids, past `dq resolve`'s command line, so they run
+in batches, in operator-directed bulk mode (sweep-policy.md). Add the dry runs' totals
+and compare them with the file's line count before the real run:
+
+```bash
+# Flags whose bar has since loaded.
+psql "$FAFNIR_DSN" -Atc "SELECT f.dq_flag_id FROM ops.data_quality_flag f
+ WHERE f.check_name LIKE 'price\_%' AND f.detail->>'source' = 'sharadar'
+   AND f.resolved_at IS NULL AND f.accepted_at IS NULL
+   AND EXISTS (SELECT 1 FROM core.daily_price p
+                WHERE p.security_id = f.security_id
+                  AND p.trade_date = (f.record_key->>'date')::date)" > /tmp/sharadar_loaded
+# Older duplicates of one bar's flag.
+psql "$FAFNIR_DSN" -Atc "SELECT dq_flag_id FROM (
+  SELECT f.dq_flag_id, row_number() OVER (
+           PARTITION BY f.security_id, f.check_name, f.record_key->>'date'
+           ORDER BY f.dq_flag_id DESC) AS n
+    FROM ops.data_quality_flag f
+   WHERE f.check_name LIKE 'price\_%' AND f.detail->>'source' = 'sharadar'
+     AND f.resolved_at IS NULL AND f.accepted_at IS NULL) d
+ WHERE n > 1" > /tmp/sharadar_duplicates
+
+wc -l < /tmp/sharadar_loaded                     # the prediction
+xargs -a /tmp/sharadar_loaded -n 5000 fafnir dq resolve --by claude --by-rule \
+  -m "Operator-directed <date>: the bar loaded on a later sharadar-prices run" \
+  --dry-run | grep -o 'Dry run: [0-9,]*' | tr -d , | awk '{s += $3} END {print s}'
+```
+
+Then the same command without `--dry-run`. Run the loaded-bar cleanup before
+building the duplicates file, since a flag can be in both.
+
 ---
 
 ## `price_missing_or_nonnumeric_ohlc` — OHLC absent or unparseable

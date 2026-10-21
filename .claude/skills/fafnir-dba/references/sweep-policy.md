@@ -170,7 +170,7 @@ The decisions, per check:
 | `sparse_coverage` | Check unchanged. **Accept**, by rule: the density is final. Its playbook's escalation still applies (a liquid name near 0.80). |
 | `outlier`, `dorq_*` | Unchanged. Classify by `outlier-classification.md`, starting at §2k for the moves that end a company's life. |
 | `stale`, `security_missing_classification` | Not written on these rows: both checks cover listed securities only. |
-| `price_*`, `sharadar_split_ratio_mismatch` | Unchanged, repair-first. A quarantined bar also leaves a `gap` on its date: work the quarantine, not the gap. |
+| `price_*`, `sharadar_split_ratio_mismatch` | Unchanged, repair-first. A quarantined bar also leaves a `gap` on its date: work the quarantine, not the gap. First resolve, by rule, the Sharadar quarantines whose bar a later run loaded, and the older duplicates (dq-playbooks.md, "Quarantines from the Sharadar loader"). |
 | Severity | No check drops to `info` for these rows. Acceptance keeps the record and stops the re-detection; a lower severity would hide the condition without a decision. |
 
 ### Precondition: `gap` on a dead Sharadar history
