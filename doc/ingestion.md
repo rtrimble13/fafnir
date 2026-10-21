@@ -232,7 +232,10 @@ Two limits follow from the data:
 4, and a 1-for-4 reverse split is 0.25. That is the direction
 `core.corporate_action` reads (a 2-for-1 is 2 / 1), so `value` maps to
 `split_numerator / split_denominator` unchanged, a reverse split as its rational (1 /
-4). Across the sample, `closeunadj /
+4). A rounded value is snapped to the nearest fraction with a denominator up to 1,000
+(0.3333 -> 1/3) only when that is within the value's own rounding; a deep reverse
+split is read as written (0.0002 -> 1/5000, 0.0008 -> 1/1250), where the snap made
+0/1 and refused the load, or 1/1000 and stored the wrong split. Across the sample, `closeunadj /
 close` matched the cumulative split product after each date on all 127,726
 split-affected bars, within the 3-decimal rounding.
 
@@ -280,7 +283,7 @@ full TICKERS file used (#52, 2026-10-19).
 | `category` `MF` | `fund`, `is_fund` | NAV-priced |
 | `category` `UNIT`, `IDX` | none, silently | units are out of scope (ADR 0012); an index is not a security |
 | `sector`, `industry` | a name already in `ref.sector` / `ref.industry` | `map_classification`: case, commas and spacing ignored; two reviewed industry aliases (`Drug Manufacturers - Major`, `Furnishings`); anything else is none, and `missing_classification` flags the security |
-| split `value` | `split_numerator / split_denominator` | `split_ratio`: `Fraction(str(value)).limit_denominator(1000)`, 4 → 4/1, 0.25 → 1/4; non-positive refused |
+| split `value` | `split_numerator / split_denominator` | `split_ratio`: the value's fraction, snapped to a denominator up to 1,000 only within its own rounding (4 → 4/1, 0.25 → 1/4, 0.3333 → 1/3, 0.0002 → 1/5000); non-positive refused |
 | dividend `value` | `dividend_amount`, as declared | `as_declared_dividend(value, split_product_after(splits, ex_date))`, quantized to 6 dp half-up; non-positive refused |
 | SEP/SFP `closeunadj` | raw `close` | `recover_raw` |
 | SEP/SFP `open`, `high`, `low` | raw, × factor | factor = `closeunadj / close`, or the ACTIONS split product when the caller passes it (exact, where the ratio carries the close's 3-dp rounding; #75 chooses) |
