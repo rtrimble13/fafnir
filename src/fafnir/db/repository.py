@@ -446,12 +446,39 @@ HISTORICAL_XREF_RESOLVE_SQL = (
     "ORDER BY valid_to DESC, valid_from DESC LIMIT 1"
 )
 
+# Point in time (#80): the security that traded under the ticker ON a date, for a
+# ticker reused across issuers (Circuit City and Chemours were both CC). A period
+# contains the date when it started on or before it and has not ended before it
+# (valid_to is the period's last day). A period starting 1900-01-01 is the
+# "first seen" fallback of upsert_symbol_xref, whose real start is unknown, so it
+# counts only from the security's first bar. Among several, the latest start wins
+# -- the most specific claim on the ticker -- then the primary period, then the
+# lowest id. Never a fallback to the ladder above: a caller who named a date asked
+# who traded then, and "nobody" is the answer when nobody did.
+AS_OF_RESOLVE_SQL = (
+    "SELECT x.security_id FROM core.symbol_xref x "
+    "WHERE x.symbol = %s AND x.valid_from <= %s "
+    "AND (x.valid_to IS NULL OR x.valid_to >= %s) "
+    "AND (x.valid_from > DATE '1900-01-01' OR EXISTS ("
+    "SELECT 1 FROM core.daily_price p "
+    "WHERE p.security_id = x.security_id AND p.trade_date <= %s)) "
+    "ORDER BY x.valid_from DESC, x.is_primary DESC, x.security_id ASC LIMIT 1"
+)
+
 
 def resolve_security_id(
-    db: Database, symbol: str, source: str = "fmp"
+    db: Database,
+    symbol: str,
+    source: str = "fmp",
+    as_of: Optional[date] = None,
 ) -> Optional[int]:
     """Resolve a ticker to a security_id: current xref, then primary_symbol, then a
-    ticker the security used to trade under."""
+    ticker the security used to trade under. With ``as_of``, the security that
+    traded under the ticker on that date (AS_OF_RESOLVE_SQL) instead; loaders never
+    pass it."""
+    if as_of is not None:
+        val = db.fetchval(AS_OF_RESOLVE_SQL, (symbol, as_of, as_of, as_of))
+        return int(val) if val is not None else None
     val = db.fetchval(XREF_RESOLVE_SQL, (symbol,))
     if val is not None:
         return int(val)

@@ -418,3 +418,66 @@ def test_an_unmatched_identifier_points_back_at_the_ticker(db):
     with pytest.raises(ToolError) as exc:
         T.price_history(dsn=DSN, symbol="cik:99999999")
     assert "no security carries CIK 99999999" in str(exc.value)
+
+
+def test_a_reused_ticker_resolves_on_a_date(db):
+    """#80: `resolve_symbol(as_of=...)`, and the `TICKER@date` form in every tool
+    that takes a symbol. Synthetic: one dead issuer with a dated period, one live
+    one whose period starts at the 1900 "first seen" fallback."""
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    live = repo.upsert_security(
+        db, primary_symbol="ZZCC", company_name="ZZ Live", exchange_code="NYSE"
+    )
+    repo.upsert_symbol_xref(db, security_id=live, symbol="ZZCC")
+    dead = repo.upsert_security(
+        db,
+        primary_symbol="ZZCC",
+        company_name="ZZ Dead",
+        exchange_code="NYSE",
+        is_actively_trading=False,
+        delisted_date=dt.date(2009, 3, 6),
+        source="sharadar",
+    )
+    repo.insert_symbol_period(
+        db,
+        security_id=dead,
+        symbol="ZZCC",
+        valid_from=dt.date(1998, 1, 2),
+        valid_to=dt.date(2009, 3, 6),
+        source="sharadar",
+    )
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": sid,
+                "trade_date": day,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 10,
+            }
+            for sid, day, close in (
+                (dead, dt.date(2008, 6, 30), 7),
+                (live, dt.date(2020, 6, 30), 50),
+            )
+        ],
+    )
+
+    def resolved(**kw):
+        return T.resolve_symbol(dsn=DSN, **kw)["rows"][0]["security_id"]
+
+    assert resolved(symbol="ZZCC", as_of="2008-06-30") == dead
+    assert resolved(symbol="ZZCC@2008-06-30") == dead
+    assert resolved(symbol="ZZCC", as_of="2020-06-30") == live
+    assert resolved(symbol="ZZCC") == live
+    with pytest.raises(ToolError, match="no security traded as ZZCC on 2012-01-03"):
+        T.resolve_symbol(dsn=DSN, symbol="ZZCC", as_of="2012-01-03")
+    with pytest.raises(ToolError, match="as_of takes a plain ticker"):
+        T.resolve_symbol(dsn=DSN, symbol="cik:1", as_of="2012-01-03")
+
+    rows = T.price_history(dsn=DSN, symbol="ZZCC@2008-06-30")["rows"]
+    assert [str(r["close"]) for r in rows] in (["7"], ["7.0"], ["7.000000"])
+    with pytest.raises(ToolError, match="no security traded as ZZCC on 2012-01-03"):
+        T.price_history(dsn=DSN, symbol="ZZCC@2012-01-03")

@@ -89,6 +89,7 @@ fafnir source vendor-gaps                        # live names FMP stopped servin
 # 7. Read with duk (the warehouse is the default source)
 duk ph AAPL --adj
 duk ph cik:51143                          # or name a security by CIK/ISIN/CUSIP
+duk ph CC@2008-06-30                      # the security that traded as CC that day
 duk ls --sector Technology
 duk -S fmp ph AAPL                        # the same series straight from a vendor
 duk -S sharadar ph AAPL

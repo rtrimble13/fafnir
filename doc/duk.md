@@ -247,6 +247,47 @@ would be worse than stopping. `ls QUERY` is db-only in every case.
 Identifiers work on the MCP surface too: every tool taking a `symbol` accepts
 `cik:`/`isin:`/`cusip:` (see [agent.md](agent.md)).
 
+### A ticker on a date: `TICKER@YYYY-MM-DD`
+
+A ticker is reused across issuers. Circuit City and Chemours were both `CC`, and
+since the dead issuers were minted from Sharadar (#71) the warehouse holds both. A
+bare ticker means the security that holds it now, or held it last. To name the one
+that traded under it on a day, add the date (#80):
+
+```bash
+duk -S db ph CC@2008-06-30 --close     # Circuit City
+duk -S db ph CC@2020-06-30 --close     # Chemours
+duk -S db ls CC@2008-06-30             # the company summary, the same way
+```
+
+- **What it reads.** The ticker's periods in `mart.v_symbol_lookup` that contain
+  the date; a period's `valid_to` is its last day. A period that starts on
+  1900-01-01 is the "first seen" fallback for a ticker whose start fafnir never
+  learned, so it counts only from its security's first bar. Of several, the
+  latest start wins, then the primary period, then the lowest id.
+- **Nobody is an answer.** A date on which no security traded under the ticker
+  finds nothing: `CC@2012-01-03`, after Circuit City died and before Chemours
+  listed. It does not fall back to the bare ticker, because the date was the
+  question.
+- **`-S db` only.** The vendors have no ticker history to read it against, so
+  `-S fmp` and `-S sharadar` refuse it. A date after `@` that does not parse is an
+  error (`TICKER@YYYY-MM-DD`). A name that merely contains `@` is still a name.
+- **The bare ticker says when it is ambiguous.** In db mode, `ph` and `ls` with a
+  ticker that has named more than one security still answer as before, and print
+  the others on stderr with the dated form that reaches each (dates illustrative):
+
+```
+Note: CC has named 2 securities. The bare ticker reads the one holding it now, or
+last; for another, name a day it traded:
+NAME IT AS     NAME                     EXCHANGE  STATUS
+-------------  -----------------------  --------  --------
+CC@2026-10-21  Chemours Co              NYSE      active
+CC@2009-03-06  Circuit City Stores Inc  NYSE      delisted
+```
+
+On the MCP surface, `resolve_symbol` takes `as_of`, and every tool taking a
+`symbol` accepts the `CC@2008-06-30` form.
+
 ## `ls QUERY` — one company, everything held
 
 `ls` with a positional argument switches from listing many securities to

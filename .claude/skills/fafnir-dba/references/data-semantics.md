@@ -77,6 +77,11 @@ An unapplied rename is the opposite problem: the company's identity is split
 across two `security_id`s, and neither has the whole history. `fafnir status`
 reports those under **Renames**.
 
+A ticker's periods are also the answer to *who traded under it on a date*:
+`resolve_security_id(db, symbol, as_of=…)`, `duk ph CC@2008-06-30`, and
+`resolve_symbol(as_of=…)` on MCP (#80). Loaders never pass a date. See §24 for
+why the bare ticker is not enough once a ticker has been reused.
+
 ## 6. `ttm_dividend_amount` is anchored to the security's own last ex-date
 
 Not to `now()`. Deliberately: a view whose output changes with the clock cannot be
@@ -331,3 +336,31 @@ Where the vendor's own `closeunadj / close` disagrees with ACTIONS, the bar was
 recovered with the vendor's ratio and the security carries
 `sharadar_split_ratio_mismatch`: a split is missing from ACTIONS or wrong there,
 so the security's adjustment factors (built from ACTIONS, #73) are suspect too.
+
+## 24. A ticker names several securities over time
+
+Tickers are reused. Since the dead issuers were minted from Sharadar (#71), one
+ticker can belong to several securities in `core.symbol_xref`: Circuit City
+(Sharadar, a closed period ending 2009) and Chemours (FMP, an open period) are both
+`CC`. The bare ticker resolves through the ladder to the security holding it now,
+or last.
+
+> **Wrong answer:** reading `CC` from 2005 to 2020 as one company's history. Before
+> 2009 it is Circuit City's, after 2015 Chemours's, and the bare ticker reaches
+> only one of them.
+
+- **Name a date for history.** `CC@2008-06-30` is Circuit City, `CC@2020-06-30`
+  Chemours. A period's `valid_to` is its last day. A date nobody traded under the
+  ticker finds nothing, unless a security still carries another issuer's bars
+  under it (§14).
+- **A 1900 start is not a fact.** A period starting 1900-01-01 is the "first seen"
+  fallback (`upsert_symbol_xref`): fafnir never learned when the ticker started.
+  The dated lookup counts such a period only from its security's first bar. Read
+  that date as "since before fafnir knew", never as a listing date.
+- **Two answers.** `duk` prints the other securities a bare ticker has named
+  (on stderr, db mode). On MCP, `resolve_symbol` returns one security: when the
+  question is about a past date, pass `as_of`.
+- **Keys are safer than tickers.** A `security_id`, a CIK/ISIN/CUSIP, or
+  `mart.v_security_lifecycle` (`symbol` with `first_trade_date`/`last_trade_date`)
+  names one security without the date.
+

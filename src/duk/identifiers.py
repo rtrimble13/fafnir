@@ -15,14 +15,23 @@ feature cannot change the meaning of a command anyone is already running.
 For the same reason an unrecognised prefix is NOT an error: ``ls "Baker: A
 History"`` is a name search, not a typo'd scheme. Only the four known schemes
 below claim the colon.
+
+A ticker may carry a date, ``CC@2008-06-30``: the security that traded under it
+on that day (#80). A ticker is reused across issuers -- Circuit City and Chemours
+were both CC -- and the plain ticker means whoever holds it now. The ``@`` claims
+only a suffix that starts with a digit, so a name that contains one is still a
+name.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
+from typing import Optional
 
 TICKER = "ticker"
+TICKER_AT = "ticker_at"
 CIK = "cik"
 ISIN = "isin"
 CUSIP = "cusip"
@@ -38,7 +47,13 @@ _ALIASES = {
     "cusip": CUSIP,
 }
 
-LABELS = {TICKER: "ticker", CIK: "CIK", ISIN: "ISIN", CUSIP: "CUSIP"}
+LABELS = {
+    TICKER: "ticker",
+    TICKER_AT: "ticker",
+    CIK: "CIK",
+    ISIN: "ISIN",
+    CUSIP: "CUSIP",
+}
 
 # ISIN: 2-letter ISO country code, 9 alphanumeric NSIN, 1 check digit.
 _ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
@@ -47,6 +62,8 @@ _ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$")
 # systems, and an 8-character CUSIP identifies the issue just as uniquely.
 _CUSIP_RE = re.compile(r"^[A-Z0-9]{8,9}$")
 _DIGITS_RE = re.compile(r"^[0-9]+$")
+# TICKER@YYYY-MM-DD. A suffix that starts with a digit is a date or an error.
+_AT_DATE_RE = re.compile(r"^(?P<symbol>[^@]*)@(?P<day>[0-9].*)$")
 
 # Separators people paste along with the value: ISINs and CUSIPs are often written
 # in groups ("US4592 0010 14", "459200-10-1").
@@ -72,6 +89,7 @@ class Identifier:
     value: str
     raw: str
     explicit: bool = False
+    as_of: Optional[date] = None
 
     @property
     def is_ticker(self) -> bool:
@@ -85,6 +103,8 @@ class Identifier:
         """How the identifier is named in user-facing prose."""
         if self.is_ticker:
             return f"ticker {self.value}"
+        if self.scheme == TICKER_AT:
+            return f"ticker {self.value} on {self.as_of.isoformat()}"
         return f"{self.label} {self.value}"
 
 
@@ -99,14 +119,36 @@ def parse(text: str) -> Identifier:
     scheme_part, sep, value_part = raw.partition(":")
     scheme = _ALIASES.get(scheme_part.strip().lower()) if sep else None
     if scheme is None:
-        return Identifier(TICKER, raw.upper(), raw, explicit=False)
+        return _dated(raw, raw) or Identifier(TICKER, raw.upper(), raw, explicit=False)
 
     value = value_part.strip()
     if not value:
         raise IdentifierError(
             f"'{raw}' has no value after '{scheme_part.strip().lower()}:'"
         )
+    if scheme == TICKER:
+        dated = _dated(value, raw)
+        if dated:
+            return dated
     return Identifier(scheme, _normalise(scheme, value, raw), raw, explicit=True)
+
+
+def _dated(text: str, raw: str) -> Optional[Identifier]:
+    """``TICKER@YYYY-MM-DD`` as a dated ticker, or None when there is no date."""
+    match = _AT_DATE_RE.match(text)
+    if not match:
+        return None
+    symbol = match["symbol"].strip().upper()
+    try:
+        day = date.fromisoformat(match["day"].strip())
+    except ValueError:
+        day = None
+    if not symbol or day is None:
+        raise IdentifierError(
+            f"'{raw}' is not a ticker on a date: expected TICKER@YYYY-MM-DD, "
+            "e.g. CC@2008-06-30"
+        )
+    return Identifier(TICKER_AT, symbol, raw, explicit=True, as_of=day)
 
 
 def _normalise(scheme: str, value: str, raw: str) -> str:

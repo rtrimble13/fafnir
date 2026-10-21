@@ -90,8 +90,27 @@ _HISTORICAL_XREF_RESOLVE_SQL = (
     "ORDER BY valid_to DESC, valid_from DESC LIMIT 1"
 )
 
+# The security that traded under the ticker on a date (#80): AS_OF_RESOLVE_SQL,
+# on the mart seam. Not a rung of the ladder above -- a caller who named a date is
+# answered for that date or not at all.
+_AS_OF_RESOLVE_SQL = (
+    "SELECT x.security_id FROM mart.v_symbol_lookup x "
+    "WHERE x.symbol = %s AND x.valid_from <= %s "
+    "AND (x.valid_to IS NULL OR x.valid_to >= %s) "
+    "AND (x.valid_from > DATE '1900-01-01' OR EXISTS ("
+    "SELECT 1 FROM mart.v_daily_price_raw p "
+    "WHERE p.security_id = x.security_id AND p.trade_date <= %s)) "
+    "ORDER BY x.valid_from DESC, x.is_primary DESC, x.security_id ASC LIMIT 1"
+)
 
-def _resolve_security_id(cur, symbol: str, source: str = "fmp") -> Optional[int]:
+
+def _resolve_security_id(
+    cur, symbol: str, source: str = "fmp", as_of: Optional[date] = None
+) -> Optional[int]:
+    if as_of is not None:
+        cur.execute(_AS_OF_RESOLVE_SQL, (symbol, as_of, as_of, as_of))
+        row = cur.fetchone()
+        return int(row["security_id"]) if row else None
     cur.execute(_XREF_RESOLVE_SQL, (symbol,))
     row = cur.fetchone()
     if row:
@@ -132,6 +151,9 @@ _IDENT_ORDER = (
     " ORDER BY (delisted_date IS NULL) DESC, is_actively_trading DESC, symbol ASC"
 )
 
+_IDENT_BY_ID_SQL = (
+    f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile WHERE security_id = %s"
+)
 _CIK_RESOLVE_SQL = (
     f"SELECT {_IDENT_COLUMNS} FROM mart.v_security_profile "
     "WHERE ltrim(btrim(cik), '0') = %s" + _IDENT_ORDER
@@ -175,6 +197,11 @@ def _resolve_by_identifier(cur, ident: identifiers.Identifier) -> list[dict]:
     search does -- answering confidently about the wrong share class is the failure
     that cannot be spotted from the output.
     """
+    if ident.scheme == identifiers.TICKER_AT:
+        sec_id = _resolve_security_id(cur, ident.value, as_of=ident.as_of)
+        if sec_id is None:
+            return []
+        return _rows(cur, _IDENT_BY_ID_SQL, (sec_id,))
     if ident.scheme == identifiers.CIK:
         return _rows(cur, _CIK_RESOLVE_SQL, (ident.value,))
     if ident.scheme == identifiers.ISIN:
@@ -192,6 +219,28 @@ def _resolve_by_identifier(cur, ident: identifiers.Identifier) -> list[dict]:
     raise DataSourceError(  # pragma: no cover -- tickers never reach here
         f"{ident.label} is not resolvable as an identifier"
     )
+
+
+# Every security that has traded under a ticker, newest first, with the last day of
+# its period under it (today for an open one): the candidates a bare ticker could
+# mean when the ticker was reused (#80).
+_TICKER_PERIODS_SQL = """
+    SELECT p.security_id, p.symbol, p.company_name, p.exchange_code,
+           p.exchange_name, p.is_actively_trading, p.delisted_date,
+           max(COALESCE(x.valid_to, CURRENT_DATE)) AS last_day
+      FROM mart.v_symbol_lookup x
+      JOIN mart.v_security_profile p ON p.security_id = x.security_id
+     WHERE x.symbol = %s
+     GROUP BY p.security_id, p.symbol, p.company_name, p.exchange_code,
+              p.exchange_name, p.is_actively_trading, p.delisted_date
+     ORDER BY last_day DESC, p.security_id
+"""
+
+
+def ticker_periods(*, dsn: str, symbol: str) -> list[dict]:
+    """The securities that have traded under ``symbol``, newest first."""
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        return _rows(cur, _TICKER_PERIODS_SQL, (symbol.upper(),))
 
 
 def resolve_identifier(*, dsn: str, identifier: identifiers.Identifier) -> list[dict]:

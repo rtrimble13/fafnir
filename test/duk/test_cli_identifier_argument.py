@@ -211,3 +211,42 @@ class TestCompanySummaryByIdentifier:
         assert result.exit_code == 1
         assert "CIK 1652044 matches 2 securities" in result.output
         assert "Re-run with one of these tickers" in result.output
+
+
+class TestDatedTicker:
+    """`TICKER@YYYY-MM-DD` (#80): resolved by the warehouse, never by a vendor."""
+
+    def test_db_resolves_it_to_one_security_by_id(self, runner, calls):
+        result = _run(runner, ["-S", "db", "ph", "CC@2008-06-30"])
+        assert result.exit_code == 0, result.output
+        assert calls["identifier"].scheme == ids.TICKER_AT
+        assert calls["price_kwargs"]["security_id"] == 42
+
+    @pytest.mark.parametrize("source", ["fmp", "sharadar"])
+    def test_a_vendor_source_is_refused(self, runner, calls, source, monkeypatch):
+        monkeypatch.setenv("SHARADAR_API_KEY", "test-key")
+        result = _run(runner, ["-S", source, "ph", "CC@2008-06-30"])
+        assert result.exit_code == 1
+        assert "use -S db" in result.output
+        assert "identifier" not in calls
+
+    def test_a_bad_date_is_a_parse_error(self, runner, calls):
+        result = _run(runner, ["-S", "db", "ph", "CC@2008-13-01"])
+        assert result.exit_code == 1
+        assert "TICKER@YYYY-MM-DD" in result.output
+
+
+class TestReusedTickerHint:
+    def test_the_hint_never_fails_the_command(self, runner, calls, monkeypatch):
+        def broken(**kw):
+            raise RuntimeError("no warehouse")
+
+        monkeypatch.setattr(ds_db, "ticker_periods", broken)
+        result = _run(runner, ["-S", "db", "ph", "IBM"])
+        assert result.exit_code == 0, result.output
+        assert "Note:" not in result.output
+
+    def test_one_security_needs_no_hint(self, runner, calls, monkeypatch):
+        monkeypatch.setattr(ds_db, "ticker_periods", lambda **kw: [dict(IBM)])
+        result = _run(runner, ["-S", "db", "ph", "IBM"])
+        assert "Note:" not in result.output
