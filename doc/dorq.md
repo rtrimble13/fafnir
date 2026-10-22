@@ -163,6 +163,19 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    thousands of dead issuers in one night, over the limit; `ingest sharadar-prices
    --gap-fill` and `vendor correct` write bars behind the window of securities that
    already had a history. Run `fafnir dq run --engine dorq --full` once after them.
+
+   Two things to know before a `--full` run in shadow mode (both met on the host on
+   2026-10-22, #77):
+   - **It replaces that night's shadow file.** Its as-of date is the market's latest
+     session, the date the night's run already wrote. The next night's `dq compare`
+     then counts "new per night" against a whole-history file, so that night's figure
+     is meaningless. Copy the night's file aside first. If the figure matters, put
+     it back (as `fafnir`) before the next morning's `dq compare`.
+   - **It becomes the "previous night" of the next nightly run.**
+     `previous_night_start` does not pass over full runs. The next night's backfill
+     pass therefore takes what was minted or overridden since the full run started.
+     Anything minted or overridden between the night's run and the full run is
+     judged only in the full file. Run it before that day's repairs.
 3. **Run.** `dorq check --format fafnir --exit-zero`. Each line is an
    `ops.data_quality_flag` row: `check_name` is `dorq_<check>` (`dorq_bad_print`,
    `dorq_scale_shift` …), `record_key` is `{"trade_date": …}`, and `detail` is
@@ -222,6 +235,9 @@ At that rate:
   16 s;
 - a `--full` run over 150M bars takes about 5 minutes, nearly all of it Postgres
   reading and sorting the history.
+
+Measured on the production host (3.8 GB RAM) on 2026-10-22: a `--full` run over all
+84.9M bars (5.2 GB through dorq) took **6 min 3 s** at a peak of 668 MB RSS.
 
 ## The shadow period
 

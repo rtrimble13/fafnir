@@ -21,6 +21,13 @@
 -- Counts only, safe to post on #79. It writes nothing but a temporary view, gone
 -- when the session ends. Reads core; run it as the owner or fafnir_ops.
 --
+-- It is slow on a full warehouse: each security's first and last bar probe every
+-- daily_price partition. A login role with a statement_timeout (the MCP's read
+-- login has one) stops it. Run it with psql as the owner, or `SET
+-- statement_timeout = 0` first. Through the MCP's `sql_read` it cannot run at all:
+-- on 2026-10-22 (#79) the first and last bars were fetched in chunks by
+-- security_id and the rules applied off-database.
+--
 -- Usage:
 --   psql "${FAFNIR_DSN}" -X -f scripts/survivorship_check.sql
 

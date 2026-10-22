@@ -595,6 +595,38 @@ sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; cd /opt/faf
 - **A table that fails** in step 3 does not undo the others. Re-run step 3: the
   tables already on record are skipped.
 
+### The dead-issuer backfill on the production host (#77)
+
+After the population above, #77 loads the dead issuers' history and corrects FMP's
+bars. Run each command as `fafnir`, inside `tmux`, with the environment file sourced.
+Run **one heavy command at a time**: on the 3.8 GB host, a `vendor correct --dry-run`
+running alongside `sharadar-actions` pushed the machine into swap. Every step writes
+nothing it has already written, so the sequence resumes wherever the host stands.
+
+| Step | Command | Measured on the host, 2026-10-20 to 10-22 |
+|---|---|---|
+| Dump | the nightly `fafnir-dump`, or `scripts/backup_dump.sh` | the dump before the mint |
+| Mint | `fafnir vendor mint-delisted` | 17 s: 11,927 minted; 2,546 held back by `vendor_history_overlap` |
+| Prices | `time fafnir ingest sharadar-prices --backfill --gap-fill` | **67 min** (v1.8.1): 15,579,765 bars over 27,494 securities; 0 quarantined; 423,234 rounding-clamped |
+| Actions | `time fafnir ingest sharadar-actions --backfill`, then `--gap-fill` | 6 min + 3 min: 88,923 + 11,550 rows |
+| Corrections | `fafnir vendor correct --dry-run`, then the real run (below) | dry run 88 min over 15,567 linked securities at a 239 MB peak; real run **49 min**: 589,256 bars on 10,213 securities |
+| Marts | `fafnir db refresh-marts`, or the nightly | |
+| dorq | `time fafnir dq run --engine dorq --full` | **6 min**, 668 MB peak; read [dorq.md](dorq.md#what-a-run-does) first: it replaces the night's shadow file |
+
+What differed from the issue's plan:
+- **The first price run took days, not hours.** SEP is not grouped by ticker, so
+  each row became its own batch. It was killed at 3.74M bars after 13 hours, and
+  #178 (grouping by ticker) brought the full run to 67 minutes.
+- **The real correction was not a blanket run.** It was
+  `vendor correct --symbols "<list>"` over the 11,088 linked securities with no
+  split on file, with `--volume keep`. A sample of the dry run's differences showed
+  that FMP and Sharadar disagree on a security's split and ADR-ratio history. Those
+  4,470 securities wait for a bar-level rule, and their `vendor_history_disagrees`
+  flags stay open.
+- **The nightly DQ run must not judge a partial load.** After the night a run
+  stopped part-way, the queue stood at 63,547 open conditions, most of them false
+  once the reload finished. Work the flags only after the last load ([sweep policy](../.claude/skills/fafnir-dba/references/sweep-policy.md)).
+
 ## Disk budget with Sharadar
 
 Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in
@@ -630,6 +662,10 @@ price files came in as projected, and SF1 came in smaller (632 MB, at 3.2M rows 
 - **`core`.** At most ~30M bars of delisted issuers (stocks and funds) are new to
   the warehouse. At 151 bytes a bar that is **~4.6 GB**, an upper bound: some of
   those issuers FMP already holds.
+  **Measured after #77 (2026-10-22):** 19.32M new bars (runs 403 and 412). The
+  whole of `core.daily_price` is 14.7 GB for 84.9M bars, **173 bytes a bar** with
+  every index (the 151 was heap and primary key). So the new bars are about
+  **3.3 GB**, and the database is 22 GB after.
 - **Dumps.** Each nightly dump grows in proportion to `core.daily_price`, and
   `backup_dump.sh` keeps 14. Measure the bytes per bar of the current dump (its
   size over `core.daily_price`'s row count), multiply by the new bars, and check
