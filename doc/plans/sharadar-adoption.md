@@ -265,6 +265,18 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-22 · P3, #98 (part 1): `fafnir vendor feed` and FMP's feed rule.** `vendor feed --vendor
+  sharadar|tiingo|fmp (--all-linked | --funds | --security-id N…) [--dry-run] [--by] [--yes]` moves `is_feed`.
+  Sharadar or Tiingo sets the vendor's open link, clearing any other first. FMP clears the links of what FMP
+  minted, which is the rollback. A switch is one ingestion run (`endpoint = feed`) recording who, the scope
+  and the ids changed; no price or action row moves.
+  - **The rule #46 handed over:** `FMP_FED_SECURITY` (`source = 'fmp'`) became `repo.fmp_fed(alias)`, "minted
+    by FMP and fed by no other vendor". It is used by the price, actions and reconciliation universes,
+    `vendor-gaps` and `is_fed_by`. The duplicate-identity check and `security dedupe` keep
+    `FMP_MINTED_SECURITY`: an FMP duplicate is one whoever feeds it.
+  - **Departure:** "recording who and when" is the run row, not new columns on the xref. No migration.
+  - **Next (part 2):** the nightly delta fetch into the ledger, `sharadar-prices` and `sharadar-actions`
+    nightly modes, and `fafnir ingest sharadar` (universe, prices, actions).
 - **2026-10-22 · P2, #76, #77, #79, #80, #81: the backfill closed out on the host.** On v1.8.4, migrations
   through 0034. Counts are on each issue; the skill's lessons are in
   [fafnir-dba skill enhancements, 2026-10-22](fafnir-dba-skill-enhancements-2026-10-22.md).

@@ -1012,12 +1012,14 @@ code for rollback.
 ### Which vendor feeds a security (ADR 0015)
 
 Every FMP loader feeds the securities FMP minted (`core.security.source = 'fmp'`)
-and nothing else. The predicate is `repo.FMP_FED_SECURITY`, and the per-symbol guard
-is `repo.is_fed_by(db, security_id, "fmp")`. Both apply to the price universe
-(`ingest prices`, with or without `--include-inactive`), the corporate-actions
-universes (first load, calendar sweep, reconciliation slice, declared funds), the
-duplicate-identity check and `security dedupe`, the `source vendor-gaps` report and
-`security venue-transfer`.
+that no other vendor feeds, and nothing else. The predicate is `repo.fmp_fed()`, and
+the per-symbol guard is `repo.is_fed_by(db, security_id, "fmp")`. Both apply to the
+price universe (`ingest prices`, with or without `--include-inactive`), the
+corporate-actions universes (first load, calendar sweep, reconciliation slice,
+declared funds), the `source vendor-gaps` report and `security venue-transfer`. The
+duplicate-identity check and `security dedupe` look among every row FMP minted
+(`repo.FMP_MINTED_SECURITY`), fed or not: two rows FMP minted for one ticker are a
+duplicate whoever feeds them now.
 
 The reason is how FMP keys history. It serves a ticker's whole history whoever used
 it, so a pull into any security FMP did not mint writes another issuer's bars into
@@ -1032,9 +1034,36 @@ A per-symbol pull that resolves to such a security logs `which FMP does not feed
 and loads nothing. In `load_prices` stats it counts as `not_fmp_fed`.
 
 Which vendor feeds a security is an explicit assignment, not a guess from `source`.
-For FMP it is `source = 'fmp'`. For any other vendor it is an open link with
-`is_feed = true` in `core.security_vendor_xref` (#55), and `is_fed_by(db, id,
-"sharadar")` reads exactly that. The table allows one feeding link per security.
+For any vendor but FMP it is an open link with `is_feed = true` in
+`core.security_vendor_xref` (#55), and `is_fed_by(db, id, "sharadar")` reads exactly
+that. The table allows one feeding link per security. FMP feeds what it minted
+unless such a link gives the security to another vendor.
+
+`fafnir vendor feed` moves the assignment (#98):
+
+```bash
+fafnir vendor feed --vendor sharadar --all-linked --dry-run   # what would move
+fafnir vendor feed --vendor sharadar --all-linked             # the cutover's switch
+fafnir vendor feed --vendor tiingo --funds                    # funds to Tiingo
+fafnir vendor feed --vendor fmp --all-linked                  # the rollback
+```
+
+- **Sharadar or Tiingo** sets `is_feed` on each in-scope security's open link to that
+  vendor, clearing any other vendor's first. A security FMP was feeding leaves FMP's
+  universes at once. One with no open link to the vendor is reported `no_link`, never
+  linked: that is `vendor link`'s decision.
+- **FMP** clears the feeding links of the securities FMP minted, so FMP loads them
+  again. A security another vendor minted (a Sharadar dead issuer) is reported
+  `not_fmp_minted` and keeps its feed.
+- **Scope:** `--all-linked` (every security linked to the vendor; for FMP, every one
+  fed by another), `--funds` (those that are funds), or `--security-id N`
+  (repeatable).
+- **Nothing else moves.** No price or action row changes, whichever vendor wrote it,
+  so a rollback leaves Sharadar's rows in place under precedence (ADR 0015 §3).
+- **The record.** A switch asks for confirmation (`--yes` skips it) and is one
+  `ops.ingestion_run` (`source` the vendor, `endpoint = feed`). Its `params` hold who
+  made it (`--by`, default the OS user), the scope, the counts and the security ids
+  it changed. `--dry-run` applies it and rolls back.
 
 Nothing sets a Sharadar feed link before `fafnir vendor feed` (#98). When it does, it
 must also take the security out of FMP's rule, which today reads `source` alone, so
