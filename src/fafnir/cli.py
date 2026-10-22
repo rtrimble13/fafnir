@@ -556,6 +556,17 @@ def ingest_delisted(ctx, full):
     is_flag=True,
     help="Fill-only for the FMP securities linked to Sharadar: dates FMP never served.",
 )
+@click.option(
+    "--nightly",
+    is_flag=True,
+    help="The delta files since the last nightly, for the securities Sharadar feeds.",
+)
+@click.option(
+    "--as-if-fed",
+    is_flag=True,
+    help="With --nightly --dry-run: also compare the FMP securities linked to "
+    "Sharadar with the bars they hold.",
+)
 @click.option("--symbols", help="Comma-separated tickers: only these securities.")
 @click.option("--dry-run", is_flag=True, help="Read and print counts; write nothing.")
 @click.option(
@@ -564,12 +575,15 @@ def ingest_delisted(ctx, full):
     help="Do not recompute the factors of the securities that gained bars.",
 )
 @click.pass_context
-def ingest_sharadar_prices(ctx, backfill, gap_fill, symbols, dry_run, no_adjust):
-    """Load Sharadar's daily bars into core.daily_price, raw recovered (#75).
+def ingest_sharadar_prices(
+    ctx, backfill, gap_fill, nightly, as_if_fed, symbols, dry_run, no_adjust
+):
+    """Load Sharadar's daily bars into core.daily_price, raw recovered (#75, #98).
 
     \b
       fafnir ingest sharadar-prices --backfill --dry-run
       fafnir ingest sharadar-prices --backfill --gap-fill
+      fafnir ingest sharadar-prices --nightly --dry-run --as-if-fed
 
     Reads the ledger's current stocks and funds files under [sharadar] bulk_dir.
     --backfill loads the whole history of the securities Sharadar feeds (the
@@ -584,12 +598,25 @@ def ingest_sharadar_prices(ctx, backfill, gap_fill, symbols, dry_run, no_adjust)
 
     The files are grouped by ticker on disk first, a dry run included: allow
     about four times the zip's size free under bulk_dir (about 4 GB for SEP).
+
+    --nightly reads instead the delta files `source sharadar-delta` recorded since
+    the last nightly run (sharadar/prices:nightly), for the securities Sharadar
+    feeds: new dates written, its own bars rewritten where the vendor revised them,
+    other vendors' bars left alone. --as-if-fed adds the linked FMP securities to a
+    dry run and reports, per trade date, the bars that agree or differ with FMP's,
+    the ones FMP lacks (new) and the ones only FMP holds.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_prices as sp
 
-    if not (backfill or gap_fill):
-        raise click.ClickException("Give --backfill, --gap-fill or both.")
+    if nightly and (backfill or gap_fill):
+        raise click.ClickException(
+            "--nightly runs alone: not with --backfill/--gap-fill."
+        )
+    if not (backfill or gap_fill or nightly):
+        raise click.ClickException("Give --backfill, --gap-fill or both, or --nightly.")
+    if as_if_fed and not (nightly and dry_run):
+        raise click.ClickException("--as-if-fed goes with --nightly --dry-run.")
     cfg = ctx.obj["config"]
     with Database(cfg.dsn) as database:
         ids = None
@@ -601,19 +628,42 @@ def ingest_sharadar_prices(ctx, backfill, gap_fill, symbols, dry_run, no_adjust)
             if missing:
                 raise click.ClickException(f"No security for: {', '.join(missing)}")
         try:
-            result = sp.load(
-                database,
-                cfg.sharadar_bulk_dir,
-                backfill=backfill,
-                gap_fill=gap_fill,
-                security_ids=ids,
-                dry_run=dry_run,
-                adjust=not no_adjust,
-            )
+            if nightly:
+                result = sp.nightly(
+                    database,
+                    cfg.sharadar_bulk_dir,
+                    security_ids=ids,
+                    dry_run=dry_run,
+                    as_if_fed=as_if_fed,
+                    adjust=not no_adjust,
+                )
+            else:
+                result = sp.load(
+                    database,
+                    cfg.sharadar_bulk_dir,
+                    backfill=backfill,
+                    gap_fill=gap_fill,
+                    security_ids=ids,
+                    dry_run=dry_run,
+                    adjust=not no_adjust,
+                )
         except (sp.PricesError, FileNotFoundError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
+    _echo_sharadar_prices(result)
 
+
+def _echo_sharadar_prices(result) -> None:
+    from fafnir.ingest import sharadar_prices as sp
+
+    dry_run = result.dry_run
     head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+    if isinstance(result, sp.NightlyResult):
+        files = ", ".join(
+            f"{table} {len(ids)} file(s)" for table, ids in result.files.items()
+        )
+        head += f" Deltas: {files}."
+        if result.as_if_fed:
+            head += f" {result.as_if_fed} linked securities compared as if fed."
     click.echo(
         f"{head} {result.securities} securities in scope; {result.read} rows read; "
         f"{result.counts['to_write']} bars to write"
@@ -627,6 +677,12 @@ def ingest_sharadar_prices(ctx, backfill, gap_fill, symbols, dry_run, no_adjust)
             f"  {result.mismatched_securities} securities whose closeunadj/close "
             "disagrees with ACTIONS somewhere (sharadar_split_ratio_mismatch)"
         )
+    by_date = getattr(result, "by_date", None)
+    if by_date:
+        click.echo("  by trade date:")
+        for day, counts in sorted(by_date.items()):
+            line = ", ".join(f"{k} {n:,}" for k, n in sorted(counts.items()))
+            click.echo(f"    {day:<10}  {line}")
     if not dry_run and result.changed_security_ids:
         click.echo(f"  factors recomputed for {result.adjusted} securities")
 
@@ -666,8 +722,6 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
     ops.ingestion_run (sharadar/actions); the factors of the securities it changed
     are recomputed, for those with bars.
     """
-    from collections import Counter
-
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_actions as sa
 
@@ -695,7 +749,13 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
             )
         except (sa.ActionsError, FileNotFoundError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
+    _echo_sharadar_actions(result)
 
+
+def _echo_sharadar_actions(result) -> None:
+    from collections import Counter
+
+    dry_run = result.dry_run
     kinds = Counter(p.action_type for p in result.planned)
     head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
     click.echo(
@@ -764,8 +824,11 @@ def ingest_sharadar_universe(ctx, since, dry_run):
             )
         except su.UniverseError as exc:
             raise click.ClickException(str(exc)) from exc
+    _echo_sharadar_universe(result)
 
-    head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+
+def _echo_sharadar_universe(result) -> None:
+    head = "Dry run: nothing written." if result.dry_run else f"Run {result.run_id}."
     click.echo(f"{head} Events from {result.since}.")
     quiet = {"out_of_scope", "not_linked"}
     for change in result.changes:
@@ -812,6 +875,13 @@ def ingest_sharadar_master(ctx, file_id):
             )
         except FileNotFoundError as exc:
             raise click.ClickException(str(exc)) from exc
+    failed = _echo_sharadar_master(results)
+    if failed:
+        raise click.ClickException(f"{len(failed)} file(s) failed: {', '.join(failed)}")
+
+
+def _echo_sharadar_master(results) -> list[str]:
+    """One line per file loaded; the tables that failed."""
     failed = []
     for r in results:
         if r.error:
@@ -824,8 +894,125 @@ def ingest_sharadar_master(ctx, file_id):
         )
         for reason, n in r.skipped.items():
             click.echo(f"{'':<8} skipped {n}: {reason}")
-    if failed:
-        raise click.ClickException(f"{len(failed)} file(s) failed: {', '.join(failed)}")
+    return failed
+
+
+@ingest.command("sharadar")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Fetch the files and refresh the vendor tables; apply nothing to fafnir's "
+    "own, and compare the linked FMP securities' bars as if Sharadar fed them.",
+)
+@click.pass_context
+def ingest_sharadar(ctx, dry_run):
+    """The Sharadar-primary night, in order (#98).
+
+    \b
+      fafnir ingest sharadar --dry-run   # before the cutover: set against FMP's night
+      fafnir ingest sharadar             # after it: what daily_update.sh runs
+
+    \b
+      1. source sharadar-bulk --tables tickers,actions --force
+      2. source sharadar-delta                  (SEP, SFP)
+      3. ingest sharadar-master
+      4. ingest sharadar-universe
+      5. ingest sharadar-prices --nightly
+      6. ingest sharadar-actions --backfill --gap-fill
+
+    TICKERS and ACTIONS are small, so they are downloaded whole each night; the
+    price tables come as deltas. A step that fails stops the night with a non-zero
+    exit. Every step is safe to run again, so the next run picks up where it
+    stopped. Factors are recomputed for the securities whose bars or actions
+    changed.
+
+    The dry run still downloads and records the files and refreshes the vendor
+    tables (core.vendor_security, core.vendor_security_event): that is Sharadar's
+    view, not fafnir's. Steps 4 to 6 then write nothing, and step 5 compares the
+    FMP securities linked to Sharadar with FMP's bars (--as-if-fed): the five
+    nights of the cutover's acceptance. A real run waits for [general]
+    primary_price_vendor = "sharadar".
+    """
+    from fafnir.ingest import sharadar_actions as sa
+    from fafnir.ingest import sharadar_bulk, sharadar_master
+    from fafnir.ingest import sharadar_prices as sp
+    from fafnir.ingest import sharadar_universe as su
+
+    cfg = ctx.obj["config"]
+    if not dry_run and cfg.primary_price_vendor != "sharadar":
+        raise click.ClickException(
+            "FMP feeds the night until the cutover ([general] primary_price_vendor "
+            '= "sharadar"). Run with --dry-run to compare.'
+        )
+    client = _sharadar_client(cfg)
+    bulk_dir = cfg.sharadar_bulk_dir
+
+    def step(n: int, name: str) -> None:
+        click.echo(f"\n[{n}/6] {name}")
+
+    def stop(n: int, why: str):
+        raise click.ClickException(f"step {n} failed: {why}. The night stopped there.")
+
+    with Database(cfg.dsn) as database:
+        step(1, "source sharadar-bulk --tables tickers,actions --force")
+        failed = _echo_sharadar_files(
+            sharadar_bulk.download_tables(
+                database, client, ["tickers", "actions"], bulk_dir, force=True
+            )
+        )
+        if failed:
+            stop(1, ", ".join(failed))
+        step(2, "source sharadar-delta")
+        failed = _echo_sharadar_files(
+            sharadar_bulk.fetch_deltas(
+                database, client, sharadar_bulk.DELTA_TABLES, bulk_dir
+            )
+        )
+        if failed:
+            stop(2, ", ".join(failed))
+        step(3, "ingest sharadar-master")
+        try:
+            failed = _echo_sharadar_master(sharadar_master.load(database, bulk_dir))
+        except FileNotFoundError as exc:
+            stop(3, str(exc))
+        if failed:
+            stop(3, ", ".join(failed))
+        try:
+            step(4, "ingest sharadar-universe" + (" --dry-run" if dry_run else ""))
+            _echo_sharadar_universe(
+                su.run(
+                    database,
+                    dry_run=dry_run,
+                    excluded_kinds=cfg.excluded_instruments,
+                )
+            )
+            step(
+                5,
+                "ingest sharadar-prices --nightly"
+                + (" --dry-run --as-if-fed" if dry_run else ""),
+            )
+            _echo_sharadar_prices(
+                sp.nightly(database, bulk_dir, dry_run=dry_run, as_if_fed=dry_run)
+            )
+            step(
+                6,
+                "ingest sharadar-actions --backfill --gap-fill"
+                + (" --dry-run" if dry_run else ""),
+            )
+            _echo_sharadar_actions(
+                sa.load(
+                    database, bulk_dir, backfill=True, gap_fill=True, dry_run=dry_run
+                )
+            )
+        except (
+            su.UniverseError,
+            sp.PricesError,
+            sa.ActionsError,
+            FileNotFoundError,
+            ValueError,
+        ) as exc:
+            raise click.ClickException(f"{exc}. The night stopped there.") from exc
+    click.echo(f"\nBytes downloaded {client.bytes_downloaded:,}; files in {bulk_dir}.")
 
 
 @ingest.command("actions")
@@ -5195,10 +5382,19 @@ def source_sharadar_bulk(ctx, tables, years, force):
         results = sharadar_bulk.download_tables(
             database, client, names, cfg.sharadar_bulk_dir, years=years, force=force
         )
+    _report_sharadar_files(results, cfg, client)
+
+
+def _echo_sharadar_files(results) -> list[str]:
+    """One line per table of a bulk or delta fetch; the tables that failed."""
     failed = []
     for r in results:
         if r.outcome == "skipped":
             click.echo(f"{r.table:<13} skipped: file {r.file_id} is current ({r.path})")
+        elif r.outcome == "empty":
+            click.echo(
+                f"{r.table:<13} no rows stamped since the last file; none recorded"
+            )
         elif r.outcome == "failed":
             failed.append(r.table)
             click.echo(f"{r.table:<13} FAILED: {r.error}")
@@ -5218,6 +5414,11 @@ def source_sharadar_bulk(ctx, tables, years, force):
                 click.echo(
                     f"{'':<13} unknown columns, read as text: {r.unmapped_columns}"
                 )
+    return failed
+
+
+def _report_sharadar_files(results, cfg, client) -> None:
+    failed = _echo_sharadar_files(results)
     click.echo(
         f"Files are in {cfg.sharadar_bulk_dir}; bytes downloaded {client.bytes_downloaded:,}"
     )
@@ -5225,6 +5426,47 @@ def source_sharadar_bulk(ctx, tables, years, force):
         raise click.ClickException(
             f"{len(failed)} table(s) failed: {', '.join(failed)}"
         )
+
+
+@source.command("sharadar-delta")
+@click.option(
+    "--tables",
+    default="SEP,SFP",
+    show_default=True,
+    help="Comma-separated price tables: SEP, SFP (or stocks, funds)",
+)
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    metavar="YYYY-MM-DD",
+    help="Rows stamped lastupdated on or after this (default: the day the "
+    "table's newest file was fetched, less 3 days).",
+)
+@click.pass_context
+def source_sharadar_delta(ctx, tables, since):
+    """Fetch the price rows Sharadar changed since its last file (the nightly slice).
+
+    Asks the table API for each table's rows with lastupdated on or after --since:
+    the new day's bars and the vendor's revisions of past ones. They land in
+    [sharadar] bulk_dir as <sha256>.csv and get one row in landing.sharadar_file
+    (kind delta); nothing is loaded into core (`ingest sharadar-prices --nightly`
+    does that). A delta with no rows is not recorded. One ops.ingestion_run per
+    table (endpoint delta:<table>). Exits non-zero if any table failed.
+    """
+    from fafnir.ingest import sharadar_bulk
+
+    cfg = ctx.obj["config"]
+    client = _sharadar_client(cfg)
+    names = [t.strip() for t in tables.split(",") if t.strip()]
+    with Database(cfg.dsn) as database:
+        results = sharadar_bulk.fetch_deltas(
+            database,
+            client,
+            names,
+            cfg.sharadar_bulk_dir,
+            since=since.date() if since else None,
+        )
+    _report_sharadar_files(results, cfg, client)
 
 
 @source.command("probe-sharadar")

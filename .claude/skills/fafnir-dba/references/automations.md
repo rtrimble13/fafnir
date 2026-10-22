@@ -43,6 +43,45 @@ warns and carries on to prices, rather than costing the night's data for every
 symbol. Nothing is swallowed — the failure is still an `ops.ingestion_run` row
 with `status = 'failed'`, which is why that query is on the monitoring list.
 
+### The Sharadar night (`fafnir ingest sharadar`, #98)
+
+From the cutover (`[general] primary_price_vendor = "sharadar"`, #125), one command
+does universe, prices and actions for the securities Sharadar feeds. Until #111
+wires it into `daily_update.sh`, it is run by hand; before the cutover only
+`--dry-run` is allowed.
+
+```
+source sharadar-bulk --tables tickers,actions --force → source sharadar-delta
+  → ingest sharadar-master → ingest sharadar-universe
+  → ingest sharadar-prices --nightly → ingest sharadar-actions --backfill --gap-fill
+```
+
+A failed step stops the night non-zero, and every step is safe to re-run. Its runs
+are all `source = 'sharadar'`:
+
+| Endpoint | Step | Read in `params` |
+|---|---|---|
+| `bulk:tickers`, `bulk:actions` | the whole-file downloads | `file_id`, `rows`, `superseded` |
+| `delta:stocks`, `delta:funds` | SEP/SFP rows by `lastupdated` | `lastupdated.gte`, `rows`, `file_id`, `dates` (a year back is normal: the vendor restamps history it adjusts) |
+| `master:tickers`, `master:actions` | the vendor tables | |
+| `universe` | renames, delistings, listings | the counts |
+| `prices:nightly` | the bars | `through` (last delta file applied per table), `counts` (`new`, `revised`, `unchanged`, `kept:<source>`), `by_date` |
+| `actions` | splits and dividends | `skipped.near_existing` |
+
+Diagnosing it:
+- **No bars tonight.** Look for a `delta:*` run that failed, or one with `rows = 0`,
+  which records no file. Then read `prices:nightly`'s `through`: the nightly reads
+  the delta files after it, so a failed night is re-read the next.
+- **`kept:fmp` is expected.** It means a security taken over from FMP keeps FMP's
+  bars. To replace them, use `vendor correct`, never the nightly.
+- **`revised` counts only material changes.** That is `vendor correct`'s price test,
+  or volume beyond 1%. A history restamped after a split recovers to within rounding
+  and stays `unchanged`.
+- **The five dry runs before the cutover** are `fafnir ingest sharadar --dry-run`
+  after FMP's night. Their price step reports per trade date `fmp_agrees`,
+  `fmp_differs`, `new` and `fmp_only`. Read the night's own date; the differences
+  are what #98 asks to have explained.
+
 ## Diagnosing a night
 
 ```sql
@@ -154,7 +193,8 @@ the evidence the switch was right, and until then it is only a reasonable bet.
 | Re-adjust | `fafnir adjust [--symbol X]` | **also after a price reload** — dividend factors are valued against the prior raw close, so new prices change them |
 | Reconciliation | `scripts/reconcile.sh AAPL,MSFT,SPY` | weekly, rotating sample; reports, never overwrites |
 | Backups | `scripts/backup_dump.sh`, `backup_offsite.sh` | dump **every** schema, not a subset |
-| Sharadar bulk files | `fafnir source sharadar-bulk [--tables …] [--force]` | operator-run, not nightly. Downloads whole tables to `[sharadar] bulk_dir` (`<sha256>.csv.zip`) and records each in `landing.sharadar_file`; loads nothing into core. A table already on record is skipped unless `--force`. Runs are `source = sharadar`, `endpoint = bulk:<table>`. The files are **not** backed up (re-downloadable while subscribed) |
+| Sharadar bulk files | `fafnir source sharadar-bulk [--tables …] [--force]` | operator-run for SEP, SFP and SF1; the Sharadar night re-downloads TICKERS and ACTIONS. Downloads whole tables to `[sharadar] bulk_dir` (`<sha256>.csv.zip`) and records each in `landing.sharadar_file`; loads nothing into core. A table already on record is skipped unless `--force`. Runs are `source = sharadar`, `endpoint = bulk:<table>`. The files are **not** backed up (re-downloadable while subscribed) |
+| Sharadar deltas | `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` | step 2 of the Sharadar night. Rows stamped `lastupdated` from the newest file's fetch day less 3 days, as `<sha256>.csv` with `kind = 'delta'`. A fresh full SEP/SFP (`sharadar-bulk --force`) shortens what a newly minted security reads: every delta since the full file |
 
 On backups, the trap worth knowing: skipping `mart` because it is derived and
 `meta` because it is "only bookkeeping" gives a restore that is not a working
