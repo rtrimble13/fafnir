@@ -934,6 +934,14 @@ judge every history each night. dorq's backfill pass skipped it (over
 `fafnir dq run --engine dorq --full`. What to do with the flags is in the fafnir-dba
 skill's sweep policy ("Dead Sharadar histories").
 
+Measured on the whole population (11,927 dead issuers, 2026-10-22, #76):
+- **SQL checks:** outliers dominate, 33,906 on 6,345 securities. `gap` and
+  `sparse_coverage` are 0 once the histories are complete.
+- **The 10-21 nightly** ran on a load that had stopped part-way (run 403). It wrote
+  16,408 gap flags, 5,416 sparse flags, and 21% of the outliers, all false once the
+  reload finished. Work the flags only after the last load.
+- **dorq `--full`:** 6,849 reports on 2,674 of the dead issuers.
+
 ### Sharadar as primary: universe maintenance (#93)
 
 At the cutover (#125) Sharadar's events replace the three FMP sweeps that keep the

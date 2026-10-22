@@ -59,6 +59,11 @@ read through the `duk` CLI.
     that followed: the outlier classification order, the plausibility gate, the
     survivorship check before deleting a segment, computed dry-run predictions
     (**applied**)
+  - [fafnir-dba skill enhancements, 2026-10-22](plans/fafnir-dba-skill-enhancements-2026-10-22.md)
+    — what closing out the Sharadar backfill (#76, #77, #79, #80, #81) taught the
+    skill: the order that cleared 33,906 dead-history outliers, §2k's tests with
+    thresholds, a scoped "already gone" set by id, and dorq `--full`'s effect on the
+    shadow file (**applied**)
   - [Sharadar adoption](plans/sharadar-adoption.md) — the living plan, revised
     2026-10-18: Sharadar (Bundle, max history) becomes the system of record in one
     warehouse — it fills the history FMP never had and corrects what FMP has wrong —

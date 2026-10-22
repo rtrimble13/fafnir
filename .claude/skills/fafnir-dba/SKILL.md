@@ -327,9 +327,11 @@ the full sort order, with the queries.
 - **Big results go to a file, never retyped.** `sql_read` caps at 500 rows and
   returns smaller results inline. To get a long id or date list into a file, return
   it as `string_agg` rows and pad the result past the inline limit (`repeat('#',
-  4000) AS pad`) so it is saved; parse the saved JSON with `python3` (there is no
-  `jq`), assert the counts, and build the command from the file (`--date` and ids
-  are repeatable). Copying hundreds of dates by hand is how a batch goes wrong.
+  90000) AS pad`) so it is saved. A 4,000-character pad is not enough: on
+  2026-10-22, results of about 85,000 characters still came back inline with it.
+  Parse the saved JSON with `python3` (there is no `jq`), assert the counts, and
+  build the command from the file (`--date` and ids are repeatable). Copying
+  hundreds of dates by hand is how a batch goes wrong.
 - **Long commands run in the background, and nothing follows until they finish.**
   `db refresh-marts` followed by a recheck passed the two-minute foreground limit
   on 2026-09-15. Chain the refresh and the recheck dry run in one background

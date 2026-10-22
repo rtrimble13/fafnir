@@ -333,6 +333,30 @@ collapse. Then test on the bars, not on the name:
 - **Ticks at the end.** Sub-dollar prices moving one or two ticks in the final
   months: §2g.
 
+The tests as run on 2026-10-22 (#81), each on one feature pass over every open flag
+(close, previous close, the bar's volume, the next 10 bars, the bars to the end):
+
+| Class | Test | Guard that pulled flags out |
+|---|---|---|
+| Tick (§2g) | `max(close, prev_close) < 1` and the difference is at most $0.02, or at most 1/8 before 2001-04-09 | none; see below |
+| Collapse | `close <= 0.5 × prev_close`; no later bar at or above `0.75 × prev_close`; the last bar within 365 days | no split within ±15 days; the ratio not within 3% of a clean split ratio (×k, ÷k, 3:2) |
+| Cash acquisition | `close >= 1.5 × prev_close`; at least 5 later bars, every one within ±5% of `close`, at least half with volume; the last bar within 365 days | the same; and a tail of zero-volume carry bars is not a deal, it is no trading |
+| Liquidating distribution | the dividends between the previous bar and this one, `div`, satisfy `close / (prev_close − div)` between 0.67 and 1.5 | a quotient near 2 or 0.5 is a dividend row twice or half its size: leave it open |
+
+- **Spot-check each class on the bars before its dry run.** The 2026-10-22 samples
+  held, for collapse, cash acquisition and liquidating distribution alike, the
+  companies' own bankruptcy filings, cash takeovers and special distributions.
+  Two tests needed tightening:
+  - a "liquidating distribution" whose dividend explained only half the drop;
+  - an "acquisition" whose flat tail was zero-volume carry bars.
+- **The clean-ratio guard is for splits, not ticks.** 1¢ → 2¢ is exactly ×2, and
+  1/16 → 3/16 exactly ×3. On a sub-dollar tick move the guard pulls out nearly
+  everything and means nothing.
+- **Elsewhere, a clean ratio needs the full §2d table.** It is only a reason to run
+  §2d, not a split by itself. Of 4,853 split-like flags still open after the §2k
+  classes, 213 passed §2d and 264 had a split on file within 120 days, 469 in all;
+  those stayed open.
+
 What does not apply, or applies differently:
 
 - **§2h does not apply.** A Sharadar history is one permaticker's (ADR 0016), and no

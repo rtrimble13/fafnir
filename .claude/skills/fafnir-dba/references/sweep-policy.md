@@ -162,13 +162,30 @@ can lead to:
 - **The history is final.** A delisted issuer gets no new bars, so its density and
   its gaps never change.
 
+**Measured on the whole population** (11,927 dead issuers, 2026-10-22, #76):
+- **On complete histories:** `gap` 0, `sparse_coverage` 0, Sharadar `price_*` 0.
+  - The 16,408 gap and 5,416 sparse flags seen on 10-21 came from a load that
+    stopped part-way (run 403). A recheck closed them once the reload finished.
+  - The gap precondition below was never exercised.
+- **Outliers dominate:** 33,906 on 6,345 securities.
+  - 21% of them were already gone, written by a nightly on the partial load.
+  - Rises outnumber falls three to one: in a sub-dollar name a one-cent rise is
+    +50–100%, and the fall back is often under the threshold.
+- **Everything else:** `sharadar_split_ratio_mismatch` 198,
+  `dividend_no_prior_close` 115, `dividend_exceeds_price` 5,
+  `split_duplicate_suspect` 1.
+- **dorq `--full`:** 6,849 reports on 2,674 of them.
+
+Work them only after the last load that writes their bars: a nightly run on a
+partial load writes flags that the finished load makes false.
+
 The decisions, per check:
 
 | Check | Decision |
 |---|---|
 | `gap` | Check unchanged. **Accept**, by rule, when the precondition below holds. |
 | `sparse_coverage` | Check unchanged. **Accept**, by rule: the density is final. Its playbook's escalation still applies (a liquid name near 0.80). |
-| `outlier`, `dorq_*` | Unchanged. Classify by `outlier-classification.md`, starting at §2k for the moves that end a company's life. |
+| `outlier`, `dorq_*` | Unchanged. Classify by `outlier-classification.md`, starting at §2k for the moves that end a company's life, in the order under "Outliers on dead histories" below. What §2k does not cover is accepted only by the operator's bulk rule. |
 | `stale`, `security_missing_classification` | Not written on these rows: both checks cover listed securities only. |
 | `price_*`, `sharadar_split_ratio_mismatch` | Unchanged, repair-first. A quarantined bar also leaves a `gap` on its date: work the quarantine, not the gap. First resolve, by rule, the Sharadar quarantines whose bar a later run loaded, and the older duplicates (dq-playbooks.md, "Quarantines from the Sharadar loader"). |
 | Severity | No check drops to `info` for these rows. Acceptance keeps the record and stops the re-detection; a lower severity would hide the condition without a decision. |
@@ -220,6 +237,61 @@ fafnir dq accept $(cat /tmp/dead_sparse_ids) --by claude --by-rule \
 
 For `gap`, the query also leaves out the dates the calendar query reported and any
 security and date with a `price_*` flag.
+
+### Outliers on dead histories: the order that cleared them (#81)
+
+On 2026-10-22 this order closed 33,207 of 33,906 in seven batches. Each batch was
+dry-run against a prediction computed from its id file and approved before it ran:
+
+| Order | Class | Disposition | Flags |
+|---|---|---|---:|
+| 1 | **Already gone**: the move is no longer over 50%, or a split now sits on the date | resolve, by id | 7,228 |
+| 2 | One- or two-tick move on a sub-dollar price (§2g) | accept | 4,961 |
+| 3 | §2k collapse, cash acquisition, liquidating distribution, with the tests and guards in §2k | accept | 1,315 |
+| 4 | **Operator bulk rule:** the move comes back to within 25% of the previous close within 10 bars | accept | 9,859 |
+| 5 | **Operator bulk rule:** the move does not come back, there is no split on file within 120 days, and it fails the §2d unreported-split test | accept | 9,844 |
+| — | Split within ±15 days; passes §2d, or a split within 120 days; a dividend on file that does not explain the drop | **leave open**: a split or dividend fix may apply | 699 |
+
+- **Step 1 is not `dq recheck`.** `dq recheck --check outlier` cannot be scoped to
+  dead histories, and its dry run also closes FMP flags held open on purpose (31 that
+  day, the wrong-instrument ETF bars). So apply its own predicate by id. Check the
+  ids against the recheck's dry-run total: the dead-history ids, plus any other
+  source's, plus the held ones, must equal it (7,228 + 117 + 31 = 7,376 that day).
+  Chunk the query by `security_id`, or the read role's `statement_timeout` stops it:
+
+  ```sql
+  -- dq recheck's outlier predicate, by id: the bar or its predecessor is gone,
+  -- a split now sits on the date, or the move is no longer over 50%
+  SELECT q.dq_flag_id
+    FROM ops.data_quality_flag q JOIN core.security s USING (security_id)
+    LEFT JOIN LATERAL (SELECT p.close FROM core.daily_price p
+                        WHERE p.security_id = q.security_id
+                          AND p.trade_date = (q.record_key->>'trade_date')::date) cur ON true
+    LEFT JOIN LATERAL (SELECT p.close FROM core.daily_price p
+                        WHERE p.security_id = q.security_id
+                          AND p.trade_date < (q.record_key->>'trade_date')::date
+                          AND p.trade_date >= (q.record_key->>'trade_date')::date - 4000
+                        ORDER BY p.trade_date DESC LIMIT 1) prev ON true
+   WHERE q.check_name = 'outlier' AND q.resolved_at IS NULL AND q.accepted_at IS NULL
+     AND s.source = 'sharadar' AND q.security_id BETWEEN <lo> AND <hi>
+     AND (cur.close IS NULL OR prev.close IS NULL OR prev.close <= 0
+          OR abs(cur.close - prev.close) / prev.close <= 0.5
+          OR EXISTS (SELECT 1 FROM core.corporate_action ca
+                      WHERE ca.security_id = q.security_id AND ca.action_type = 'split'
+                        AND ca.ex_date = (q.record_key->>'trade_date')::date));
+  ```
+- **Steps 4 and 5 are an operator decision**, made on 2026-10-22 for this
+  population, not a standing licence. The decision rests on the section's two
+  facts: nothing re-fetches these rows, and the history is final. So a thin print on
+  a dead issuer has no repair, and keeping it open only hides the flags that do.
+  Each note says what was not checked per flag: whether an individual print is the
+  vendor's error, and the news behind a move.
+- **What stays open** is what an `actions add`, `actions redate` or a dividend fix
+  could still change. A clean ratio alone does not keep a flag open: a one-cent
+  move from 1¢ to 2¢ is exactly ×2. The §2d table decides, over 40 sessions.
+- **Partition first and count back.** Build every class from one feature pass,
+  count the classes back to the total, and spot-check each accept class on the bars
+  before its dry run (§1).
 
 ---
 
