@@ -934,6 +934,63 @@ judge every history each night. dorq's backfill pass skipped it (over
 `fafnir dq run --engine dorq --full`. What to do with the flags is in the fafnir-dba
 skill's sweep policy ("Dead Sharadar histories").
 
+### Sharadar as primary: universe maintenance (#93)
+
+At the cutover (#125) Sharadar's events replace the three FMP sweeps that keep the
+universe current: `ingest symbol-changes`, `securities` and `delisted`. Those
+resolve a feed row by `(source, ticker)`, which would find none of the FMP-minted
+securities under `source = 'sharadar'`. `fafnir ingest sharadar-universe` resolves
+each event by its permaticker's open link in `core.security_vendor_xref`
+([ADR 0016](adr/0016-sharadar-identity-and-survivorship-floor.md) §1):
+
+```bash
+fafnir ingest sharadar-master                   # the night's TICKERS + ACTIONS first
+fafnir ingest sharadar-universe --dry-run       # what it would do; writes nothing
+fafnir ingest sharadar-universe                 # after the cutover only
+```
+
+**Which events.** Those dated in a window that opens 30 days before the last real
+run (or before today, the first time), because ACTIONS records some events days
+late. `--since` sets it. Every step is safe to re-run over the same window.
+
+1. **Renames.** `tickerchangefrom` names the old ticker and `tickerchangeto` the new
+   one, both filed under the issuer's current ticker, so a chain resolves step by
+   step. A linked security still trading as the old ticker moves to the new one by
+   the FMP sweep's own rules: `repository.apply_rename`, the half of
+   `apply_symbol_change` after resolution.
+   - Every rename is recorded in `core.symbol_change` with `source = 'sharadar'`.
+   - A security already on the new ticker is `already`: FMP's sweep got there
+     first.
+   - One on a third ticker is a `conflict` (`ticker_mismatch`), flagged
+     `symbol_change_conflict` like the FMP sweep's, and retried on the next run.
+2. **Delistings.** A `delisted` event marks the linked security delisted on that
+   date. It is declined when:
+   - TICKERS no longer lists the key as delisted (`vendor_lists_it`);
+   - a later `listed` event relisted it (`relisted`);
+   - its own bars contradict the date: the FMP sweep's
+     `delisting_contradicted` guard, flagged `security_delisting_contradicted`;
+   - an operator has already decided, or not yet decided, that flag.
+
+   The vendor's reason (`acquisitionby`, `mergerto`, …) is reported beside it;
+   `mart.v_security_lifecycle` reads it.
+3. **New listings.** A live key first priced in the window, in a category and on a
+   venue ADR 0016 keeps, with no link, is minted: `source = 'sharadar'`, active, an
+   open ticker period from its first price, and a `minted` feeding link. **Link
+   before mint:** a key whose ticker a fafnir security already trades under is
+   `held`, never minted, so one issuer cannot become two rows. `fafnir vendor link`
+   decides it.
+
+**Before the cutover** the command refuses a real run (`[general]
+primary_price_vendor` must be `"sharadar"`), and the dry run is the comparison with
+the FMP sweeps that #122's criterion asks for. `already` is a change FMP's sweep
+also made; a change listed without it is one FMP's did not make. The dry run applies
+every step and rolls it back, so it reports exactly what a real run would do that
+night.
+
+**What stays FMP's.** Securities with no Sharadar link keep their FMP identity
+(ADR 0016 §1). After the cutover no sweep maintains them; the FMP sweeps stay in the
+code for rollback.
+
 ### Which vendor feeds a security (ADR 0015)
 
 Every FMP loader feeds the securities FMP minted (`core.security.source = 'fmp'`)

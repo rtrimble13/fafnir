@@ -713,6 +713,72 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
         )
 
 
+@ingest.command("sharadar-universe")
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    metavar="YYYY-MM-DD",
+    help="Events dated on or after this (default: 30 days before the last run).",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Apply, report and roll back; write nothing."
+)
+@click.pass_context
+def ingest_sharadar_universe(ctx, since, dry_run):
+    """Apply Sharadar's renames, delistings and new listings through the xref (#93).
+
+    \b
+      fafnir ingest sharadar-universe --dry-run      # what tonight would do
+      fafnir ingest sharadar-universe                # after the cutover only
+
+    From cutover Sharadar's TICKERS/ACTIONS events drive the universe instead of
+    `ingest symbol-changes`, `securities` and `delisted` (ADR 0016). Each event is
+    resolved by its permaticker's open link, not by ticker. A rename moves the
+    linked security to the new ticker (recorded in core.symbol_change, source
+    sharadar); a delisting marks it, unless TICKERS, a relisting or its own bars
+    contradict the date; a new listing with no link is minted, unless a fafnir
+    security already trades under its ticker (held: `vendor link` decides it).
+    Reads the vendor tables: `ingest sharadar-master` first.
+
+    A real run waits for [general] primary_price_vendor = "sharadar" (#125). Until
+    then the FMP sweeps own the universe, and the dry run is the comparison with
+    them: `already` where FMP's sweep did the same, a change where it did not.
+    """
+    from fafnir.ingest import sharadar_universe as su
+
+    cfg = ctx.obj["config"]
+    if not dry_run and cfg.primary_price_vendor != "sharadar":
+        raise click.ClickException(
+            "The FMP sweeps own the universe until the cutover ([general] "
+            'primary_price_vendor = "sharadar"). Run with --dry-run to compare.'
+        )
+    with Database(cfg.dsn) as database:
+        try:
+            result = su.run(
+                database,
+                since=since.date() if since else None,
+                dry_run=dry_run,
+            )
+        except su.UniverseError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    head = "Dry run: nothing written." if dry_run else f"Run {result.run_id}."
+    click.echo(f"{head} Events from {result.since}.")
+    quiet = {"out_of_scope", "not_linked"}
+    for change in result.changes:
+        if change.outcome in quiet or change.outcome.startswith("recorded_"):
+            continue
+        detail = f"  {change.detail}" if change.detail else ""
+        click.echo(
+            f"  {change.step:<9} {change.outcome:<26} {change.day}  "
+            f"{change.symbol} ({change.vendor_key}){detail}"
+        )
+    counts = result.counts()
+    click.echo("Counts:")
+    for (step, outcome), n in sorted(counts.items()):
+        click.echo(f"  {step:<9} {outcome:<26} {n}")
+
+
 @ingest.command("sharadar-master")
 @click.option(
     "--from-file",

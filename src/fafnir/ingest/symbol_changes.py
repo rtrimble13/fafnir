@@ -82,7 +82,7 @@ def _ordered_changes(rows: list[dict]) -> list[tuple[date, str, str, Optional[st
     return out
 
 
-def _close_applied_conflict(
+def close_applied_conflict(
     db: Database,
     *,
     old: str,
@@ -195,7 +195,7 @@ def load_symbol_changes(
                 # will ever see the row again. Dismissed and ignored rows are left
                 # exactly as they are.
                 if recorded == repo.CHANGE_APPLIED:
-                    closed = _close_applied_conflict(
+                    closed = close_applied_conflict(
                         db, old=old, new=new, change_date=when, security_id=None
                     )
                     if closed:
@@ -294,7 +294,7 @@ def load_symbol_changes(
                 )
                 # Part of the same unit of work as the rename, so the flag closes
                 # in the commit that makes it untrue.
-                counts["conflicts_closed"] += _close_applied_conflict(
+                counts["conflicts_closed"] += close_applied_conflict(
                     db,
                     old=old,
                     new=new,

@@ -262,6 +262,23 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-22 · P3, #93: Sharadar-driven universe maintenance.** `fafnir ingest sharadar-universe
+  [--dry-run] [--since D]` applies Sharadar's renames, delistings and new listings, resolved by the
+  permaticker's open link. The window opens 30 days before the last real run. The FMP sweeps' rules carry
+  over: `repository.apply_rename` is `apply_symbol_change` after resolution, and `symbol_change_conflict` and
+  `security_delisting_contradicted` are flagged the same way. The FMP path and its tests are unchanged.
+  - **Departures from the issue:**
+    - no `--staging` (there is no staging database, plan v2). A real run waits for
+      `primary_price_vendor = "sharadar"`, and the dry run applies every step and rolls it back, so it is the
+      rehearsal and #122's comparison: `already` where FMP's sweep made the same change;
+    - the TICKERS/ACTIONS load stays `ingest sharadar-master`, run before it, not a step inside it;
+    - "link before mint" is a guard, not a `vendor link --new` call: `--new` evaluates FMP's new securities,
+      and after cutover there are none. A new key whose ticker a fafnir security already trades under is
+      `held`, for `vendor link`, never minted;
+    - a delisting is also declined when TICKERS no longer lists the key as delisted, or a later `listed` event
+      relisted it.
+  - **Next.** On the host: `sharadar-universe --dry-run` after each night's `sharadar-master`, five sessions,
+    each difference from the FMP sweeps explained (acceptance).
 - **2026-10-21 · P2, #81 (part 1): the playbook for Sharadar's quarantines.** Preparing the bulk triage
   turned up a gap. `sharadar-prices` quarantines through `add_dq_flag` (no dedupe), and a quarantined date is
   not held, so every run re-reads it. A bar a later run loads leaves its flag open, because nothing re-checks a
