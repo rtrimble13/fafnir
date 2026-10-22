@@ -16,7 +16,7 @@ Config sections
     sharadar_base_url -- shared with duk; the Sharadar *key* is never read here
 ``[general]``
     log_level, log_dir, universe, request_rate_per_min, overlap_days,
-    exclude_instruments, primary_price_vendor
+    exclude_instruments, primary_price_vendor, fmp_secondary
 ``[sharadar]``
     rate_per_min, bulk_dir -- see :mod:`fafnir.sources.sharadar`
 ``[prices]``
@@ -54,6 +54,16 @@ PASSWORD_ENV_VARS = ("FAFNIR_DB_PASSWORD", "PGPASSWORD")
 SHARADAR_KEY_ENV_VAR = "SHARADAR_API_KEY"
 #: The vendors `[general] primary_price_vendor` may name.
 PRICE_VENDORS = ("fmp", "sharadar")
+#: What `fafnir config get` prints: the settings scripts branch on. None is a
+#: secret; a key or a password is never printed.
+SCRIPT_KEYS = (
+    "primary_price_vendor",
+    "fmp_secondary",
+    "actions_mode",
+    "dq_engine",
+    "log_dir",
+    "sharadar_bulk_dir",
+)
 
 
 class FafnirConfig:
@@ -209,15 +219,27 @@ class FafnirConfig:
 
     @property
     def primary_price_vendor(self) -> str:
-        """The vendor whose bars a new security is fed from: ``fmp`` until the
-        Sharadar cutover (plan v2, P3), ``sharadar`` after. Nothing reads it
-        before the cutover; it is validated now so a typo fails on day one."""
+        """The night's primary vendor: ``fmp`` until the Sharadar cutover (plan v2,
+        P3), ``sharadar`` after. ``daily_update.sh`` picks its sequence by it, and
+        FMP's loaders refuse to write under ``sharadar`` unless told they are the
+        secondary (#111). A typo fails rather than picking a mode."""
         value = str(self._get("general", "primary_price_vendor", "fmp")).strip().lower()
         if value not in PRICE_VENDORS:
             raise ValueError(
                 f"[general] primary_price_vendor: {value!r} is not one of "
                 f"{', '.join(repr(v) for v in PRICE_VENDORS)}"
             )
+        return value
+
+    @property
+    def fmp_secondary(self) -> bool:
+        """Whether the Sharadar night also runs FMP's loaders for what FMP still
+        feeds: the funds and the securities with no Sharadar link (#111). True by
+        default, while the reduced FMP tier serves them (#128); false once it
+        does not. Read only when ``primary_price_vendor`` is ``sharadar``."""
+        value = self._get("general", "fmp_secondary", True)
+        if not isinstance(value, bool):
+            raise ValueError(f"[general] fmp_secondary: {value!r} is not true or false")
         return value
 
     # -- general ------------------------------------------------------------

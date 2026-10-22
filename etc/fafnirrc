@@ -52,9 +52,18 @@ request_rate_per_min = 280
 # corrections / re-adjustments.
 overlap_days = 5
 
-# The vendor new securities' bars come from: "fmp" until the Sharadar cutover
-# (doc/plans/sharadar-adoption.md, P3), then "sharadar". Nothing reads it before.
+# The night's primary vendor (doc/operations.md, "Primary vendor switch and
+# rollback"). daily_update.sh runs FMP's night under "fmp", and `fafnir ingest
+# sharadar` under "sharadar" (from the cutover, #125). Under "sharadar", FMP's
+# loaders refuse to write unless given --allow-secondary. Rolling back is this
+# flipped to "fmp", after `fafnir vendor feed --vendor fmp --all-linked`.
 # primary_price_vendor = "fmp"
+
+# Under "sharadar": whether the night also runs FMP's tracked, prices and actions
+# loaders, with --allow-secondary, for what FMP still feeds (the funds and the
+# securities with no Sharadar link). True while the reduced FMP tier serves them
+# (#128); set false once it does not. Ignored under "fmp".
+# fmp_secondary = true
 
 # Corporate actions (ADR 0007).
 #   actions_mode  : "symbol"   -- one splits + one dividends request per security,

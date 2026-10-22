@@ -5,11 +5,21 @@
 Two scheduled jobs, one after the other, after US settlement. Both are
 incremental and idempotent — a missed day is caught up on the next run.
 
-1. **The daily load**, `fafnir-daily` (`scripts/daily_update.sh`, `daily.log`):
+1. **The daily load**, `fafnir-daily` (`scripts/daily_update.sh`, `daily.log`).
+   It runs one of two nights, by `[general] primary_price_vendor` (#111); the log's
+   first line names it (`primary vendor: fmp`). FMP mode:
 
    ```
    ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
-     → ingest delisted → ingest prices → ingest actions → adjust --changed
+     → ingest delisted → ingest prices → vendor link --new → ingest actions
+     → adjust --changed → db refresh-marts → status
+   ```
+
+   Sharadar mode, from the cutover:
+
+   ```
+   ensure-horizon → ingest sharadar
+     → [fmp_secondary] ingest tracked, prices, actions --allow-secondary → adjust --changed
      → db refresh-marts → status
    ```
 
@@ -46,9 +56,8 @@ with `status = 'failed'`, which is why that query is on the monitoring list.
 ### The Sharadar night (`fafnir ingest sharadar`, #98)
 
 From the cutover (`[general] primary_price_vendor = "sharadar"`, #125), one command
-does universe, prices and actions for the securities Sharadar feeds. Until #111
-wires it into `daily_update.sh`, it is run by hand; before the cutover only
-`--dry-run` is allowed.
+does universe, prices and actions for the securities Sharadar feeds, and
+`daily_update.sh` runs it (#111). Before the cutover only `--dry-run` is allowed.
 
 ```
 source sharadar-bulk --tables tickers,actions --force → source sharadar-delta
@@ -77,6 +86,18 @@ Diagnosing it:
 - **`revised` counts only material changes.** That is `vendor correct`'s price test,
   or volume beyond 1%. A history restamped after a split recovers to within rounding
   and stays `unchanged`.
+- **FMP as secondary.** While `[general] fmp_secondary` is true (`fafnir config get
+  fmp_secondary`), the night runs FMP's `tracked`, `prices` and `actions` with
+  `--allow-secondary`, upkeep-wrapped. They load only what FMP still feeds: funds
+  and unlinked securities (`repo.fmp_fed`). A failure there warns and does not
+  stop the marts.
+- **"`fafnir ingest prices` is FMP's, and ... primary_price_vendor is sharadar"**
+  is the guard working: in Sharadar mode FMP's six loaders refuse without
+  `--allow-secondary`. A cron line or runbook step that hits it is FMP's night
+  trying to resume. Do not add the flag to make it pass; find out why it ran.
+- **Rollback** is `vendor feed --vendor fmp --all-linked`, then the setting back to
+  `"fmp"` (operations.md, "Primary vendor switch and rollback"). FMP resumes from
+  its watermarks and never overwrites a Sharadar row.
 - **The five dry runs before the cutover** are `fafnir ingest sharadar --dry-run`
   after FMP's night. Their price step reports per trade date `fmp_agrees`,
   `fmp_differs`, `new` and `fmp_only`. Read the night's own date; the differences

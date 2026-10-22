@@ -265,6 +265,23 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-22 · P3, #111: the vendor switch in `daily_update.sh`.** The script reads `fafnir config get
+  primary_price_vendor`, a new subcommand that prints only the settings scripts branch on.
+  - **`fmp`** runs today's night, unchanged.
+  - **`sharadar`** runs `ensure-horizon → ingest sharadar`, then, while `[general] fmp_secondary` is true (the
+    new setting, default true), FMP's `tracked`, `prices` and `actions` with `--allow-secondary` and
+    `adjust --changed`, then `refresh-marts → status`.
+  - **The guard.** FMP's six loaders refuse to write in Sharadar mode without `--allow-secondary`.
+  - **Rollback** is `vendor feed --vendor fmp --all-linked` and the setting flipped back. Precedence makes FMP
+    fill only what Sharadar did not.
+  - **Tests.** `test/scripts/test_daily_update_modes.py` runs the real script against a stub `fafnir`, in both
+    modes, with `fmp_secondary` on and off, across the rollback and on failures. It also tests the CLI guard,
+    and the rollback's fill-only upsert.
+  - **Departures** (the issue was edited first):
+    - `fmp_reconcile` became `fmp_secondary`, since `vendor reconcile` was folded into `vendor correct` (#66).
+      FMP keeps feeding the funds and the unlinked residue while the reduced tier serves them.
+    - `dq run` stays in its own unit, `fafnir-dq`.
+    - Tiingo joins with #97.
 - **2026-10-22 · P3, #98 (part 2): the Sharadar night.** `fafnir ingest sharadar [--dry-run]` runs
   six steps in order:
   1. TICKERS and ACTIONS downloaded whole (`sharadar-bulk --force`);

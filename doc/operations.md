@@ -83,25 +83,48 @@ path* below for the step that dominates it.
 
 ### FMP mode and Sharadar mode
 
-`[general] primary_price_vendor` names the mode.
+`daily_update.sh` reads `[general] primary_price_vendor` (`fafnir config get
+primary_price_vendor`) and runs one of two nights (#111). A value that does not
+validate stops it before anything loads.
 
-- **FMP mode (`"fmp"`, the default).** The job above runs. FMP feeds the
+- **FMP mode (`"fmp"`, the default).** The job above runs, unchanged. FMP feeds the
   securities it minted that no other vendor feeds. Sharadar feeds the dead issuers
   it minted (#71), and nothing loads those nightly.
-- **Sharadar mode (`"sharadar"`, from the cutover, #125).** The universe, price and
-  action steps for the securities Sharadar feeds are one command, `fafnir ingest
-  sharadar`. It runs six steps:
-  1. TICKERS and ACTIONS downloaded whole;
-  2. the SEP and SFP deltas;
-  3. the vendor master;
-  4. renames, delistings and new listings;
-  5. the bars;
-  6. the splits and dividends.
+- **Sharadar mode (`"sharadar"`, from the cutover, #125):**
 
-  [ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98) has each
-  step. A failed step stops it non-zero, and the next run resumes. `daily_update.sh`
-  starts choosing the mode from the setting in #111, which also decides which FMP
-  steps stay beside it. Until then, the Sharadar night is run by hand.
+  ```
+  ensure-horizon → ingest sharadar
+    → [fmp_secondary] ingest tracked, prices, actions --allow-secondary → adjust --changed
+    → db refresh-marts → status
+  ```
+
+  - **`fafnir ingest sharadar`** is the universe, prices and actions for the
+    securities Sharadar feeds, in six steps:
+    1. TICKERS and ACTIONS downloaded whole;
+    2. the SEP and SFP deltas;
+    3. the vendor master;
+    4. renames, delistings and new listings;
+    5. the bars;
+    6. the splits and dividends.
+
+    [ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98) has each
+    step. It is the payload, so a failure stops the night before the marts, as a
+    failed `ingest prices` does in FMP mode.
+  - **FMP as secondary**, while `[general] fmp_secondary` is true (the default).
+    - **What it loads.** FMP's loaders load only what FMP still feeds
+      (`repo.fmp_fed`): the funds, and the securities with no Sharadar link.
+    - **Errors.** Each step warns and carries on, like the universe steps: an FMP
+      outage must not cost the marts the Sharadar night's data.
+    - **When to turn it off.** Set it false once the reduced FMP tier (#128) no
+      longer serves them. They then stop updating, and the funds wait for Tiingo
+      (#97).
+  - **Not run:** FMP's universe sweeps (`symbol-changes`, `securities`, `delisted`)
+    and `vendor link --new`. Sharadar's universe step replaces them (ADR 0016).
+  - **FMP's loaders refuse to write in Sharadar mode.** `ingest symbol-changes`,
+    `securities`, `tracked`, `delisted`, `prices` and `actions` exit with an error
+    unless given `--allow-secondary`. So a stray cron line, or a runbook command such
+    as `initial_backfill.sh` or `reset_data.sh`'s next steps, cannot resume FMP's
+    night. A deliberate run for FMP's securities passes the flag.
 
 **Before the cutover**, run the dry run after FMP's night on five nights:
 
@@ -119,10 +142,32 @@ fafnir ingest sharadar --dry-run 2>&1 | tee -a sharadar-dry-run.log
   One day of SFP was 2.3 MB, because the vendor restamps a fund's history when it
   distributes.
 
-**The switch** is `fafnir vendor feed --vendor sharadar --all-linked`, then the
-setting. **The rollback** is `fafnir vendor feed --vendor fmp --all-linked`, then
-`"fmp"`. Neither moves a price or action row
+### Primary vendor switch and rollback
+
+**The switch** is the cutover (#125), after the five dry runs above. Both steps go
+in before the next night:
+1. **Move the feeds.** Run `fafnir vendor feed --vendor sharadar --all-linked
+   --dry-run` to see what moves, then run it without `--dry-run`. FMP stops feeding
+   every linked security at once.
+2. **Set the mode.** Set `primary_price_vendor = "sharadar"` in the rc file, then
+   check it: `fafnir config get primary_price_vendor` prints `sharadar`. The next
+   night's `daily.log` opens with `(primary vendor: sharadar)`.
+
+**The rollback** is the same two steps reversed:
+1. **Give the feeds back.** `fafnir vendor feed --vendor fmp --all-linked` returns
+   to FMP the securities it minted. Sharadar's dead issuers keep their feed.
+2. **Set the mode back** to `primary_price_vendor = "fmp"`.
+
+The next night is FMP's. Its loaders resume from their watermarks. The rows Sharadar
+wrote in the nights between stay: under precedence FMP never overwrites a row
+another vendor wrote, so it fills only the dates Sharadar did not. There is nothing
+to delete or reclaim
 ([ingestion.md](ingestion.md#which-vendor-feeds-a-security-adr-0015)).
+
+Do both steps of either. The setting picks the night, and the feeds pick which
+vendor loads each security; with only one of them, a linked security is loaded by
+the wrong vendor or by none. Both nights and the rollback between them are tested in
+`test/scripts/test_daily_update_modes.py`.
 
 ### Tracking a mutual fund
 
