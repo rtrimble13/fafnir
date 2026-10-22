@@ -736,8 +736,10 @@ def ingest_sharadar_universe(ctx, since, dry_run):
     resolved by its permaticker's open link, not by ticker. A rename moves the
     linked security to the new ticker (recorded in core.symbol_change, source
     sharadar); a delisting marks it, unless TICKERS, a relisting or its own bars
-    contradict the date; a new listing with no link is minted, unless a fafnir
-    security already trades under its ticker (held: `vendor link` decides it).
+    contradict the date; a new listing with no link is minted (NYSE, NASDAQ,
+    AMEX, BATS or TXSE; never a warrant, right or unit excluded by [general]
+    exclude_instruments), unless a fafnir security already trades under its
+    ticker (held: `vendor link` decides it).
     Reads the vendor tables: `ingest sharadar-master` first.
 
     A real run waits for [general] primary_price_vendor = "sharadar" (#125). Until
@@ -758,6 +760,7 @@ def ingest_sharadar_universe(ctx, since, dry_run):
                 database,
                 since=since.date() if since else None,
                 dry_run=dry_run,
+                excluded_kinds=cfg.excluded_instruments,
             )
         except su.UniverseError as exc:
             raise click.ClickException(str(exc)) from exc

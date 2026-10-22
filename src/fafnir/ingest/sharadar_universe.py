@@ -28,9 +28,10 @@ some events days late. Every step is safe to re-run over the same window:
    date (``delisted.delisting_contradicted``, flagged
    ``security_delisting_contradicted`` as the FMP sweep does), or an operator
    already decided that flag.
-3. **New listings.** A live key first priced in the window, in a category and on a
-   venue ADR 0016 keeps, with no link: minted (``source = 'sharadar'``, active, an
-   open ticker period from its first price, a ``minted`` feeding link). Link before
+3. **New listings.** A live key first priced in the window, with no link, in a
+   category and on a venue fafnir keeps (:data:`LISTING_VENUES`), and not an
+   instrument ADR 0012 excludes: minted (``source = 'sharadar'``, active, an open
+   ticker period from its first price, a ``minted`` feeding link). Link before
    mint: a key whose ticker a fafnir security already trades under is ``held``,
    never minted, so one issuer cannot become two rows. `fafnir vendor link` decides
    it.
@@ -45,7 +46,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Optional
+from typing import Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
@@ -55,6 +56,7 @@ from fafnir.ingest import symbol_changes as sc
 from fafnir.ingest import vendor_link as vl
 from fafnir.ingest import vendor_overlap as vo
 from fafnir.ingest.runlog import RunLog
+from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
 from fafnir.logging_config import get_logger
 
 logger = get_logger("ingest.sharadar_universe")
@@ -76,6 +78,10 @@ REASON_EVENTS = (
     "voluntarydelisting",
 )
 EVENTS = RENAME_EVENTS + ("delisted", "listed") + REASON_EVENTS
+#: Where a new listing is minted: the dead-issuer mint's venues (ADR 0016 §3) and
+#: the Texas Stock Exchange, which Sharadar lists and FMP's screener cannot be
+#: asked for.
+LISTING_VENUES = vo.MINT_VENUES | {"TXSE"}
 
 
 class UniverseError(RuntimeError):
@@ -286,14 +292,14 @@ def _apply_delistings(db, result, by_key, links, vendor, run_id) -> None:
 
 
 def _in_scope(c: dict) -> bool:
-    """A live listing ADR 0016 keeps: a priced table, a stock or exchange-traded
-    category (not a NAV fund), a screener venue."""
+    """A live listing fafnir keeps: a priced table, a stock or exchange-traded
+    category (not a NAV fund), one of :data:`LISTING_VENUES`."""
     if c["vendor_table"] not in vl.PRICED_TABLES:
         return False
     kind = sharadar_map.map_category(c.get("category"))
     if kind is None or kind.asset_type == "fund":
         return False
-    return sharadar_map.map_exchange(c.get("exchange")) in vo.MINT_VENUES
+    return sharadar_map.map_exchange(c.get("exchange")) in LISTING_VENUES
 
 
 def _mint_listing(db, c, ipo, sectors, industries, run_id) -> int:
@@ -345,7 +351,7 @@ def _mint_listing(db, c, ipo, sectors, industries, run_id) -> int:
     return sid
 
 
-def _apply_listings(db, result, candidates, by_key, since, run_id) -> None:
+def _apply_listings(db, result, candidates, by_key, since, run_id, excluded) -> None:
     fresh = [
         c
         for c in candidates
@@ -355,10 +361,32 @@ def _apply_listings(db, result, candidates, by_key, since, run_id) -> None:
         and c["first_price_date"] >= since
     ]
     sectors, industries = repo.classification_names(db)
+    # The FMP security-master load's exemption: a declared symbol is kept.
+    declared = (
+        {r["symbol"] for r in repo.list_tracked_symbols(db)} if excluded else set()
+    )
     for c in sorted(fresh, key=lambda c: c["vendor_key"]):
         key, ticker, day = c["vendor_key"], c["ticker"], c["first_price_date"]
         if not _in_scope(c):
             result.add("listing", "out_of_scope", key, ticker, day)
+            continue
+        # ADR 0012 by ticker and name, as the FMP load does. Sharadar's categories
+        # carry no warrant or right today; this keeps one out if it ever files one
+        # as a stock.
+        kind = sharadar_map.map_category(c["category"])
+        instrument = (
+            None
+            if ticker in declared
+            else out_of_scope_kind(
+                ticker,
+                c["name"],
+                is_etf=kind.is_etf,
+                is_fund=kind.is_fund,
+                excluded=excluded,
+            )
+        )
+        if instrument:
+            result.add("listing", f"out_of_scope:{instrument}", key, ticker, day)
             continue
         holder = repo.active_security_for_symbol(db, ticker, VENDOR)
         if holder is not None:
@@ -373,7 +401,12 @@ def _apply_listings(db, result, candidates, by_key, since, run_id) -> None:
         result.add("listing", "minted", key, ticker, day, sid)
 
 
-def _apply(db: Database, result: UniverseResult, run_id: Optional[int]) -> None:
+def _apply(
+    db: Database,
+    result: UniverseResult,
+    run_id: Optional[int],
+    excluded: Sequence[str],
+) -> None:
     candidates = repo.vendor_link_candidates(db, VENDOR, vl.PRICED_TABLES)
     if not candidates:
         raise UniverseError(
@@ -396,7 +429,7 @@ def _apply(db: Database, result: UniverseResult, run_id: Optional[int]) -> None:
     }
     _apply_renames(db, result, by_key, links, symbols, run_id)
     _apply_delistings(db, result, by_key, links, vendor, run_id)
-    _apply_listings(db, result, candidates, by_key, result.since, run_id)
+    _apply_listings(db, result, candidates, by_key, result.since, run_id, excluded)
 
 
 def run(
@@ -405,21 +438,24 @@ def run(
     since: Optional[date] = None,
     dry_run: bool = False,
     today: Optional[date] = None,
+    excluded_kinds: Sequence[str] = INSTRUMENT_KINDS,
 ) -> UniverseResult:
     """Apply the window's renames, delistings and new listings (one run), or with
-    ``dry_run`` apply them and roll back."""
+    ``dry_run`` apply them and roll back. ``excluded_kinds`` is ``[general]
+    exclude_instruments`` (ADR 0012)."""
+    excluded = tuple(excluded_kinds)
     today = today or date.today()
     result = UniverseResult(dry_run=dry_run, since=since or default_since(db, today))
     if dry_run:
         with db.conn.transaction(force_rollback=True):
-            _apply(db, result, None)
+            _apply(db, result, None, excluded)
         return result
     run_log = RunLog(
         db, source=VENDOR, endpoint=ENDPOINT, params={"since": result.since}
     )
     with run_log:
         result.run_id = run_log.run_id
-        _apply(db, result, run_log.run_id)
+        _apply(db, result, run_log.run_id, excluded)
         counts = result.counts()
         run_log.rows_inserted = counts[("listing", "minted")]
         run_log.params.update(

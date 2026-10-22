@@ -973,12 +973,22 @@ late. `--since` sets it. Every step is safe to re-run over the same window.
 
    The vendor's reason (`acquisitionby`, `mergerto`, …) is reported beside it;
    `mart.v_security_lifecycle` reads it.
-3. **New listings.** A live key first priced in the window, in a category and on a
-   venue ADR 0016 keeps, with no link, is minted: `source = 'sharadar'`, active, an
-   open ticker period from its first price, and a `minted` feeding link. **Link
-   before mint:** a key whose ticker a fafnir security already trades under is
-   `held`, never minted, so one issuer cannot become two rows. `fafnir vendor link`
-   decides it.
+3. **New listings.** A live key first priced in the window with no link is minted:
+   `source = 'sharadar'`, active, an open ticker period from its first price, and a
+   `minted` feeding link. What it must be:
+   - **a category ADR 0016 keeps:** stock, preferred or ADR, or exchange-traded,
+     not a NAV fund;
+   - **on NYSE, NASDAQ, AMEX, BATS or TXSE.** The Texas Stock Exchange is listed by
+     Sharadar, and FMP's screener cannot be asked for it;
+   - **not a warrant, right or unit** by ADR 0012's ticker-and-name rule, as the FMP
+     load applies it: `[general] exclude_instruments`, with a declared symbol
+     (`fafnir track add`) exempt. Skipped as `out_of_scope:warrant` and so on.
+     Sharadar's categories carry no warrant or right today; this keeps one out if
+     it ever files one as a stock.
+
+   **Link before mint:** a key whose ticker a fafnir security already trades under
+   is `held`, never minted, so one issuer cannot become two rows. `fafnir vendor
+   link` decides it.
 
 **Before the cutover** the command refuses a real run (`[general]
 primary_price_vendor` must be `"sharadar"`), and the dry run is the comparison with

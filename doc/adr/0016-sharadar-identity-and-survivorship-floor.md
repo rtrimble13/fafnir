@@ -105,7 +105,9 @@ evaluates it.
   `fafnir ingest sharadar-universe --dry-run` (#93) reports it. It applies
   renames, delistings and new listings through the permaticker's link, and mints a
   live listing only when no fafnir security trades under its ticker (link before
-  mint), the live counterpart of §3.
+  mint), the live counterpart of §3. A live listing may also be on TXSE, which
+  Sharadar lists and FMP's screener cannot reach. It must also pass ADR 0012's
+  instrument rule by ticker and name, as the FMP load applies it.
 - **4.8% of active non-fund securities stay FMP-identified** after linking: the
   2026-10-20 decision accepts that rather than triage each by hand. Their flags
   (`vendor_xref_unmatched`, `vendor_xref_ambiguous`) say why, and the nightly

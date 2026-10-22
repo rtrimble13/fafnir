@@ -276,7 +276,11 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
       and after cutover there are none. A new key whose ticker a fafnir security already trades under is
       `held`, for `vendor link`, never minted;
     - a delisting is also declined when TICKERS no longer lists the key as delisted, or a later `listed` event
-      relisted it.
+      relisted it;
+    - new listings keep the FMP load's product scope: ADR 0012's warrant/right/unit rule by ticker and name
+      (`exclude_instruments`, declared symbols exempt). They also take TXSE, which Sharadar lists and FMP's
+      screener cannot reach. The six names that moved there on 2026-10-05 are one security each in Sharadar,
+      with no `delisted` event, so nothing here touches them.
   - **Next.** On the host: `sharadar-universe --dry-run` after each night's `sharadar-master`, five sessions,
     each difference from the FMP sweeps explained (acceptance).
 - **2026-10-21 · P2, #81 (part 1): the playbook for Sharadar's quarantines.** Preparing the bulk triage

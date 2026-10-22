@@ -399,3 +399,29 @@ def test_the_command_refuses_a_real_run_before_the_cutover(db, tmp_path, monkeyp
 def test_an_empty_vendor_master_is_an_error(db):
     with pytest.raises(su.UniverseError, match="sharadar-master"):
         su.run(db, since=SINCE, dry_run=True)
+
+
+@integration
+def test_listings_keep_fafnirs_instrument_scope_and_take_txse(db):
+    """ADR 0012 by ticker and name, as the FMP load applies it, with its exemption
+    for a declared symbol; and the Texas Stock Exchange, which Sharadar lists."""
+    day = Y(2026, 10, 10)
+    _vendor(db, "900431", "ZZWAW", first=day)  # a warrant, by its ticker
+    _vendor(db, "900432", "ZZRAR", first=day)  # a right
+    _vendor(db, "900433", "ZZDCW", first=day)  # a warrant an operator declared
+    repo.upsert_tracked_symbol(db, symbol="ZZDCW", asset_type="equity")
+    _vendor(db, "900434", "ZZTX", first=day, exchange="TXSE")
+
+    result = su.run(db, since=SINCE)
+    assert _outcomes(result, "listing") == {
+        "ZZWAW": "out_of_scope:warrant",
+        "ZZRAR": "out_of_scope:right",
+        "ZZDCW": "minted",
+        "ZZTX": "minted",
+    }
+    (txse,) = [c.security_id for c in result.changes if c.symbol == "ZZTX"]
+    assert _security_row(db, txse)["exchange_code"] == "TXSE"
+
+    # `[general] exclude_instruments = []` admits them again.
+    admitted = su.run(db, since=SINCE, dry_run=True, excluded_kinds=())
+    assert _outcomes(admitted, "listing")["ZZWAW"] == "minted"
