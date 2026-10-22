@@ -114,6 +114,24 @@ view exposes them yet (#79). To see which Sharadar key a security is, or who fee
 `SELECT vendor, vendor_key, valid_from, valid_to, is_feed FROM
 core.security_vendor_xref WHERE security_id = …`.
 
+## Which vendor, for what
+
+Questions about the vendors are answered on the ops tier (ADR 0009 keeps `source`
+out of the marts):
+
+| Question | Relation |
+|---|---|
+| Who wrote this bar or action | `core.daily_price.source`, `core.corporate_action.source` |
+| Who minted this security | `core.security.source` |
+| Who loads its next bar | the open link with `is_feed` in `core.security_vendor_xref`; none means FMP, for what FMP minted (`repo.fmp_fed`) |
+| When the feed moved, and who moved it | `ops.ingestion_run` with `endpoint = 'feed'`: `started_at`, `params.by`, `params.changed` |
+| Which night runs (FMP's or Sharadar's) | `fafnir config get primary_price_vendor`, or the `Primary` line of `fafnir status` |
+| What the Sharadar night did | `ops.ingestion_run` with `source = 'sharadar'`: `delta:*`, `prices:nightly` (`params.counts`, `params.through`), `universe`, `actions` |
+| Which Sharadar files landed | `landing.sharadar_file` (MCP `sharadar_files`) |
+| Which FMP bar a Sharadar correction replaced | `ops.vendor_correction.old_row` |
+
+A security's series can change vendor at the cutover date: data-semantics.md §25.
+
 ## Useful joins
 
 ```sql

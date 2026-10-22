@@ -265,6 +265,24 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-22 · P3, #120: the cutover runbook.** The runbook is `doc/operations.md` › *Cutover to Sharadar
+  as primary*:
+  - preconditions (gate GO, release, no night in progress);
+  - seven steps: say so, dump, `vendor link --new` and the unlinked-by-reason query, `vendor feed`, the
+    setting, the first night, and next-morning verification;
+  - six verification queries, each run against a migrated database: the night ran, fed bars are
+    Sharadar's, FMP wrote only as the secondary, freshness, the night's counts, flag deltas;
+  - rollback triggers and steps, and where to say what.
+
+  The issues were edited first: #120 no longer depends on #115, and #125's step 3b no longer feeds the
+  funds to Tiingo, which has no loader until #97. Skill updates:
+  - **data-semantics:** §25, a series' vendor seam at the cutover and how to see it, and the volume step
+    #69 measured. §22 is brought up to date (the feed rule, no reconciliation categories), and §8 notes
+    Sharadar's once-only quarantines.
+  - **dq-playbooks:** a vendor-check index, and *After the cutover*.
+  - **schema-map:** *Which vendor, for what*.
+  - **automations:** a pointer to the runbook.
+  - **Still the operator's:** the dry-read the issue's acceptance asks for.
 - **2026-10-22 · P3, #118: operations tooling for more than one vendor.** The issue was edited first. Shadow
   capture and reconciliation were folded away (#53, #66), there is no staging, and an install that starts
   from Sharadar would need a mint for live securities that does not exist.

@@ -119,7 +119,10 @@ hold logic). Everything else is one row per *open condition*.
 problems. Two `price_*` checks are not quarantines and do not repeat:
 `price_scale_collapse` and `price_restatement_conflict` (the bar was stored, or kept)
 are one row per open condition. `price_split_scale_mismatch` is a quarantine and
-repeats like the rest.
+repeats like the rest. **Sharadar's quarantines do not repeat:** since #98 its
+price loader flags each bar once (`detail.source = 'sharadar'`). No Sharadar
+watermark waits on the count, and its nightly deltas overlap, so the same bad bar
+is read on several nights.
 
 ## 9. Open DQ is a count of problems, not of runs
 
@@ -302,17 +305,17 @@ Once Sharadar loads, one security's history can hold rows from two vendors.
 `core.daily_price.source` and `core.corporate_action.source` name the party that
 wrote **that row**; `core.security.source` names the vendor that **minted** the
 security. Neither says which vendor loads its next bar: that is the open link with
-`is_feed = true` in `core.security_vendor_xref` (or, while FMP is primary, `source =
-'fmp'`).
+`is_feed = true` in `core.security_vendor_xref`. With no such link, FMP feeds what it
+minted (`repo.fmp_fed`, #98), whichever vendor is primary.
 
 > **Wrong answer:** "AAPL is an FMP security, so this 2019 bar came from FMP." Read
 > the bar's own `source`. A Sharadar correction may have replaced it, and
 > `ops.vendor_correction` holds the FMP row it replaced.
 
 > **Wrong answer:** "the vendors disagree on this date, so one of them is broken."
-> A divergence can be a convention (consolidated vs primary-exchange volume). The
-> reconciliation's category says which; only categories the operator chose to
-> correct are ever replaced.
+> A divergence can be a convention. Volume is the one found: `vendor correct`
+> replaces differing *prices* with Sharadar's, and keeps FMP's volume (#69's
+> convention, `--volume keep`).
 
 Precedence is `operator > sharadar > tiingo > fmp`. FMP never overwrites a Sharadar
 row, and no vendor overwrites an operator row. `mart` views do not expose `source`
@@ -364,3 +367,37 @@ or last.
   `mart.v_security_lifecycle` (`symbol` with `first_trade_date`/`last_trade_date`)
   names one security without the date.
 
+## 25. A series can change vendor at the cutover date
+
+From the cutover (#125), a security Sharadar feeds gets its new bars as `source =
+'sharadar'`. Its bars before that date are FMP's, except those `vendor correct`
+replaced. So one series has a seam on the day Sharadar became primary, and a
+rollback adds a second. Both dates are in the plan's decision log.
+
+> **Wrong answer:** "volume stepped on the cutover date, so trading changed." The
+> volume convention changed. Before the seam, corrected bars kept FMP's volume.
+> After it, the volume is Sharadar's: on bars whose closes agree, FMP's over
+> Sharadar's has a median of 1.0, with 88.5% within 1% and 94.9% within 5% (#69).
+> Prices are continuous across it: `vendor correct` made the two vendors agree
+> before the switch.
+
+How to see it:
+- **The seam in one series:**
+
+  ```sql
+  SELECT source, min(trade_date), max(trade_date), count(*)
+    FROM core.daily_price WHERE security_id = … GROUP BY 1 ORDER BY 2;
+  ```
+
+- **When the feed moved:** the `vendor feed` runs (`ops.ingestion_run`, `endpoint =
+  'feed'`), with who made them in `params.by`.
+- **Who feeds it now:** the open link with `is_feed` (§22).
+
+What else changes across the seam:
+- **Sharadar's raw bars are recovered** (§23), FMP's observed.
+- **Revisions.** Sharadar revises its own bars after the fact. The nightly rewrites
+  one only when the change is material (`revised` in the `prices:nightly` run's
+  counts). `price_restatement_conflict` is FMP's check, so it stops for the
+  securities Sharadar feeds.
+- **Older bars are never re-vendored.** A bar FMP wrote before the seam stays FMP's
+  (`kept:fmp`): the nightly never overwrites another vendor's row.

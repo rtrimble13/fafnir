@@ -319,6 +319,174 @@ seen, not on each nightly retry, so one unresolved rename does not inflate the
 open-flag count night after night. `core.symbol_change` is the durable queue; the
 flag is only the notification.
 
+## Cutover to Sharadar as primary
+
+The one-time switch of the nightly to Sharadar (#125). It runs on a Monday, so a week
+of weeknights follows to watch it. Its core is the two steps under
+[Primary vendor switch and rollback](#primary-vendor-switch-and-rollback); this
+section adds the checks, verification and communication around them. Run `fafnir`
+as the service user, `sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env;
+set +a; fafnir …'`, and the queries in `psql` as the ops role.
+
+### Preconditions
+
+- **Gate GO on #122.** The corrections are applied, every unlinked active non-fund
+  security has a reason, and five `ingest sharadar --dry-run` nights have run with
+  their differences explained.
+- **The release is deployed.** That is v2.0.0 (#124), per
+  [releasing.md](releasing.md#deploying-it). `fafnir --version` names it, and
+  `fafnir db status` shows every migration applied.
+- **No night in progress.** Work before 22:30 ET, and check
+  `systemctl list-timers 'fafnir-*'`.
+
+### Steps
+
+1. **Say so.** Comment on #125 that the cutover is starting, naming the release.
+2. **Dump:** `sudo -u fafnir /opt/fafnir/scripts/backup_dump.sh`. Record the path
+   from its `wrote …` line on #125. This comes before any command that writes.
+3. **Link what FMP minted since the last night:** `fafnir vendor link --vendor
+   sharadar --new`. Then list the unlinked active non-fund securities by reason:
+
+   ```sql
+   SELECT coalesce(f.detail->>'reason', '(no flag)') AS reason, count(*)
+     FROM core.security s
+     LEFT JOIN LATERAL (
+           SELECT detail FROM ops.data_quality_flag f
+            WHERE f.security_id = s.security_id
+              AND f.check_name IN ('vendor_xref_unmatched', 'vendor_xref_ambiguous')
+            ORDER BY f.detected_at DESC LIMIT 1) f ON true
+    WHERE s.is_actively_trading AND NOT s.is_fund
+      AND NOT EXISTS (SELECT 1 FROM core.security_vendor_xref x
+                       WHERE x.security_id = s.security_id
+                         AND x.vendor = 'sharadar' AND x.valid_to IS NULL)
+    GROUP BY 1 ORDER BY 2 DESC;
+   ```
+
+   The counts should match the gate's. A `(no flag)` row is a security without a
+   reason: decide it with `fafnir vendor link show <SYMBOL> --evaluate`
+   ([Resolving vendor links](#resolving-vendor-links)). These securities stay
+   FMP's.
+4. **Move the feeds:** `fafnir vendor feed --vendor sharadar --all-linked
+   --dry-run`, then the same without `--dry-run`, with `--by <your name>`. Put
+   the counts it prints on #125.
+   - **Not `--vendor tiingo --funds` yet.** Tiingo has no loader until #97, and
+     the funds would then be fed by no one. FMP keeps them as the secondary.
+5. **Set the mode.** In `/var/lib/fafnir/.fafnirrc`, under `[general]`, set
+   `primary_price_vendor = "sharadar"`. Leave `fmp_secondary` at its default,
+   true. Check that `fafnir config get primary_price_vendor` prints `sharadar`,
+   and that `fafnir status` opens with `Primary    : sharadar (FMP secondary on)`.
+6. **The first night.** Let the timer start it at 22:30 ET, or start it then by
+   hand with `sudo systemctl start fafnir-daily.service`. Starting earlier loads a
+   day whose bars are not all out. Watch it with `journalctl -u fafnir-daily -f`.
+   Its log opens `(primary vendor: sharadar)`, and `fafnir-dq` follows it.
+7. **Next morning,** run the verification below and post its counts on #125, and
+   a line on #41. Counts only: no prices.
+
+### Verification after the first night
+
+Set the cutover's trading day once, in `psql`: `\set cutover '2027-01-11'`, using
+the actual date.
+
+1. **The night ran.** `scripts/monitor.sh sharadar runs timers` is clean.
+2. **The fed securities' new bars are Sharadar's:**
+
+   ```sql
+   SELECT p.source, count(*) AS bars, count(DISTINCT p.security_id) AS securities
+     FROM core.daily_price p
+     JOIN core.security_vendor_xref x
+       ON x.security_id = p.security_id AND x.vendor = 'sharadar'
+      AND x.is_feed AND x.valid_to IS NULL
+    WHERE p.trade_date >= :'cutover'
+    GROUP BY 1;
+   ```
+
+   Expect one row, `sharadar`. Any `fmp` row is FMP writing into a security it no
+   longer feeds.
+3. **FMP wrote only as the secondary:**
+
+   ```sql
+   SELECT endpoint, count(*) AS runs, sum(rows_inserted) AS rows
+     FROM ops.ingestion_run
+    WHERE source = 'fmp' AND started_at >= :'cutover'
+    GROUP BY 1 ORDER BY 1;
+   ```
+
+   - **Expected:** the secondary's loaders only: `profile` (`ingest tracked`),
+     `historical-price-eod/non-split-adjusted` (`ingest prices`) and the
+     `corporate-actions` endpoints.
+   - **Must not appear:** `symbol-change`, `stock-list` or `delisted-companies`.
+     These are FMP's universe sweeps, which no longer run.
+4. **Freshness.** Fed, actively trading securities with a bar on the cutover day:
+
+   ```sql
+   SELECT count(*) AS fed_active,
+          count(*) FILTER (WHERE EXISTS (
+              SELECT 1 FROM core.daily_price p
+               WHERE p.security_id = s.security_id
+                 AND p.trade_date = :'cutover')) AS with_bar
+     FROM core.security s
+     JOIN core.security_vendor_xref x
+       ON x.security_id = s.security_id AND x.vendor = 'sharadar'
+      AND x.is_feed AND x.valid_to IS NULL
+    WHERE s.is_actively_trading;
+   ```
+
+   The shortfall should be about the dry runs' `fmp_only` count for a night: halts
+   and names Sharadar does not price.
+5. **The night's own counts:**
+
+   ```sql
+   SELECT ingestion_run_id, status, params->'counts' AS counts
+     FROM ops.ingestion_run
+    WHERE source = 'sharadar' AND endpoint = 'prices:nightly'
+    ORDER BY ingestion_run_id DESC LIMIT 1;
+   ```
+
+   - `new` is about the fed active count.
+   - `kept:fmp` is the FMP history the deltas reached back over.
+   - `quarantined:*` is small.
+6. **Flag deltas.** The flags raised since the cutover, by check:
+
+   ```sql
+   SELECT check_name, count(*) AS flags, count(DISTINCT security_id) AS securities
+     FROM ops.data_quality_flag
+    WHERE detected_at >= :'cutover'
+    GROUP BY 1 ORDER BY 2 DESC;
+   ```
+
+   Compare the result with the week before: the same query, with `detected_at >=
+   :'cutover'::date - 7 AND detected_at < :'cutover'`. A check that is new, or
+   several times its usual size, needs a look before the second night. See
+   dq-playbooks › *After the cutover* in the fafnir-dba skill.
+
+### Rollback: when
+
+Roll back on any one of these:
+- **The night keeps failing.** The Sharadar night fails two weeknights running,
+  with no fix in hand for the third.
+- **The delta does not come.** The SEP/SFP delta fails or comes back empty for a
+  weekday (`monitor.sh sharadar`), and the vendor has not explained why by the next
+  night.
+- **Bars go missing.** Verification 4's shortfall is several times the dry runs'
+  `fmp_only`, two nights running.
+- **Bars go wrong at scale.** A spike of `price_*` quarantines, or of
+  `sharadar_split_ratio_mismatch` on the capture day, across many securities.
+
+Verification 2 or 3 failing is a bug, not a reason to roll back. FMP's loaders
+refuse to write in Sharadar mode without `--allow-secondary`, so find the cron line
+or command that passed it.
+
+### Rollback: how
+
+The two steps under [Primary vendor switch and rollback](#primary-vendor-switch-and-rollback):
+`fafnir vendor feed --vendor fmp --all-linked`, then `primary_price_vendor =
+"fmp"`, both before the next night.
+- **What stays.** Sharadar's rows, and the corrections, stay. Do not revert or
+  delete them: FMP fills only the dates Sharadar did not.
+- **Say so** on #125 and #41, naming the trigger.
+- **The second seam.** The rollback date becomes another vendor seam. Record it in
+  the plan's decision log beside the cutover date.
+
 ## Monitoring
 
 ```bash
