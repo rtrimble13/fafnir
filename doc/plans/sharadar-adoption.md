@@ -265,6 +265,33 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-22 · P3, #98 (part 2): the Sharadar night.** `fafnir ingest sharadar [--dry-run]` runs
+  six steps in order:
+  1. TICKERS and ACTIONS downloaded whole (`sharadar-bulk --force`);
+  2. `source sharadar-delta`;
+  3. `sharadar-master`;
+  4. `sharadar-universe`;
+  5. `sharadar-prices --nightly`;
+  6. `sharadar-actions --backfill --gap-fill`.
+
+  A failed step stops the night. A real run waits for `primary_price_vendor = "sharadar"`.
+  - **Deltas.** SEP and SFP rows by `lastupdated`, from the newest file's fetch day less 3 days. They are
+    plain `<sha256>.csv` files with `kind = 'delta'`. Measured: one day of SFP was 33,022 rows on four
+    pages, dated across a year. That is the probe's item 9, restamped history.
+  - **The nightly.** It applies the delta files after the last nightly's `params.through`. For a fed
+    security it writes new dates and revises Sharadar's own bars. A revision counts only beyond `vendor
+    correct`'s test or 1% of volume, because a restamped history recovered at a new factor moves by rounding.
+    Other parties' bars are left (`kept:<source>`). A security with no bars reads every delta since the
+    full file.
+  - **Actions.** The 7-day near-duplicate guard now applies to fed securities: one taken over from FMP keeps
+    FMP's history.
+  - **The acceptance tool.** `--as-if-fed` (dry run) compares the linked FMP securities per trade date:
+    `fmp_agrees`, `fmp_differs`, `new` and `fmp_only`. The five nights are the host's to run.
+  - **Departures.**
+    - SF1 deltas (#53's list) wait for the fundamentals loader, which has nothing to apply them to yet.
+    - `daily_update.sh` calls the night from #111, as the issue says; until then it is run by hand.
+    - The nightly recomputes its own factors, as the backfill does, because `adjust --changed` reads FMP's
+      actions runs.
 - **2026-10-22 · P3, #98 (part 1): `fafnir vendor feed` and FMP's feed rule.** `vendor feed --vendor
   sharadar|tiingo|fmp (--all-linked | --funds | --security-id N…) [--dry-run] [--by] [--yes]` moves `is_feed`.
   Sharadar or Tiingo sets the vendor's open link, clearing any other first. FMP clears the links of what FMP

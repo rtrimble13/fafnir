@@ -81,6 +81,49 @@ night per fund, which is noise against the budget. Requests, not bytes, are the
 constraint on the nightly window; see *Switching corporate actions to the incremental
 path* below for the step that dominates it.
 
+### FMP mode and Sharadar mode
+
+`[general] primary_price_vendor` names the mode.
+
+- **FMP mode (`"fmp"`, the default).** The job above runs. FMP feeds the
+  securities it minted that no other vendor feeds. Sharadar feeds the dead issuers
+  it minted (#71), and nothing loads those nightly.
+- **Sharadar mode (`"sharadar"`, from the cutover, #125).** The universe, price and
+  action steps for the securities Sharadar feeds are one command, `fafnir ingest
+  sharadar`. It runs six steps:
+  1. TICKERS and ACTIONS downloaded whole;
+  2. the SEP and SFP deltas;
+  3. the vendor master;
+  4. renames, delistings and new listings;
+  5. the bars;
+  6. the splits and dividends.
+
+  [ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98) has each
+  step. A failed step stops it non-zero, and the next run resumes. `daily_update.sh`
+  starts choosing the mode from the setting in #111, which also decides which FMP
+  steps stay beside it. Until then, the Sharadar night is run by hand.
+
+**Before the cutover**, run the dry run after FMP's night on five nights:
+
+```bash
+fafnir ingest sharadar --dry-run 2>&1 | tee -a sharadar-dry-run.log
+```
+
+- **What it does.** It downloads that night's files and refreshes the vendor tables,
+  and writes nothing else. Its price step compares the FMP securities linked to
+  Sharadar with the bars FMP loaded, per trade date: `fmp_agrees`, `fmp_differs`,
+  `new` (FMP lacks it) and `fmp_only` (Sharadar lacks it).
+- **What to check.** The night's own date should be nearly all `fmp_agrees`. Explain
+  the rest before the cutover.
+- **Sizes.** The download is under 0.1 GB of TICKERS and ACTIONS, plus the deltas.
+  One day of SFP was 2.3 MB, because the vendor restamps a fund's history when it
+  distributes.
+
+**The switch** is `fafnir vendor feed --vendor sharadar --all-linked`, then the
+setting. **The rollback** is `fafnir vendor feed --vendor fmp --all-linked`, then
+`"fmp"`. Neither moves a price or action row
+([ingestion.md](ingestion.md#which-vendor-feeds-a-security-adr-0015)).
+
 ### Tracking a mutual fund
 
 ```bash

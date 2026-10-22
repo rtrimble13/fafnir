@@ -7,14 +7,17 @@ and FMP's history of a live security can lack some. The ACTIONS file holds both,
 filed under each security's current ticker; the other lifecycle events are already
 in ``core.vendor_security_event`` (#58). Two modes, either or both:
 
-- ``--backfill``: every split and dividend of the securities Sharadar **feeds** (the
-  minted dead issuers). Nobody else holds their actions.
+- ``--backfill``: every split and dividend of the securities Sharadar **feeds**: the
+  minted dead issuers, and from the cutover the securities `vendor feed` gave it.
 - ``--gap-fill``: **fill-only** for the FMP securities linked to Sharadar. An action
   is added only inside the link's span (from its ``valid_from`` to the security's
-  last bar, where the identity is established), and never within
-  :data:`NEAR` of an action of the same type another source holds: a date the two
-  vendors disagree on would otherwise store one dividend twice. Those are counted
-  ``near_existing``; correcting them is #75's.
+  last bar, where the identity is established).
+
+In both, an action is never added within :data:`NEAR` of an action of the same type
+another source holds: a date the two vendors disagree on would otherwise store one
+dividend twice, and a security Sharadar took over from FMP (#98) holds FMP's whole
+history. Those are counted ``near_existing``; correcting them is #75's. The nightly
+(`ingest sharadar`) runs both modes over the ACTIONS file it re-downloads.
 
 Every row is written under ADR 0015's precedence as ``source = 'sharadar'``, never
 as a correction: a key another party holds is left alone, an operator's above all,
@@ -143,11 +146,11 @@ def _in_scope(
         return "future"
     if (p.security_id, p.action_type, p.ex_date) in suppressed:
         return "suppressed"
-    if target["is_feed"]:
-        return None
-    last = target["last_trade_date"]
-    if last is None or not target["valid_from"] <= p.ex_date <= last:
-        return "outside_span"
+    if not target["is_feed"]:
+        last = target["last_trade_date"]
+        if last is None or not target["valid_from"] <= p.ex_date <= last:
+            return "outside_span"
+    # Fed or not: a security Sharadar took over from FMP keeps FMP's history (#98).
     for d in foreign.get((p.security_id, p.action_type), ()):
         if abs(d - p.ex_date) <= NEAR:
             return "near_existing"

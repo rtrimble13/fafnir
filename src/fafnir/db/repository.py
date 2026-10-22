@@ -6534,6 +6534,34 @@ def current_sharadar_full(db: Database, vendor_table: str) -> Optional[dict]:
     )
 
 
+def newest_sharadar_file(db: Database, vendor_table: str) -> Optional[dict]:
+    """The file of ``vendor_table``, full or delta, fetched last, or None: where
+    the next delta starts (#98)."""
+    return db.fetchone(
+        """
+        SELECT * FROM landing.sharadar_file
+         WHERE vendor_table = %s
+         ORDER BY fetched_at DESC, file_id DESC
+         LIMIT 1
+        """,
+        (vendor_table,),
+    )
+
+
+def sharadar_deltas_after(db: Database, vendor_table: str, file_id: int) -> list[dict]:
+    """The delta files of ``vendor_table`` recorded after ``file_id`` and still on
+    disk, oldest first: what the nightly price load has not applied (#98)."""
+    return db.fetchall(
+        """
+        SELECT * FROM landing.sharadar_file
+         WHERE vendor_table = %s AND kind = 'delta' AND status = 'downloaded'
+           AND file_id > %s
+         ORDER BY file_id
+        """,
+        (vendor_table, file_id),
+    )
+
+
 def record_sharadar_file(
     db: Database,
     *,

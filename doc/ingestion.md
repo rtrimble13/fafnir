@@ -501,9 +501,10 @@ see it.
 |---|---|---|
 | `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71) | the whole history |
 | `--gap-fill` | the FMP securities linked to Sharadar | fill-only: the dates the security does not hold, from the link's `valid_from` |
+| `--nightly` | the securities Sharadar feeds | the delta files since the last nightly (*Sharadar as primary: prices and actions*) |
 
-A date the security already holds, whoever supplied it, is never read, so a re-run
-writes nothing new.
+In the two bulk modes a date the security already holds, whoever supplied it, is
+never read, so a re-run writes nothing new.
 
 **Why raw is recovered.** No observed raw source exists for a dead issuer's history:
 SEP's `open/high/low/close/volume` are split-adjusted, and only `closeunadj` is raw.
@@ -608,7 +609,7 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
 
 | Mode | For | What it writes |
 |---|---|---|
-| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71) | every split and dividend |
+| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98) | every split and dividend, never within 7 days of an action of the same type another source holds |
 | `--gap-fill` | the FMP securities linked to Sharadar | fill-only: an action inside the link's span (its `valid_from` to the last bar), and never within 7 days of an action of the same type another source holds |
 
 - **The conversions** are #56's: a split's value is new shares per old
@@ -617,7 +618,7 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
   one ex-date, a regular and a special, are summed; identical rows count once.
 - **Precedence, never a correction.** A key another party holds is left alone, an
   operator's above all, and a key an operator deleted is set aside. An FMP dividend
-  dated a few days from Sharadar's is the same event: `--gap-fill` skips it
+  dated a few days from Sharadar's is the same event: both modes skip it
   (`near_existing`) rather than store it twice. Correcting it is #75's
   `vendor correct`.
 - **Never a future ex-date** (ADR 0007), the same guard as `ingest actions`.
@@ -1065,9 +1066,106 @@ fafnir vendor feed --vendor fmp --all-linked                  # the rollback
   made it (`--by`, default the OS user), the scope, the counts and the security ids
   it changed. `--dry-run` applies it and rolls back.
 
-Nothing sets a Sharadar feed link before `fafnir vendor feed` (#98). When it does, it
-must also take the security out of FMP's rule, which today reads `source` alone, so
-that one vendor feeds it.
+### Sharadar as primary: prices and actions (#98)
+
+From the cutover (#125) the night's prices and actions come from Sharadar for the
+securities it feeds (`vendor feed`, above), and the universe from its events (#93).
+One command runs the night in order:
+
+```bash
+fafnir ingest sharadar --dry-run   # before the cutover: set against FMP's night
+fafnir ingest sharadar             # after it ([general] primary_price_vendor = "sharadar")
+```
+
+| Step | Command it runs | What it does |
+|---|---|---|
+| 1 | `source sharadar-bulk --tables tickers,actions --force` | Downloads TICKERS and ACTIONS whole: together under 0.1 GB. |
+| 2 | `source sharadar-delta` | Fetches SEP and SFP rows by `lastupdated` (below). |
+| 3 | `ingest sharadar-master` | Refreshes `core.vendor_security` and `core.vendor_security_event`. |
+| 4 | `ingest sharadar-universe` | Renames, delistings and new listings (#93). |
+| 5 | `ingest sharadar-prices --nightly` | Writes the deltas' bars (below). |
+| 6 | `ingest sharadar-actions --backfill --gap-fill` | Splits and dividends from the fresh ACTIONS file. |
+
+A step that fails stops the night with a non-zero exit. Every step is safe to run
+again, so the next run picks up where the last one stopped. A real run refuses
+until `primary_price_vendor = "sharadar"`.
+
+**The deltas.** `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` asks
+the table API for the rows stamped `lastupdated` on or after a date.
+- **The date** defaults to the day the table's newest file, full or delta, was
+  fetched, less three days. A bar is stamped no earlier than its own date, so a
+  delta holds every bar dated from its start on, and the vendor's revisions of
+  older ones.
+- **Revisions reach far back.** The vendor restamps a security's history when it
+  adjusts it, for a split or a dividend (the probe's item 9). One day of SFP
+  (measured 2026-10-22) was 33,022 rows on four pages, dated across a year.
+- **The file** is written as a plain CSV in the bulk file's column order, named
+  `<sha256>.csv` under `[sharadar] bulk_dir`. It is recorded in
+  `landing.sharadar_file` with `kind = 'delta'` and `filters = {"lastupdated.gte":
+  …}`.
+- **Edge cases.** A row stamped before the date means the filter was not applied,
+  and the table fails. A delta with no rows is not recorded, and the same content
+  twice is one file. Each table is one run (`endpoint = delta:<table>`).
+
+**The nightly price load.** `fafnir ingest sharadar-prices --nightly` reads the
+delta files recorded since the last successful nightly. Its run (`endpoint =
+prices:nightly`) names the last file applied per table in `params.through`. Before
+the first nightly, it reads the files recorded since the current full file, which
+the backfill read. A night that failed is read again the next night. A run with
+`--symbols` applies the files to those securities and leaves `through` where it was.
+Where two files hold a bar, the one stamped later wins. For each security Sharadar
+feeds:
+- **A date it does not hold** is written (`new`).
+- **A bar of Sharadar's own** is rewritten when the vendor revised it (`revised`):
+  a price beyond `vendor correct`'s test, max($0.01, 1 bp) or the recovery's rounding,
+  or the volume by more than 1%. Otherwise it is left (`unchanged`). The tolerance is
+  needed because a restamped history, recovered again at a new split factor, moves
+  by rounding alone.
+- **Another party's bar is left alone** (`kept:<source>`). A security `vendor feed`
+  gave to Sharadar keeps the FMP history it had; replacing those bars is `vendor
+  correct`'s job.
+
+The bars pass the backfill's gates. Raw prices are recovered from ACTIONS: on the
+capture day the vendor's ratio must be 1, or the security is flagged
+`sharadar_split_ratio_mismatch`. Non-session and operator-edited dates are set
+aside, and the validator quarantines bad bars. A bar the overlapping deltas bring
+back is flagged once, in both bulk and nightly modes, because no Sharadar watermark
+waits on the count. The watermark `(sharadar, SEP|SFP,
+security_id)` advances, and factors are recomputed for the securities that changed
+and hold actions.
+
+A security with no bars yet, such as a listing step 4 minted tonight, reads every
+delta since the full file, so the days before it existed are not lost. Its history
+before that file is `--backfill`'s: `fafnir ingest sharadar-prices --backfill
+--symbols X`.
+
+**The nightly actions.** Both modes run over the ACTIONS file step 1 downloaded. The
+near-duplicate guard now holds for fed securities too. An action within 7 days of
+one of the same type another source holds is `near_existing`, because a security
+taken over from FMP keeps FMP's history (*Splits and dividends from Sharadar*).
+
+**The acceptance: five dry-run nights.** Run `fafnir ingest sharadar --dry-run`
+after FMP's night.
+- **What a dry run still does.** It downloads and records the files and refreshes
+  the vendor tables, which are Sharadar's view, not fafnir's. Steps 4 to 6 write
+  nothing.
+- **The comparison.** Step 5 runs with `--as-if-fed`: the FMP securities linked to
+  Sharadar are read as if Sharadar fed them, each from its link's `valid_from`, and
+  set against FMP's bars. The counts per trade date are:
+  - `fmp_agrees` and `fmp_differs`, by `vendor correct`'s test;
+  - `new`, a bar FMP lacks;
+  - `fmp_only`, a bar FMP holds and Sharadar did not serve, on a date the files hold
+    in whole.
+- **Reading it.** The night's own trade date is the row to read; the differences are
+  what the issue asks to have explained. No real nightly has advanced `through` yet,
+  so each dry run covers every delta since the full file, and the earlier dates
+  repeat. A standalone check is `fafnir ingest sharadar-prices --nightly --dry-run
+  --as-if-fed`.
+
+**Rollback.** `fafnir vendor feed --vendor fmp --all-linked` gives FMP back the
+securities it minted. Set `primary_price_vendor` back to `"fmp"` and the real night
+refuses again. Sharadar's rows stay under precedence, and FMP's loaders resume from
+their watermarks.
 
 ### Who may write a row: precedence (ADR 0015)
 
