@@ -5,8 +5,9 @@ resolving anything of that kind.
 
 **Two facts that change how the queue is counted, before any playbook:**
 
-- **`price_*` flags repeat by design.** The price loader uses `add_dq_flag`, not
-  `add_dq_flag_once`, because each detection is itself the signal —
+- **`price_*` flags repeat by design** (FMP's; Sharadar's are flagged once, #98).
+  FMP's price loader uses `add_dq_flag`, not `add_dq_flag_once`, because each
+  detection is itself the signal —
   `count_price_quarantines` counts them to decide when a persistently bad bar has
   held the watermark long enough. Every other check is one row per open condition
   (`add_dq_flag_once`, migrations 0014/0016). Filter `price_*` out before treating
@@ -15,6 +16,18 @@ resolving anything of that kind.
   runs, then the loader steps past it. So a symbol accumulating `price_*` flags is
   usually also a symbol that has **stopped advancing** — check `watermarks`. That
   is the more urgent half and it is invisible in the flag itself.
+
+**The vendor checks** are about the two vendors disagreeing, not the market:
+
+| Check | From | Playbook |
+|---|---|---|
+| `vendor_xref_unmatched`, `vendor_xref_ambiguous` | `vendor link` | below; operations.md › *Resolving vendor links* |
+| `vendor_history_disagrees` | `vendor link` | below: `vendor correct` replaces the bars |
+| `vendor_history_overlap` | `vendor overlap` | below |
+| `sharadar_split_ratio_mismatch` | `ingest sharadar-prices`, the nightly included | below |
+| `symbol_change_conflict`, `security_delisting_contradicted` with `detail.source = 'sharadar'` | `ingest sharadar-universe` (#93) | their own entries below |
+
+What changes once Sharadar is primary is in [After the cutover](#after-the-cutover) at the end.
 
 ---
 
@@ -423,10 +436,11 @@ things differ from FMP's:
   date. Resolve those by rule, first: it is bookkeeping, and it is most of the
   queue. On the host, run 412 (v1.8.1) loaded every one of the 146,710, and they
   were resolved on 2026-10-21; none was left to work by #81.
-- **Every re-run flags the rest again.** The loader writes through `add_dq_flag`,
-  so a second `--backfill` run adds a second open flag for each bar it still
-  refuses. Work them after the last backfill run. Several open flags on one
-  security, check and date are one condition: close all but the newest by rule.
+- **Before #98, every re-run flagged the rest again.** The loader wrote through
+  `add_dq_flag`, so a second `--backfill` run added a second open flag for each bar
+  it still refused. Several open flags on one security, check and date are one
+  condition: close all but the newest by rule. Since #98 it flags each bar once
+  (`add_dq_flag_once`), the nightly included.
 - **There is no other vendor to re-fetch from** on a dead history: FMP never feeds
   it. A bar Sharadar's own data fails validation on stays absent, and leaves a
   `gap` on its date that belongs to the quarantine. Decide it by its reason's
@@ -1365,3 +1379,33 @@ first night's 16,272 were thin ETFs printing one 100-share lot a day, where a
 single trade makes a flat bar. That is a dorq defect, to be fixed in dorq. Do not
 work those one by one, and do not filter them in fafnir.
 
+---
+
+## After the cutover
+
+From the day Sharadar became primary (#125; operations.md › *Cutover to Sharadar as
+primary*), the queue changes shape. Judge it by these, not by the FMP-era habits:
+
+- **`price_restatement_conflict` stops for the securities Sharadar feeds.** It is
+  FMP's check on FMP's re-reads. Sharadar's revisions are applied when material
+  (`revised` in the `prices:nightly` run's `counts`) and leave no flag. A new one
+  is on a security FMP still feeds as the secondary: a fund, or an unlinked name.
+- **`stale` on a fed security means the nightly did not reach it.** Check the
+  newest `prices:nightly` run first, then `monitor.sh sharadar`. `fafnir source
+  vendor-gaps` is FMP's view (`repo.fmp_fed`): a fed security is never in it.
+- **`sharadar_split_ratio_mismatch` on the capture day** means the vendor's
+  `closeunadj / close` is not 1 on the newest bar. Usually a split is in SEP before
+  ACTIONS. The bar loads with the vendor's ratio. Wait one night: the nightly
+  re-downloads ACTIONS, and the same security's next bars agree. Resolve it once
+  they do and its factors are recomputed. A run of them across many securities is
+  a rollback trigger.
+- **`price_*` from the nightly** carry `detail.source = 'sharadar'` and are flagged
+  once, though the deltas overlap. A large first night is the deltas reaching back
+  over history (`kept:fmp` and `unchanged` in the counts). It is not a new problem
+  unless `quarantined:*` grows night on night.
+- **Universe flags come from Sharadar.** `symbol_change_conflict` and
+  `security_delisting_contradicted` now come from `ingest sharadar-universe`, and
+  FMP's sweeps no longer run. A rename conflict FMP's sweep raised has the same
+  `(old_symbol, new_symbol)` record key, so Sharadar's step closes it when it
+  applies that rename (#93). One whose rename Sharadar never files stays open:
+  work it through its own entry.

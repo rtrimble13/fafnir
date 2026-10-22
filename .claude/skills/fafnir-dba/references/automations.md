@@ -55,6 +55,10 @@ with `status = 'failed'`, which is why that query is on the monitoring list.
 
 ### The Sharadar night (`fafnir ingest sharadar`, #98)
 
+The switch itself, with its checks, verification queries and rollback triggers, is
+operations.md › *Cutover to Sharadar as primary* (#120). On the morning after a
+cutover, run that section's verification; this one is for every night after.
+
 From the cutover (`[general] primary_price_vendor = "sharadar"`, #125), one command
 does universe, prices and actions for the securities Sharadar feeds, and
 `daily_update.sh` runs it (#111). Before the cutover only `--dry-run` is allowed.
