@@ -1088,7 +1088,10 @@ fafnir ingest sharadar             # after it ([general] primary_price_vendor = 
 
 A step that fails stops the night with a non-zero exit. Every step is safe to run
 again, so the next run picks up where the last one stopped. A real run refuses
-until `primary_price_vendor = "sharadar"`.
+until `primary_price_vendor = "sharadar"`. From then on, `daily_update.sh` runs it
+in place of FMP's universe, price and action steps, and FMP's loaders refuse to
+write without `--allow-secondary`
+([operations.md](operations.md#fmp-mode-and-sharadar-mode)).
 
 **The deltas.** `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` asks
 the table API for the rows stamped `lastupdated` on or after a date.

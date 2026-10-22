@@ -122,6 +122,42 @@ def main(ctx, config):
 
 
 # ---------------------------------------------------------------------------
+# config group
+# ---------------------------------------------------------------------------
+@main.group("config")
+def config_group():
+    """Read the settings the night's scripts branch on."""
+
+
+@config_group.command("get")
+@click.argument("key")
+@click.pass_context
+def config_get(ctx, key):
+    """Print one setting as fafnir reads it, rc file and defaults applied.
+
+    \b
+      fafnir config get primary_price_vendor   # fmp | sharadar
+      fafnir config get fmp_secondary          # true | false
+
+    KEY is one of primary_price_vendor, fmp_secondary, actions_mode, dq_engine,
+    log_dir, sharadar_bulk_dir. Booleans print as true or false. A value that does
+    not validate exits non-zero, so a script stops rather than guessing. Keys and
+    passwords are never printed.
+    """
+    from fafnir.config import SCRIPT_KEYS
+
+    if key not in SCRIPT_KEYS:
+        raise click.ClickException(
+            f"unknown key {key!r}: expected one of {', '.join(SCRIPT_KEYS)}"
+        )
+    try:
+        value = getattr(ctx.obj["config"], key)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(str(value).lower() if isinstance(value, bool) else value)
+
+
+# ---------------------------------------------------------------------------
 # db group
 # ---------------------------------------------------------------------------
 @main.group()
@@ -283,6 +319,30 @@ def _sharadar_client(cfg):
     )
 
 
+_allow_secondary = click.option(
+    "--allow-secondary",
+    is_flag=True,
+    help="Load as the secondary vendor when [general] primary_price_vendor is "
+    '"sharadar": only what FMP still feeds (#111).',
+)
+
+
+def _refuse_fmp_after_cutover(cfg, allow_secondary: bool, command: str) -> None:
+    """FMP's loaders write only as the primary vendor, or when told they are the
+    secondary: a stray cron line must not resume FMP's night after the cutover."""
+    try:
+        primary = cfg.primary_price_vendor
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if primary == "sharadar" and not allow_secondary:
+        raise click.ClickException(
+            f"`fafnir {command}` is FMP's, and [general] primary_price_vendor is "
+            '"sharadar": `fafnir ingest sharadar` runs the night. Pass '
+            "--allow-secondary to load what FMP still feeds (daily_update.sh does "
+            "when [general] fmp_secondary is true)."
+        )
+
+
 @ingest.command("securities")
 @click.option("--universe", default=None, help="Universe id (default from config)")
 @click.option("--no-etfs", is_flag=True, help="Exclude ETFs")
@@ -292,12 +352,14 @@ def _sharadar_client(cfg):
     default=False,
     help="Also fetch per-symbol profiles (sector/industry)",
 )
+@_allow_secondary
 @click.pass_context
-def ingest_securities(ctx, universe, no_etfs, limit, enrich):
+def ingest_securities(ctx, universe, no_etfs, limit, enrich, allow_secondary):
     """Load the security master from FMP bulk lists."""
     from fafnir.ingest import security_master
 
     cfg = ctx.obj["config"]
+    _refuse_fmp_after_cutover(cfg, allow_secondary, "ingest securities")
     fmp = _fmp_client(cfg)
     universe = universe or cfg.universe
     excluded = _excluded_instruments(cfg)
@@ -349,8 +411,9 @@ def ingest_securities(ctx, universe, no_etfs, limit, enrich):
 
 
 @ingest.command("tracked")
+@_allow_secondary
 @click.pass_context
-def ingest_tracked(ctx):
+def ingest_tracked(ctx, allow_secondary):
     """Load the declared universe (ref.tracked_symbol) into the security master.
 
     The screener cannot reach a mutual fund -- it has no listing venue -- so this is
@@ -361,6 +424,7 @@ def ingest_tracked(ctx):
     from fafnir.ingest import tracked
 
     cfg = ctx.obj["config"]
+    _refuse_fmp_after_cutover(cfg, allow_secondary, "ingest tracked")
     fmp = _fmp_client(cfg)
     with Database(cfg.dsn) as database:
         result = tracked.load_tracked(database, fmp)
@@ -400,8 +464,9 @@ def ingest_tracked(ctx):
     help="Also load delisted securities (use for backfills -- omitting it is "
     "what makes a history survivorship-biased)",
 )
+@_allow_secondary
 @click.pass_context
-def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
+def ingest_prices(ctx, symbols, from_date, to_date, include_inactive, allow_secondary):
     """Load daily OHLCV (incremental by default).
 
     The incremental load never overwrites a stored bar by more than [prices]
@@ -416,6 +481,7 @@ def ingest_prices(ctx, symbols, from_date, to_date, include_inactive):
     from fafnir.ingest import daily_price
 
     cfg = ctx.obj["config"]
+    _refuse_fmp_after_cutover(cfg, allow_secondary, "ingest prices")
     try:
         guard = daily_price.RestatementGuard(
             max_ratio=cfg.restatement_max_ratio,
@@ -494,8 +560,9 @@ def _echo_restated(restated, guard, *, limit: int = 50) -> None:
     is_flag=True,
     help="Sweep the entire rename feed instead of only its recent tail",
 )
+@_allow_secondary
 @click.pass_context
-def ingest_symbol_changes(ctx, full):
+def ingest_symbol_changes(ctx, full, allow_secondary):
     """Apply ticker renames to the securities that already hold the history.
 
     Run this BEFORE `ingest securities`: to the screener a renamed ticker looks
@@ -504,6 +571,7 @@ def ingest_symbol_changes(ctx, full):
     from fafnir.ingest import symbol_changes
 
     cfg = ctx.obj["config"]
+    _refuse_fmp_after_cutover(cfg, allow_secondary, "ingest symbol-changes")
     fmp = _fmp_client(cfg)
     with Database(cfg.dsn) as database:
         counts = symbol_changes.load_symbol_changes(
@@ -528,12 +596,14 @@ def ingest_symbol_changes(ctx, full):
     is_flag=True,
     help="Sweep the entire delisted feed instead of only its recent tail",
 )
+@_allow_secondary
 @click.pass_context
-def ingest_delisted(ctx, full):
+def ingest_delisted(ctx, full, allow_secondary):
     """Mark securities that have stopped trading (survivorship-bias guard)."""
     from fafnir.ingest import delisted
 
     cfg = ctx.obj["config"]
+    _refuse_fmp_after_cutover(cfg, allow_secondary, "ingest delisted")
     fmp = _fmp_client(cfg)
     with Database(cfg.dsn) as database:
         marked, seen = delisted.load_delisted(
@@ -1040,8 +1110,11 @@ def ingest_sharadar(ctx, dry_run):
     "(0 disables) [default: general.actions_reconcile_buckets].",
 )
 @click.option("--as-of", help="Treat this date as today (YYYY-MM-DD). Testing/replay.")
+@_allow_secondary
 @click.pass_context
-def ingest_actions(ctx, symbols, mode, include_inactive, reconcile_buckets, as_of):
+def ingest_actions(
+    ctx, symbols, mode, include_inactive, reconcile_buckets, as_of, allow_secondary
+):
     """Load corporate actions (splits + dividends).
 
     Incremental by default once `general.actions_mode` is switched to `auto`: one
@@ -1052,6 +1125,7 @@ def ingest_actions(ctx, symbols, mode, include_inactive, reconcile_buckets, as_o
     from fafnir.ingest import corporate_actions
 
     cfg = ctx.obj["config"]
+    _refuse_fmp_after_cutover(cfg, allow_secondary, "ingest actions")
     fmp = _fmp_client(cfg)
     mode = mode or cfg.actions_mode
     buckets = (
