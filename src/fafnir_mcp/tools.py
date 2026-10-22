@@ -909,6 +909,57 @@ def landing_payload(*, dsn: str, endpoint: str, symbol: Optional[str] = None) ->
     return {"payload": jsonable(rows[0])}
 
 
+#: The legacy codes Sharadar's API still takes, to the modern names the file ledger
+#: stores (``fafnir.sources.sharadar_files.LEGACY_NAMES``, the price and
+#: fundamentals half; this package does not import fafnir).
+_SHARADAR_LEGACY = {"SEP": "stocks", "SFP": "funds", "SF1": "fundamentals"}
+
+
+def sharadar_files(
+    *,
+    dsn: str,
+    table: Optional[str] = None,
+    kind: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """The Sharadar file ledger, newest first: which files landed, when, from what
+    request, with how many rows and bytes, and whether they are still current.
+
+    ``landing.sharadar_file`` records each file under ``[sharadar] bulk_dir``: a
+    whole table (``kind = full``) or a nightly slice by ``lastupdated`` (``delta``).
+    The rows themselves are in the files, not the database, so this answers "did
+    tonight's delta land, and how big was it?", never "what did Sharadar say about
+    a bar?" (#118).
+    """
+    clauses = ["1=1"]
+    params: list[Any] = []
+    if table:
+        name = str(table).strip()
+        clauses.append("vendor_table = %s")
+        params.append(_SHARADAR_LEGACY.get(name.upper(), name.lower()))
+    if kind:
+        if kind not in ("full", "delta"):
+            raise ToolError("kind must be one of: full, delta")
+        clauses.append("kind = %s")
+        params.append(kind)
+    if status:
+        if status not in ("downloaded", "superseded", "deleted"):
+            raise ToolError("status must be one of: downloaded, superseded, deleted")
+        clauses.append("status = %s")
+        params.append(status)
+    cap = clamp_limit(limit, DEFAULT_MAX_ROWS)
+    params.append(cap + 1)
+    sql = (
+        "SELECT file_id, vendor_table, kind, filters, path, member, rows, bytes, "
+        "       status, fetched_at, status_at, ingestion_run_id "
+        "  FROM landing.sharadar_file "
+        f" WHERE {' AND '.join(clauses)} "
+        " ORDER BY fetched_at DESC, file_id DESC LIMIT %s"
+    )
+    return envelope(_query(dsn, sql, tuple(params)), max_rows=cap)
+
+
 def schema_state(*, dsn: str) -> dict:
     """Applied migrations -- is this host running the schema the repo expects?
 

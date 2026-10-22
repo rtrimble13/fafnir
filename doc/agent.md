@@ -178,7 +178,7 @@ absent, for exactly this reason.
 
 | | |
 |---|---|
-| **Reads, unattended** | every MCP tool; `scripts/monitor.sh`; `systemctl status`/`list-timers`; `journalctl -u fafnir-*`; `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir status`/`dq list`/`db status`/`vendor corrections list`; `duk -S db …` |
+| **Reads, unattended** | every MCP tool; `scripts/monitor.sh`; `systemctl status`/`list-timers`; `journalctl -u fafnir-*`; `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir status`/`dq list`/`db status`/`config get`/`vendor corrections list`; `duk -S db …` |
 | **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename`/`split-history`, `actions add`/`delete`/`redate`, `prices delete`/`shift`/`rescale`, `override revoke`, `vendor corrections revert` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `security descope`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
@@ -190,6 +190,16 @@ stopped (#79). The warehouse holds thousands of dead issuers minted from Sharada
 and a screen without the filter would be mostly companies that no longer trade. A
 question about why one stopped, or who acquired it, reads
 `mart.v_security_lifecycle`. [duk.md](duk.md#reading-dead-issuers) has the rest.
+
+### Sharadar's files
+
+The ops profile's `sharadar_files` lists the Sharadar file ledger
+(`landing.sharadar_file`, #118): which bulk files and nightly deltas landed, when,
+from what request, and how many rows. The rows themselves are in the files under
+`[sharadar] bulk_dir`, which the agent does not read. So the ledger answers whether
+tonight's delta landed, not what a bar was; `price_history` answers that. Which
+night ran, FMP's or Sharadar's, is `fafnir config get primary_price_vendor`, or
+the `Primary` line of `fafnir status`.
 
 ### The nightly report
 

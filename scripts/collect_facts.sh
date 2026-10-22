@@ -23,6 +23,14 @@ section() { printf '\n===== %s =====\n' "$1"; }
 printf 'fafnir nightly evidence -- collected %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'host: %s\n' "$(hostname)"
 
+# Which night ran (#111): FMP's, or the Sharadar night with FMP as secondary. Read
+# as fafnir, whose rc file holds the setting; the agent has none of its own.
+section "VENDOR MODE"
+PRIMARY=$("${FAF[@]}" config get primary_price_vendor 2>&1)
+printf 'primary_price_vendor: %s\n' "$PRIMARY"
+printf 'fmp_secondary: %s\n' "$("${FAF[@]}" config get fmp_secondary 2>&1)"
+case "$PRIMARY" in fmp | sharadar) ;; *) PRIMARY="" ;; esac
+
 section "TIMERS (did last night fire, when is the next?)"
 systemctl list-timers 'fafnir-*' --all --no-pager 2>&1
 
@@ -65,7 +73,7 @@ section "VENDOR GAPS (live securities FMP stopped serving)"
 # NOT --quiet, either: under it monitor.sh emits only warnings and a summary, so a
 # clean night carries no numbers for the model to compare against tomorrow's -- and
 # a section that skipped itself is indistinguishable from one that passed.
-section "DISK / RUNS / BANDWIDTH"
+section "DISK / RUNS / BANDWIDTH / SHARADAR"
 if [[ -z "${FAFNIR_DSN:-}" ]]; then
     # monitor.sh sources /etc/fafnir/fafnir.env for a DSN, which is root:fafnir
     # 0640 and denied to the agent by design (doc/agent.md). Unset, `runs` and
@@ -73,9 +81,11 @@ if [[ -z "${FAFNIR_DSN:-}" ]]; then
     # say plainly that they did not run, rather than letting silence read as good
     # news. Set FAFNIR_DSN to the agent read role in /etc/fafnir/report.env.
     cat <<'NODSN'
-!!  FAFNIR_DSN is unset, so the `runs` and `bandwidth` checks below did NOT run.
+!!  FAFNIR_DSN is unset, so the `runs`, `bandwidth` and `sharadar` checks below
+!!  did NOT run their queries.
 !!  Any "clean" summary line covers `disk` only. This is missing evidence, not a
 !!  healthy result -- see doc/nightly_report.md step 2.
 NODSN
 fi
-"$FAFNIR_HOME/scripts/monitor.sh" disk runs bandwidth 2>&1
+FAFNIR_PRIMARY_VENDOR="$PRIMARY" \
+    "$FAFNIR_HOME/scripts/monitor.sh" disk runs bandwidth sharadar 2>&1

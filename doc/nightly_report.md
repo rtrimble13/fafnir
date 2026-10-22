@@ -122,8 +122,8 @@ outright ([agent.md](agent.md#what-it-can-and-cannot-do)) and which this does
 not need.
 
 It also carries `FAFNIR_DSN=dbname=fafnir user=claude_ops` — the agent's own
-read-only role, peer-authenticated, so still no secret. `monitor.sh`'s `runs` and
-`bandwidth` checks query Postgres, and their only other source of a DSN is that
+read-only role, peer-authenticated, so still no secret. `monitor.sh`'s `runs`,
+`bandwidth` and `sharadar` checks query Postgres, and their only other source of a DSN is that
 denied `fafnir.env`. Without the line they skip themselves, and because a skipped
 section neither warns nor fails, the run still summarises as clean. That is the
 one failure this report cannot tolerate, so `collect_facts.sh` also states the
@@ -176,6 +176,15 @@ result. It is not sent to go and look. That keeps the nightly cost flat, makes
 two nights comparable, and means a bad report can be reproduced from the
 evidence file rather than re-run against a warehouse that has since moved.
 
+**It says which night ran.** A `VENDOR MODE` section reads `primary_price_vendor`
+and `fmp_secondary` as `fafnir`, through the agent's sudo rule; the agent has no rc
+file of its own (#118). `collect_facts.sh` passes the mode to `monitor.sh`, whose
+`sharadar` section lists the newest delta fetch and nightly load and the file
+ledger. In Sharadar mode it also warns when the last weeknight's load did not
+succeed. The prompt has the model say whether that night succeeded. It also names
+the vendor DQ checks (`vendor_*`, `sharadar_split_ratio_mismatch`) apart from the
+rest, because they are the two vendors disagreeing, not the market moving.
+
 **It names the symbols the vendor stopped serving.** A `VENDOR GAPS` section runs
 `fafnir source vendor-gaps` (v1.5.0): live securities whose newest payload came back
 empty while their venue moved on. The email lists them, new ones first, as the
@@ -224,7 +233,8 @@ the report leads with its largest number, which is the least meaningful one.
 | Report claims no backup dump exists | `monitor.sh backups` was re-added to `collect_facts.sh` | remove it; `/var/backups/fafnir` is unreadable to the agent by design |
 | `sudo: no tty present` / `a password is required` | the sudoers rule is absent or the binary path differs | [agent.md](agent.md) step 4 |
 | Unit fails instantly, *Failed to open standard output file … No such file or directory* | `~/fafnir-report` does not exist; systemd opens the log before `ExecStart` can create it | `mkdir -p ~/fafnir-report` (step 1) |
-| Evidence says `runs` and `bandwidth` did NOT run | `FAFNIR_DSN` missing from `/etc/fafnir/report.env`; the agent cannot read `fafnir.env` to fall back on | add `FAFNIR_DSN=dbname=fafnir user=claude_ops` (step 2) |
+| `VENDOR MODE` reads an error, or the `sharadar` section a wrong mode | the sudo rule refused `fafnir config get`, or fafnir's rc file has a typo | run `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir config get primary_price_vendor` as the agent |
+| Evidence says `runs`, `bandwidth` and `sharadar` did NOT run their queries | `FAFNIR_DSN` missing from `/etc/fafnir/report.env`; the agent cannot read `fafnir.env` to fall back on | add `FAFNIR_DSN=dbname=fafnir user=claude_ops` (step 2) |
 | Every morning reads as day one | `last_facts.txt` is not persisting | check `FAFNIR_REPORT_STATE_DIR` is writable by the agent |
 
 ## Turning it off

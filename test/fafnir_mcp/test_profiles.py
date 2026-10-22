@@ -44,6 +44,7 @@ OPS_ONLY_TOOLS = {
     "ingestion_runs",
     "watermarks",
     "landing_payload",
+    "sharadar_files",
     "schema_state",
     "sql_read",
 }

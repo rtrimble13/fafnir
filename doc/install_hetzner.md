@@ -977,6 +977,14 @@ Depth, chunking strategy, and the bandwidth math are covered in
 [backfill.md](backfill.md#6-full-backfill--a-single-run-of-a-few-hours). Verify with
 `fafnir dq run` and the queries in [backfill.md §7](backfill.md#7-verify) when it finishes.
 
+**Then Sharadar, if subscribed.** The install starts from FMP; Sharadar comes after,
+on top of it: the bulk files, the links, and the dead issuers FMP never had. That
+sequence and its timings are in
+[backfill.md › Sharadar initial population](backfill.md#sharadar-initial-population)
+and [the dead-issuer backfill](backfill.md#the-dead-issuer-backfill-on-the-production-host-77).
+There is no install that starts from Sharadar alone: fafnir mints live securities
+from FMP's screener, and only dead issuers and new listings from Sharadar.
+
 ---
 
 ## 8. Schedule the nightly update
@@ -986,12 +994,17 @@ with DST. A systemd timer handles that correctly; fixed-UTC cron does not.
 
 `daily_update.sh` maintains the **universe** before it loads any market data —
 renames, then new listings, then delistings — so the price step runs against what is
-actually trading that day:
+actually trading that day. In FMP mode, the default:
 
 ```
-ensure-horizon → symbol-changes → securities → delisted →
-prices → actions → adjust → refresh-marts
+ensure-horizon → symbol-changes → securities → tracked → delisted →
+prices → vendor link --new → actions → adjust → refresh-marts
 ```
+
+From the Sharadar cutover (`[general] primary_price_vendor = "sharadar"`), the
+universe, prices and actions are `fafnir ingest sharadar`, with FMP's loaders as
+the secondary for what FMP still feeds
+([operations.md](operations.md#fmp-mode-and-sharadar-mode)).
 
 DQ is not part of it: `dq run` is the `fafnir-dq` unit's job, which runs after the
 daily (§8.1).
@@ -1288,9 +1301,10 @@ journalctl -u fafnir-daily.service --since '2 days ago'
 What to watch, and the SQL for each, is in
 [operations.md](operations.md#monitoring): freshness, quarantine spikes, FMP bandwidth,
 failed runs, and three signals that come from the nightly universe maintenance —
-`New (7d)` (a week of zeroes on a working key means the security-master step is not
-running), unapplied ticker renames awaiting a decision, and `security_company_name_drift`
-flags. `fafnir status` surfaces the first two directly, and `fafnir dq list` reads
+`New (7d)`, by the vendor that minted them (a week of zeroes on a working key means
+the universe step is not running), unapplied ticker renames awaiting a decision, and
+`security_company_name_drift` flags. `monitor.sh sharadar` adds the Sharadar night:
+the newest delta fetch and nightly load, and the file ledger. `fafnir status` surfaces the first two directly, and `fafnir dq list` reads
 the flag queue itself — with `fafnir dq resolve` to close what you have worked
 (see [operations.md](operations.md#working-the-dq-queue)).
 

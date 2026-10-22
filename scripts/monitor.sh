@@ -16,6 +16,10 @@
 # so this script does that for you when FAFNIR_DSN is not already set and the
 # file is readable. Under systemd the EnvironmentFile has already provided it and
 # nothing is sourced.
+#
+# The `sharadar` section reads the primary vendor with `fafnir config get`, which
+# reads the calling user's rc file. A caller running as another user (the nightly
+# report runs as the agent) reads it as fafnir and passes FAFNIR_PRIMARY_VENDOR.
 set -uo pipefail          # NOT -e: a failing check must be reported, not fatal
 
 ENV_FILE="${FAFNIR_ENV_FILE:-/etc/fafnir/fafnir.env}"
@@ -26,15 +30,15 @@ BACKUP_MAX_AGE_H="${FAFNIR_BACKUP_MAX_AGE_HOURS:-36}"
 JOURNAL_SINCE="${FAFNIR_JOURNAL_SINCE:-2 days ago}"
 QUIET="no"
 
-ALL_SECTIONS=(status dq disk timers journal backups runs bandwidth slow)
+ALL_SECTIONS=(status dq disk timers journal backups runs bandwidth sharadar slow)
 
 usage() {
     cat <<'USAGE'
 Usage: scripts/monitor.sh [SECTION...] [options]
 
 Sections (default: all, in this order):
-  status     `fafnir status` -- securities, price rows, latest date, renames,
-             New (7d), open DQ count.
+  status     `fafnir status` -- the primary vendor, securities, New (7d) by
+             minting vendor, price rows, latest date, renames, open DQ count.
   dq         `fafnir dq list` -- the open quality queue by check and severity.
   disk       Free space on the Postgres data directory and the log/backup
              volumes. An out-of-space Postgres stops writing.
@@ -43,7 +47,10 @@ Sections (default: all, in this order):
   journal    Recent journal lines for the fafnir units.
   backups    Newest dump in the backup directory, and its age.
   runs       ops.ingestion_run rows in status failed/partial.
-  bandwidth  bytes_downloaded per month against the 50 GB FMP budget.
+  bandwidth  bytes_downloaded per month and vendor; FMP's against its 50 GB budget.
+  sharadar   The Sharadar night: the newest successful delta fetch, nightly
+             price load and file download, and the file ledger. Warns, in
+             Sharadar mode only, when last weeknight's night did not succeed.
   slow       Top queries by total time from pg_stat_statements.
 
 Options:
@@ -271,25 +278,86 @@ SQL
 
 # ------------------------------------------------------------- bandwidth ----
 sec_bandwidth() {
-    head_ "FMP bandwidth by month (Professional budget: 50 GB/month)"
+    head_ "Bandwidth by month and vendor (FMP Professional budget: 50 GB/month)"
     if ! psql_q -c '\x off' >/dev/null 2>&1; then
         say "    (no FAFNIR_DSN -- skipped)"
         return
     fi
     say "$(psql_q -P pager=off <<'SQL'
 SELECT to_char(date_trunc('month', started_at), 'YYYY-MM') AS month,
+       source                                              AS vendor,
        pg_size_pretty(sum(bytes_downloaded)::bigint)       AS downloaded,
        count(*)                                            AS runs
 FROM ops.ingestion_run
-GROUP BY 1 ORDER BY 1 DESC LIMIT 6;
+WHERE started_at >= date_trunc('month', now()) - interval '5 months'
+GROUP BY 1, 2 ORDER BY 1 DESC, 2;
 SQL
 )"
+    # FMP's budget is FMP's bytes: a Sharadar bulk download is not charged to it.
     local gb
     gb=$(psql_q -tAc "SELECT coalesce(sum(bytes_downloaded),0)/1073741824.0
                       FROM ops.ingestion_run
-                      WHERE started_at >= date_trunc('month', now());" 2>/dev/null)
+                      WHERE source = 'fmp'
+                        AND started_at >= date_trunc('month', now());" 2>/dev/null)
     if [[ -n "${gb}" ]] && awk -v g="${gb}" 'BEGIN{exit !(g > 40)}'; then
-        warn "$(printf '%.1f' "${gb}") GB downloaded this month -- close to the 50 GB budget."
+        warn "$(printf '%.1f' "${gb}") GB downloaded from FMP this month -- close to the 50 GB budget."
+    fi
+}
+
+# -------------------------------------------------------------- sharadar ----
+sec_sharadar() {
+    head_ "Sharadar (the night's freshness, the file ledger)"
+    local mode="${FAFNIR_PRIMARY_VENDOR:-}"
+    if [[ -z "${mode}" ]] && ! mode=$(fafnir config get primary_price_vendor 2>&1); then
+        warn "fafnir config get primary_price_vendor failed: ${mode}"
+        return
+    fi
+    say "    primary vendor: ${mode}"
+    if ! psql_q -c '\x off' >/dev/null 2>&1; then
+        say "    (no FAFNIR_DSN -- skipped)"
+        return
+    fi
+    say "$(psql_q -P pager=off <<'SQL'
+SELECT endpoint,
+       max(started_at)                            AS last_success,
+       date_trunc('minute', now() - max(started_at)) AS age
+FROM ops.ingestion_run
+WHERE source = 'sharadar' AND status = 'success'
+  AND (endpoint LIKE 'delta:%' OR endpoint LIKE 'bulk:%'
+       OR endpoint IN ('prices:nightly', 'universe', 'actions'))
+GROUP BY endpoint ORDER BY endpoint;
+SQL
+)"
+    say ""
+    say "$(psql_q -P pager=off <<'SQL'
+SELECT vendor_table, kind, count(*) AS files, sum(rows) AS rows,
+       pg_size_pretty(sum(bytes)) AS size, max(fetched_at) AS newest
+FROM landing.sharadar_file
+WHERE status = 'downloaded'
+GROUP BY 1, 2 ORDER BY 1, 2;
+SQL
+)"
+    local dir size
+    if dir=$(fafnir config get sharadar_bulk_dir 2>/dev/null) \
+       && size=$(du -sh "${dir}" 2>/dev/null | cut -f1) && [[ -n "${size}" ]]; then
+        say "    bulk_dir ${dir}: ${size}"
+    fi
+    [[ "${mode}" == "sharadar" ]] || return 0
+    # The night runs Mon-Fri (install_timers.sh), so the night that should have
+    # succeeded last is the previous weekday's, in New York: Friday's on a Monday.
+    local stale
+    stale=$(psql_q -tAc "
+        WITH t AS (SELECT (now() AT TIME ZONE 'America/New_York')::date AS today),
+        due AS (SELECT CASE extract(isodow FROM today)
+                         WHEN 1 THEN today - 3 WHEN 7 THEN today - 2
+                         ELSE today - 1 END AS d FROM t)
+        SELECT coalesce(max(started_at AT TIME ZONE 'America/New_York')::date
+                        < (SELECT d FROM due), true)
+          FROM ops.ingestion_run
+         WHERE source = 'sharadar' AND endpoint = 'prices:nightly'
+           AND status = 'success';" 2>/dev/null)
+    if [[ "${stale}" == "t" ]]; then
+        warn "No successful Sharadar night (prices:nightly) since the last weeknight -- check fafnir-daily and its runs."
     fi
 }
 

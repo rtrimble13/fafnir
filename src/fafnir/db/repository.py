@@ -2402,14 +2402,22 @@ def untrack_symbol(db: Database, *, symbol: str, source: str = "fmp") -> bool:
 
 def count_recent_listings(db: Database, days: int = 7) -> int:
     """Securities that entered scope in the last ``days`` days."""
-    return (
-        db.fetchval(
-            "SELECT count(*) FROM core.security "
-            "WHERE first_seen_at >= now() - make_interval(days => %s)",
+    return sum(recent_listings_by_source(db, days).values())
+
+
+def recent_listings_by_source(db: Database, days: int = 7) -> dict[str, int]:
+    """Securities that entered scope in the last ``days`` days, by the vendor that
+    minted them (``core.security.source``): FMP's screener before the cutover,
+    Sharadar's listings after it (#118)."""
+    return {
+        r["source"]: int(r["n"])
+        for r in db.fetchall(
+            "SELECT source, count(*) AS n FROM core.security "
+            "WHERE first_seen_at >= now() - make_interval(days => %s) "
+            "GROUP BY source ORDER BY source",
             (days,),
         )
-        or 0
-    )
+    }
 
 
 # ---------------------------------------------------------------------------

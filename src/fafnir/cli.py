@@ -7599,17 +7599,22 @@ def status(ctx):
             )
             or 0
         )
-        new_listings = repo.count_recent_listings(database, days=7)
+        new_by_source = repo.recent_listings_by_source(database, days=7)
         pending_renames = repo.count_unapplied_symbol_changes(database)
         rename_sample = repo.unapplied_symbol_changes(database, limit=10)
         sharadar = repo.vendor_status(
             database, "sharadar", order=("stocks", "funds", "fundamentals", "insiders")
         )
+    click.echo(f"Primary    : {_primary_line(ctx.obj['config'])}")
     click.echo(
         f"Securities : {counts.get('securities', 0)} "
         f"(active {counts.get('active', 0)}, delisted {counts.get('delisted', 0)})"
     )
-    click.echo(f"New (7d)   : {new_listings}")
+    new_line = f"New (7d)   : {sum(new_by_source.values())}"
+    if new_by_source:
+        # Who minted them: FMP's screener before the cutover, Sharadar's after.
+        new_line += " (" + ", ".join(f"{s} {n}" for s, n in new_by_source.items()) + ")"
+    click.echo(new_line)
     click.echo(f"Price rows : {price_rows}  (latest {latest})")
     click.echo(f"Actions    : {actions}")
     dq_line = f"Open DQ    : {open_flags}"
@@ -7630,6 +7635,17 @@ def status(ctx):
             )
     for line in _vendor_status_lines("Sharadar", sharadar):
         click.echo(line)
+
+
+def _primary_line(cfg) -> str:
+    """The night's mode, as `daily_update.sh` reads it (#111)."""
+    try:
+        primary = cfg.primary_price_vendor
+        if primary != "sharadar":
+            return primary
+        return f"sharadar (FMP secondary {'on' if cfg.fmp_secondary else 'off'})"
+    except ValueError as exc:
+        return f"invalid: {exc}"
 
 
 def _vendor_status_lines(label: str, st: dict) -> list[str]:

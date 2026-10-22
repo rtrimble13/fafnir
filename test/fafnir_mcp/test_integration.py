@@ -327,6 +327,38 @@ def test_landing_payload_requires_an_endpoint(db):
     assert "endpoint is required" in str(exc.value)
 
 
+def test_sharadar_files_lists_the_ledger_newest_first(db):
+    for n, (table, kind) in enumerate(
+        [("stocks", "full"), ("stocks", "delta"), ("funds", "delta")]
+    ):
+        repo.record_sharadar_file(
+            db,
+            vendor_table=table,
+            kind=kind,
+            filters={"lastupdated.gte": "2026-10-19"} if kind == "delta" else {},
+            path=f"{n:064x}.csv",
+            member=None,
+            sha256=f"{n:064x}",
+            nbytes=100 + n,
+            rows=10 + n,
+            columns=None,
+            ingestion_run_id=None,
+        )
+    every = T.sharadar_files(dsn=DSN)["rows"]
+    assert [(r["vendor_table"], r["kind"]) for r in every] == [
+        ("funds", "delta"),
+        ("stocks", "delta"),
+        ("stocks", "full"),
+    ]
+    sep = T.sharadar_files(dsn=DSN, table="SEP", kind="delta")["rows"]
+    assert [(r["rows"], r["filters"]) for r in sep] == [
+        (11, {"lastupdated.gte": "2026-10-19"})
+    ]
+    assert T.sharadar_files(dsn=DSN, status="deleted")["rows"] == []
+    with pytest.raises(ToolError, match="kind must be"):
+        T.sharadar_files(dsn=DSN, kind="slice")
+
+
 def test_schema_state_lists_applied_migrations(db):
     result = T.schema_state(dsn=DSN)
     versions = [row["version"] for row in result["rows"]]
