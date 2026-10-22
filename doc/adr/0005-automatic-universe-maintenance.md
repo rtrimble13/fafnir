@@ -7,6 +7,11 @@
   long-term answer is adopted by [ADR 0016](0016-sharadar-identity-and-survivorship-floor.md):
   Sharadar's permaticker, through `core.security_vendor_xref`. The sweeps below stay
   until cutover, and after it for rollback.
+- Note (2026-10-22): the sweeps' Sharadar successor is `fafnir ingest
+  sharadar-universe` (#93): renames, delistings and new listings resolved by the
+  permaticker's link, with the rename rules of this ADR (`repository.apply_rename`).
+  It runs from the cutover (#125); until then its dry run is compared with the
+  sweeps ([ingestion.md](../ingestion.md#sharadar-as-primary-universe-maintenance-93)).
 
 ## Context
 

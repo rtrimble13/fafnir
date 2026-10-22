@@ -1765,6 +1765,34 @@ def apply_symbol_change(
         # name. Retryable: the security master may catch up.
         return SymbolChangeOutcome(CHANGE_UNKNOWN, None)
 
+    return apply_rename(
+        db,
+        security_id=security_id,
+        old_symbol=old_symbol,
+        new_symbol=new_symbol,
+        change_date=change_date,
+        company_name=company_name,
+        source=source,
+    )
+
+
+def apply_rename(
+    db: Database,
+    *,
+    security_id: int,
+    old_symbol: str,
+    new_symbol: str,
+    change_date: date,
+    company_name: Optional[str] = None,
+    source: str = "fmp",
+) -> SymbolChangeOutcome:
+    """Move a security already resolved to its new ticker: the half of
+    :func:`apply_symbol_change` after it found the security by the old ticker.
+
+    Separate so a caller that resolves by another key can apply a rename the same
+    way: `ingest sharadar-universe` (#93) resolves through the security's Sharadar
+    link, not the ticker. ``applied`` or ``conflict``, with the reasons above.
+    """
     # Before the fold and before the free-ticker path: the shuffle this refuses
     # (ABCD -> ABCDU) is usually unblocked, either because ADR 0012 never mints the
     # unit or because the unit is still empty and would be folded away.
@@ -7061,6 +7089,34 @@ def vendor_events(
         """,
         (vendor, list(keys), list(actions)),
     )
+
+
+def vendor_events_since(
+    db: Database, vendor: str, actions: Sequence[str], since: date
+) -> list[dict]:
+    """The vendor's ``actions`` events dated on or after ``since``, oldest first
+    per key: what `ingest sharadar-universe` (#93) applies."""
+    return db.fetchall(
+        """
+        SELECT vendor_key, event_date, action, ticker, contra_ticker, contra_name
+          FROM core.vendor_security_event
+         WHERE vendor = %s AND action = ANY(%s) AND event_date >= %s
+         ORDER BY vendor_key, event_date, action
+        """,
+        (vendor, list(actions), since),
+    )
+
+
+def open_vendor_links(db: Database, vendor: str) -> dict[str, int]:
+    """``{vendor_key: security_id}`` for every open link to ``vendor``."""
+    return {
+        r["vendor_key"]: int(r["security_id"])
+        for r in db.fetchall(
+            "SELECT vendor_key, security_id FROM core.security_vendor_xref "
+            "WHERE vendor = %s AND valid_to IS NULL",
+            (vendor,),
+        )
+    }
 
 
 def insert_symbol_period(

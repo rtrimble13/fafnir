@@ -101,7 +101,13 @@ evaluates it.
 
 - **Rename and delisting handling changes owner at cutover.** Until then the FMP
   sweeps run as today and Sharadar's events are only stored. A difference between
-  the two during the overlap is what #122's dry-run criterion looks for.
+  the two during the overlap is what #122's dry-run criterion looks for:
+  `fafnir ingest sharadar-universe --dry-run` (#93) reports it. It applies
+  renames, delistings and new listings through the permaticker's link, and mints a
+  live listing only when no fafnir security trades under its ticker (link before
+  mint), the live counterpart of §3. A live listing may also be on TXSE, which
+  Sharadar lists and FMP's screener cannot reach. It must also pass ADR 0012's
+  instrument rule by ticker and name, as the FMP load applies it.
 - **4.8% of active non-fund securities stay FMP-identified** after linking: the
   2026-10-20 decision accepts that rather than triage each by hand. Their flags
   (`vendor_xref_unmatched`, `vendor_xref_ambiguous`) say why, and the nightly

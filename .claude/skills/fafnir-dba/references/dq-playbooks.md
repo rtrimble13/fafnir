@@ -949,6 +949,16 @@ SELECT f.detail->>'reason' AS reason,
 If neither fits, re-run `fafnir ingest symbol-changes`, which retries every
 non-terminal row.
 
+**From Sharadar** (`detail.source = 'sharadar'`, #93): `ingest sharadar-universe`
+resolved the rename through the security's Sharadar link and raises the same flag,
+with the same record_key, so the commands above apply.
+- **`detail.reason = ticker_mismatch:<T>`**: Sharadar says the linked security
+  moved from OLD to NEW, but fafnir has it on `<T>`. Either the link is wrong
+  (`vendor link show <T> --evaluate`, then `vendor link reject`), or fafnir missed
+  a rename: compare `core.symbol_change` for `<T>`.
+- **Closed by** the next `sharadar-universe` run, once the security is on the new
+  ticker, as the FMP sweep closes its own.
+
 **The sweep now closes this flag itself** when a retry applies the rename — in the
 same commit as the rename, matched on the `(old, new)` record_key — and clears
 leftovers from before that existed the next time it sees the terminal row. So a
@@ -1011,6 +1021,13 @@ Then `fafnir db refresh-marts`.
 
 **Never a bare `dq resolve`.** It frees the slot, the sweep asks the vendor again,
 and once the record is past its 60 days it is stamped by default.
+
+**From Sharadar** (`detail.source = 'sharadar'`, #93): `ingest sharadar-universe`
+found a `delisted` event the security's own stored bars contradict (`detail.reason`:
+`traded_after` or `precedes_first_bar`, with `first_bar`/`last_bar`). It declines the
+record the same way while the flag is open or accepted, so the same decisions
+apply. Check the link first: a wrong link puts another issuer's delisting on this
+security (`vendor link show <SYM> --evaluate`).
 
 **Close with:** `security venue-transfer` (accepts it) or `security delist`
 (resolves it).
