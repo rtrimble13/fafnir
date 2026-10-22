@@ -421,7 +421,8 @@ things differ from FMP's:
   the rounding clamp (v1.8.1) loads, and their flags stayed open: nothing re-checks
   a `price_*` flag. The condition is gone when the security holds a bar on the
   date. Resolve those by rule, first: it is bookkeeping, and it is most of the
-  queue.
+  queue. On the host, run 412 (v1.8.1) loaded every one of the 146,710, and they
+  were resolved on 2026-10-21; none was left to work by #81.
 - **Every re-run flags the rest again.** The loader writes through `add_dq_flag`,
   so a second `--backfill` run adds a second open flag for each bar it still
   refuses. Work them after the last backfill run. Several open flags on one
@@ -1215,6 +1216,13 @@ Written by `fafnir dq run --engine dorq` (or `both`) **only with `--no-shadow`**
 (dorq plan §8), dorq writes to `<dorq_shadow_dir>/<as-of>.jsonl` instead
 (`/var/lib/fafnir/dorq-shadow` on the host) and the queue carries none of these.
 `doc/dorq.md` covers the engine.
+
+**A shadow `--full` run replaces that night's file.** `dq run --engine dorq --full`
+writes `<as-of>.jsonl` for the market's latest session, which is the file the night's
+run already wrote. The next night's `dq compare` then measures "new per night" against
+a whole-history file, so that night's figure is meaningless. Copy the night's file
+aside before the run (the shadow directory is readable by `claude`), and say in the
+report which night is affected. See [dorq.md](../../../../doc/dorq.md#what-a-run-does).
 
 A `dorq_*` flag is not a threshold crossing. dorq weighed the explanations of a
 bar — a bad print, a scale error, an unreported split, a feed outage, a real move —

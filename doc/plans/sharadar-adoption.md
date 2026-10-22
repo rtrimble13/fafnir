@@ -259,8 +259,43 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-20 | **#64's gate recorded as it stands: 4.8% of active non-fund securities unlinked**, against the issue's < 1%. Every one carries a reason code, so P1's own criterion (≥ 99% linked *or explained*) holds. Further triage is not worth the effort: the residue is immaterial, and half of it is duplicate rows of linked issuers. The 126 identifier links without price support are kept, at their low confidence | #64 |
 | 2026-10-20 | **Sharadar is the more reliable vendor for identity linking.** FMP's history disagreeing with Sharadar's is a correction to make, not a reason to withhold a link: `vendor link` links on the latest sample or a shared identifier when the history disagrees, and flags the history `vendor_history_disagrees`. The identity evidence must still not rest on FMP's history | #62 |
 | 2026-10-21 | **Screens are actively trading only by default.** With thousands of dead issuers in `mart.security_latest`, `duk ls` screens and the MCP `screen_securities` tool return actively trading securities unless `--include-delisted` / `include_delisted=true` (or `is_actively_trading=false`, only delisted). The warehouse still retains every one; plain `duk ls` and single-company reads are unchanged | #79 |
+| 2026-10-21 | **Volume convention: `keep`.** Corrected bars keep FMP's volume. On bars whose closes agree, FMP's volume over Sharadar's has a median of 1.0, with 88.5% within 1% and 94.9% within 5% | #69, #75, #77 |
+| 2026-10-21 | **The first correction is limited to linked securities with no split on file.** That is 11,088 securities, and 589,256 bars corrected (run 415). A sample of the dry run's differing bars showed whole-split-factor and ADR-ratio differences where Sharadar is not always the right side. The 4,470 split-bearing securities wait for a bar-level rule, and their 763 `vendor_history_disagrees` flags stay open | #75, #77 |
+| 2026-10-22 | **Dead-history outliers beyond §2k are accepted by an operator bulk rule.** One rule covers a move that comes back within 10 bars; the other a move that does not, but fails the §2d unreported-split test with no split within 120 days. 19,703 were accepted, and 699 stay open for split or dividend review. This is a decision for this population, recorded in the sweep policy, not a standing licence | #81 |
 
 ## [built] notes
+
+- **2026-10-22 · P2, #76, #77, #79, #80, #81: the backfill closed out on the host.** On v1.8.4, migrations
+  through 0034. Counts are on each issue; the skill's lessons are in
+  [fafnir-dba skill enhancements, 2026-10-22](fafnir-dba-skill-enhancements-2026-10-22.md).
+  - **#77, the backfill:**
+    - **Sequence and timings** are now in [backfill.md](../backfill.md#the-dead-issuer-backfill-on-the-production-host-77):
+      mint 17 s, prices 67 min, actions 9 min, corrections 49 min, dorq `--full` 6 min.
+    - **Bars:** Sharadar now holds 19,910,449 = 3,741,428 (run 403) + 15,579,765 (run 412) + 589,256
+      corrected from FMP. Actions: 4,921 splits and 95,548 dividends.
+    - **Size:** the new bars are about 3.3 GB at 173 B a bar, and the database is 22 GB.
+    - **Level checks:** Lehman, Bear Stearns, Enron and Sun's 1:4 reverse split match published closes, raw and
+      adjusted. Washington Mutual is **not minted**: it is held back by `vendor_history_overlap`, its samples
+      disagree with the FMP `WM` row, and the repair is a mint with `--allow-overlap`.
+  - **#76, measured:** 33,906 outliers on 6,345 of 11,927 dead issuers; `gap` and `sparse_coverage` 0 on
+    complete histories; dorq `--full` 6,849 reports on 2,674. The policy held. §2k needed the bulk rule above.
+    Closed.
+  - **#79, survivorship:** 30,962 Sharadar securities in scope, 27,474 held.
+    - Every gap has a reason: 2,546 dead issuers held back by overlap flags, and 942 live names unlinked (826
+      outside fafnir's FMP universe).
+    - 894 FMP-linked histories start later by design, because gap-fill fills from the link's `valid_from`.
+    - Closed.
+  - **#80, acceptance:** `CC@2008-06-30` resolves to Circuit City and `CC@2020-06-30` to Chemours. Closed.
+  - **#81, triage:**
+    - 33,324 flags closed in eight batches, each dry-run and approved; the queue went from 51,277 conditions to
+      17,953.
+    - Left open with reasons: `vendor_history_overlap` 4,206, `vendor_history_disagrees` 763,
+      `sharadar_split_ratio_mismatch` 226, and on dead histories 699 outliers, 115 `dividend_no_prior_close`,
+      5 `dividend_exceeds_price` and 1 `split_duplicate_suspect`.
+  - **Next:**
+    - the 2,546 held-back dead issuers (`--allow-overlap` mints, by agreement class);
+    - a bar-level rule for correcting the split-bearing securities;
+    - the split review of the 226 mismatches and 699 outliers.
 
 - **2026-10-22 · P3, #93: Sharadar-driven universe maintenance.** `fafnir ingest sharadar-universe
   [--dry-run] [--since D]` applies Sharadar's renames, delistings and new listings, resolved by the
