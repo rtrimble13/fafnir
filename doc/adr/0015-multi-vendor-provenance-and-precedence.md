@@ -76,6 +76,11 @@ Which vendor loads a security's *new* rows is decided by a rule, not inferred fr
   `core.security_vendor_xref` whose `is_feed` is true (#55).
 - At cutover, `fafnir vendor feed --vendor sharadar --all-linked` moves `is_feed`
   from FMP to Sharadar; flipping it back is the rollback (#98, #111).
+  - **As built (#98):** FMP's predicate became "minted by FMP and fed by no other
+    vendor" (`repo.fmp_fed`). Setting a Sharadar or Tiingo feed therefore takes a
+    security out of FMP's universes at once, and `vendor feed --vendor fmp` clears
+    the links to give it back. The duplicate-identity check keeps "minted by FMP"
+    (`FMP_MINTED_SECURITY`).
 - One vendor feeds a security's new rows at a time.
 - Operator-minted securities (`security split-history`) are fed by nobody,
   unchanged.

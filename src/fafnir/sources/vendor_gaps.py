@@ -100,7 +100,7 @@ def _universe(db: Database) -> list[dict]:
                  WHERE p.security_id = s.security_id
                  ORDER BY p.trade_date DESC LIMIT 1) AS last_bar
           FROM core.security s
-         WHERE s.{repo.FMP_FED_SECURITY}
+         WHERE {repo.fmp_fed("s.")}
            AND {repo.nightly_universe("s.")}
         """)
 

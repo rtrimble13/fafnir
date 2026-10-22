@@ -782,7 +782,7 @@ def duplicate_symbol_groups(
     # shares its ticker with the issuer it was split off by design, and a security
     # another vendor minted may share it with an unrelated issuer: neither is a
     # duplicate FMP minted.
-    symbol_clause = f"WHERE s.{FMP_FED_SECURITY}"
+    symbol_clause = f"WHERE s.{FMP_MINTED_SECURITY}"
     if symbol:
         symbol_clause += " AND s.primary_symbol = %s"
         params.append(symbol.upper())
@@ -803,7 +803,7 @@ def duplicate_symbol_groups(
             SELECT s.security_id, s.primary_symbol, s.first_seen_at::date AS seen,
                    s.delisted_date, s.company_name
               FROM core.security s JOIN dup USING (primary_symbol)
-             WHERE s.{FMP_FED_SECURITY}
+             WHERE s.{FMP_MINTED_SECURITY}
         )
         SELECT r.security_id, r.primary_symbol, r.seen, r.delisted_date,
                r.company_name,
@@ -4226,7 +4226,7 @@ def set_override_reason(
 #
 # The destination is either an existing security (the old issuer is already held
 # elsewhere) or a row minted here with source = 'operator'. An operator-minted
-# security is never fed by the FMP loaders -- see FMP_FED_SECURITY -- because the
+# security is never fed by the FMP loaders -- see fmp_fed -- because the
 # ticker it carries now belongs to someone else: a per-symbol pull for it would
 # fetch the new issuer's history into the old issuer's row.
 
@@ -4236,10 +4236,30 @@ def set_override_reason(
 # issuer's bars into it: an operator-minted one holds a history split off a ticker
 # FMP has since given to someone else, and one another vendor minted (a Sharadar dead
 # issuer) shares a ticker with whoever trades under it today. Every FMP universe,
-# per-symbol guard and FMP-only ticker check applies this predicate. Until
-# core.security_vendor_xref exists (#55), the minting vendor is the whole rule.
+# per-symbol guard and FMP-only ticker check applies this predicate.
+#
+# And not once another vendor feeds it (#98): `fafnir vendor feed` gives a security
+# a feeding link (is_feed) in core.security_vendor_xref, and from then that vendor
+# loads its new rows, not FMP. ADR 0015 §2 allows one feeding vendor per security.
 FMP_SOURCE = "fmp"
-FMP_FED_SECURITY = f"source = '{FMP_SOURCE}'"
+#: The securities FMP minted, fed or not: what the duplicate-identity check and
+#: `security dedupe` look among, since FMP minting two rows for one ticker is a
+#: duplicate whichever vendor feeds them now.
+FMP_MINTED_SECURITY = f"source = '{FMP_SOURCE}'"
+
+
+def fmp_fed(alias: str = "core.security.") -> str:
+    """The predicate for the securities FMP feeds: minted by FMP, and with no
+    feeding link to another vendor. ``alias`` qualifies ``core.security``'s columns
+    (``"s."``); the default suits an unaliased ``FROM core.security``."""
+    return (
+        f"({alias}source = '{FMP_SOURCE}' AND NOT EXISTS ("
+        "SELECT 1 FROM core.security_vendor_xref fx "
+        f"WHERE fx.security_id = {alias}security_id "
+        "AND fx.is_feed AND fx.valid_to IS NULL))"
+    )
+
+
 #: Vendors whose feed is an explicit link in core.security_vendor_xref (#55).
 LINKED_VENDORS = ("sharadar", "tiingo")
 
@@ -4300,7 +4320,8 @@ _SPLIT_ACTION_FIELDS = (
 def is_fed_by(db: Database, security_id: int, vendor: str) -> bool:
     """True when ``vendor``'s loaders may write this security's new rows (ADR 0015 §2).
 
-    FMP feeds the securities it minted (:data:`FMP_FED_SECURITY`). Any other vendor
+    FMP feeds the securities it minted that no other vendor feeds
+    (:func:`fmp_fed`). Any other vendor
     feeds the securities with an open link to it in ``core.security_vendor_xref``
     whose ``is_feed`` is true (#55); the table allows one such feeding link per
     security. An unknown ``security_id`` is fed by nobody, and so is an
@@ -4309,8 +4330,8 @@ def is_fed_by(db: Database, security_id: int, vendor: str) -> bool:
     if vendor == FMP_SOURCE:
         return bool(
             db.fetchval(
-                "SELECT source = %s FROM core.security WHERE security_id = %s",
-                (FMP_SOURCE, security_id),
+                f"SELECT {fmp_fed()} FROM core.security WHERE security_id = %s",
+                (security_id,),
             )
         )
     if vendor not in LINKED_VENDORS:
@@ -4331,7 +4352,7 @@ def is_fed_by(db: Database, security_id: int, vendor: str) -> bool:
 def fmp_price_universe(db: Database, *, include_inactive: bool = False) -> list[str]:
     """The tickers `fafnir ingest prices` pulls when no ``--symbols`` are given.
 
-    Securities FMP feeds (:data:`FMP_FED_SECURITY`), in ``security_id`` order. The
+    Securities FMP feeds (:func:`fmp_fed`), in ``security_id`` order. The
     nightly run wants the trading names only (:func:`nightly_universe`, ADR 0014); a
     historical backfill passes ``include_inactive``, since a universe of survivors is
     what makes a history survivorship-biased. Even then a security another vendor
@@ -4341,7 +4362,7 @@ def fmp_price_universe(db: Database, *, include_inactive: bool = False) -> list[
     return [
         r["primary_symbol"]
         for r in db.fetchall(
-            f"SELECT primary_symbol FROM core.security WHERE {FMP_FED_SECURITY} "
+            f"SELECT primary_symbol FROM core.security WHERE {fmp_fed()} "
             f"{where}ORDER BY security_id"
         )
     ]
@@ -5492,7 +5513,7 @@ def securities_without_actions_watermark(
                 AND w.source = %s
                 AND w.endpoint = %s
          WHERE w.security_id IS NULL
-           AND s.{FMP_FED_SECURITY}
+           AND {fmp_fed("s.")}
            {where}
          ORDER BY s.security_id
         """,
@@ -5517,7 +5538,7 @@ def universe_securities(db: Database, *, include_inactive: bool = False) -> list
     where = f"AND {nightly_universe()} " if not include_inactive else ""
     rows = db.fetchall(f"""
         SELECT security_id, primary_symbol FROM core.security
-         WHERE {FMP_FED_SECURITY}
+         WHERE {fmp_fed()}
         {where}
         ORDER BY security_id
         """)
@@ -5543,7 +5564,7 @@ def securities_by_asset_type(
         f"""
         SELECT security_id, primary_symbol FROM core.security
          WHERE asset_type = ANY(%s)
-           AND {FMP_FED_SECURITY}
+           AND {fmp_fed()}
            {where}
          ORDER BY security_id
         """,
@@ -5572,7 +5593,7 @@ def actions_reconciliation_slice(
         f"""
         SELECT security_id, primary_symbol FROM core.security
          WHERE security_id %% %s = %s
-           AND {FMP_FED_SECURITY}
+           AND {fmp_fed()}
            {where}
          ORDER BY security_id
         """,

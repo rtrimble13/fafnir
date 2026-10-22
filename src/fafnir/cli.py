@@ -4864,6 +4864,102 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit, sample
                 click.echo(f"  {str(key):<40} {n}")
 
 
+@vendor.command("feed")
+@click.option(
+    "--vendor",
+    "vendor_name",
+    required=True,
+    type=click.Choice(["sharadar", "tiingo", "fmp"]),
+    help="The vendor to feed the securities in scope (fmp: the rollback).",
+)
+@click.option("--all-linked", is_flag=True, help="Every security linked to the vendor.")
+@click.option("--funds", is_flag=True, help="The linked securities that are funds.")
+@click.option(
+    "--security-id",
+    "security_ids",
+    multiple=True,
+    type=int,
+    metavar="ID",
+    help="These securities. Repeatable.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Report what would change; write nothing."
+)
+@click.option("--by", "by", help="Who  [default: the OS user running the command]")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def vendor_feed(ctx, vendor_name, all_linked, funds, security_ids, dry_run, by, yes):
+    """Choose which vendor loads a security's new rows (ADR 0015 §2, #98).
+
+    \b
+      fafnir vendor feed --vendor sharadar --all-linked --dry-run
+      fafnir vendor feed --vendor tiingo --funds
+      fafnir vendor feed --vendor fmp --all-linked          # the rollback
+
+    One vendor feeds a security at a time. Sharadar or Tiingo: sets the feed on
+    each in-scope security's open link to that vendor, clearing any other first; a
+    security FMP was feeding leaves FMP's universes. One with no open link is
+    reported, never linked (`vendor link` decides that). FMP: clears the feeds of
+    the securities FMP minted, so FMP loads them again; a security another vendor
+    minted keeps its feed. No price or action row changes. Recorded as an
+    ingestion run (endpoint feed) with who made it and what it changed.
+    """
+    from collections import Counter
+
+    from fafnir.ingest import vendor_feed as vf
+
+    cfg = ctx.obj["config"]
+    ids = list(security_ids) if security_ids else None
+    who = by or _os_user()
+    with Database(cfg.dsn) as database:
+
+        def run(dry):
+            return vf.feed(
+                database,
+                vendor_name,
+                all_linked=all_linked,
+                funds=funds,
+                security_ids=ids,
+                by=who,
+                dry_run=dry,
+            )
+
+        try:
+            preview = run(True)
+            result = preview
+            changing = len(preview.changed())
+            if not dry_run and changing:
+                if not yes:
+                    click.confirm(
+                        f"Move the feed of {changing} securities to {vendor_name}?",
+                        abort=True,
+                    )
+                result = run(False)
+        except vf.FeedError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    if dry_run:
+        head = "Dry run: nothing written."
+    elif not result.changed():
+        head = "Nothing to change."
+    else:
+        head = f"Run {result.run_id}, by {who}."
+    counts = result.counts()
+    click.echo(
+        f"{head} Feed to {vendor_name}: "
+        + ", ".join(f"{n} {outcome}" for outcome, n in sorted(counts.items()))
+    )
+    for c in result.changes:
+        if c.outcome in ("no_link", "not_fmp_minted"):
+            click.echo(f"  {c.outcome:<15} {c.symbol} (security {c.security_id})")
+    moved = Counter(c.previous or "none" for c in result.changes if c.previous)
+    if moved:
+        click.echo(
+            "  previously fed by: "
+            + ", ".join(f"{v} {n}" for v, n in sorted(moved.items()))
+        )
+
+
 @vendor.group("corrections")
 def vendor_corrections():
     """Rows one vendor replaced in place of another's (ops.vendor_correction)."""
