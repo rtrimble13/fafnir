@@ -59,10 +59,16 @@ Write a plain-text email body, at most 40 lines. Structure:
 2. "What ran" -- each nightly unit (daily update, DQ sweep, dump, offsite
    backup), whether it succeeded, and how long it took. Note anything that
    did not run at all, and say when that is expected (reconcile is weekly).
+   VENDOR MODE says which night the daily update ran: FMP's, or Sharadar's
+   (with FMP as secondary when fmp_secondary is true). In Sharadar mode, say
+   whether the night's prices:nightly run succeeded, from the SHARADAR
+   section, and name any "!!" line there.
 3. "Data quality" -- the open DQ queue, error severity first. Lead with what
    MOVED against the previous run; raw totals alone are not news. price_*
    checks repeat per re-detection by design, so their flag counts are not
    counts of distinct problems -- report their security counts instead.
+   Name the vendor checks (vendor_* and sharadar_split_ratio_mismatch)
+   apart: they are the two vendors disagreeing, not the market moving.
 4. "Vendor gaps" -- the securities in the VENDOR GAPS section, one line
    each (symbol, last bar, sessions behind), or "none". Say which are new
    since the previous run. These are for an FMP ticket, not a DQ resolve.

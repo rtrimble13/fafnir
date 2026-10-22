@@ -331,7 +331,8 @@ scripts/monitor.sh            # all of the below in one pass; non-zero if any tr
 `scripts/monitor.sh` exists because the checks in this section are spread across
 the fafnir CLI, the OS and psql, which makes them easy to half-do at 8am. It runs
 the lot — status, the DQ queue, disk, timers, journal, backup age, failed runs,
-FMP bandwidth, `pg_stat_statements` — and reports; it changes nothing. Narrow it
+bandwidth by vendor, the Sharadar night, `pg_stat_statements` — and reports; it
+changes nothing. Narrow it
 with section names (`scripts/monitor.sh disk timers backups`) or `--quiet` to see
 only what tripped.
 
@@ -382,8 +383,14 @@ Things to watch:
     the `core.vendor_security_event` row count.
   - **The last load** is the newest `master:*` run. A status other than `success`
     there is a failed load: its `error_message` in `ops.ingestion_run` says why.
-- **New listings** — the `New (7d)` line. A week of zero on a working FMP key means
-  the security-master step is not running, and the universe is quietly going stale.
+- **New listings** — the `New (7d)` line, with the vendor that minted them: FMP's
+  screener before the cutover, Sharadar's listings after it. A week of zero on a
+  working key means the universe step is not running, and the universe is quietly
+  going stale. The `Primary` line above it names the night's mode.
+- **The Sharadar night** — `scripts/monitor.sh sharadar` lists the newest
+  successful delta fetch, nightly price load and file download, and the file ledger
+  by table. In Sharadar mode it warns when the last weeknight's `prices:nightly` did
+  not succeed. The night runs Mon–Fri, so on a Monday that is Friday's.
 - **Freshness** — `fafnir status` latest date should track the last trading day.
   Stale securities raise `stale` DQ flags.
 - **Quarantine spikes** — a jump in `ops.data_quality_flag` (warn/error) on a load
@@ -410,11 +417,12 @@ Things to watch:
   consistent and passes every structural check. The deep-history spot check in
   [backfill.md §7](backfill.md#7-verify) is the one that catches it; it is worth
   re-running after any change to the price loader.
-- **Bandwidth** — sum `ops.ingestion_run.bytes_downloaded` over the month against
-  the 50 GB FMP budget:
+- **Bandwidth** — sum `ops.ingestion_run.bytes_downloaded` over the month, by
+  vendor. The 50 GB budget is FMP's, so only FMP's bytes count against it; a
+  Sharadar bulk download is not charged to it:
   ```sql
-  SELECT date_trunc('month', started_at) AS m, sum(bytes_downloaded)
-  FROM ops.ingestion_run GROUP BY 1 ORDER BY 1;
+  SELECT date_trunc('month', started_at) AS m, source, sum(bytes_downloaded)
+  FROM ops.ingestion_run GROUP BY 1, 2 ORDER BY 1, 2;
   ```
 - **Failed runs** —
   ```sql

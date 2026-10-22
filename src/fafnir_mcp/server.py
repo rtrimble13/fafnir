@@ -311,6 +311,26 @@ def _register_ops_tools(server, dsn: str) -> None:
 
     @server.tool()
     @_surfaced
+    def sharadar_files(
+        table: Optional[str] = None,
+        kind: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """The Sharadar file ledger, newest first: which bulk files and nightly
+        deltas landed, when, from what request, with how many rows and bytes.
+
+        table is stocks, funds, actions, tickers, fundamentals (or SEP, SFP, SF1);
+        kind is full or delta; status is downloaded, superseded or deleted. The
+        rows are in the files, not the database: this says whether tonight's delta
+        landed, not what a bar was.
+        """
+        return T.sharadar_files(
+            dsn=dsn, table=table, kind=kind, status=status, limit=limit
+        )
+
+    @server.tool()
+    @_surfaced
     def schema_state() -> dict:
         """Applied migrations: is this host running the schema the repo expects?"""
         return T.schema_state(dsn=dsn)

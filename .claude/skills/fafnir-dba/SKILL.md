@@ -157,7 +157,8 @@ a revoke that in fact left the security with none.
 | Individual flags, with `detail` and past resolutions | `dq_queue` |
 | Working the queue in bulk — cohort size, repeat closures | `dq_triage` |
 | Correlate flags across securities/dates | `sql_read` |
-| What the vendor actually sent | `landing_payload` |
+| What the vendor actually sent | `landing_payload` (FMP's payloads) |
+| Which Sharadar files landed: bulk, nightly delta | `sharadar_files` |
 | Which step ran long, what failed, bandwidth | `ingestion_runs` |
 | Whether a symbol has stopped advancing | `watermarks` |
 | One security, end to end | `security_profile` |

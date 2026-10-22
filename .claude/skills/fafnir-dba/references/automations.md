@@ -122,7 +122,7 @@ Or via the tools: `ingestion_runs(since=…)` and `ingestion_runs(status="failed
 Host side — all read-only, safe to run freely:
 
 ```bash
-scripts/monitor.sh                     # all nine sections; non-zero if any tripped
+scripts/monitor.sh                     # all ten sections; non-zero if any tripped
 scripts/monitor.sh disk timers backups # or narrow it
 scripts/monitor.sh --quiet             # only what tripped
 systemctl list-timers 'fafnir-*'
@@ -130,7 +130,11 @@ journalctl -u fafnir-daily -n 200 --no-pager
 fafnir status
 ```
 
-`monitor.sh` sections: `status dq disk timers journal backups runs bandwidth slow`.
+`monitor.sh` sections: `status dq disk timers journal backups runs bandwidth sharadar slow`.
+`bandwidth` is by vendor, and FMP's budget counts FMP's bytes alone. `sharadar`
+shows the newest delta fetch, nightly load and file download, and the file ledger.
+In Sharadar mode it warns when the last weeknight's `prices:nightly` did not
+succeed.
 It changes nothing, by design — it exists because these checks are spread across
 the fafnir CLI, the OS and psql, which makes them easy to half-do at 8am.
 
@@ -162,11 +166,12 @@ a round lot: never a conflict; the stored volume is kept and counted in
 
 ## The two budgets
 
-**Bandwidth** — 50 GB/month on the FMP Professional plan:
+**Bandwidth** — 50 GB/month on the FMP Professional plan, counted in FMP's bytes
+alone (`source = 'fmp'`); Sharadar's downloads are their own:
 
 ```sql
-SELECT date_trunc('month', started_at) AS m, sum(bytes_downloaded)
-  FROM ops.ingestion_run GROUP BY 1 ORDER BY 1;
+SELECT date_trunc('month', started_at) AS m, source, sum(bytes_downloaded)
+  FROM ops.ingestion_run GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
 **Requests** — the actual constraint on the nightly window, and dominated by one

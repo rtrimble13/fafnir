@@ -265,6 +265,26 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-22 · P3, #118: operations tooling for more than one vendor.** The issue was edited first. Shadow
+  capture and reconciliation were folded away (#53, #66), there is no staging, and an install that starts
+  from Sharadar would need a mint for live securities that does not exist.
+  - **`monitor.sh`:**
+    - **A `sharadar` section** shows the newest successful delta fetch, nightly load and file download, and the
+      file ledger by table. It warns only in Sharadar mode, when the last *weeknight's* `prices:nightly`
+      failed. The night runs Mon–Fri, so a fixed age would cry wolf every Monday.
+    - **`bandwidth`** is split by vendor, and FMP's 50 GB budget counts FMP's bytes alone.
+  - **`fafnir status`** gains a `Primary` line and `New (7d)` by minting vendor.
+  - **Nightly report:**
+    - **Evidence.** A `VENDOR MODE` section is read as fafnir and handed to `monitor.sh sharadar`.
+    - **Prompt.** The model says whether the Sharadar night succeeded, and names the vendor DQ checks
+      apart.
+  - **MCP.** A new ops-only tool, `sharadar_files`, lists the ledger. `landing_payload` keeps its one-payload
+    contract.
+  - **`install_hetzner.md`** says the install starts from FMP, and points to backfill.md for Sharadar.
+  - **Tests:**
+    - `monitor.sh` against the test database: the warning by mode, and the budget by vendor;
+    - a `collect_facts.sh` smoke test;
+    - the MCP profile and integration tests.
 - **2026-10-22 · P3, #111: the vendor switch in `daily_update.sh`.** The script reads `fafnir config get
   primary_price_vendor`, a new subcommand that prints only the settings scripts branch on.
   - **`fmp`** runs today's night, unchanged.
