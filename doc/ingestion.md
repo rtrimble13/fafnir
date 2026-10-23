@@ -600,6 +600,42 @@ fafnir vendor correct                    # after the volume decision
 fafnir vendor corrections list --limit 20
 ```
 
+**The split-bearing securities** (`--split-bearing`) are what the first correction
+left out: the FMP-minted securities linked to Sharadar, fed or not, that hold
+Sharadar's splits. Those are the splits FMP never listed, which `sharadar-actions`
+added. FMP's history before such a split is often already divided by it.
+
+CELG's 2003–2013 bars are an example. They are exactly half Sharadar's as-traded
+closes, and match after its 2014 2:1. The adjusted series then divides them twice.
+Of 149 such splits checked on 2026-10-23, 93 showed it with that one split's factor:
+Sharadar's own as-traded close jumps by the factor across the date, and FMP's price
+before it sits exactly that factor below. About nine more sit the product of
+several later splits below (GMCR's 1/13.5).
+
+- **A bar is explained** when FMP's close times Π, the product of the stored
+  Sharadar splits after it, meets Sharadar's recovered close within 0.5%, a cent,
+  or FMP's 6-dp rounding at Π.
+- **A stretch between two such splits** is corrected only when at least 90% of its
+  compared bars are explained. Only the explained bars are replaced. A stretch that
+  differs for another reason, such as an ADR's ratio or another instrument, is
+  counted (`split_bearing:stretch_left`) and left. Sharadar is not always the
+  right side of those.
+- **The vendor's volume.** A corrected bar takes the vendor's recovered volume,
+  not FMP's: the exception to the `keep` convention. FMP's volume is pre-adjusted
+  with its prices. CELG's FMP median volume is 4.27M before the 2014 split and
+  4.35M after, where an as-traded series halves before. `--volume keep` is refused.
+- **Uncovered bars.** An FMP bar in an explained stretch on a date the vendor does
+  not hold, before the link or in one of its gaps, is counted
+  (`split_bearing:uncovered`) and not touched.
+- **Bars after the last such split** (`split_bearing:no_split_after`) are this
+  mode's to skip. The first correction already compared them.
+
+```bash
+fafnir ingest sharadar-actions --prune-outside-span     # first: only in-span splits count
+fafnir vendor correct --split-bearing --dry-run
+fafnir vendor correct --split-bearing
+```
+
 ### Splits and dividends from Sharadar (#73)
 
 `fafnir ingest sharadar-actions` reads the ledger's current ACTIONS file and writes

@@ -7133,6 +7133,48 @@ def action_dates(db: Database, security_ids: Sequence[int]) -> list[dict]:
     return out
 
 
+def stored_split_values(
+    db: Database, security_ids: Sequence[int], source: str
+) -> dict[int, list[tuple[date, Decimal]]]:
+    """``security_id -> [(ex_date, new shares per old)]`` of the stored splits one
+    source wrote, in date order: on an FMP-minted security, Sharadar's are the
+    splits FMP never listed (`vendor correct --split-bearing`)."""
+    out: dict[int, list[tuple[date, Decimal]]] = {}
+    ids = list(security_ids)
+    for i in range(0, len(ids), 5000):
+        for r in db.fetchall(
+            """
+            SELECT security_id, ex_date, split_numerator / split_denominator AS value
+              FROM core.corporate_action
+             WHERE security_id = ANY(%s) AND action_type = 'split' AND source = %s
+               AND split_numerator > 0 AND split_denominator > 0
+             ORDER BY security_id, ex_date
+            """,
+            (ids[i : i + 5000], source),
+        ):
+            out.setdefault(int(r["security_id"]), []).append(
+                (r["ex_date"], Decimal(r["value"]))
+            )
+    return out
+
+
+def source_dates(
+    db: Database, security_id: int, source: str, start: date, end: date
+) -> set[date]:
+    """The dates in ``[start, end)`` on which ``source`` holds the bar."""
+    return {
+        r["trade_date"]
+        for r in db.fetchall(
+            """
+            SELECT trade_date FROM core.daily_price
+             WHERE security_id = %s AND source = %s
+               AND trade_date >= %s AND trade_date < %s
+            """,
+            (security_id, source, start, end),
+        )
+    }
+
+
 def vendor_events(
     db: Database, vendor: str, keys: Sequence[str], actions: Sequence[str]
 ) -> list[dict]:

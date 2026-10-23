@@ -4897,9 +4897,15 @@ def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
 @click.option(
     "--volume",
     type=click.Choice(["keep", "sharadar"]),
-    default="keep",
-    show_default=True,
-    help="A corrected bar's volume: FMP's, or Sharadar's",
+    default=None,
+    help="A corrected bar's volume: FMP's, or Sharadar's [default: keep; "
+    "--split-bearing: sharadar]",
+)
+@click.option(
+    "--split-bearing",
+    is_flag=True,
+    help="The FMP-minted securities holding Sharadar's splits, fed or not: replace "
+    "only the bars FMP pre-adjusted for those splits.",
 )
 @click.option(
     "--no-adjust",
@@ -4907,12 +4913,13 @@ def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
     help="Do not recompute the factors of the corrected securities.",
 )
 @click.pass_context
-def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
+def vendor_correct(ctx, symbols, dry_run, volume, split_bearing, no_adjust):
     """Replace the FMP bars that disagree with Sharadar's, audited (#75).
 
     \b
       fafnir vendor correct --dry-run       # the comparison report (#69's)
       fafnir vendor correct
+      fafnir vendor correct --split-bearing --dry-run
       fafnir vendor corrections list        # what it replaced; `revert` undoes one
 
     For every FMP security linked to Sharadar, compares its bars with Sharadar's,
@@ -4925,6 +4932,13 @@ def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
     every date it samples agrees. One ops.ingestion_run (sharadar/correct), its
     progress written every minute. The files are grouped by ticker on disk first,
     as for `ingest sharadar-prices`: allow about 4 GB free under bulk_dir.
+
+    --split-bearing takes the FMP-minted securities linked to Sharadar, fed or not,
+    that hold Sharadar's splits (the splits FMP never listed). It replaces a bar only
+    when FMP's close times the product of those splits after it meets Sharadar's
+    recovered close within 0.5%: FMP's history pre-adjusted for them. It does so
+    only in a stretch between two such splits where 90% of the compared bars are
+    explained, and takes the vendor's volume. The rest is counted and left.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_prices as sp
@@ -4948,6 +4962,7 @@ def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
                 dry_run=dry_run,
                 volume=volume,
                 adjust=not no_adjust,
+                split_bearing=split_bearing,
             )
         except (sp.PricesError, FileNotFoundError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
