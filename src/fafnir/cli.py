@@ -4993,9 +4993,12 @@ def vendor_correct(ctx, symbols, dry_run, volume, split_bearing, no_adjust):
     --split-bearing takes the FMP-minted securities linked to Sharadar, fed or not,
     that hold Sharadar's splits (the splits FMP never listed). It replaces a bar only
     when FMP's close times the product of those splits after it meets Sharadar's
-    recovered close within 0.5%: FMP's history pre-adjusted for them. It does so
-    only in a stretch between two such splits where 90% of the compared bars are
-    explained, and takes the vendor's volume. The rest is counted and left.
+    recovered close within 0.5%: FMP's history pre-adjusted for them. A stretch
+    between two such splits where 90% of the compared bars are explained is
+    corrected whole: every compared bar from the vendor, with its volume, and FMP's
+    bars on dates the vendor lacks rescaled by the same factor, as one revertible
+    edit (`fafnir override revoke`). Other stretches are counted and left; the dry
+    run lists the securities whose left bars differ from the vendor's.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_prices as sp
@@ -5056,6 +5059,19 @@ def vendor_correct(ctx, symbols, dry_run, volume, split_bearing, no_adjust):
             f"{100 * summary['within_1pct']:.1f}% within 1%, "
             f"{100 * summary['within_5pct']:.1f}% within 5%"
         )
+    left = sorted(
+        ((sym, c) for sym, c in result.split_bearing_by.items() if c["left_differ"]),
+        key=lambda x: (-x[1]["left_differ"], x[0]),
+    )
+    if left:
+        click.echo(
+            f"Left, differing from the vendor ({len(left)} securities; the first 25): "
+            "symbol, bars left, bars corrected, bars rescaled"
+        )
+        for sym, c in left[:25]:
+            click.echo(
+                f"  {sym:<8} {c['left_differ']:>8} {c['explained']:>8} {c['rescaled']:>8}"
+            )
     if not dry_run and result.corrected_security_ids:
         click.echo(f"  factors recomputed for {result.adjusted} securities")
 

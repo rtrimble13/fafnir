@@ -31,10 +31,25 @@ it, :func:`sharadar_map.split_product_after`, meets Sharadar's recovered close w
 those splits is corrected only when at least 90% of its compared bars are explained,
 so a chance match never patches a stretch that differs for another reason (an ADR's
 ratio, another instrument). Sharadar is not always the right side of those, and they
-are counted and left. A corrected bar takes the vendor's recovered volume, because
-FMP's volume is pre-adjusted with its prices. An FMP bar in an explained stretch on a
-date the vendor does not hold, before the link or in a gap, is counted
-(``split_bearing:uncovered``), not touched.
+are counted and left, split into the bars that already agree with the vendor
+(``left_agree``: FMP was as traded, the split on file is right) and the ones that do
+not (``left_differ``).
+
+An explained stretch is corrected whole, so it stays one series:
+
+- **every compared bar** is replaced by Sharadar's, the few unexplained ones too
+  (``bar_replaced_unexplained``). In a stretch FMP is known to have pre-adjusted, an
+  FMP bar left as it is would sit ``Π`` times off its neighbours;
+- **FMP's bars on dates the vendor does not hold** (before the link, in a gap, or a
+  vendor bar that does not recover) are rescaled by ``Π``, the volume by ``1/Π``.
+  This uses :func:`price_edits.plan_rescale_bars`, the operator rescale's own
+  checks, as one edit per stretch, revertible with `fafnir override revoke`
+  (``uncovered_rescaled``). If that edit would be refused (a bar the loader would
+  quarantine at the new scale), the whole stretch is left (``stretch_refused``),
+  because correcting part of it would leave a break.
+
+A corrected bar takes the vendor's recovered volume, because FMP's volume is
+pre-adjusted with its prices.
 
 ``--dry-run`` writes nothing and is the comparison report (#69's): bars compared and
 bars that would be replaced, by asset type, exchange and decade, and the volume
@@ -60,7 +75,7 @@ from typing import Mapping, Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
-from fafnir.ingest import adjustments, sharadar_map
+from fafnir.ingest import adjustments, price_edits, sharadar_map
 from fafnir.ingest import sharadar_prices as sp
 from fafnir.ingest.daily_price import _is_nav_priced, _validate_bar
 from fafnir.ingest.runlog import RunLog
@@ -137,6 +152,9 @@ class CorrectResult:
     corrected_security_ids: set[int] = field(default_factory=set)
     flags_resolved: int = 0
     adjusted: int = 0
+    #: --split-bearing: per symbol, ``explained`` (bars replaced), ``rescaled`` and
+    #: ``left_differ``: what the dry run lists for review.
+    split_bearing_by: dict = field(default_factory=lambda: defaultdict(Counter))
 
     def add_volume_ratio(self, ratio: float) -> None:
         """Count one FMP/Sharadar volume ratio; keep a reservoir sample of them."""
@@ -254,15 +272,16 @@ def _compare_split_bearing(
     agreed: dict,
     sampled: Mapping[int, frozenset],
 ) -> None:
-    """``--split-bearing`` for one security: correct its FMP bars that are Sharadar's
-    divided by the product of the stored Sharadar ``splits`` after them, one stretch
-    between those splits at a time."""
+    """``--split-bearing`` for one security: one stretch between the stored Sharadar
+    ``splits`` at a time, correct whole the stretches where FMP's bars are Sharadar's
+    divided by the product of those splits after them."""
     samples = sampled.get(t.security_id, frozenset())
     rows = [r for r in rows if t.valid_from <= r["date"] <= as_of]
     stored = repo.stored_bars_on(db, t.security_id, [r["date"] for r in rows])
     profile = repo.security_price_profile(db, t.security_id) or {}
     nav_only = _is_nav_priced(profile.get("asset_type"), profile.get("is_fund"))
     ex_dates = [d for d, _ in splits]
+    tally = result.split_bearing_by[t.symbol]
     stretches: dict[date, list] = defaultdict(list)  # keyed by the next split
     for r in rows:
         old = stored.get(r["date"])
@@ -282,43 +301,88 @@ def _compare_split_bearing(
             result.counts[f"vendor_invalid:{reason}"] += 1
             continue
         nxt = min(d for d in ex_dates if d > r["date"])
-        stretches[nxt].append((old, new, explained(old, new, product)))
-    fixes = []
+        stretches[nxt].append((old, new, factor, explained(old, new, product)))
+    fixes, plans = [], []
     for nxt, items in stretches.items():
         ok = sum(1 for *_, e in items if e)
         result.counts["split_bearing:compared"] += len(items)
         if ok < SEGMENT_SHARE * len(items):
+            agree = sum(1 for old, new, f, _ in items if not differs(old, new, f))
             result.counts["split_bearing:stretch_left"] += 1
-            result.counts["split_bearing:bars_left"] += len(items)
+            if agree:
+                result.counts["split_bearing:left_agree"] += agree
+            if agree < len(items):
+                result.counts["split_bearing:left_differ"] += len(items) - agree
+                tally["left_differ"] += len(items) - agree
             continue
+        # Explained: the FMP bars the vendor does not hold join the edit too.
+        product = sharadar_map.split_product_after(splits, items[0][0]["trade_date"])
+        before = max((d for d in ex_dates if d < nxt), default=date.min)
+        covered = {old["trade_date"] for old, *_ in items}
+        uncovered = repo.source_dates(db, t.security_id, repo.FMP_SOURCE, before, nxt)
+        uncovered -= covered
+        plan = None
+        if uncovered:
+            bars = [
+                b
+                for b in repo.stored_bars(
+                    db, t.security_id, min(uncovered), max(uncovered)
+                )
+                if b["trade_date"] in uncovered
+            ]
+            plan = price_edits.plan_rescale_bars(
+                db, t.security_id, bars, product, 1 / product
+            )
+            if plan.refusals:
+                result.counts["split_bearing:stretch_refused"] += 1
+                result.counts["split_bearing:bars_refused"] += len(items)
+                logger.warning(
+                    "%s: stretch before %s left, its rescale refused: %s",
+                    t.symbol,
+                    nxt,
+                    "; ".join(plan.refusals),
+                )
+                continue
+            plans.append((nxt, product, plan))
+            result.counts["split_bearing:uncovered_rescaled"] += len(plan.changes)
+            tally["rescaled"] += len(plan.changes)
         result.counts["split_bearing:stretch_explained"] += 1
         if ok < len(items):
-            result.counts["split_bearing:bar_unexplained"] += len(items) - ok
-        covered = set()
-        for old, new, e in items:
-            covered.add(old["trade_date"])
-            if e:
-                new["security_id"] = t.security_id
-                fixes.append(new)
-        before = max((d for d in ex_dates if d < nxt), default=date.min)
-        uncovered = repo.source_dates(db, t.security_id, repo.FMP_SOURCE, before, nxt)
-        result.counts["split_bearing:uncovered"] += len(uncovered - covered)
+            result.counts["split_bearing:bar_replaced_unexplained"] += len(items) - ok
+        for old, new, _, _ in items:
+            new["security_id"] = t.security_id
+            fixes.append(new)
+        tally["explained"] += len(items)
     result.counts["differ"] += len(fixes)
-    if run is None or not fixes:
+    if run is None or not (fixes or plans):
         return
-    written = repo.upsert_daily_prices(
-        db,
-        fixes,
-        ingestion_run_id=run.run_id,
-        source=VENDOR,
-        correct=True,
-        reason="reconcile_divergence",
-    )
-    result.counts["skipped_suppressed"] += written.skipped_suppressed
-    result.corrected += written.corrected
-    if written.corrected:
+    for nxt, product, plan in plans:
+        price_edits.apply_plan(
+            db,
+            plan,
+            note=(
+                f"vendor correct --split-bearing, run {run.run_id}: FMP's bars before "
+                f"the Sharadar split of {nxt} are pre-adjusted by x{1 / product:g}; "
+                "the vendor holds no bar on these dates, so they are rescaled by the "
+                "factor their neighbours were corrected by."
+            ),
+            created_by=CREATED_BY,
+        )
         result.corrected_security_ids.add(t.security_id)
-        agreed[t.security_id] |= {f["trade_date"] for f in fixes} & samples
+    if fixes:
+        written = repo.upsert_daily_prices(
+            db,
+            fixes,
+            ingestion_run_id=run.run_id,
+            source=VENDOR,
+            correct=True,
+            reason="reconcile_divergence",
+        )
+        result.counts["skipped_suppressed"] += written.skipped_suppressed
+        result.corrected += written.corrected
+        if written.corrected:
+            result.corrected_security_ids.add(t.security_id)
+            agreed[t.security_id] |= {f["trade_date"] for f in fixes} & samples
     db.commit()
 
 

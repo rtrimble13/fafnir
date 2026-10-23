@@ -616,17 +616,25 @@ several later splits below (GMCR's 1/13.5).
   Sharadar splits after it, meets Sharadar's recovered close within 0.5%, a cent,
   or FMP's 6-dp rounding at Π.
 - **A stretch between two such splits** is corrected only when at least 90% of its
-  compared bars are explained. Only the explained bars are replaced. A stretch that
-  differs for another reason, such as an ADR's ratio or another instrument, is
-  counted (`split_bearing:stretch_left`) and left. Sharadar is not always the
-  right side of those.
+  compared bars are explained. A stretch below that is counted
+  (`split_bearing:stretch_left`) and left. Its bars are split into `left_agree`
+  (FMP was as traded, so the split on file is right) and `left_differ` (an ADR's
+  ratio, another instrument: Sharadar is not always the right side of those). The
+  dry run lists the securities with `left_differ` bars.
+- **An explained stretch is corrected whole**, so it stays one series:
+  - Every compared bar is replaced by Sharadar's, the few unexplained ones too
+    (`bar_replaced_unexplained`). Left as they were, they would sit Π times off
+    their neighbours.
+  - FMP's bars on dates the vendor does not hold (before the link, in a gap, or a
+    vendor bar that will not recover) are rescaled by Π, and their volume by 1/Π.
+    This is one `prices rescale`-style edit per stretch (`uncovered_rescaled`),
+    undone whole by `fafnir override revoke <edit>`.
+  - If that edit would be refused, the stretch is left whole (`stretch_refused`). A
+    refusal is a bar the loader would quarantine at the new scale.
 - **The vendor's volume.** A corrected bar takes the vendor's recovered volume,
   not FMP's: the exception to the `keep` convention. FMP's volume is pre-adjusted
   with its prices. CELG's FMP median volume is 4.27M before the 2014 split and
   4.35M after, where an as-traded series halves before. `--volume keep` is refused.
-- **Uncovered bars.** An FMP bar in an explained stretch on a date the vendor does
-  not hold, before the link or in one of its gaps, is counted
-  (`split_bearing:uncovered`) and not touched.
 - **Bars after the last such split** (`split_bearing:no_split_after`) are this
   mode's to skip. The first correction already compared them.
 

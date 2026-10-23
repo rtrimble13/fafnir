@@ -350,24 +350,33 @@ def test_split_bearing_corrects_only_the_bars_fmp_pre_adjusted(db, tmp_path):
         "split_bearing:compared": 6,
         "split_bearing:stretch_explained": 1,
         "split_bearing:stretch_left": 1,
-        "split_bearing:bars_left": 3,
+        "split_bearing:left_differ": 3,  # ZZT: FMP differs, not by the split
         "split_bearing:no_split_after": 2,
-        "split_bearing:uncovered": 1,  # ZZS's 06-20, before the link
+        "split_bearing:uncovered_rescaled": 1,  # ZZS's 06-20, before the link
     }
     assert plan.counts["differ"] == 3
+    assert dict(plan.split_bearing_by["ZZT"]) == {"left_differ": 3}
     assert _bars(db, zzs)[Y(2014, 6, 23)]["close"] == D("50")  # nothing written
 
     result = vc.correct(db, tmp_path, split_bearing=True, as_of=Y(2026, 1, 2))
     assert result.corrected == 3
     bars = _bars(db, zzs)
     assert [(bars[d]["close"], bars[d]["source"]) for d in sorted(bars)] == [
-        (D("49"), "fmp"),  # before the link: left, and counted
+        (D("98"), "operator"),  # before the link: rescaled with its stretch
         (D("100"), "sharadar"),
         (D("101"), "sharadar"),
         (D("98"), "sharadar"),
         (D("51"), "fmp"),  # the split's own day: FMP was right
     ]
     assert bars[Y(2014, 6, 23)]["volume"] == 100  # the vendor's, recovered raw
+    assert bars[Y(2014, 6, 20)]["volume"] == 200  # FMP's 400, by 1/2
+    (edit,) = db.fetchall(
+        "SELECT operation, created_by, note FROM ops.operator_override "
+        "WHERE security_id = %s AND target = 'daily_price' AND operation = 'add'",
+        (zzs,),
+    )
+    assert edit["created_by"] == vc.CREATED_BY
+    assert "rescaled by the factor" in edit["note"]
     assert {r["close"] for r in _bars(db, zzt).values()} == {
         D("70"),
         D("71"),
@@ -412,4 +421,63 @@ def test_the_split_bearing_command(db, tmp_path, monkeypatch):
     assert out.exit_code == 0, out.output
     assert "Dry run: nothing written. 2 linked securities;" in out.output
     assert "3 bars differ" in out.output
-    assert "split_bearing:uncovered" in out.output
+    assert "split_bearing:uncovered_rescaled" in out.output
+    assert "Left, differing from the vendor (1 securities" in out.output
+    assert "  ZZT " in out.output
+
+
+@integration
+def test_an_explained_stretch_is_corrected_whole(db, tmp_path, monkeypatch):
+    """Two of three bars explained (at a lowered threshold): the third is replaced
+    too, rather than left at half its neighbours. A stretch where FMP is already as
+    traded is left, and counted as agreeing."""
+    days = [Y(2014, 6, 23), Y(2014, 6, 24), Y(2014, 6, 25), Y(2014, 6, 26)]
+    zzs = _split_security(
+        db, "ZZS", "900041", list(zip(days, ["50", "50.5", "60", "51"]))
+    )
+    _split_security(db, "ZZV", "900042", list(zip(days, ["100", "101", "98", "51"])))
+    sep = PRICES
+    for t in ("ZZS", "ZZV"):
+        sep += (
+            _sbar(t, "2014-06-23", "50", "100")
+            + _sbar(t, "2014-06-24", "50.5", "101")
+            + _sbar(t, "2014-06-25", "49", "98")
+            + _sbar(t, "2014-06-26", "51", "51", volume=100)
+        )
+    _file(db, tmp_path, "stocks", sep)
+    _file(
+        db,
+        tmp_path,
+        "actions",
+        ACTIONS + "2014-06-26,split,ZZS,ZZS Co,2,,\n2014-06-26,split,ZZV,ZZV Co,2,,\n",
+    )
+    monkeypatch.setattr(vc, "SEGMENT_SHARE", D("0.6"))
+    result = vc.correct(db, tmp_path, split_bearing=True, as_of=Y(2026, 1, 2))
+    counts = {k: v for k, v in result.counts.items() if k.startswith("split_bearing")}
+    assert counts["split_bearing:bar_replaced_unexplained"] == 1
+    assert counts["split_bearing:left_agree"] == 3  # ZZV: as traded already
+    assert "split_bearing:left_differ" not in counts
+    assert result.corrected == 3
+    assert _bars(db, zzs)[Y(2014, 6, 25)]["close"] == D("98")  # FMP's 60 replaced
+
+
+@integration
+def test_a_rescaled_stretch_reverts_with_its_edit(db, tmp_path, monkeypatch):
+    zzs, _ = _split_setup(db, tmp_path)
+    vc.correct(db, tmp_path, split_bearing=True, as_of=Y(2026, 1, 2))
+    edit = db.fetchval(
+        "SELECT detail->'transform'->>'edit' FROM ops.operator_override "
+        "WHERE security_id = %s AND target = 'daily_price' AND operation = 'add'",
+        (zzs,),
+    )
+    assert _bars(db, zzs)[Y(2014, 6, 20)]["close"] == D("98")
+    monkeypatch.setenv("FAFNIR_DSN", db.dsn)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(f'[sharadar]\nbulk_dir = "{tmp_path}"\n')
+    out = CliRunner().invoke(
+        cli.main,
+        ["--config", str(rc), "override", "revoke", edit, "-m", "test", "--yes"],
+    )
+    assert out.exit_code == 0, out.output
+    bar = _bars(db, zzs)[Y(2014, 6, 20)]
+    assert (bar["close"], bar["source"], bar["volume"]) == (D("49"), "fmp", 400)
