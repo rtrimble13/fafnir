@@ -660,6 +660,56 @@ def _count_missing(
         result.by_date[day.isoformat()][outcome] += 1
 
 
+def _count_unserved(
+    db: Database, result: NightlyResult, security_ids: Optional[Sequence[int]]
+) -> None:
+    """The fed securities the vendor's master prices on the newest date the files
+    hold that still have no bar on it, once the night is written: ``unserved``.
+
+    TICKERS can name a day its price table does not yet hold (on 2026-10-23, 49
+    funds and a stock), so a missing bar is not always a lost one. It is a count to
+    watch night on night, with the securities in the log, not a flag."""
+    days = [d for d in result.by_date if d != "revisions"]
+    if not days:
+        return
+    day = date.fromisoformat(max(days))
+    rows = db.fetchall(
+        """
+        SELECT DISTINCT s.primary_symbol
+          FROM core.security_vendor_xref x
+          JOIN core.security s ON s.security_id = x.security_id
+          JOIN core.vendor_security v
+            ON v.vendor = x.vendor AND v.vendor_key = x.vendor_key
+           AND v.vendor_table = ANY(%s)
+         WHERE x.vendor = %s AND x.is_feed AND x.valid_to IS NULL
+           AND v.last_price_date >= %s
+           AND (%s::bigint[] IS NULL OR x.security_id = ANY(%s::bigint[]))
+           AND NOT EXISTS (SELECT 1 FROM core.daily_price p
+                            WHERE p.security_id = x.security_id AND p.trade_date = %s)
+         ORDER BY 1
+        """,
+        (
+            list(TABLES),
+            VENDOR,
+            day,
+            None if security_ids is None else list(security_ids),
+            None if security_ids is None else list(security_ids),
+            day,
+        ),
+    )
+    if not rows:
+        return
+    symbols = [r["primary_symbol"] for r in rows]
+    result.counts["unserved"] += len(symbols)
+    result.by_date[day.isoformat()]["unserved"] += len(symbols)
+    logger.warning(
+        "%d fed securities the vendor's master prices on %s have no bar on it: %s",
+        len(symbols),
+        day,
+        " ".join(symbols[:50]) + (" ..." if len(symbols) > 50 else ""),
+    )
+
+
 def nightly(
     db: Database,
     bulk_dir: str | Path,
@@ -752,6 +802,7 @@ def nightly(
         _flag_mismatches(db, keys, run=run, result=result)
         if run is None:
             return
+        _count_unserved(db, result, security_ids)
         run.rows_inserted = result.written
         run.params.pop("progress", None)
         run.params.update(

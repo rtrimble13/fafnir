@@ -1391,7 +1391,9 @@ primary*), the queue changes shape. Judge it by these, not by the FMP-era habits
   (`revised` in the `prices:nightly` run's `counts`) and leave no flag. A new one
   is on a security FMP still feeds as the secondary: a fund, or an unlinked name.
 - **`stale` on a fed security means the nightly did not reach it.** Check the
-  newest `prices:nightly` run first, then `monitor.sh sharadar`. `fafnir source
+  newest `prices:nightly` run first: its `unserved` count is the fed securities the
+  vendor's master prices on the night's newest date that got no bar, named in the
+  run's log. Then check `monitor.sh sharadar`. `fafnir source
   vendor-gaps` is FMP's view (`repo.fmp_fed`): a fed security is never in it.
 - **`sharadar_split_ratio_mismatch` on the capture day** means the vendor's
   `closeunadj / close` is not 1 on the newest bar. Usually a split is in SEP before

@@ -27,10 +27,12 @@ loaded into ``core`` here: the loaders (#55, #58, #75) read the files through
 vendor stamped ``lastupdated`` on or after a date, from the table API
 (:func:`fetch_delta`). The date defaults to when the table's newest file was
 fetched, less ``DELTA_OVERLAP_DAYS``, so a revision stamped the day the last file
-was fetched is read again rather than missed. The rows are written as a plain CSV in
-the bulk file's column order, named by its content, and recorded with ``kind =
-'delta'``: one run per table (``endpoint = delta:<table>``). A delta with no rows is
-not recorded.
+was fetched is read again rather than missed. The rows are read in date order,
+never by offset (:meth:`SharadarClient.query_by_date`), and a (ticker, date) that
+comes back twice fails the table: it is how rows lost to paging show. The rows are
+written as a plain CSV in the bulk file's column order, named by its content, and
+recorded with ``kind = 'delta'``: one run per table (``endpoint = delta:<table>``).
+A delta with no rows is not recorded.
 """
 
 from __future__ import annotations
@@ -65,6 +67,9 @@ DELTA_TABLES = ("SEP", "SFP")
 API_TABLE = {"stocks": "SEP", "funds": "SFP"}
 #: How far a delta reaches back before its table's newest file was fetched.
 DELTA_OVERLAP_DAYS = 3
+#: Where a delta's date window starts. A revision restamps a security's whole
+#: history, so a row stamped yesterday can be dated in any year the tables hold.
+DELTA_FIRST_DATE = date(1900, 1, 1)
 
 
 @dataclass
@@ -294,7 +299,12 @@ def fetch_delta(
     try:
         with run:
             before = client.bytes_downloaded
-            rows = client.query(API_TABLE[vendor_table], filters)
+            rows = client.query_by_date(
+                API_TABLE[vendor_table],
+                filters,
+                start=DELTA_FIRST_DATE,
+                end=date.today() + timedelta(days=1),
+            )
             run.bytes_downloaded = client.bytes_downloaded - before
             stale = [
                 r
@@ -307,6 +317,13 @@ def fetch_delta(
                     f"{vendor_table}: {len(stale)} of {len(rows)} rows were stamped "
                     f"before {since} (first {stale[0].get('ticker')} "
                     f"{stale[0].get('date')}): the lastupdated filter was not applied"
+                )
+            keys = {(r.get("ticker"), str(r.get("date"))[:10]) for r in rows}
+            if len(keys) < len(rows):
+                raise SourceError(
+                    f"{vendor_table}: {len(rows) - len(keys)} of {len(rows)} rows "
+                    "repeat a (ticker, date): the reads overlapped, so as many rows "
+                    "may be missing"
                 )
             run.params["rows"] = len(rows)
             if not rows:
