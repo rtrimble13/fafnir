@@ -240,3 +240,176 @@ def test_the_command(db, tmp_path, monkeypatch):
     out = run()
     assert out.exit_code == 0, out.output
     assert "1 corrected, 1 vendor_history_disagrees flags resolved" in out.output
+
+
+# ---------------------------------------------------------------------------
+# --split-bearing
+# ---------------------------------------------------------------------------
+
+ACTIONS = "date,action,ticker,name,value,contraticker,contraname\n"
+
+
+def test_explained_is_fmps_close_times_the_splits_after_it():
+    fmp = {"close": D("22.639")}
+    assert vc.explained(fmp, {"close": D("45.278")}, D("2"))  # CELG's 2003 bar
+    assert not vc.explained(fmp, {"close": D("45.278")}, D("1"))
+    assert not vc.explained(fmp, {"close": D("50")}, D("2"))  # 9% off: another cause
+    # A reverse split: FMP's pre-adjusted close is the larger one.
+    assert vc.explained({"close": D("26440")}, {"close": D("6.61")}, D("0.00025"))
+
+
+def _sbar(ticker, day, close, unadj, volume=200):
+    """A SEP row: OHLC and volume split-adjusted, closeunadj as traded."""
+    return (
+        f"{ticker},{day},{close},{close},{close},{close},{volume},{close},{unadj},"
+        f"{day}\n"
+    )
+
+
+def _split_security(db, symbol, key, fmp_closes, *, split=True):
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    sid = repo.upsert_security(
+        db, primary_symbol=symbol, company_name=f"{symbol} Co", exchange_code="NYSE"
+    )
+    db.execute(
+        "INSERT INTO core.vendor_security (vendor, vendor_table, vendor_key, ticker) "
+        "VALUES ('sharadar', 'stocks', %s, %s)",
+        (key, symbol),
+    )
+    repo.insert_vendor_link(
+        db,
+        security_id=sid,
+        vendor="sharadar",
+        vendor_key=key,
+        valid_from=Y(2014, 6, 23),
+        match_method="ticker_span_price",
+        confidence=None,
+        evidence={},
+        created_by="tester",
+        is_feed=True,  # the cutover fed every linked security
+    )
+    repo.upsert_daily_prices(
+        db, [_fmp_bar(sid, day, close, volume=400) for day, close in fmp_closes]
+    )
+    if split:  # the 2:1 FMP never listed, which the gap-fill added
+        repo.upsert_corporate_action(
+            db,
+            security_id=sid,
+            action_type="split",
+            ex_date=Y(2014, 6, 26),
+            split_numerator=D(2),
+            split_denominator=D(1),
+            source="sharadar",
+        )
+    return sid
+
+
+def _split_setup(db, tmp_path):
+    days = [Y(2014, 6, 23), Y(2014, 6, 24), Y(2014, 6, 25), Y(2014, 6, 26)]
+    # ZZS: FMP's bars before the split are Sharadar's as-traded halved.
+    zzs = _split_security(
+        db,
+        "ZZS",
+        "900031",
+        [(Y(2014, 6, 20), "49")]  # before the link: FMP's alone
+        + list(zip(days, ["50", "50.5", "49", "51"])),
+    )
+    # ZZT: FMP differs before the split, but not by it.
+    zzt = _split_security(
+        db, "ZZT", "900032", list(zip(days, ["70", "71", "72", "51"]))
+    )
+    # ZZU: no Sharadar split, so not a target.
+    _split_security(db, "ZZU", "900033", list(zip(days, ["10"] * 4)), split=False)
+    sep = PRICES
+    for t in ("ZZS", "ZZT"):
+        sep += (
+            _sbar(t, "2014-06-23", "50", "100")
+            + _sbar(t, "2014-06-24", "50.5", "101")
+            + _sbar(t, "2014-06-25", "49", "98")
+            + _sbar(t, "2014-06-26", "51", "51", volume=100)
+        )
+    sep += "".join(_sbar("ZZU", d.isoformat(), "10", "10") for d in days)
+    _file(db, tmp_path, "stocks", sep)
+    _file(
+        db,
+        tmp_path,
+        "actions",
+        ACTIONS + "2014-06-26,split,ZZS,ZZS Co,2,,\n2014-06-26,split,ZZT,ZZT Co,2,,\n",
+    )
+    return zzs, zzt
+
+
+@integration
+def test_split_bearing_corrects_only_the_bars_fmp_pre_adjusted(db, tmp_path):
+    zzs, zzt = _split_setup(db, tmp_path)
+    plan = vc.correct(
+        db, tmp_path, dry_run=True, split_bearing=True, as_of=Y(2026, 1, 2)
+    )
+    assert plan.securities == 2  # not ZZU, which holds no Sharadar split
+    assert {k: v for k, v in plan.counts.items() if k.startswith("split_bearing")} == {
+        "split_bearing:compared": 6,
+        "split_bearing:stretch_explained": 1,
+        "split_bearing:stretch_left": 1,
+        "split_bearing:bars_left": 3,
+        "split_bearing:no_split_after": 2,
+        "split_bearing:uncovered": 1,  # ZZS's 06-20, before the link
+    }
+    assert plan.counts["differ"] == 3
+    assert _bars(db, zzs)[Y(2014, 6, 23)]["close"] == D("50")  # nothing written
+
+    result = vc.correct(db, tmp_path, split_bearing=True, as_of=Y(2026, 1, 2))
+    assert result.corrected == 3
+    bars = _bars(db, zzs)
+    assert [(bars[d]["close"], bars[d]["source"]) for d in sorted(bars)] == [
+        (D("49"), "fmp"),  # before the link: left, and counted
+        (D("100"), "sharadar"),
+        (D("101"), "sharadar"),
+        (D("98"), "sharadar"),
+        (D("51"), "fmp"),  # the split's own day: FMP was right
+    ]
+    assert bars[Y(2014, 6, 23)]["volume"] == 100  # the vendor's, recovered raw
+    assert {r["close"] for r in _bars(db, zzt).values()} == {
+        D("70"),
+        D("71"),
+        D("72"),
+        D("51"),
+    }
+    audit = db.fetchall(
+        "SELECT key_date, old_source, new_source FROM ops.vendor_correction "
+        "ORDER BY key_date"
+    )
+    assert [(a["key_date"], a["old_source"], a["new_source"]) for a in audit] == [
+        (d, "fmp", "sharadar") for d in (Y(2014, 6, 23), Y(2014, 6, 24), Y(2014, 6, 25))
+    ]
+    run = repo.last_successful_run(db, "sharadar", "correct")
+    assert run["params"]["split_bearing"] is True
+    # Corrected, the stretch has nothing left to explain.
+    again = vc.correct(db, tmp_path, split_bearing=True, as_of=Y(2026, 1, 2))
+    assert again.corrected == 0
+
+
+@integration
+def test_split_bearing_refuses_fmps_volume(db, tmp_path):
+    with pytest.raises(ValueError, match="pre-adjusted with its prices"):
+        vc.correct(db, tmp_path, split_bearing=True, volume="keep")
+
+
+@integration
+def test_the_split_bearing_command(db, tmp_path, monkeypatch):
+    _split_setup(db, tmp_path)
+    monkeypatch.setenv("FAFNIR_DSN", db.dsn)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(f'[sharadar]\nbulk_dir = "{tmp_path}"\n')
+
+    def run(*args):
+        return CliRunner().invoke(
+            cli.main, ["--config", str(rc), "vendor", "correct", *args]
+        )
+
+    out = run("--split-bearing", "--volume", "keep", "--dry-run")
+    assert out.exit_code != 0 and "pre-adjusted with its prices" in out.output
+    out = run("--split-bearing", "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert "Dry run: nothing written. 2 linked securities;" in out.output
+    assert "3 bars differ" in out.output
+    assert "split_bearing:uncovered" in out.output
