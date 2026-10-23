@@ -1102,13 +1102,23 @@ the table API for the rows stamped `lastupdated` on or after a date.
 - **Revisions reach far back.** The vendor restamps a security's history when it
   adjusts it, for a split or a dividend (the probe's item 9). One day of SFP
   (measured 2026-10-22) was 33,022 rows on four pages, dated across a year.
+- **The reads** go in date order, never by offset. The API orders one date's rows
+  differently on each request, so offset paging lost the rows of any date a page
+  boundary split, and repeated as many others: on the first night, 2,569 of SEP's
+  and 3,261 of SFP's rows dated 10-19 and 10-21. Each request now asks for the rows
+  from a date on, `sort=date`. It keeps every date before the last one a full page
+  reaches, and the next request starts at that last date, so one request reads each
+  date whole. The order and the window are checked in the rows that come back. A
+  single date of 10,000 rows or more cannot be read this way and fails the table.
 - **The file** is written as a plain CSV in the bulk file's column order, named
   `<sha256>.csv` under `[sharadar] bulk_dir`. It is recorded in
   `landing.sharadar_file` with `kind = 'delta'` and `filters = {"lastupdated.gte":
   …}`.
 - **Edge cases.** A row stamped before the date means the filter was not applied,
-  and the table fails. A delta with no rows is not recorded, and the same content
-  twice is one file. Each table is one run (`endpoint = delta:<table>`).
+  and the table fails. So does a (ticker, date) that comes back twice: reads that
+  overlapped, and as many rows missing. A delta with no rows is not recorded, and
+  the same content twice is one file. Each table is one run (`endpoint =
+  delta:<table>`).
 
 **The nightly price load.** `fafnir ingest sharadar-prices --nightly` reads the
 delta files recorded since the last successful nightly. Its run (`endpoint =
@@ -1127,6 +1137,13 @@ feeds:
 - **Another party's bar is left alone** (`kept:<source>`). A security `vendor feed`
   gave to Sharadar keeps the FMP history it had; replacing those bars is `vendor
   correct`'s job.
+
+Once the night is written, `unserved` counts the fed securities that the vendor's
+master (TICKERS' `lastpricedate`) says it priced on the newest date the files hold
+but that have no bar on it. The run's log names them. TICKERS can be ahead of the
+price tables: on 2026-10-23 it named 49 funds and a stock whose 10-22 rows SFP and
+SEP did not yet hold. So it is a count to watch from night to night, not a flag. A
+security that stays in it for several nights has stopped being served.
 
 The bars pass the backfill's gates. Raw prices are recovered from ACTIONS: on the
 capture day the vendor's ratio must be 1, or the security is flagged

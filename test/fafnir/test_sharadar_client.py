@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import date as Y
 
 import pytest
 import requests
@@ -176,6 +177,96 @@ def test_paging_that_never_ends_is_refused(monkeypatch):
     pages = [_page(i, 1) for i in range(3)]
     with pytest.raises(SourceError, match="belongs in a bulk download"):
         _client(*pages).query("SEP", max_pages=3)
+
+
+class _Reshuffling(_Session):
+    """A dated table as the vendor served it on 2026-10-23: newest date first unless
+    ``sort=date``, ``from``/``to`` applied, and one date's rows in the opposite
+    order on every other request. Either rule can be switched off."""
+
+    def __init__(self, rows, *, honour_sort=True, honour_window=True):
+        super().__init__()
+        self.rows = rows
+        self.honour_sort = honour_sort
+        self.honour_window = honour_window
+
+    def get(self, url, params=None, headers=None, **kw):
+        p = dict(params or {})
+        self.calls.append((url, p))
+        rows = list(self.rows)
+        if self.honour_window:
+            rows = [
+                r
+                for r in rows
+                if p.get("from", "") <= r["date"] <= p.get("to", "9999-12-31")
+            ]
+        rows.sort(key=lambda r: r["ticker"], reverse=len(self.calls) % 2 == 0)
+        ascending = self.honour_sort and p.get("sort") == "date"
+        rows.sort(key=lambda r: r["date"], reverse=not ascending)  # stable: ties keep
+        offset = int(p.get("offset", 0))
+        return _Resp(body=rows[offset : offset + int(p["limit"])])
+
+
+DAYS = ("2026-10-19", "2026-10-20", "2026-10-21")
+DATED = [{"ticker": t, "date": d} for d in DAYS for t in "ABC"]
+
+
+def _keys(rows):
+    return sorted((r["date"], r["ticker"]) for r in rows)
+
+
+def test_offset_paging_loses_the_rows_a_reshuffled_date_splits(monkeypatch):
+    # Why the delta does not use query(): what this pins is the vendor's behaviour.
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 4)
+    c = SharadarClient(KEY, rate_per_min=10_000)
+    c._session = _Reshuffling(DATED)
+    rows = c.query("SEP")
+    assert len(rows) == 9 and len(set(_keys(rows))) == 7
+
+
+def test_query_by_date_reads_every_row_once_without_an_offset(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 4)
+    c = SharadarClient(KEY, rate_per_min=10_000)
+    c._session = _Reshuffling(DATED)
+    rows = c.query_by_date(
+        "SEP",
+        {"lastupdated.gte": "2026-10-16"},
+        start=Y(2026, 10, 1),
+        end=Y(2026, 10, 31),
+    )
+    assert _keys(rows) == _keys(DATED)
+    params = [p for _, p in c._session.calls]
+    assert [p["from"] for p in params] == ["2026-10-01", "2026-10-20", "2026-10-21"]
+    assert all(
+        "offset" not in p
+        and (p["sort"], p["to"], p["limit"], p["lastupdated.gte"])
+        == ("date", "2026-10-31", 4, "2026-10-16")
+        for p in params
+    )
+
+
+def test_query_by_date_refuses_a_server_that_ignores_the_sort(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 4)
+    c = SharadarClient(KEY, rate_per_min=10_000)
+    c._session = _Reshuffling(DATED, honour_sort=False)
+    with pytest.raises(SourceError, match="sort=date was not applied"):
+        c.query_by_date("SEP", start=Y(2026, 10, 1), end=Y(2026, 10, 31))
+
+
+def test_query_by_date_refuses_a_server_that_ignores_the_window(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 4)
+    c = SharadarClient(KEY, rate_per_min=10_000)
+    c._session = _Reshuffling(DATED, honour_window=False)
+    with pytest.raises(SourceError, match="the window was not applied"):
+        c.query_by_date("SEP", start=Y(2026, 10, 1), end=Y(2026, 10, 31))
+
+
+def test_a_date_that_fills_a_page_alone_is_refused(monkeypatch):
+    monkeypatch.setattr(SharadarClient, "PAGE_ROWS", 2)
+    c = SharadarClient(KEY, rate_per_min=10_000)
+    c._session = _Reshuffling([r for r in DATED if r["date"] == DAYS[0]])
+    with pytest.raises(SourceError, match="2026-10-19 alone holds 2 rows"):
+        c.query_by_date("SEP", start=Y(2026, 10, 1), end=Y(2026, 10, 31))
 
 
 def test_the_key_is_required():

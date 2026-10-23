@@ -55,7 +55,13 @@ key and corrects this docstring, the constants and ``duk.sharadar_api`` together
    silent cap; ``offset`` is honoured; ``SEP`` answers newest date first by
    default and ``sort=date`` reverses it. TICKERS has no useful default order, so
    paging it sorts explicitly. The vendor says not to page a whole table: that is
-   what bulk is for (item 8).
+   what bulk is for (item 8). MEASURED 2026-10-23 (the first nightly delta): **the
+   rows of one date come back in a different order on each request**, so a date
+   split across two pages loses some rows and repeats as many others. 2,569 of
+   SEP's and 3,261 of SFP's rows (dated 10-19 and 10-21) were lost that way,
+   every duplicate straddling a page boundary. A slice longer than a page is
+   therefore read with :meth:`SharadarClient.query_by_date`, which never uses
+   ``offset``.
 7. **Rate limits** -- not documented. MEASURED: ``X-Ratelimit-Limit: 5000`` requests
    and ``X-Ratelimit-Weighted-Limit: 25000`` per window, with ``-Remaining``,
    ``-Reset`` (epoch seconds) and ``-Cost`` (1 a request) headers. ``[sharadar]
@@ -90,6 +96,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from urllib.parse import urlsplit
@@ -337,6 +344,62 @@ class SharadarClient(BaseSource):
             first_of_last = rows[0]
         raise SourceError(
             f"Sharadar {table}: more than {limit} pages of {self.PAGE_ROWS} rows; "
+            "a slice that long belongs in a bulk download"
+        )
+
+    def query_by_date(
+        self,
+        table: str,
+        filters: Optional[dict] = None,
+        *,
+        start: date,
+        end: date,
+        max_requests: Optional[int] = None,
+    ) -> list[dict]:
+        """Every row of a slice of a dated table from ``start`` to ``end``, read in
+        date order and never by ``offset``.
+
+        :meth:`query`'s offset paging loses rows here: the server orders one date's
+        rows differently on each request, so a date split across two pages drops
+        some and repeats others (item 6). Each request instead asks for the rows
+        from a date on, ``sort=date``. Every date before the last one a full page
+        reaches is whole, and the next request starts at that last date, so each
+        date is read by one request. The sort and the window are checked in the
+        rows that come back, because an unknown or ignored parameter is not
+        refused (item 5) and a page that is not in date order proves nothing.
+        """
+        params = dict(filters or {})
+        params.update({"sort": "date", "limit": self.PAGE_ROWS, "to": end.isoformat()})
+        limit = max_requests or self.MAX_PAGES
+        out: list[dict] = []
+        cursor = start.isoformat()
+        for _ in range(limit):
+            params["from"] = cursor
+            data, _, _ = self._call(table, params)
+            rows = self._rows(data)
+            days = [str(r.get("date"))[:10] for r in rows]
+            if days != sorted(days):
+                raise SourceError(
+                    f"Sharadar {table}: the rows from {cursor} are not in date "
+                    "order: sort=date was not applied"
+                )
+            if days and not (cursor <= days[0] and days[-1] <= params["to"]):
+                raise SourceError(
+                    f"Sharadar {table}: rows dated {days[0]} to {days[-1]} answered "
+                    f"from={cursor}, to={params['to']}: the window was not applied"
+                )
+            if len(rows) < self.PAGE_ROWS:
+                out.extend(rows)
+                return out
+            if days[-1] == cursor:
+                raise SourceError(
+                    f"Sharadar {table}: {cursor} alone holds {self.PAGE_ROWS} rows "
+                    "or more, which cannot be read whole by date"
+                )
+            out.extend(r for r, d in zip(rows, days) if d < days[-1])
+            cursor = days[-1]
+        raise SourceError(
+            f"Sharadar {table}: more than {limit} requests from {start} to {end}; "
             "a slice that long belongs in a bulk download"
         )
 

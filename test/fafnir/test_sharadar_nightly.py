@@ -62,7 +62,8 @@ def _csv_bar(ticker, day, close, *, stamp=None):
 
 class _FakeNight(SharadarClient):
     """Answers SEP/SFP queries from ``tables`` (applying ``lastupdated.gte`` unless
-    ``ignore_filter``) and serves ``files`` as bulk zips."""
+    ``ignore_filter``, and ``from``, ``to`` and ``sort=date``) and serves ``files``
+    as bulk zips."""
 
     def __init__(self, tables=None, files=None, *, ignore_filter=False):
         super().__init__("synthetic-key", rate_per_min=100_000)
@@ -78,9 +79,13 @@ class _FakeNight(SharadarClient):
         rows = [
             r
             for r in self.tables.get(table, [])
-            if self.ignore_filter or since is None or r["lastupdated"] >= since
+            if (self.ignore_filter or since is None or r["lastupdated"] >= since)
+            and params.get("from", "") <= r["date"] <= params.get("to", "9999-12-31")
         ]
-        page = rows[params["offset"] : params["offset"] + params["limit"]]
+        if params.get("sort") == "date":
+            rows.sort(key=lambda r: r["date"])
+        offset = params.get("offset", 0)
+        page = rows[offset : offset + params["limit"]]
         names = list(page[0]) if page else list(sp_columns())
         payload = {
             "datatable": {
@@ -261,6 +266,17 @@ def test_a_delta_the_filter_did_not_apply_to_is_refused(db, tmp_path):
     assert not repo.sharadar_deltas_after(db, "stocks", 0)
 
 
+def test_a_delta_that_repeats_a_row_is_refused(db, tmp_path):
+    # A repeated (ticker, date) is how rows lost to overlapping reads show.
+    _record(db, tmp_path, "stocks", PRICES)
+    bar = _json_bar("ZZA", "2026-10-20", 9.5, stamp="2026-10-20")
+    client = _FakeNight({"SEP": [bar, dict(bar)]})
+    result = bulk.fetch_delta(db, client, "SEP", tmp_path, since=Y(2026, 10, 19))
+    assert result.outcome == "failed"
+    assert "1 of 2 rows repeat a (ticker, date)" in result.error
+    assert not repo.sharadar_deltas_after(db, "stocks", 0)
+
+
 # ---------------------------------------------------------------------------
 # ingest sharadar-prices --nightly
 # ---------------------------------------------------------------------------
@@ -334,6 +350,41 @@ def test_the_nightly_writes_new_dates_revises_its_own_and_keeps_others(db, tmp_p
     assert (later.counts["unchanged"], later.counts["new"], later.written) == (1, 1, 1)
     assert _bars(db, fed)[Y(2026, 10, 22)] == (D(13), "sharadar")
     assert _bars(db, fed)[Y(2026, 10, 21)] == (D(12), "sharadar")
+
+
+def test_a_day_the_master_prices_and_the_files_lack_is_counted(db, tmp_path):
+    served = _security(db, "ZZS", source="sharadar", key="900301", feed=True)
+    _security(db, "ZZU", source="sharadar", key="900302", feed=True)
+    _security(db, "ZZG", source="sharadar", key="900303", feed=True)
+    for key, day in (("900301", 22), ("900302", 22), ("900303", 21)):
+        db.execute(
+            "UPDATE core.vendor_security SET last_price_date = %s "
+            "WHERE vendor = 'sharadar' AND vendor_key = %s",
+            (Y(2026, 10, day), key),
+        )
+    _fulls(db, tmp_path)
+    _record(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES
+        + _csv_bar("ZZS", "2026-10-21", "10")
+        + _csv_bar("ZZS", "2026-10-22", "10")
+        + _csv_bar("ZZU", "2026-10-21", "10")  # the master says 10-22 too
+        + _csv_bar("ZZG", "2026-10-21", "10"),  # its last price: nothing missing
+        kind="delta",
+        since="2026-10-21",
+    )
+    _other_delta(db, tmp_path, "funds", "2026-10-21")
+
+    plan = sp.nightly(db, tmp_path, dry_run=True, as_of=Y(2026, 10, 23))
+    assert "unserved" not in plan.counts  # counted on what a night wrote
+    done = sp.nightly(db, tmp_path, as_of=Y(2026, 10, 23))
+    assert done.counts["unserved"] == 1
+    assert Y(2026, 10, 22) in _bars(db, served)
+    run = repo.last_successful_run(db, "sharadar", sp.NIGHTLY_ENDPOINT)
+    assert run["params"]["counts"]["unserved"] == 1
+    assert run["params"]["by_date"]["2026-10-22"] == {"new": 1, "unserved": 1}
 
 
 def test_a_run_for_some_securities_leaves_the_files_pending(db, tmp_path):
