@@ -610,7 +610,7 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
 | Mode | For | What it writes |
 |---|---|---|
 | `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98) | every split and dividend, never within 7 days of an action of the same type another source holds |
-| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: an action inside the link's span (its `valid_from` to the last bar), and never within 7 days of an action of the same type another source holds |
+| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: an action after the link's `valid_from` and up to the last bar, and never within 7 days of an action of the same type another source holds |
 
 - **The conversions** are #56's: a split's value is new shares per old
   (`split_ratio`), and a dividend's is split-adjusted, so it is multiplied by the
@@ -622,6 +622,23 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
   (`near_existing`) rather than store it twice. Correcting it is #75's
   `vendor correct`.
 - **Never a future ex-date** (ADR 0007), the same guard as `ingest actions`.
+- **Only after the link's start, on a security another vendor minted.** Fed or not,
+  an FMP-minted security takes only the actions dated after its link's
+  `valid_from` (`outside_span` otherwise). The link starts where Sharadar's own
+  prices do, and an action on or before that date adjusts only FMP's bars, which no
+  Sharadar price confirms. COPR's 1:20 of 2025-12-15 is an example: Sharadar prices
+  COPR from 2026-07-02. A security Sharadar minted holds only its bars and takes
+  every action.
+  - **Before this held** (up to v2.0.1), the gap-fill counted the link's first day as
+    inside it. After the cutover fed every linked security, the backfill checked no
+    span at all. The first Sharadar night wrote 466 splits and 2,256 dividends
+    outside the span. 34 splits and 45 dividends reached a stored bar. The rest
+    raised 2,211 `dividend_no_prior_close` flags.
+  - **`--prune-outside-span` removes them.** Each goes through the override path
+    with reason `cleanup`: kept in `ops.operator_override`, with no label, because
+    nothing says the vendor's action was wrong. The dividend flags of a removed
+    dividend are closed with it, and the factors are recomputed. Its run is
+    `sharadar` / `actions:prune`.
 - **Spin-offs are not adjusted.** ACTIONS records them, and they are kept as events
   in `core.vendor_security_event`; fafnir has never adjusted for them, and does not
   start here.
@@ -633,6 +650,8 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
 ```bash
 fafnir ingest sharadar-actions --backfill --gap-fill --dry-run   # counts per reason
 fafnir ingest sharadar-actions --backfill --gap-fill
+fafnir ingest sharadar-actions --prune-outside-span --dry-run    # once, after deploying
+fafnir ingest sharadar-actions --prune-outside-span --by <you>
 ```
 
 One `ops.ingestion_run` (`sharadar` / `actions`), a commit per 1,000 securities. A
