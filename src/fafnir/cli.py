@@ -768,6 +768,12 @@ def _echo_sharadar_prices(result) -> None:
     is_flag=True,
     help="Fill-only for the FMP securities linked to Sharadar.",
 )
+@click.option(
+    "--prune-outside-span",
+    is_flag=True,
+    help="Remove the Sharadar actions dated on or before a link's start, on "
+    "securities another vendor minted. Runs alone.",
+)
 @click.option("--symbols", help="Comma-separated tickers: only these securities.")
 @click.option("--dry-run", is_flag=True, help="Plan and print counts; write nothing.")
 @click.option(
@@ -775,28 +781,48 @@ def _echo_sharadar_prices(result) -> None:
     is_flag=True,
     help="Do not recompute the factors of the securities it changed.",
 )
+@click.option(
+    "--by",
+    "created_by",
+    help="With --prune-outside-span: who, on the overrides and the closed flags "
+    "[default: the OS user]",
+)
 @click.pass_context
-def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust):
+def ingest_sharadar_actions(
+    ctx, backfill, gap_fill, prune_outside_span, symbols, dry_run, no_adjust, created_by
+):
     """Load Sharadar's splits and dividends into core.corporate_action (#73).
 
     \b
       fafnir ingest sharadar-actions --backfill --dry-run
       fafnir ingest sharadar-actions --backfill --gap-fill
+      fafnir ingest sharadar-actions --prune-outside-span --dry-run
 
     Reads the ledger's current ACTIONS file under [sharadar] bulk_dir. --backfill
     loads every split and dividend of the securities Sharadar feeds (the minted
     dead issuers); --gap-fill adds, fill-only, what an FMP security linked to
-    Sharadar lacks: inside the link's span, and never within 7 days of an action
-    of the same type another source holds. Written as source sharadar under
-    precedence, never as a correction; a future ex-date is never stored. One
-    ops.ingestion_run (sharadar/actions); the factors of the securities it changed
-    are recomputed, for those with bars.
+    Sharadar lacks, up to its last bar. A security another vendor minted takes only
+    the actions dated after its link's start, fed or not, and never one within 7
+    days of an action of the same type another source holds. Written as source
+    sharadar under precedence, never as a correction; a future ex-date is never
+    stored. One ops.ingestion_run (sharadar/actions); the factors of the securities
+    it changed are recomputed, for those with bars.
+
+    --prune-outside-span removes the Sharadar actions such a security holds on or
+    before its link's start, written before that rule held. Each is deleted through
+    the override path, reason cleanup (kept in ops.operator_override, no label);
+    the dividend_no_prior_close and dividend_exceeds_price flags of a removed
+    dividend are closed with it. One ops.ingestion_run (sharadar/actions:prune).
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_actions as sa
 
-    if not (backfill or gap_fill):
-        raise click.ClickException("Give --backfill, --gap-fill or both.")
+    if prune_outside_span and (backfill or gap_fill):
+        raise click.ClickException("--prune-outside-span runs alone.")
+    if not (backfill or gap_fill or prune_outside_span):
+        raise click.ClickException(
+            "Give --backfill, --gap-fill or both, or --prune-outside-span."
+        )
     cfg = ctx.obj["config"]
     with Database(cfg.dsn) as database:
         ids = None
@@ -807,6 +833,16 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
                 (ids.append(sid) if sid is not None else missing.append(sym))
             if missing:
                 raise click.ClickException(f"No security for: {', '.join(missing)}")
+        if prune_outside_span:
+            pruned = sa.prune_outside_span(
+                database,
+                created_by=created_by or _os_user(),
+                security_ids=ids,
+                dry_run=dry_run,
+                adjust=not no_adjust,
+            )
+            _echo_sharadar_prune(pruned)
+            return
         try:
             result = sa.load(
                 database,
@@ -820,6 +856,27 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
         except (sa.ActionsError, FileNotFoundError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
     _echo_sharadar_actions(result)
+
+
+def _echo_sharadar_prune(result) -> None:
+    c = result.counts
+    securities = len({r["security_id"] for r in result.rows})
+    head = "Dry run: nothing changed." if result.dry_run else f"Run {result.run_id}."
+    click.echo(
+        f"{head} {len(result.rows)} Sharadar actions outside the link's span on "
+        f"{securities} securities: {c['split:reaches_bars']} splits and "
+        f"{c['dividend:reaches_bars']} dividends reach a stored bar; "
+        f"{c['split:before_bars']} splits and {c['dividend:before_bars']} dividends "
+        "precede the first."
+    )
+    if result.dry_run or not result.rows:
+        return
+    click.echo(
+        f"  removed {len(result.override_ids)} (overrides "
+        f"{min(result.override_ids)}-{max(result.override_ids)}, reason cleanup); "
+        f"closed {len(result.closed_flags)} dividend flags; factors recomputed for "
+        f"{result.adjusted} securities"
+    )
 
 
 def _echo_sharadar_actions(result) -> None:

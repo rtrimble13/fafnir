@@ -703,6 +703,13 @@ truncated before that deploy still need the re-backfill.)
 dividend. Fix the gap first, then `fafnir adjust --symbol <SYM>`, then
 `dq recheck`.
 
+**Sharadar's dividends outside its link's span close themselves.** A Sharadar
+dividend dated on or before an FMP-minted security's link start (the first Sharadar
+night wrote 2,211 of them, before the security's first bar) is removed by
+`fafnir ingest sharadar-actions --prune-outside-span`. The prune closes its flag,
+citing the run. Do not accept or resolve those by hand; run the prune's dry run
+first.
+
 **A security with no bars at all can never be closed by the recheck**, because its
 rule is "a prior raw close now exists". The usual case is a stray dividend on an
 empty echo row: the calendar sweep attaching a renamed company's distribution to

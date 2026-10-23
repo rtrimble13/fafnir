@@ -260,6 +260,7 @@ def test_gap_fill_adds_only_what_fmp_lacks_inside_the_link(db, tmp_path):
         tmp_path,
         [
             ("2009-03-10", "dividend", "ZZL", "1"),  # before the link
+            ("2010-01-04", "dividend", "ZZL", "1"),  # its first day: FMP's bars only
             ("2011-03-14", "dividend", "ZZL", "1"),  # FMP's, four days apart
             ("2011-06-10", "dividend", "ZZL", "1"),  # missing from FMP
             ("2012-03-09", "dividend", "ZZL", "1"),  # suppressed
@@ -277,7 +278,7 @@ def test_gap_fill_adds_only_what_fmp_lacks_inside_the_link(db, tmp_path):
     assert [(p.action_type, p.ex_date) for p in plan.planned] == [
         ("dividend", Y(2011, 6, 10))
     ]
-    assert plan.skipped == {"outside_span": 2, "near_existing": 1, "suppressed": 1}
+    assert plan.skipped == {"outside_span": 3, "near_existing": 1, "suppressed": 1}
     assert len(_actions(db, fmp)) == 1  # the dry run wrote nothing
     result = sa.load(db, tmp_path, backfill=False, gap_fill=True, as_of=Y(2026, 1, 2))
     rows = _actions(db, fmp)
@@ -288,6 +289,134 @@ def test_gap_fill_adds_only_what_fmp_lacks_inside_the_link(db, tmp_path):
     assert result.adjusted == 1
     # A re-run: its own row is not "near" another source's, and nothing changes.
     assert sa.load(db, tmp_path, backfill=False, gap_fill=True).written == 0
+
+
+@integration
+def test_a_fed_security_another_vendor_minted_takes_only_its_link_span(db, tmp_path):
+    # The cutover fed every linked security; its history before the link is FMP's.
+    fed = _sec(db, "ZZF", Y(2008, 1, 2), Y(2012, 12, 31))
+    _vendor(db, "900011", "ZZF")
+    _link(db, fed, "900011", Y(2010, 1, 4), feed=True)
+    dead = _sec(db, "ZZF1", Y(2005, 1, 3), Y(2005, 3, 31), source="sharadar")
+    _vendor(db, "900012", "ZZF1")
+    _link(db, dead, "900012", Y(2005, 2, 1), feed=True)
+    _actions_file(
+        db,
+        tmp_path,
+        [
+            ("2009-06-01", "split", "ZZF", "0.05"),  # before the link: refused
+            ("2010-01-04", "dividend", "ZZF", "1"),  # on its start: refused
+            ("2013-03-11", "dividend", "ZZF", "1"),  # after the last bar: a feed's
+            ("2005-01-10", "dividend", "ZZF1", "1"),  # minted: all its history
+        ],
+    )
+    plan = sa.load(
+        db, tmp_path, backfill=True, gap_fill=False, dry_run=True, as_of=Y(2026, 1, 2)
+    )
+    assert {(p.security_id, p.ex_date) for p in plan.planned} == {
+        (dead, Y(2005, 1, 10)),
+        (fed, Y(2013, 3, 11)),
+    }
+    assert plan.skipped == {"outside_span": 2}
+
+
+def _sharadar_action(db, sid, action_type, ex_date):
+    repo.upsert_corporate_action(
+        db,
+        security_id=sid,
+        action_type=action_type,
+        ex_date=ex_date,
+        split_numerator=D(1) if action_type == "split" else None,
+        split_denominator=D(20) if action_type == "split" else None,
+        dividend_amount=D("0.5") if action_type == "dividend" else None,
+        source="sharadar",
+    )
+
+
+@integration
+def test_prune_removes_what_was_written_before_the_span_held(db, tmp_path):
+    fed = _sec(db, "ZZP", Y(2008, 1, 2), Y(2012, 12, 31))
+    _vendor(db, "900013", "ZZP")
+    _link(db, fed, "900013", Y(2010, 1, 4), feed=True)
+    _sharadar_action(db, fed, "split", Y(2009, 6, 1))  # reaches FMP's bars
+    _sharadar_action(db, fed, "dividend", Y(2010, 1, 4))  # the link's first day
+    _sharadar_action(db, fed, "dividend", Y(2007, 3, 9))  # before the first bar
+    _sharadar_action(db, fed, "dividend", Y(2011, 6, 10))  # inside: kept
+    repo.upsert_corporate_action(  # FMP's own: kept
+        db,
+        security_id=fed,
+        action_type="dividend",
+        ex_date=Y(2009, 3, 10),
+        dividend_amount=D("0.4"),
+    )
+    dead = _sec(db, "ZZP1", Y(2005, 1, 3), Y(2005, 3, 31), source="sharadar")
+    _vendor(db, "900014", "ZZP1")
+    _link(db, dead, "900014", Y(2005, 2, 1), feed=True)
+    _sharadar_action(db, dead, "dividend", Y(2005, 1, 10))  # minted: kept
+    for ex in (Y(2007, 3, 9), Y(2011, 6, 10)):
+        repo.add_dq_flag_once(
+            db,
+            check_name="dividend_no_prior_close",
+            severity="info",
+            security_id=fed,
+            table_name="core.corporate_action",
+            record_key={"ex_date": ex.isoformat()},
+        )
+    db.commit()
+
+    plan = sa.prune_outside_span(db, created_by="tester", dry_run=True)
+    assert plan.counts == Counter(
+        {"split:reaches_bars": 1, "dividend:reaches_bars": 1, "dividend:before_bars": 1}
+    )
+    assert plan.run_id is None and len(_actions(db, fed)) == 5
+
+    result = sa.prune_outside_span(db, created_by="tester")
+    assert sorted(_actions(db, fed)) == [
+        ("dividend", Y(2009, 3, 10)),
+        ("dividend", Y(2011, 6, 10)),
+    ]
+    assert len(_actions(db, dead)) == 1
+    overrides = db.fetchall(
+        "SELECT action_type, key_date, operation, reason, created_by, detail "
+        "FROM ops.operator_override WHERE override_id = ANY(%s) ORDER BY key_date",
+        (result.override_ids,),
+    )
+    assert [(o["action_type"], o["key_date"]) for o in overrides] == [
+        ("dividend", Y(2007, 3, 9)),
+        ("split", Y(2009, 6, 1)),
+        ("dividend", Y(2010, 1, 4)),
+    ]
+    assert {(o["operation"], o["reason"], o["created_by"]) for o in overrides} == {
+        ("delete", "cleanup", "tester")
+    }
+    assert {o["detail"]["pruned_by_run"] for o in overrides} == {result.run_id}
+    flags = db.fetchall(
+        "SELECT record_key->>'ex_date' AS ex, resolved_at IS NOT NULL AS closed, "
+        "resolved_by, judgement_basis FROM ops.data_quality_flag "
+        "WHERE security_id = %s ORDER BY 1",
+        (fed,),
+    )
+    assert [(f["ex"], f["closed"]) for f in flags] == [
+        ("2007-03-09", True),
+        ("2011-06-10", False),  # its dividend is still there
+    ]
+    assert (flags[0]["resolved_by"], flags[0]["judgement_basis"]) == (
+        "tester",
+        "by_rule",
+    )
+    assert result.closed_flags and result.adjusted == 1
+    run = db.fetchone(
+        "SELECT endpoint, status, params FROM ops.ingestion_run "
+        "WHERE ingestion_run_id = %s",
+        (result.run_id,),
+    )
+    assert (run["endpoint"], run["status"]) == ("actions:prune", "success")
+    assert (run["params"]["removed"], run["params"]["closed_flags"]) == (3, 1)
+
+    # Nothing left to prune, and the loader does not put them back.
+    assert sa.prune_outside_span(db, created_by="tester").rows == []
+    _actions_file(db, tmp_path, [("2009-06-01", "split", "ZZP", "0.05")])
+    assert sa.load(db, tmp_path, backfill=True, gap_fill=False).written == 0
 
 
 @integration
@@ -312,6 +441,10 @@ def test_the_command(db, tmp_path, monkeypatch):
         )
 
     assert "Give --backfill, --gap-fill or both" in run().output
+    assert "runs alone" in run("--prune-outside-span", "--backfill").output
+    out = run("--prune-outside-span", "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert "Dry run: nothing changed. 0 Sharadar actions outside" in out.output
     out = run("--backfill", "--dry-run")
     assert out.exit_code == 0, out.output
     assert (

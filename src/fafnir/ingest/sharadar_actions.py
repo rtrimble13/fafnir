@@ -9,9 +9,15 @@ in ``core.vendor_security_event`` (#58). Two modes, either or both:
 
 - ``--backfill``: every split and dividend of the securities Sharadar **feeds**: the
   minted dead issuers, and from the cutover the securities `vendor feed` gave it.
-- ``--gap-fill``: **fill-only** for the FMP securities linked to Sharadar. An action
-  is added only inside the link's span (from its ``valid_from`` to the security's
-  last bar, where the identity is established).
+- ``--gap-fill``: **fill-only** for the FMP securities linked to Sharadar, up to the
+  security's last bar.
+
+A security another vendor minted takes only the actions dated **after** its link's
+``valid_from``, fed or not: the link starts where the vendor's own prices do, and an
+action on or before that date adjusts only the other vendor's bars, which the
+vendor's prices never confirmed (2026-10-23: COPR's 1:20 of 2025-12-15, when
+Sharadar prices it from 2026-07-02). Those are counted ``outside_span``.
+:func:`prune_outside_span` removes the ones written before this rule held.
 
 In both, an action is never added within :data:`NEAR` of an action of the same type
 another source holds: a date the two vendors disagree on would otherwise store one
@@ -146,9 +152,11 @@ def _in_scope(
         return "future"
     if (p.security_id, p.action_type, p.ex_date) in suppressed:
         return "suppressed"
+    if target["source"] != VENDOR and p.ex_date <= target["valid_from"]:
+        return "outside_span"
     if not target["is_feed"]:
         last = target["last_trade_date"]
-        if last is None or not target["valid_from"] <= p.ex_date <= last:
+        if last is None or p.ex_date > last:
             return "outside_span"
     # Fed or not: a security Sharadar took over from FMP keeps FMP's history (#98).
     for d in foreign.get((p.security_id, p.action_type), ()):
@@ -261,6 +269,115 @@ def load(
         }
         ids = sorted(result.changed_security_ids & with_bars)
         result.awaiting_prices = len(result.changed_security_ids) - len(ids)
+        if ids:
+            result.adjusted = adjustments.adjust_all(db, security_ids=ids)["securities"]
+    return result
+
+
+PRUNE_ENDPOINT = "actions:prune"
+#: The flags `adjust` keys on a dividend's ex-date. A removed dividend's are closed
+#: with it: nothing will write them again.
+DIVIDEND_FLAGS = ("dividend_no_prior_close", "dividend_exceeds_price")
+
+
+@dataclass
+class PruneResult:
+    dry_run: bool
+    run_id: Optional[int] = None
+    rows: list[dict] = field(default_factory=list)
+    #: ``<split|dividend>:<reaches_bars|before_bars>``: whether a stored bar
+    #: precedes the ex-date, so the action changed an adjusted price.
+    counts: Counter = field(default_factory=Counter)
+    override_ids: list[int] = field(default_factory=list)
+    closed_flags: list[int] = field(default_factory=list)
+    adjusted: int = 0
+
+
+def prune_outside_span(
+    db: Database,
+    *,
+    created_by: str,
+    security_ids: Optional[Sequence[int]] = None,
+    dry_run: bool = False,
+    adjust: bool = True,
+) -> PruneResult:
+    """Remove the Sharadar actions a security minted by another vendor holds on or
+    before its link's start: the ones written before :func:`_in_scope` refused them
+    (the gap-fill of 2026-10-21 counted the start as inside; the backfill of
+    2026-10-23 checked no span for the securities the cutover fed).
+
+    Each row goes through the operator-override path with reason ``cleanup``. The
+    row as it stood is kept in ``ops.operator_override`` and its key is set aside if
+    the vendor files it again. No label is written: nothing says the vendor's
+    action was wrong, only that no price of theirs stands behind it. The
+    ``dividend_no_prior_close`` and ``dividend_exceeds_price`` flags of a removed
+    dividend are closed with it, and the factors of the securities that hold bars
+    are recomputed. One ``ops.ingestion_run`` (``sharadar`` / ``actions:prune``).
+    """
+    result = PruneResult(dry_run=dry_run)
+    result.rows = repo.vendor_actions_outside_span(db, VENDOR, security_ids)
+    for r in result.rows:
+        first = r["first_trade_date"]
+        reach = (
+            "reaches_bars"
+            if first is not None and first < r["ex_date"]
+            else ("before_bars")
+        )
+        result.counts[f"{r['action_type']}:{reach}"] += 1
+    if dry_run or not result.rows:
+        return result
+
+    run = RunLog(db, source=VENDOR, endpoint=PRUNE_ENDPOINT, params={})
+    with run:
+        result.run_id = run.run_id
+        for r in result.rows:
+            result.override_ids.append(
+                repo.delete_operator_action(
+                    db,
+                    corporate_action_id=int(r["corporate_action_id"]),
+                    note=(
+                        f"Outside the Sharadar link's span: dated {r['ex_date']}, on "
+                        f"or before the link's start ({r['valid_from']}), so it "
+                        "adjusts only another vendor's bars, which no Sharadar price "
+                        "confirms. Removed by `ingest sharadar-actions "
+                        f"--prune-outside-span` (run {run.run_id})."
+                    ),
+                    created_by=created_by,
+                    reason="cleanup",
+                    detail_extra={"pruned_by_run": run.run_id},
+                )
+            )
+        keys = [
+            (int(r["security_id"]), r["ex_date"])
+            for r in result.rows
+            if r["action_type"] == "dividend"
+        ]
+        flag_ids = repo.open_flags_on_ex_dates(db, DIVIDEND_FLAGS, keys)
+        if flag_ids:
+            result.closed_flags = repo.resolve_dq_flags(
+                db,
+                repo.DqFilter(flag_ids=flag_ids),
+                note=(
+                    "Its dividend was outside the Sharadar link's span and was "
+                    f"removed by `ingest sharadar-actions --prune-outside-span` "
+                    f"(run {run.run_id}; the override names the row)."
+                ),
+                resolved_by=created_by,
+                judgement_basis="by_rule",
+            )
+        run.params.update(
+            removed=len(result.rows),
+            counts=dict(sorted(result.counts.items())),
+            securities=len({r["security_id"] for r in result.rows}),
+            overrides=[min(result.override_ids), max(result.override_ids)],
+            closed_flags=len(result.closed_flags),
+        )
+        db.commit()
+
+    if adjust:
+        ids = sorted(
+            {int(r["security_id"]) for r in result.rows if r["first_trade_date"]}
+        )
         if ids:
             result.adjusted = adjustments.adjust_all(db, security_ids=ids)["securities"]
     return result
