@@ -1040,6 +1040,168 @@ def clear_venue_override(db: Database, security_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A fed security held inactive: `security relist` (#125)
+# ---------------------------------------------------------------------------
+
+
+def inactive_fed_securities(db: Database, vendor: str) -> list[dict]:
+    """Every security held inactive although an open link to ``vendor`` feeds it,
+    with that link's key. Operator-minted rows (`security split-history`) are never
+    fed, so none is here."""
+    return db.fetchall(
+        """
+        SELECT s.security_id, s.primary_symbol, s.exchange_code, s.delisted_date,
+               x.vendor_key, x.valid_from AS link_from
+          FROM core.security_vendor_xref x
+          JOIN core.security s ON s.security_id = x.security_id
+         WHERE x.vendor = %s AND x.is_feed AND x.valid_to IS NULL
+           AND NOT s.is_actively_trading
+         ORDER BY s.security_id
+        """,
+        (vendor,),
+    )
+
+
+def feeding_link(db: Database, security_id: int) -> Optional[dict]:
+    """The security's open feeding link (one at most, ADR 0015), or None."""
+    return db.fetchone(
+        """
+        SELECT vendor, vendor_key, valid_from FROM core.security_vendor_xref
+         WHERE security_id = %s AND is_feed AND valid_to IS NULL
+        """,
+        (security_id,),
+    )
+
+
+def vendor_master_row(
+    db: Database, vendor: str, vendor_key: str, tables: Sequence[str]
+) -> Optional[dict]:
+    """The vendor's master row for a key, from its priced ``tables``."""
+    return db.fetchone(
+        """
+        SELECT vendor_key, vendor_table, ticker, name, exchange, is_delisted,
+               first_price_date, last_price_date
+          FROM core.vendor_security
+         WHERE vendor = %s AND vendor_key = %s AND vendor_table = ANY(%s)
+         ORDER BY vendor_table
+         LIMIT 1
+        """,
+        (vendor, vendor_key, list(tables)),
+    )
+
+
+def vendor_newest_price_date(
+    db: Database, vendor: str, tables: Sequence[str]
+) -> Optional[date]:
+    """The newest price date the vendor's master names: its latest session."""
+    return db.fetchval(
+        """
+        SELECT max(last_price_date) FROM core.vendor_security
+         WHERE vendor = %s AND vendor_table = ANY(%s)
+        """,
+        (vendor, list(tables)),
+    )
+
+
+def vendor_events_for_keys(
+    db: Database, vendor: str, actions: Sequence[str], keys: Sequence[str]
+) -> list[dict]:
+    """Every ``actions`` event of these keys, whatever its date, oldest first per
+    key. :func:`vendor_events_since` is the nightly window; a rename the window
+    never saw is found here."""
+    return db.fetchall(
+        """
+        SELECT vendor_key, event_date, action, ticker, contra_ticker, contra_name
+          FROM core.vendor_security_event
+         WHERE vendor = %s AND action = ANY(%s) AND vendor_key = ANY(%s)
+         ORDER BY vendor_key, event_date, action
+        """,
+        (vendor, list(actions), list(keys)),
+    )
+
+
+def last_traded_bar(db: Database, security_id: int, since: date) -> Optional[date]:
+    """The security's latest bar on or after ``since`` that traded (volume > 0).
+
+    A bar is not evidence of trading by itself: Sharadar keeps printing a flat,
+    zero-volume row for a halted or wound-down listing it has not marked delisted
+    (MAGH's every row after its 2026-08-12 delisting). ``since`` bounds the scan.
+    """
+    return db.fetchval(
+        """
+        SELECT max(trade_date) FROM core.daily_price
+         WHERE security_id = %s AND trade_date >= %s AND volume > 0
+        """,
+        (security_id, since),
+    )
+
+
+def holds_earlier_issuer(
+    *, first_bar: Optional[date], delisted_date: Optional[date], link_from: date
+) -> bool:
+    """True when a row's delisting and first bars both predate its vendor link.
+
+    That is a reused ticker on one row: an earlier issuer's bars and its delisting,
+    then the vendor's issuer from the link's start. Relisting it would revive the
+    earlier issuer's row as the new one; `security split-history` separates them.
+    A delisting with no bars before the link is not one: the earlier issuer left
+    only its stamp (RVI holds Robinhood Ventures Fund I's bars from 2026 under
+    Retail Value's 2022 delisting, from FMP's delisted feed), and that relists.
+    """
+    return (
+        delisted_date is not None
+        and first_bar is not None
+        and delisted_date < link_from
+        and first_bar < link_from
+    )
+
+
+def mark_trading(db: Database, security_id: int) -> bool:
+    """List an inactive security that carries no delisting as trading again.
+    Returns False when it was already trading or is stamped delisted (that is
+    :func:`reverse_delisting`'s to undo)."""
+    row = db.fetchone(
+        """
+        UPDATE core.security SET is_actively_trading = TRUE, updated_at = now()
+         WHERE security_id = %s AND NOT is_actively_trading AND delisted_date IS NULL
+        RETURNING security_id
+        """,
+        (security_id,),
+    )
+    return row is not None
+
+
+def end_periods_before_rename(
+    db: Database,
+    *,
+    security_id: int,
+    symbol: str,
+    delisted_date: date,
+    change_date: date,
+) -> int:
+    """End the ``symbol`` periods a stamped delisting closed at the day before a
+    rename, where the rename came first.
+
+    FMP's delisted feed reported many renames as delistings, so the old ticker's
+    period was closed at that date by :func:`mark_delisted`. Relisting under the new
+    ticker opens its period at the change date (:func:`retarget_symbol`); the old
+    one ends the day before, as a rename applied in time would have left it. A
+    delisting earlier than the rename keeps its earlier end. Returns the periods
+    changed.
+    """
+    return db.execute(
+        """
+        UPDATE core.symbol_xref
+           SET valid_to = GREATEST(valid_from, %s::date - 1)
+         WHERE security_id = %s AND symbol = %s
+           AND valid_to = GREATEST(valid_from, %s::date)
+           AND valid_to > GREATEST(valid_from, %s::date - 1)
+        """,
+        (change_date, security_id, symbol, delisted_date, change_date),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Merging two securities that are one company
 # ---------------------------------------------------------------------------
 #
@@ -6114,6 +6276,50 @@ def list_dq_flags(
          LIMIT %s OFFSET %s
         """,
         [*params, limit, offset],
+    )
+
+
+def condition_open(db: Database, *, security_id: int, check_name: str) -> bool:
+    """True when the security has any open ``check_name`` flag, whatever its key."""
+    return bool(
+        db.fetchval(
+            """
+            SELECT EXISTS (SELECT 1 FROM ops.data_quality_flag
+                            WHERE security_id = %s AND check_name = %s
+                              AND resolved_at IS NULL)
+            """,
+            (security_id, check_name),
+        )
+    )
+
+
+def resolve_sourced_flags_except(
+    db: Database,
+    *,
+    check_name: str,
+    source: str,
+    keep: Sequence[str],
+    note: str,
+    resolved_by: str,
+) -> list[dict]:
+    """Close the open ``check_name`` flags a vendor's step raised (``detail.source``)
+    except those in ``keep``, each written ``"<security_id>|<record_key.symbol>"``.
+
+    For a step that re-detects every condition still true on each run: what it did
+    not re-detect has gone. Flags another path raised (no ``detail.source``, or a
+    different one) are left alone. Returns the closed rows.
+    """
+    return db.fetchall(
+        """
+        UPDATE ops.data_quality_flag
+           SET resolved_at = now(), resolved_by = %s, resolution_note = %s
+         WHERE check_name = %s AND resolved_at IS NULL
+           AND detail->>'source' = %s
+           AND NOT (security_id::text || '|' || coalesce(record_key->>'symbol', '')
+                    = ANY(%s))
+        RETURNING dq_flag_id, security_id, record_key, detail, detected_at
+        """,
+        (resolved_by, note, check_name, source, list(keep)),
     )
 
 

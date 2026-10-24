@@ -1008,6 +1008,92 @@ The `declined` reasons are:
 - `precedes_first_bar` and `traded_after`: the security's own bars contradict the
   delisting.
 
+### A fed security held inactive
+
+FMP's delisted feed reported many renames as delistings, and its screener then called
+the old row inactive: NLOK when it became GEN, LVHB when it became BUFF. At the
+Sharadar cutover (#125) those rows were linked by permaticker and fed, so each takes
+the company's bars every night while fafnir holds it inactive on a ticker the company
+no longer trades under. `stale` judges active rows only, and the marts' active
+universe leaves them out. On 2026-10-24 there were 88.
+
+**Found** by `ingest sharadar-universe` every night (step 4,
+[ingestion.md](ingestion.md#sharadar-as-primary-universe-maintenance-93)): a
+`security_inactive_but_trading` flag (warn, `detail.source = 'sharadar'`) whose
+`detail.next` says what decides it:
+
+```sql
+SELECT s.primary_symbol, f.detail->>'vendor_ticker' AS vendor_ticker,
+       f.detail->>'next' AS next, f.detail->'rename' AS rename,
+       f.detail->>'held_by' AS held_by
+  FROM ops.data_quality_flag f JOIN core.security s USING (security_id)
+ WHERE f.check_name = 'security_inactive_but_trading' AND f.resolved_at IS NULL
+   AND f.detail->>'source' = 'sharadar'
+ ORDER BY 3, 1;
+```
+
+**`next = relist`**: list it trading again with `security relist`:
+
+```bash
+fafnir security relist 21009 -m "Innovator's LVHB, renamed BUFF 2020-07-17" --dry-run
+fafnir security relist 21009 -m "Innovator's LVHB, renamed BUFF 2020-07-17" --yes
+fafnir db refresh-marts
+```
+
+- **What it checks.** The vendor that feeds it lists the key live, and a bar with
+  volume arrived within 5 sessions of the vendor's newest price date. A zero-volume
+  row is not trading: Sharadar keeps printing them for a halted listing it has not
+  called delisted. Otherwise it refuses.
+- **What it changes.** A stamped delisting is reversed. Otherwise the row is listed
+  as trading again. Where the vendor's ticker differs, the row moves to it by the
+  rename sweep's rules (`repository.apply_rename`), dated by the vendor's own
+  `tickerchangeto` event or `--rename-date`:
+  - the old ticker's period ends the day before;
+  - an empty row on the new ticker is folded in;
+  - the rename is recorded in `core.symbol_change` under the vendor, and its
+    `symbol_change_conflict` flag closes.
+- **The record.** The `security_inactive_but_trading` flags are resolved with the
+  note, and an `ops.ingestion_run` row (source `operator`, endpoint
+  `security-relist`) holds the row before and the rename.
+- **What it never does.** No bar changes and nothing is deleted. `security delist`
+  stamps it again.
+- **The dry run** applies the change, shows the row after, and rolls it back.
+- **It refuses:**
+  - a row with history on the new ticker;
+  - an open `security_delisting_contradicted` flag;
+  - a row holding bars, and a delisting, from before its vendor link starts
+    (`next = earlier_issuer`): an earlier issuer of a reused ticker, which
+    `security split-history` separates first. A stamp with no bars before the
+    link relists: RVI's row holds only Robinhood Ventures Fund I's bars, under
+    Retail Value's 2022 delisting from FMP's delisted feed;
+  - a same-ticker row the vendor lists on another venue: that is a move, and
+    `security venue-transfer` records it and lists the row trading again.
+
+  A rename onto another venue relists with a note: follow it with
+  `venue-transfer` if the company moved.
+
+**`next = venue_transfer`** (TXS, USAC, OILT on TXSE): [Venue transfers](#venue-transfers).
+**`next = pending_decision`**: decide the open `security_delisting_contradicted` flag
+first, the same way.
+
+**`next = held`**: another row with history trades under the vendor's ticker
+(`held_by`). Mostly that row is the same company, minted again by FMP's screener
+under the new ticker with FMP's whole history, while the inactive row holds the
+pre-rename years plus Sharadar's bars since the cutover. That is NLOK and GEN, NYCB
+and FLG, and 66 more. Relist refuses them, and `security merge` refuses them too:
+- **Half a cent apart.** Sharadar's and FMP's copies of a session often differ by
+  that much (NLOK and GEN disagree on 814 of 1,751 shared days).
+- **An old split.** FMP's history under the new ticker is pre-adjusted for a later
+  split (FLG's closes before its 2024 reverse split are three times NYCB's).
+
+Leave these open, with the flag as the record: making the two rows one needs a
+vendor-aware merge, which is not built yet. Two exceptions are not one company held
+twice but two issuers on one row. BUFF holds Blue Buffalo until 2018 and FMP's copy
+of the Innovator fund after; CHGX holds the AXS fund until 2025 and a copy of
+Stance's. Separate them first ([Separating two issuers](#separating-two-issuers-held-on-one-security)
+or `prices delete`, then `security delist` at the old issuer's end), and the fund's
+own row becomes `next = relist`.
+
 ## Resolving vendor links
 
 `fafnir vendor link` (the engine, [ingestion.md](ingestion.md#linking-to-a-vendors-identity))

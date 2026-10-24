@@ -78,7 +78,7 @@ are all `source = 'sharadar'`:
 | `bulk:tickers`, `bulk:actions` | the whole-file downloads | `file_id`, `rows`, `superseded` |
 | `delta:stocks`, `delta:funds` | SEP/SFP rows by `lastupdated` | `lastupdated.gte`, `rows`, `file_id`, `dates` (a year back is normal: the vendor restamps history it adjusts) |
 | `master:tickers`, `master:actions` | the vendor tables | |
-| `universe` | renames, delistings, listings | the counts |
+| `universe` | renames, delistings, listings; fed rows held inactive (`inactive:flagged`, `inactive:open`, `inactive:resolved`) | the counts |
 | `prune` | files nothing reads any more | `deleted` (by reason), `bytes_freed`, `kept`, `foreign`, `failed` |
 | `prices:nightly` | the bars | `through` (last delta file applied per table), `counts` (`new`, `revised`, `unchanged`, `kept:<source>`), `by_date` |
 | `actions` | splits and dividends | `skipped.near_existing` |

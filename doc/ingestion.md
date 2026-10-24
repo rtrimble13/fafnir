@@ -1061,6 +1061,27 @@ late. `--since` sets it. Every step is safe to re-run over the same window.
    **Link before mint:** a key whose ticker a fafnir security already trades under
    is `held`, never minted, so one issuer cannot become two rows. `fafnir vendor
    link` decides it.
+4. **Fed but inactive.** Whatever the window, and without changing a security: a
+   row Sharadar feeds that fafnir holds inactive, while TICKERS lists its key live
+   and it still trades (a bar with volume within 5 sessions of the vendor's newest
+   price date: Sharadar keeps printing zero-volume rows for a halted listing), is
+   flagged `security_inactive_but_trading` (warn, `detail.source =
+   'sharadar'`). FMP called many renames delistings (NLOK when it became GEN), and
+   the cutover fed those rows by permaticker: the stale check skips them and the
+   marts leave them out of the active universe. `detail` says what the vendor
+   says and what decides it (`next`):
+   - `relist`: `fafnir security relist` lists it trading again, on the vendor's
+     ticker when that differs ([operations.md](operations.md#a-fed-security-held-inactive));
+   - `venue_transfer`: same ticker, another venue (TXSE): `security venue-transfer`;
+   - `pending_decision`: a `security_delisting_contradicted` flag waits;
+   - `earlier_issuer`: the row also holds bars, and a delisting, from before its
+     link starts: a reused ticker on one row, for `security split-history`;
+   - `held`: another row with history trades under the vendor's ticker, usually
+     the same company FMP minted again after the rename (`held_by`). Not
+     relistable until the two rows are one.
+
+   A flag this step raised is resolved by the run that no longer finds its
+   condition. One FMP's universe load raised (no `detail.source`) is left alone.
 
 **Before the cutover** the command refuses a real run (`[general]
 primary_price_vendor` must be `"sharadar"`), and the dry run is the comparison with
@@ -1145,7 +1166,7 @@ fafnir ingest sharadar             # after it ([general] primary_price_vendor = 
 | 1 | `source sharadar-bulk --tables tickers,actions --force` | Downloads TICKERS and ACTIONS whole: together under 0.1 GB. |
 | 2 | `source sharadar-delta` | Fetches SEP and SFP rows by `lastupdated` (below). |
 | 3 | `ingest sharadar-master` | Refreshes `core.vendor_security` and `core.vendor_security_event`. |
-| 4 | `ingest sharadar-universe` | Renames, delistings and new listings (#93). |
+| 4 | `ingest sharadar-universe` | Renames, delistings and new listings (#93); flags fed rows held inactive. |
 | 5 | `ingest sharadar-prices --nightly` | Writes the deltas' bars (below). |
 | 6 | `ingest sharadar-actions --backfill --gap-fill` | Splits and dividends from the fresh ACTIONS file. |
 | 7 | `source sharadar-prune` | Deletes the files nothing reads any more, keeping a week of them (below). |

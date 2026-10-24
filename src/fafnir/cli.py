@@ -929,6 +929,11 @@ def ingest_sharadar_universe(ctx, since, dry_run):
     ticker (held: `vendor link` decides it).
     Reads the vendor tables: `ingest sharadar-master` first.
 
+    Then, whatever the window: a fed security fafnir holds inactive while
+    Sharadar lists its key live and its bars still arrive is flagged
+    security_inactive_but_trading (`security relist` decides it), and such a flag
+    whose condition has gone is resolved.
+
     A real run waits for [general] primary_price_vendor = "sharadar" (#125). Until
     then the FMP sweeps own the universe, and the dry run is the comparison with
     them: `already` where FMP's sweep did the same, a change where it did not.
@@ -957,7 +962,8 @@ def ingest_sharadar_universe(ctx, since, dry_run):
 def _echo_sharadar_universe(result) -> None:
     head = "Dry run: nothing written." if result.dry_run else f"Run {result.run_id}."
     click.echo(f"{head} Events from {result.since}.")
-    quiet = {"out_of_scope", "not_linked"}
+    # `open`: a step 4 flag raised on an earlier night, still standing.
+    quiet = {"out_of_scope", "not_linked", "open"}
     for change in result.changes:
         if change.outcome in quiet or change.outcome.startswith("recorded_"):
             continue
@@ -2586,6 +2592,181 @@ def security_delist(ctx, security_id, delisted_on, note, delisted_by, dry_run, y
     )
     if resolved:
         click.echo(f"Resolved {_plural(len(resolved), 'DQ flag')}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+@security.command("relist")
+@click.argument("security_id", type=int)
+@click.option(
+    "--rename-date",
+    metavar="YYYY-MM-DD",
+    help="Date the move to the vendor's ticker, when the vendor's events name no "
+    "rename to it.",
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="Why it trades as the vendor says. Required -- it is the whole record.",
+)
+@click.option("--by", "recorded_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_relist(ctx, security_id, rename_date, note, recorded_by, dry_run, yes):
+    """List a fed security trading again, on the vendor's current ticker (#125).
+
+    \b
+      fafnir security relist 21009 \\
+          -m "Innovator's LVHB, renamed BUFF 2020-07-17; Sharadar feeds it" --dry-run
+
+    For a security the vendor that feeds it lists as live, with its bars still
+    arriving, that fafnir holds inactive: FMP called many renames delistings,
+    and the cutover fed those rows by permaticker. `ingest sharadar-universe`
+    flags each security_inactive_but_trading. This:
+
+    \b
+      * reverses a stamped delisting, or lists the row as trading again;
+      * moves it to the vendor's ticker when that differs, dated by the vendor's
+        rename event (or --rename-date), through the rename sweep's rules: an
+        empty row on that ticker is folded in, a row with history refuses;
+      * records the rename in core.symbol_change under the vendor, and resolves
+        the security_inactive_but_trading flags and the rename's conflict flag;
+      * writes an ops.ingestion_run row (source 'operator', endpoint
+        'security-relist') with the row before and the rename.
+
+    Refuses unless the vendor lists the key live and a bar arrived within five
+    sessions of its newest price date. Refuses too while a
+    security_delisting_contradicted flag is open, and for a same-ticker row the
+    vendor lists on another venue: those are `security venue-transfer`'s or
+    `security delist`'s (ADR 0014). No bar changes. `security delist` takes it
+    back.
+    """
+    from fafnir.ingest import relist as rl
+    from fafnir.ingest.runlog import RunLog
+
+    cfg = ctx.obj["config"]
+    if recorded_by is None:
+        recorded_by = _os_user()
+    renamed_on = _parse_date(rename_date) if rename_date else None
+
+    with Database(cfg.dsn) as database:
+        plan = rl.plan_relist(database, security_id=security_id, rename_date=renamed_on)
+        if plan.symbol is not None:
+            state = "inactive" if not plan.active_before else "trading"
+            if plan.delisted_date:
+                state += f", delisted {plan.delisted_date}"
+            click.echo(
+                f"Security {security_id} {plan.symbol} ({plan.company_name or ''}) on "
+                f"{plan.exchange}: {state}"
+            )
+        if plan.vendor_key is not None:
+            click.echo(
+                f"Fed by {plan.vendor} {plan.vendor_key}: {plan.vendor_ticker}; "
+                f"last traded {plan.last_traded or 'not this month'}, vendor's newest "
+                f"{plan.vendor_newest or 'none'}"
+            )
+        if plan.refusals:
+            for refusal in plan.refusals:
+                _echo_wrapped(f"Refused: {refusal}")
+            raise click.ClickException("Nothing was changed.")
+        if plan.delisted_date:
+            click.echo(f"Delisting reversed: {plan.delisted_date}")
+        if plan.rename:
+            day, old, new = plan.rename
+            click.echo(f"Rename: {old} -> {new} on {day}")
+            if plan.folds:
+                click.echo(f"  folds empty security {plan.folds} on {new}")
+            if plan.venue_differs:
+                _echo_wrapped(
+                    f"Note: {plan.vendor} lists {new} on {plan.vendor_exchange}, not "
+                    f"{plan.exchange}. If it moved, record that with `security "
+                    f"venue-transfer {security_id}` after this."
+                )
+        elif plan.periods:
+            for p in plan.periods:
+                click.echo(
+                    f"Ticker period re-opened: {p['symbol']} {p['valid_from']}.."
+                )
+        click.echo(
+            "Flags resolved: " + (", ".join(map(str, plan.open_flags)) or "none open")
+        )
+
+        if dry_run:
+            with database.conn.transaction(force_rollback=True):
+                try:
+                    rl.apply_relist(database, plan, note=note, by=recorded_by)
+                except rl.RelistRefused as exc:
+                    raise click.ClickException(f"Would fail: {exc}") from exc
+                after = rl._security(database, security_id)
+            click.echo(
+                f"After: {after['primary_symbol']}, "
+                f"{'trading' if after['is_actively_trading'] else 'inactive'}, "
+                f"delisted {after['delisted_date'] or 'never'}"
+            )
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Relist {plan.symbol} ({security_id})"
+                + (f" as {plan.rename[2]}" if plan.rename else "")
+                + "?",
+                abort=True,
+            )
+
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-relist",
+            params={
+                "security_id": security_id,
+                "symbol": plan.symbol,
+                "note": note,
+                "by": recorded_by,
+                "vendor": plan.vendor,
+                "vendor_key": plan.vendor_key,
+                "before": {
+                    "primary_symbol": plan.symbol,
+                    "is_actively_trading": plan.active_before,
+                    "delisted_date": plan.delisted_date,
+                },
+                "rename": (
+                    {
+                        "date": plan.rename[0],
+                        "old": plan.rename[1],
+                        "new": plan.rename[2],
+                    }
+                    if plan.rename
+                    else None
+                ),
+                "last_traded": plan.last_traded,
+            },
+        ) as run:
+            try:
+                done = rl.apply_relist(database, plan, note=note, by=recorded_by)
+            except rl.RelistRefused as exc:
+                raise click.ClickException(
+                    f"{exc} -- it changed since the plan above. Re-run to see the "
+                    "current one."
+                ) from exc
+            run.symbols_requested = 1
+            run.params.update(
+                flags_resolved=done.flags_resolved,
+                conflicts_closed=done.conflicts_closed,
+                folded=done.folded,
+                periods_ended=done.periods_ended,
+            )
+            run_id = run.run_id
+
+    click.echo(
+        f"Relisted {plan.symbol} ({security_id})"
+        + (f" as {plan.rename[2]} from {plan.rename[0]}" if plan.rename else "")
+        + f", as {recorded_by} (ops.ingestion_run {run_id})."
+    )
+    if done.flags_resolved:
+        click.echo(f"Resolved {_plural(len(done.flags_resolved), 'DQ flag')}.")
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 

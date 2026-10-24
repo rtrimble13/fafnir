@@ -35,6 +35,15 @@ some events days late. Every step is safe to re-run over the same window:
    mint: a key whose ticker a fafnir security already trades under is ``held``,
    never minted, so one issuer cannot become two rows. `fafnir vendor link` decides
    it.
+4. **Fed but inactive.** Not windowed, and it changes no security. A security the
+   vendor feeds, held inactive here while the vendor lists its key as live and it
+   still trades (a bar with volume in the last 5 sessions), is flagged
+   ``security_inactive_but_trading`` with what the vendor says (its ticker, the
+   rename that moved it there, any other row on that ticker). FMP called many
+   renames delistings, and the cutover fed such rows (88 on 2026-10-24): invisible
+   to ``stale``, absent from the marts' active universe, and often the same company
+   as another row. `fafnir security relist` decides each; a flag whose condition
+   has gone is resolved here.
 
 ``dry_run`` runs the same steps and rolls them back: the report is what a real run
 would do tonight. A real run is the cutover's (#125): the command refuses one
@@ -56,6 +65,10 @@ from fafnir.ingest import symbol_changes as sc
 from fafnir.ingest import vendor_link as vl
 from fafnir.ingest import vendor_overlap as vo
 from fafnir.ingest.runlog import RunLog
+from fafnir.ingest.security_master import (
+    INACTIVE_BUT_TRADING_CHECK,
+    INACTIVE_BUT_TRADING_SESSIONS,
+)
 from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind
 from fafnir.logging_config import get_logger
 
@@ -90,7 +103,7 @@ class UniverseError(RuntimeError):
 
 @dataclass
 class Change:
-    step: str  # rename | delisting | listing
+    step: str  # rename | delisting | listing | inactive
     outcome: str
     vendor_key: str
     symbol: str  # OLD->NEW for a rename
@@ -119,6 +132,26 @@ def _ticker(value: Optional[str]) -> Optional[str]:
     """A ticker as the vendor spells it, or None for its ``N/A``."""
     text = (value or "").strip().upper()
     return None if text in ("", "N/A") else text
+
+
+def fafnir_ticker(value: Optional[str]) -> Optional[str]:
+    """The vendor's ticker as fafnir spells it: Sharadar writes a share class with
+    a dot (``BRK.B``), FMP and this warehouse with a dash (``BRK-B``)."""
+    text = _ticker(value)
+    return text.replace(".", "-") if text else None
+
+
+def latest_rename_to(
+    events: list[dict], ticker: str
+) -> Optional[tuple[date, str, str]]:
+    """The newest of one key's renames that ends on ``ticker`` (fafnir's spelling),
+    as ``(date, old, new)``, or None."""
+    found = [
+        (day, old, new)
+        for day, old, new in renames(events)
+        if fafnir_ticker(new) == ticker
+    ]
+    return found[-1] if found else None
 
 
 def renames(events: list[dict]) -> list[tuple[date, str, str]]:
@@ -401,6 +434,143 @@ def _apply_listings(db, result, candidates, by_key, since, run_id, excluded) -> 
         result.add("listing", "minted", key, ticker, day, sid)
 
 
+#: What the step 4 flag's ``detail.next`` says decides it.
+NEXT_RELIST = "relist"  # `security relist`
+NEXT_HELD = "held"  # another row with history trades under the vendor's ticker
+NEXT_PENDING = "pending_decision"  # `security venue-transfer` or `security delist`
+NEXT_VENUE = "venue_transfer"  # same ticker, another venue: `security venue-transfer`
+NEXT_EARLIER = "earlier_issuer"  # an earlier issuer's bars too: `split-history`
+
+#: How far back step 4 looks for a traded bar (it needs one within
+#: :data:`INACTIVE_BUT_TRADING_SESSIONS` sessions; this only bounds the scan).
+TRADED_LOOKBACK_DAYS = 30
+
+#: Two codes for one venue: FMP files Cboe BZX listings as CBOE, Sharadar as BATS.
+_ONE_VENUE = frozenset({"BATS", "CBOE"})
+
+
+def same_venue(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two ``ref.exchange`` codes name one venue, or either is unknown."""
+    if a is None or b is None or a == b:
+        return True
+    return {a, b} <= _ONE_VENUE
+
+
+def _flag_inactive_but_fed(db, result, vendor, run_id) -> None:
+    """Step 4: flag each security the vendor feeds and lists as live that is held
+    inactive here while it still trades, and resolve this step's flags whose
+    condition has gone. Changes no security: `security relist` decides each.
+
+    "Still trades" is a bar with volume within :data:`INACTIVE_BUT_TRADING_SESSIONS`
+    sessions of the vendor's newest price date: the FMP universe load's window, but
+    a traded bar, because the vendor keeps printing zero-volume rows for a halted
+    listing it has not called delisted.
+    """
+    rows = [
+        r
+        for r in repo.inactive_fed_securities(db, VENDOR)
+        if r["vendor_key"] in vendor and not vendor[r["vendor_key"]]["is_delisted"]
+    ]
+    newest = max(
+        (c["last_price_date"] for c in vendor.values() if c["last_price_date"]),
+        default=None,
+    )
+    events: dict[str, list[dict]] = defaultdict(list)
+    for e in repo.vendor_events_for_keys(
+        db, VENDOR, RENAME_EVENTS, [r["vendor_key"] for r in rows]
+    ):
+        events[e["vendor_key"]].append(e)
+    kept: list[str] = []
+    for r in rows:
+        sid, key, symbol = int(r["security_id"]), r["vendor_key"], r["primary_symbol"]
+        if newest is None:
+            break
+        traded = repo.last_traded_bar(
+            db, sid, newest - timedelta(days=TRADED_LOOKBACK_DAYS)
+        )
+        if (
+            traded is None
+            or repo.sessions_apart(db, traded, newest) > INACTIVE_BUT_TRADING_SESSIONS
+        ):
+            continue
+        first_bar, _ = repo.security_bar_span(db, sid)
+        earlier = repo.holds_earlier_issuer(
+            first_bar=first_bar,
+            delisted_date=r["delisted_date"],
+            link_from=r["link_from"],
+        )
+        ticker = fafnir_ticker(vendor[key]["ticker"]) or symbol
+        rename = holder = None
+        if ticker != symbol:
+            rename = latest_rename_to(events[key], ticker)
+            holder = repo.active_security_for_symbol(db, ticker, VENDOR)
+            if holder == sid:
+                holder = None
+        held = holder is not None and repo.security_has_history(db, holder)
+        venue = sharadar_map.map_exchange(vendor[key].get("exchange"))
+        if repo.condition_open(db, security_id=sid, check_name=dl.CONTRADICTED_CHECK):
+            hint = NEXT_PENDING
+        elif earlier:
+            hint = NEXT_EARLIER
+        elif held:
+            hint = NEXT_HELD
+        elif ticker == symbol and not same_venue(venue, r["exchange_code"]):
+            hint = NEXT_VENUE
+        else:
+            hint = NEXT_RELIST
+        delisted = r["delisted_date"]
+        new = repo.add_dq_flag_once(
+            db,
+            check_name=INACTIVE_BUT_TRADING_CHECK,
+            severity="warn",
+            security_id=sid,
+            table_name="core.security",
+            record_key={"symbol": symbol},
+            detail={
+                "source": VENDOR,
+                "vendor_key": key,
+                "vendor_ticker": ticker,
+                "vendor_exchange": venue,
+                "last_traded": traded.isoformat(),
+                "first_bar": first_bar.isoformat() if first_bar else None,
+                "link_from": r["link_from"].isoformat(),
+                "vendor_newest": newest.isoformat(),
+                "delisted_date": delisted.isoformat() if delisted else None,
+                "rename": (
+                    {"date": rename[0].isoformat(), "old": rename[1], "new": rename[2]}
+                    if rename
+                    else None
+                ),
+                "held_by": holder,
+                "held_with_history": held,
+                "next": hint,
+            },
+            ingestion_run_id=run_id,
+        )
+        label = symbol if ticker == symbol else f"{symbol}->{ticker}"
+        result.add(
+            "inactive", "flagged" if new else "open", key, label, traded, sid, hint
+        )
+        kept.append(f"{sid}|{symbol}")
+    for f in repo.resolve_sourced_flags_except(
+        db,
+        check_name=INACTIVE_BUT_TRADING_CHECK,
+        source=VENDOR,
+        keep=kept,
+        note="Condition gone: trading here again, no longer fed, or the vendor no "
+        "longer lists it live with bars arriving.",
+        resolved_by=CREATED_BY,
+    ):
+        result.add(
+            "inactive",
+            "resolved",
+            (f["detail"] or {}).get("vendor_key") or "",
+            (f["record_key"] or {}).get("symbol") or "",
+            f["detected_at"].date(),
+            int(f["security_id"]),
+        )
+
+
 def _apply(
     db: Database,
     result: UniverseResult,
@@ -430,6 +600,7 @@ def _apply(
     _apply_renames(db, result, by_key, links, symbols, run_id)
     _apply_delistings(db, result, by_key, links, vendor, run_id)
     _apply_listings(db, result, candidates, by_key, result.since, run_id, excluded)
+    _flag_inactive_but_fed(db, result, vendor, run_id)
 
 
 def run(
