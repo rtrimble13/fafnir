@@ -547,7 +547,7 @@ session):
 - **Time:** most of each run is counting rows, not the download. A host on a slower
   link will differ.
 - **Reading:** every row of all five files reads back through
-  `sharadar_files.rows` with no parse error. A full `stocks` read takes 260 s
+  `sharadar_ledger.rows` (then `sharadar_files.rows`) with no parse error. A full `stocks` read takes 260 s
   (about 175,000 rows a second); `funds` takes 95 s and `fundamentals` 180 s.
 
 ### On the production host

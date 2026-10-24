@@ -41,6 +41,15 @@ patterns to add new sources, tables, and consumers.
      feed: `FafnirConfig.sharadar_api_key` reads `SHARADAR_API_KEY` only.
    - **A `fafnir source ping --vendor <name>`** that makes one request and writes
      nothing, so an operator can check the key and the endpoint before any load.
+   - **Nothing from the warehouse.** A module in `sources/` imports the standard
+     library, `requests`, `fafnir.logging_config` and other `sources` modules only
+     ([ADR 0017](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md));
+     `test/fafnir/test_sources_boundary.py` fails on anything else. What needs the
+     database -- a probe that uses the loader's validation, a reader that looks a
+     file up in a ledger, a report over `core` -- lives in `ingest/` beside the
+     loader (`ingest/fmp_probe.py`, `ingest/sharadar_ledger.py`,
+     `ingest/vendor_gaps.py` are the three that moved). `duk -S <name>` is an
+     adapter over the same client, never a second one.
 2. **Schema.** Add a migration `sql/migrations/NNNN_<name>.up.sql` (+ `.down.sql`)
    for the new tables. Economic series fit a tidy shape:
    `core.economic_series(series_id, source, title, units, frequency, seasonal_adj)`

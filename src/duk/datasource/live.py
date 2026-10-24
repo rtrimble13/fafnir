@@ -1,7 +1,7 @@
 """
-Live data source: the FMP API. Thin adapters over the carried-over fmp_api
-functions so the CLI can dispatch uniformly. This preserves duk's original
-standalone behaviour.
+FMP data source (``-S fmp``; ``live`` is the older spelling). Thin adapters over
+``duk.fmp_api``, which shapes the warehouse's ``FMPClient`` rows into duk's frames
+(ADR 0017), so the CLI dispatches uniformly across ``db``, ``fmp`` and ``sharadar``.
 """
 
 from __future__ import annotations

@@ -68,6 +68,7 @@ from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest import adjustments
 from fafnir.ingest import sharadar_actions as sa
+from fafnir.ingest import sharadar_ledger as ledger
 from fafnir.ingest import sharadar_map
 from fafnir.ingest.daily_price import (
     _drop_non_session,
@@ -388,7 +389,7 @@ def prepare(
     if actions is not None and keys:
         key_of = repo.vendor_keys_by_ticker(db, VENDOR, SECURITY_TABLES)
         found = sa.key_actions(
-            sf.rows(db, actions["file_id"], bulk_dir), set(keys), key_of
+            ledger.rows(db, actions["file_id"], bulk_dir), set(keys), key_of
         )
         for key, t in keys.items():
             splits = [
@@ -425,7 +426,7 @@ def load(
         last = time.monotonic()
         for table, file_id in files.items():
             wanted = {ticker: sf.ALL_DATES for ticker in by_file[table]}
-            groups = sf.select_by_ticker(db, file_id, bulk_dir, wanted)
+            groups = ledger.select_by_ticker(db, file_id, bulk_dir, wanted)
             for done, (ticker, rows) in enumerate(groups, start=1):
                 result.read += len(rows)
                 _load_run(
@@ -544,7 +545,7 @@ def merged_rows(
     wanted = {ticker: sf.ALL_DATES for ticker in tickers}
     out: dict[str, dict[date, dict]] = defaultdict(dict)
     for f in files if wanted else ():
-        for r in sf.select(db, f["file_id"], bulk_dir, wanted):
+        for r in ledger.select(db, f["file_id"], bulk_dir, wanted):
             held = out[r["ticker"]].get(r["date"])
             stamp = r.get("lastupdated") or date.min
             if held is None or stamp >= (held.get("lastupdated") or date.min):

@@ -1,20 +1,17 @@
 """
-Sharadar API integration for ``duk -S sharadar``.
+Sharadar for ``duk -S sharadar``: the warehouse's client, shaped into duk's frame.
 
-Reads Sharadar's equity-price table (SEP) directly, the way ``duk.fmp_api`` reads
-FMP. It exists so a series can be checked against the warehouse from an
-independent vendor, and so a symbol fafnir does not hold yet can be read before
-it is loaded.
+Reads Sharadar's equity-price table (SEP) and fund table (SFP) so a series can be
+checked against the warehouse from an independent vendor, and so a symbol fafnir
+does not hold yet can be read before it is loaded.
 
-**The request follows Sharadar's documentation and is not yet measured.** The
-vendor's agent guide documents ``GET https://api.sharadar.com/v1.0/data/{table}``,
-the key as an ``api_key`` query parameter, and ``ticker`` / ``from`` / ``to``
-filters with ``format=json``; ``fafnir.sources.sharadar`` records the evidence item
-by item. The payload *shape* is undocumented, so the parser (shared with that
-module) accepts a list of row objects and the datatable shape. The base URL stays
-configurable (``[api].sharadar_base_url`` / ``SHARADAR_BASE_URL``), and the
-warehouse-side probe (``fafnir source probe-sharadar``, plan issue SA-0201)
-measures the rest; correct this module from its findings rather than from memory.
+**No HTTP is made here** (ADR 0017). Every request goes through
+:class:`fafnir.sources.sharadar.SharadarClient`, the same object the loaders and the
+probe use: its throttle, its retries, its byte metering, the key carried in the
+``x-api-key`` header rather than the URL, and its redaction of the key from every
+message that can leave. What this module owns is what duk does *with* the rows:
+which tables are tried, in what order, and how the vendor's split-adjusted fields
+become the raw or the adjusted series ``duk ph`` prints.
 
 Field semantics (Sharadar's documented SEP contract):
 
@@ -23,13 +20,11 @@ Field semantics (Sharadar's documented SEP contract):
 - ``closeunadj`` is the close as traded, the one unadjusted field.
 
 ``duk ph`` without ``--adj`` means *raw*, so the raw series is recovered with the
-vendor's own identities ``OpenUnadj = Open × CloseUnadj / Close`` and
-``VolumeUnadj = Volume × Close / CloseUnadj``. On the capture day the ratio is
-exactly 1; it departs from 1 only for bars followed by a later split, where the
-recovered values carry the vendor's rounding (ADR 0004's objection, confined to
-history). With ``--adj`` every price field is scaled by ``closeadj / close`` so the
-series is fully adjusted; volume stays as delivered (split-adjusted), as on FMP's
-dividend-adjusted feed.
+vendor's own identities (``OpenUnadj = Open x CloseUnadj / Close``, ``VolumeUnadj =
+Volume x Close / CloseUnadj``): exact on bars with no later split, the vendor's
+rounding on bars with one. With ``--adj`` every price is scaled by
+``closeadj / close``. SEP (stocks) is read first and SFP (ETFs, closed-end funds)
+when SEP has no rows, so one spelling of a ticker works for both.
 """
 
 from __future__ import annotations
@@ -39,26 +34,19 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-import requests
 
 from duk.date_utils import get_api_date_range
-from duk.fmp_api import redact_secrets
 from fafnir.sources.base import SourceError
 from fafnir.sources.sharadar import (  # noqa: F401 -- re-exported
     DEFAULT_BASE_URL,
     PRICE_TABLES,
+    SharadarClient,
     rows_from_payload,
 )
 
 logger = logging.getLogger(__name__)
 
-# The base URL, the price tables and the payload parser are the warehouse
-# client's (fafnir.sources.sharadar), so the probe (#49) corrects them once for
-# both. SEP holds equities, SFP funds (ETFs, CEFs): `duk` tries SEP first and
-# falls back to SFP when SEP returns no rows, so one spelling of a ticker works
-# for both.
-
-#: Columns the price tables carry; the parser requires `date` and `close`.
+#: Columns the price tables carry; the frame builder requires `date` and `close`.
 PRICE_COLUMNS = (
     "ticker",
     "date",
@@ -72,74 +60,67 @@ PRICE_COLUMNS = (
     "lastupdated",
 )
 
+#: One ``duk`` invocation makes a handful of requests, so it is never the thing
+#: that trips the vendor's limit; the client's throttle exists for the loaders.
+RATE_PER_MIN = 600
 
-class SharadarAPIError(Exception):
-    """Raised when a Sharadar request fails or returns an unusable payload."""
+
+class SharadarAPIError(SourceError):
+    """A Sharadar request failed or returned an unusable payload.
+
+    A :class:`~fafnir.sources.base.SourceError`, so a caller that handles the
+    warehouse client's errors handles duk's too; kept under its old name for the
+    callers and tests that import it.
+    """
 
 
-def _rows_from_payload(data: Any) -> List[Dict[str, Any]]:
-    """Normalise either payload shape to a list of row dicts."""
-    try:
-        return rows_from_payload(data)
-    except SourceError as exc:
-        raise SharadarAPIError(str(exc)) from None
+def make_client(api_key: str, *, base_url: Optional[str] = None) -> SharadarClient:
+    """The warehouse's Sharadar client, configured for a shell session."""
+    if not api_key:
+        raise ValueError("API key cannot be empty")
+    return SharadarClient(api_key, base_url=base_url, rate_per_min=RATE_PER_MIN)
 
 
 def price_table_api(
     table: str,
     symbol: str,
-    api_key: str,
+    api_key: str = "",
     *,
     base_url: Optional[str] = None,
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
+    client: Optional[SharadarClient] = None,
 ) -> List[Dict[str, Any]]:
     """Request one ticker's rows from a Sharadar price table (SEP or SFP).
 
-    Returns the vendor's rows as dicts, unmodified. Raises ``SharadarAPIError``
-    on transport failure, a non-2xx status or an error payload. The API key is
-    redacted from every message that can leave this function.
+    Returns the vendor's rows as dicts, unmodified, every page of them. Pass a
+    ``client`` to reuse one across tables (its byte count then covers the whole
+    read); otherwise one is made from ``api_key`` and ``base_url``. Raises
+    :class:`SharadarAPIError` on transport failure, a non-2xx status or an error
+    payload, with the key redacted.
     """
     if not symbol:
         raise ValueError("Symbol cannot be empty")
-    if not api_key:
-        raise ValueError("API key cannot be empty")
     if table not in PRICE_TABLES:
         raise ValueError(f"Unknown Sharadar price table {table!r}")
+    client = client or make_client(api_key, base_url=base_url)
 
-    base = (base_url or DEFAULT_BASE_URL).rstrip("/")
-    endpoint = f"{base}/{table}"
-    params: Dict[str, str] = {
-        "ticker": symbol.upper(),
-        "format": "json",
-        "api_key": api_key,
-    }
+    filters: Dict[str, str] = {"ticker": symbol.upper()}
     if from_date:
-        params["from"] = from_date.strftime("%Y-%m-%d")
+        filters["from"] = from_date.strftime("%Y-%m-%d")
     if to_date:
-        params["to"] = to_date.strftime("%Y-%m-%d")
+        filters["to"] = to_date.strftime("%Y-%m-%d")
 
     logger.debug(f"Requesting {table} rows for {symbol} from Sharadar")
     try:
-        response = requests.get(endpoint, params=params, timeout=60)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch {table} for {symbol}: {detail}")
+        rows = client.query(table, filters)
+    except SourceError as exc:
+        # The client's message is already redacted; chain nothing, since the
+        # original may hold a URL (ADR 0017, the base client's own rule).
         raise SharadarAPIError(
-            f"Failed to fetch Sharadar {table} for {symbol}: {detail}. "
-            "The endpoint shape is unverified; see doc/duk.md › Sources and "
-            "[api].sharadar_base_url."
+            f"Failed to fetch Sharadar {table} for {symbol}: {exc}. "
+            "See doc/duk.md › Sources and [api].sharadar_base_url."
         ) from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        raise SharadarAPIError(
-            f"Sharadar {table} for {symbol}: response is not JSON ({e})"
-        ) from None
-
-    rows = _rows_from_payload(data)
     logger.info(f"Retrieved {len(rows)} {table} rows for {symbol}")
     return rows
 
@@ -201,6 +182,7 @@ def get_price_history(
     adjusted: bool = False,
     *,
     base_url: Optional[str] = None,
+    client: Optional[SharadarClient] = None,
 ) -> pd.DataFrame:
     """Sharadar counterpart of ``duk.fmp_api.get_price_history``: the same
     arguments, the same frame contract, so the CLI and the compute modules do not
@@ -213,15 +195,11 @@ def get_price_history(
         start_date=start_obj, end_date=end_obj, limit=limit, frequency=frequency
     )
 
+    client = client or make_client(api_key, base_url=base_url)
     rows: List[Dict[str, Any]] = []
     for table in PRICE_TABLES:
         rows = price_table_api(
-            table,
-            symbol,
-            api_key,
-            base_url=base_url,
-            from_date=from_date,
-            to_date=to_date,
+            table, symbol, client=client, from_date=from_date, to_date=to_date
         )
         if rows:
             break

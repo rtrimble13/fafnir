@@ -1,5 +1,9 @@
 """
-Tests for FMP API module.
+Tests for ``duk.fmp_api``: the warehouse's FMP client, shaped into duk's frames.
+
+duk makes no request of its own (ADR 0017), so the HTTP seam under test is the
+client's session, and a failure is the client's: retried, then raised redacted.
+The frame shaping (``get_price_history``, ``get_yield_curve``) is duk's.
 """
 
 import datetime as dt
@@ -21,8 +25,18 @@ from duk.fmp_api import (
     sector_list_api,
     treasury_rates_api,
 )
+from fafnir.sources import base as base_mod
 
 SECRET = "2F6Gza19PPjluyAomWz16vmQGwH2DwvW"
+
+# What ``BaseSource._get`` calls; patching it covers every request duk can make.
+GET = "requests.Session.get"
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    # The client backs off between retries; a failing test should not wait for it.
+    monkeypatch.setattr(base_mod.time, "sleep", lambda s: None)
 
 
 class TestRedaction:
@@ -38,7 +52,7 @@ class TestRedaction:
         assert "apikey=***" in out
         assert "402 Client Error" in out and "symbol=AAPL" in out
 
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_request_failure_neither_logs_nor_raises_the_key(self, mock_get, caplog):
         mock_get.side_effect = requests.exceptions.ConnectionError(
             f"Max retries exceeded with url: /stable/x?apikey={SECRET}"
@@ -81,7 +95,7 @@ class TestPriceHistoryAPI:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -106,7 +120,7 @@ class TestPriceHistoryAPI:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -136,7 +150,7 @@ class TestPriceHistoryAPI:
 
     def test_price_history_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch price history"):
@@ -144,7 +158,7 @@ class TestPriceHistoryAPI:
 
     def test_price_history_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -155,24 +169,24 @@ class TestPriceHistoryAPI:
 
     def test_price_history_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 price_history_api("AAPL", "test_api_key")
 
     def test_price_history_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 price_history_api("AAPL", "test_api_key")
 
     def test_price_history_api_list_response(self):
@@ -182,7 +196,7 @@ class TestPriceHistoryAPI:
             {"date": "2023-01-02", "close": 150.0},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -196,7 +210,7 @@ class TestPriceHistoryAPI:
         """Test handling of empty or unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -207,7 +221,7 @@ class TestPriceHistoryAPI:
 
     def test_price_history_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch price history"):
@@ -217,7 +231,7 @@ class TestPriceHistoryAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = {"symbol": "AAPL", "historical": []}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -228,7 +242,7 @@ class TestPriceHistoryAPI:
             # that returns prices as they actually traded; `.../full` is split-adjusted.
             call_args = mock_get.call_args
             assert "historical-price-eod/non-split-adjusted" in call_args[0][0]
-            assert "symbol=AAPL" in call_args[0][0]
+            assert call_args[1]["params"]["symbol"] == "AAPL"
             assert call_args[1]["params"]["apikey"] == "test_api_key"
             assert call_args[1]["timeout"] == 30
 
@@ -260,17 +274,19 @@ class TestAdjustedPriceHistoryAPI:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
             result = adjusted_price_history_api("AAPL", "test_api_key")
 
+            # The client returns one bar per date, ascending, whatever order the
+            # vendor sent (the same contract as the warehouse's raw bars).
             assert len(result) == 2
-            assert result[0]["date"] == "2023-01-03"
-            assert result[0]["close"] == 154.0
-            assert result[1]["date"] == "2023-01-02"
+            assert result[0]["date"] == "2023-01-02"
+            assert result[1]["date"] == "2023-01-03"
+            assert result[1]["close"] == 154.0
 
     def test_adjusted_price_history_api_with_date_range(self):
         """Test API call with from and to dates."""
@@ -285,7 +301,7 @@ class TestAdjustedPriceHistoryAPI:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -318,7 +334,7 @@ class TestAdjustedPriceHistoryAPI:
 
     def test_adjusted_price_history_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(
@@ -328,7 +344,7 @@ class TestAdjustedPriceHistoryAPI:
 
     def test_adjusted_price_history_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -341,24 +357,24 @@ class TestAdjustedPriceHistoryAPI:
 
     def test_adjusted_price_history_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 adjusted_price_history_api("AAPL", "test_api_key")
 
     def test_adjusted_price_history_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 adjusted_price_history_api("AAPL", "test_api_key")
 
     def test_adjusted_price_history_api_list_response(self):
@@ -368,7 +384,7 @@ class TestAdjustedPriceHistoryAPI:
             {"date": "2023-01-02", "close": 150.0},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -376,13 +392,13 @@ class TestAdjustedPriceHistoryAPI:
             result = adjusted_price_history_api("AAPL", "test_api_key")
 
             assert len(result) == 2
-            assert result[0]["date"] == "2023-01-03"
+            assert [r["date"] for r in result] == ["2023-01-02", "2023-01-03"]
 
     def test_adjusted_price_history_api_empty_response(self):
         """Test handling of empty or unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -393,7 +409,7 @@ class TestAdjustedPriceHistoryAPI:
 
     def test_adjusted_price_history_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(
@@ -405,7 +421,7 @@ class TestAdjustedPriceHistoryAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = {"symbol": "AAPL", "historical": []}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -415,7 +431,7 @@ class TestAdjustedPriceHistoryAPI:
             # Verify the correct URL was called
             call_args = mock_get.call_args
             assert "dividend-adjusted" in call_args[0][0]
-            assert "symbol=AAPL" in call_args[0][0]
+            assert call_args[1]["params"]["symbol"] == "AAPL"
             assert call_args[1]["params"]["apikey"] == "test_api_key"
             assert call_args[1]["timeout"] == 30
 
@@ -448,7 +464,7 @@ class TestTreasuryRatesAPI:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -472,7 +488,7 @@ class TestTreasuryRatesAPI:
             }
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -496,7 +512,7 @@ class TestTreasuryRatesAPI:
 
     def test_treasury_rates_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch treasury rates"):
@@ -504,7 +520,7 @@ class TestTreasuryRatesAPI:
 
     def test_treasury_rates_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -515,31 +531,31 @@ class TestTreasuryRatesAPI:
 
     def test_treasury_rates_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 treasury_rates_api("test_api_key")
 
     def test_treasury_rates_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 treasury_rates_api("test_api_key")
 
     def test_treasury_rates_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -552,7 +568,7 @@ class TestTreasuryRatesAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -563,7 +579,7 @@ class TestTreasuryRatesAPI:
 
     def test_treasury_rates_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch treasury rates"):
@@ -573,7 +589,7 @@ class TestTreasuryRatesAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -616,7 +632,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -643,7 +659,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -676,7 +692,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -705,7 +721,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -753,7 +769,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -804,7 +820,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -826,7 +842,7 @@ class TestGetPriceHistory:
 
         mock_response = {"symbol": "AAPL", "historical": []}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -856,7 +872,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -884,7 +900,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -925,7 +941,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -956,7 +972,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -990,7 +1006,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1024,7 +1040,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1057,7 +1073,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1087,7 +1103,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1122,7 +1138,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1169,7 +1185,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1209,7 +1225,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1246,7 +1262,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1284,7 +1300,7 @@ class TestGetPriceHistory:
             ],
         }
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1327,7 +1343,7 @@ class TestGetYieldCurve:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1359,7 +1375,7 @@ class TestGetYieldCurve:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1402,7 +1418,7 @@ class TestGetYieldCurve:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1431,7 +1447,7 @@ class TestGetYieldCurve:
             {"date": "2023-01-01", "year10": 3.72},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1461,7 +1477,7 @@ class TestGetYieldCurve:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1494,7 +1510,7 @@ class TestGetYieldCurve:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1517,7 +1533,7 @@ class TestGetYieldCurve:
 
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1542,7 +1558,7 @@ class TestGetYieldCurve:
             {"date": "2023-06-01", "year1": 4.68},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1563,7 +1579,7 @@ class TestGetYieldCurve:
             {"date": "2023-06-01", "year1": 4.68},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1590,7 +1606,7 @@ class TestGetYieldCurve:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1619,7 +1635,7 @@ class TestGetYieldCurve:
             {"date": "2023-01-03", "month1": 4.35, "year1": 4.68, "year10": 3.79},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1647,7 +1663,7 @@ class TestGetYieldCurve:
             {"date": "2023-01-05", "year10": 3.80},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1670,7 +1686,7 @@ class TestGetYieldCurve:
             {"date": "2023-01-03", "month6": 4.55, "year1": 4.65},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1709,7 +1725,7 @@ class TestCompanyListAPI:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1727,7 +1743,7 @@ class TestCompanyListAPI:
 
     def test_company_list_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch company list"):
@@ -1735,7 +1751,7 @@ class TestCompanyListAPI:
 
     def test_company_list_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -1746,31 +1762,31 @@ class TestCompanyListAPI:
 
     def test_company_list_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 company_list_api("test_api_key")
 
     def test_company_list_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 company_list_api("test_api_key")
 
     def test_company_list_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1783,7 +1799,7 @@ class TestCompanyListAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1794,7 +1810,7 @@ class TestCompanyListAPI:
 
     def test_company_list_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch company list"):
@@ -1804,7 +1820,7 @@ class TestCompanyListAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1838,7 +1854,7 @@ class TestEtfSymbolListAPI:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1856,7 +1872,7 @@ class TestEtfSymbolListAPI:
 
     def test_etf_symbol_list_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch ETF symbol list"):
@@ -1864,7 +1880,7 @@ class TestEtfSymbolListAPI:
 
     def test_etf_symbol_list_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -1875,31 +1891,31 @@ class TestEtfSymbolListAPI:
 
     def test_etf_symbol_list_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 etf_symbol_list_api("test_api_key")
 
     def test_etf_symbol_list_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 etf_symbol_list_api("test_api_key")
 
     def test_etf_symbol_list_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1912,7 +1928,7 @@ class TestEtfSymbolListAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1923,7 +1939,7 @@ class TestEtfSymbolListAPI:
 
     def test_etf_symbol_list_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch ETF symbol list"):
@@ -1933,7 +1949,7 @@ class TestEtfSymbolListAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1958,7 +1974,7 @@ class TestSectorListAPI:
             {"sector": "Financial Services"},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -1976,7 +1992,7 @@ class TestSectorListAPI:
 
     def test_sector_list_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch sector list"):
@@ -1984,7 +2000,7 @@ class TestSectorListAPI:
 
     def test_sector_list_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -1995,31 +2011,31 @@ class TestSectorListAPI:
 
     def test_sector_list_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 sector_list_api("test_api_key")
 
     def test_sector_list_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 sector_list_api("test_api_key")
 
     def test_sector_list_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2032,7 +2048,7 @@ class TestSectorListAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2043,7 +2059,7 @@ class TestSectorListAPI:
 
     def test_sector_list_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch sector list"):
@@ -2053,7 +2069,7 @@ class TestSectorListAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2078,7 +2094,7 @@ class TestIndustryListAPI:
             {"industry": "Biotechnology"},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2096,7 +2112,7 @@ class TestIndustryListAPI:
 
     def test_industry_list_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch industry list"):
@@ -2104,7 +2120,7 @@ class TestIndustryListAPI:
 
     def test_industry_list_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -2115,31 +2131,31 @@ class TestIndustryListAPI:
 
     def test_industry_list_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 industry_list_api("test_api_key")
 
     def test_industry_list_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 industry_list_api("test_api_key")
 
     def test_industry_list_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2152,7 +2168,7 @@ class TestIndustryListAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2163,7 +2179,7 @@ class TestIndustryListAPI:
 
     def test_industry_list_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(FMPAPIError, match="Failed to fetch industry list"):
@@ -2173,7 +2189,7 @@ class TestIndustryListAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2207,7 +2223,7 @@ class TestActivelyTradingListAPI:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2225,7 +2241,7 @@ class TestActivelyTradingListAPI:
 
     def test_actively_trading_list_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(
@@ -2235,7 +2251,7 @@ class TestActivelyTradingListAPI:
 
     def test_actively_trading_list_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -2248,31 +2264,31 @@ class TestActivelyTradingListAPI:
 
     def test_actively_trading_list_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 actively_trading_list_api("test_api_key")
 
     def test_actively_trading_list_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 actively_trading_list_api("test_api_key")
 
     def test_actively_trading_list_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2285,7 +2301,7 @@ class TestActivelyTradingListAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2296,7 +2312,7 @@ class TestActivelyTradingListAPI:
 
     def test_actively_trading_list_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(
@@ -2308,7 +2324,7 @@ class TestActivelyTradingListAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2348,7 +2364,7 @@ class TestScreenerAPI:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2369,7 +2385,7 @@ class TestScreenerAPI:
             }
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2387,7 +2403,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "marketCap": 2500000000000},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2410,7 +2426,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "price": 150.0},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2429,7 +2445,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "beta": 1.2},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2448,7 +2464,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "dividend": 0.92},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2469,7 +2485,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "volume": 50000000},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2490,7 +2506,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "exchange": "NASDAQ"},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2508,7 +2524,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "country": "US"},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2526,7 +2542,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "industry": "Consumer Electronics"},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2544,7 +2560,7 @@ class TestScreenerAPI:
             {"symbol": "AAPL", "isEtf": False, "isFund": False},
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2567,7 +2583,7 @@ class TestScreenerAPI:
         """Test API call with limit parameter."""
         mock_response = [{"symbol": f"SYM{i}", "price": 100.0 + i} for i in range(100)]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2597,7 +2613,7 @@ class TestScreenerAPI:
             },
         ]
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2654,7 +2670,7 @@ class TestScreenerAPI:
 
     def test_screener_api_network_error(self):
         """Test handling of network errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.ConnectionError("Network error")
 
             with pytest.raises(
@@ -2664,7 +2680,7 @@ class TestScreenerAPI:
 
     def test_screener_api_http_error(self):
         """Test handling of HTTP errors."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 404
             mock_get.return_value.raise_for_status.side_effect = (
                 requests.exceptions.HTTPError("404 Not Found")
@@ -2677,31 +2693,31 @@ class TestScreenerAPI:
 
     def test_screener_api_invalid_json(self):
         """Test handling of invalid JSON response."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
             mock_get.return_value.json.side_effect = ValueError("Invalid JSON")
 
-            with pytest.raises(FMPAPIError, match="Failed to parse JSON response"):
+            with pytest.raises(FMPAPIError, match="non-JSON body"):
                 screener_api("test_api_key")
 
     def test_screener_api_error_message_in_response(self):
         """Test handling of error message in API response."""
         mock_response = {"Error Message": "Invalid API key"}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
 
-            with pytest.raises(FMPAPIError, match="FMP API error"):
+            with pytest.raises(FMPAPIError, match="fmp error"):
                 screener_api("test_api_key")
 
     def test_screener_api_empty_response(self):
         """Test handling of empty list response."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2714,7 +2730,7 @@ class TestScreenerAPI:
         """Test handling of unexpected response format."""
         mock_response = {}
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2725,7 +2741,7 @@ class TestScreenerAPI:
 
     def test_screener_api_timeout(self):
         """Test handling of request timeout."""
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.side_effect = requests.exceptions.Timeout("Request timeout")
 
             with pytest.raises(
@@ -2737,7 +2753,7 @@ class TestScreenerAPI:
         """Test that the correct URL and parameters are used."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()
@@ -2754,7 +2770,7 @@ class TestScreenerAPI:
         """Test that None parameters are not included in the request."""
         mock_response = []
 
-        with mock.patch("requests.get") as mock_get:
+        with mock.patch(GET) as mock_get:
             mock_get.return_value.json.return_value = mock_response
             mock_get.return_value.status_code = 200
             mock_get.return_value.raise_for_status = mock.Mock()

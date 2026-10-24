@@ -21,9 +21,8 @@ import pytest
 
 from fafnir.db import repository as repo
 from fafnir.dq import checks
-from fafnir.ingest import corporate_actions, daily_price, venue_transfer
+from fafnir.ingest import corporate_actions, daily_price, vendor_gaps, venue_transfer
 from fafnir.ingest.runlog import RunLog
-from fafnir.sources import vendor_gaps
 
 pytestmark = pytest.mark.integration
 

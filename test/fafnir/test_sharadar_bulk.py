@@ -19,6 +19,7 @@ from click.testing import CliRunner
 
 from fafnir import cli
 from fafnir.ingest import sharadar_bulk as bulk
+from fafnir.ingest import sharadar_ledger as ledger
 from fafnir.sources import sharadar_files as sf
 from fafnir.sources.base import SourceError
 from fafnir.sources.sharadar import SharadarClient
@@ -101,7 +102,7 @@ def test_a_table_downloads_records_and_reads_back(db, tmp_path):
     assert run["params"]["rows"] == 2 and run["params"]["file_id"] == f["file_id"]
     assert "synthetic-key" not in json.dumps(run["params"])
 
-    rows = list(sf.rows(db, f["file_id"], tmp_path))
+    rows = list(ledger.rows(db, f["file_id"], tmp_path))
     assert rows[0]["date"] == date(2024, 1, 3) and rows[0]["close"] == Decimal("10.25")
 
 
@@ -183,12 +184,12 @@ def test_the_reader_refuses_a_missing_or_changed_file(db, tmp_path):
     path = tmp_path / r.path
     path.write_bytes(path.read_bytes() + b"x")
     with pytest.raises(sf.SharadarFileError, match="the ledger recorded"):
-        sf.rows(db, r.file_id, tmp_path)
+        ledger.rows(db, r.file_id, tmp_path)
     path.unlink()
     with pytest.raises(sf.SharadarFileError, match="re-download it"):
-        sf.rows(db, r.file_id, tmp_path)
+        ledger.rows(db, r.file_id, tmp_path)
     with pytest.raises(sf.SharadarFileError, match="no file 999"):
-        sf.rows(db, 999, tmp_path)
+        ledger.rows(db, 999, tmp_path)
 
 
 def test_the_command(db, tmp_path, monkeypatch):

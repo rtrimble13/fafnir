@@ -191,9 +191,9 @@ TABLES="$(echo "${TABLES}" | tr -s ' \n\t' ' ' | sed 's/^ //; s/ $//')"
 # (postgresql://user:pass@host/db -- supported, see src/fafnir/config.py) contains
 # no spaces, so any "print a prefix of it" approach leaks the password into the
 # terminal and into whatever log the operator redirected to. The project already
-# holds this line elsewhere (redact_secrets/SECRET_QUERY_PARAMS in duk/fmp_api.py
-# and sources/base.py). The dbname is the useful confirmation anyway: it names the
-# database about to be truncated.
+# holds this line elsewhere (redact_secrets/SECRET_QUERY_PARAMS in
+# src/fafnir/sources/base.py, which duk shares). The dbname is the useful
+# confirmation anyway: it names the database about to be truncated.
 describe_dsn() {
     local dsn="$1" host="" db="" rest=""
     if [[ "${dsn}" == *"://"* ]]; then

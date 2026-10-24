@@ -4,8 +4,10 @@ Read a downloaded Sharadar file as typed rows (plan SA-0203, #50).
 Plan v2 keeps Sharadar's files on disk, recorded in ``landing.sharadar_file``, and
 loads ``core`` straight from them: there are no typed landing tables, and nothing is
 COPYed into the database. This module is the one place a file becomes rows, so
-every loader (#52's downloader checks headers with it; #55, #58, #75 read with it)
-types a value the same way.
+every loader (#52's downloader checks headers with it; #55, #58, #75 read with it,
+through :mod:`fafnir.ingest.sharadar_ledger`) types a value the same way. Nothing
+here touches the database: this module is vendor code (ADR 0017), and the ledger
+that says which file to read is the warehouse's.
 
 * **Containers.** A bulk file is a zip holding one CSV (measured 2026-10-19:
   ``/bulk-sharadar/<table>.csv.zip`` holding ``<modern name>.csv``; a zip with
@@ -274,45 +276,6 @@ def count_rows(path: str | Path, member: Optional[str] = None) -> int:
         return sum(1 for fields in reader if fields)
 
 
-def ledger_path(bulk_dir: str | Path, entry: dict) -> Path:
-    """Where a ledger row's file is: ``path`` is relative to ``bulk_dir``."""
-    return Path(bulk_dir) / entry["path"]
-
-
-def checked_path(db, file_id: int, bulk_dir: str | Path) -> tuple[dict, Path]:
-    """The ledger row of a file and where it is, after the checks every reader
-    makes: refuses a file the ledger marks deleted, one missing from ``bulk_dir``
-    (after a restore onto a new host, the ledger comes back without the files), and
-    one whose size differs from what was recorded, which is a different file under
-    the same name."""
-    from fafnir.db import repository as repo
-
-    entry = repo.sharadar_file(db, file_id)
-    if entry is None:
-        raise SharadarFileError(f"no file {file_id} in landing.sharadar_file")
-    if entry["status"] == "deleted":
-        raise SharadarFileError(f"file {file_id} ({entry['path']}) is marked deleted")
-    path = ledger_path(bulk_dir, entry)
-    if not path.is_file():
-        raise SharadarFileError(
-            f"file {file_id} is not at {path}: re-download it "
-            "(`fafnir source sharadar-bulk --force`), or check [sharadar] bulk_dir"
-        )
-    if path.stat().st_size != entry["bytes"]:
-        raise SharadarFileError(
-            f"{path} is {path.stat().st_size} bytes; the ledger recorded "
-            f"{entry['bytes']} for file {file_id}"
-        )
-    return entry, path
-
-
-def rows(db, file_id: int, bulk_dir: str | Path) -> Iterator[dict]:
-    """The typed rows of a file the ledger holds: the one reader the loaders use.
-    The file is checked first (:func:`checked_path`)."""
-    entry, path = checked_path(db, file_id, bulk_dir)
-    return iter_rows(path, entry["vendor_table"], member=entry["member"])
-
-
 class _AllDates:
     """A date collection holding every date: :func:`select` a ticker's whole
     history with ``{ticker: ALL_DATES}``."""
@@ -377,43 +340,27 @@ def _typer(table: str, cols: list[str], name: str) -> Callable[[int, list], dict
     return typed
 
 
-def select(
-    db, file_id: int, bulk_dir: str | Path, wanted: Mapping[str, Collection[str]]
+def select_rows(
+    path: str | Path,
+    table: str,
+    wanted: Mapping[str, Collection[str]],
+    *,
+    member: Optional[str] = None,
 ) -> Iterator[dict]:
-    """The typed rows of a ledger file whose ``ticker`` is a key of ``wanted`` and
-    whose ``date`` (``YYYY-MM-DD``) is in that key's collection, in file order.
+    """The typed rows of a file whose ``ticker`` is a key of ``wanted`` and whose
+    ``date`` (``YYYY-MM-DD``) is in that key's collection, in file order.
 
     Both are tested on the raw text, and only a row that passes is converted. A
     price table is 45M rows, and a caller that wants a few dates for each of
-    thousands of tickers would otherwise parse most of them.
+    thousands of tickers would otherwise parse most of them. The loaders reach this
+    through :func:`fafnir.ingest.sharadar_ledger.select`, which names the file.
     """
-    entry, path = checked_path(db, file_id, bulk_dir)
-    with open_text(path, entry["member"]) as fh:
+    path = Path(path)
+    with open_text(path, member) as fh:
         cols, _, _, rows = _matching(csv.reader(fh), path.name, wanted)
-        typed = _typer(entry["vendor_table"], cols, path.name)
+        typed = _typer(table, cols, path.name)
         for line, fields in rows:
             yield typed(line, fields)
-
-
-def select_by_ticker(
-    db,
-    file_id: int,
-    bulk_dir: str | Path,
-    wanted: Mapping[str, Collection[str]],
-    *,
-    scratch_dir: Optional[str | Path] = None,
-) -> Iterator[tuple[str, list[dict]]]:
-    """:func:`select`'s rows grouped: ``(ticker, rows)`` once per ticker. The file
-    is checked first, and the buckets go under ``scratch_dir``, by default
-    ``bulk_dir`` (see :func:`group_by_ticker`)."""
-    entry, path = checked_path(db, file_id, bulk_dir)
-    return group_by_ticker(
-        path,
-        entry["vendor_table"],
-        wanted,
-        member=entry["member"],
-        scratch_dir=scratch_dir or bulk_dir,
-    )
 
 
 def group_by_ticker(

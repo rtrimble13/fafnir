@@ -5787,7 +5787,7 @@ def source_probe_prices(ctx, symbol, on_date):
     requests and writes nothing. Run it before a backfill, and after any change to
     the price loader.
     """
-    from fafnir.sources import probe
+    from fafnir.ingest import fmp_probe as probe
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
@@ -5831,7 +5831,7 @@ def source_probe_fund(ctx, symbol, window_days):
 
     Costs 3 requests and writes nothing. Run it before `fafnir track add`.
     """
-    from fafnir.sources import probe
+    from fafnir.ingest import fmp_probe as probe
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
@@ -5871,7 +5871,7 @@ def source_probe_actions(ctx, symbols, days):
     Costs 2 + 2N requests and writes nothing. Probe a fund separately if you hold
     any; a fund has no listing venue and the calendar is not assumed to reach it.
     """
-    from fafnir.sources import probe
+    from fafnir.ingest import fmp_probe as probe
 
     cfg = ctx.obj["config"]
     fmp = _fmp_client(cfg)
@@ -5920,7 +5920,7 @@ def source_vendor_gaps(ctx, min_sessions, exchange, as_json):
     delisted-companies payload does not name it. Its `stale` flag is not to be
     resolved: the security trades, the vendor does not serve it. Reads only.
     """
-    from fafnir.sources import vendor_gaps as vg
+    from fafnir.ingest import vendor_gaps as vg
 
     with Database(ctx.obj["config"].dsn) as database:
         report = vg.vendor_gaps(

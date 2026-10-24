@@ -75,7 +75,9 @@ from typing import Mapping, Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
-from fafnir.ingest import adjustments, price_edits, sharadar_map
+from fafnir.ingest import adjustments, price_edits
+from fafnir.ingest import sharadar_ledger as ledger
+from fafnir.ingest import sharadar_map
 from fafnir.ingest import sharadar_prices as sp
 from fafnir.ingest.daily_price import _is_nav_priced, _validate_bar
 from fafnir.ingest.runlog import RunLog
@@ -486,7 +488,7 @@ def correct(
         last = time.monotonic()
         for table, file_id in files.items():
             wanted = {ticker: sf.ALL_DATES for ticker in by_file[table]}
-            groups = sf.select_by_ticker(db, file_id, bulk_dir, wanted)
+            groups = ledger.select_by_ticker(db, file_id, bulk_dir, wanted)
             for done, (ticker, rows) in enumerate(groups, start=1):
                 result.read += len(rows)
                 t = by_file[table][ticker]
