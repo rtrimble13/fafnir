@@ -1046,23 +1046,28 @@ def ingest_sharadar(ctx, dry_run):
       4. ingest sharadar-universe
       5. ingest sharadar-prices --nightly
       6. ingest sharadar-actions --backfill --gap-fill
+      7. source sharadar-prune
 
     TICKERS and ACTIONS are small, so they are downloaded whole each night; the
     price tables come as deltas. A step that fails stops the night with a non-zero
     exit. Every step is safe to run again, so the next run picks up where it
     stopped. Factors are recomputed for the securities whose bars or actions
-    changed.
+    changed. Step 7 deletes the files nothing reads any more, keeping [sharadar]
+    keep_days of them; it runs only after the rest succeeded, and if it cannot
+    run it warns without failing the night.
 
     The dry run still downloads and records the files and refreshes the vendor
     tables (core.vendor_security, core.vendor_security_event): that is Sharadar's
     view, not fafnir's. Steps 4 to 6 then write nothing, and step 5 compares the
     FMP securities linked to Sharadar with FMP's bars (--as-if-fed): the five
-    nights of the cutover's acceptance. A real run waits for [general]
+    nights of the cutover's acceptance. Step 7 prunes as on a real night: the
+    dry runs download the same files. A real run waits for [general]
     primary_price_vendor = "sharadar".
     """
     from fafnir.ingest import sharadar_actions as sa
     from fafnir.ingest import sharadar_bulk, sharadar_master
     from fafnir.ingest import sharadar_prices as sp
+    from fafnir.ingest import sharadar_prune
     from fafnir.ingest import sharadar_universe as su
 
     cfg = ctx.obj["config"]
@@ -1075,7 +1080,7 @@ def ingest_sharadar(ctx, dry_run):
     bulk_dir = cfg.sharadar_bulk_dir
 
     def step(n: int, name: str) -> None:
-        click.echo(f"\n[{n}/6] {name}")
+        click.echo(f"\n[{n}/7] {name}")
 
     def stop(n: int, why: str):
         raise click.ClickException(f"step {n} failed: {why}. The night stopped there.")
@@ -1139,7 +1144,51 @@ def ingest_sharadar(ctx, dry_run):
             ValueError,
         ) as exc:
             raise click.ClickException(f"{exc}. The night stopped there.") from exc
+        # Housekeeping, so it never costs the night: a prune that cannot run says
+        # so, and the next night tries again (monitor.sh sharadar shows the size).
+        step(7, "source sharadar-prune")
+        try:
+            _echo_sharadar_file_prune(
+                sharadar_prune.prune(
+                    database, bulk_dir, keep_days=cfg.sharadar_keep_days
+                )
+            )
+        except (sharadar_prune.PruneError, OSError, ValueError) as exc:
+            click.echo(f"!! prune skipped: {exc}")
     click.echo(f"\nBytes downloaded {client.bytes_downloaded:,}; files in {bulk_dir}.")
+
+
+def _size_text(nbytes: int) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if nbytes < 1024 or unit == "GB":
+            return f"{nbytes:,} {unit}" if unit == "bytes" else f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} GB"
+
+
+def _echo_sharadar_file_prune(result) -> None:
+    head = "Dry run: nothing deleted." if result.dry_run else f"Run {result.run_id}."
+    removed = len(result.removals) - len(result.failed)
+    click.echo(
+        f"{head} {'Would remove' if result.dry_run else 'Removed'} {removed} "
+        f"file(s), {_size_text(result.bytes_freed())}"
+        + (
+            ": " + ", ".join(f"{k} {n}" for k, n in sorted(result.counts().items()))
+            if result.removals
+            else ""
+        )
+    )
+    if result.kept:
+        click.echo(
+            "  kept: " + ", ".join(f"{k} {n}" for k, n in sorted(result.kept.items()))
+        )
+    if result.foreign:
+        shown = ", ".join(result.foreign[:5]) + (
+            " ..." if len(result.foreign) > 5 else ""
+        )
+        click.echo(f"  not fafnir's, left alone: {len(result.foreign)} ({shown})")
+    for name in result.failed:
+        click.echo(f"!! could not remove {name}")
 
 
 @ingest.command("actions")
@@ -5629,6 +5678,49 @@ def source_sharadar_delta(ctx, tables, since):
             since=since.date() if since else None,
         )
     _report_sharadar_files(results, cfg, client)
+
+
+@source.command("sharadar-prune")
+@click.option(
+    "--keep-days",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Keep superseded files and applied deltas this many days "
+    "(default [sharadar] keep_days, 7).",
+)
+@click.option("--dry-run", is_flag=True, help="Report what would go; delete nothing.")
+@click.pass_context
+def source_sharadar_prune(ctx, keep_days, dry_run):
+    """Delete the Sharadar files nothing reads any more, keeping a short history.
+
+    \b
+      fafnir source sharadar-prune --dry-run
+      fafnir source sharadar-prune
+
+    Decided from the file ledger (landing.sharadar_file). Kept: each table's
+    current full file; the deltas the nightly has not applied, and those within
+    the universe step's window (45 days), which a new listing reads; superseded
+    files for --keep-days, and the newest superseded file of each table whatever
+    its age. A deleted file's ledger row stays, marked deleted. Also removed: a
+    download (.*.part) or sort scratch (.sharadar-sort-*) a killed run left, after
+    24 hours, and a <sha256> file the ledger never recorded, after 14 days. Any
+    other file is reported and left alone. Refuses to run when a current file is
+    missing from [sharadar] bulk_dir. `fafnir ingest sharadar` runs it nightly.
+    """
+    from fafnir.ingest import sharadar_prune
+
+    cfg = ctx.obj["config"]
+    keep = cfg.sharadar_keep_days if keep_days is None else keep_days
+    with Database(cfg.dsn) as database:
+        try:
+            result = sharadar_prune.prune(
+                database, cfg.sharadar_bulk_dir, keep_days=keep, dry_run=dry_run
+            )
+        except sharadar_prune.PruneError as exc:
+            raise click.ClickException(str(exc)) from exc
+    _echo_sharadar_file_prune(result)
+    if result.failed:
+        raise click.ClickException(f"{len(result.failed)} file(s) could not be removed")
 
 
 @source.command("probe-sharadar")

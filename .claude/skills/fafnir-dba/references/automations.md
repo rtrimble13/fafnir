@@ -67,6 +67,7 @@ does universe, prices and actions for the securities Sharadar feeds, and
 source sharadar-bulk --tables tickers,actions --force → source sharadar-delta
   → ingest sharadar-master → ingest sharadar-universe
   → ingest sharadar-prices --nightly → ingest sharadar-actions --backfill --gap-fill
+  → source sharadar-prune
 ```
 
 A failed step stops the night non-zero, and every step is safe to re-run. Its runs
@@ -78,6 +79,7 @@ are all `source = 'sharadar'`:
 | `delta:stocks`, `delta:funds` | SEP/SFP rows by `lastupdated` | `lastupdated.gte`, `rows`, `file_id`, `dates` (a year back is normal: the vendor restamps history it adjusts) |
 | `master:tickers`, `master:actions` | the vendor tables | |
 | `universe` | renames, delistings, listings | the counts |
+| `prune` | files nothing reads any more | `deleted` (by reason), `bytes_freed`, `kept`, `foreign`, `failed` |
 | `prices:nightly` | the bars | `through` (last delta file applied per table), `counts` (`new`, `revised`, `unchanged`, `kept:<source>`), `by_date` |
 | `actions` | splits and dividends | `skipped.near_existing` |
 
@@ -224,7 +226,8 @@ the evidence the switch was right, and until then it is only a reasonable bet.
 | Reconciliation | `scripts/reconcile.sh AAPL,MSFT,SPY` | weekly, rotating sample; reports, never overwrites |
 | Backups | `scripts/backup_dump.sh`, `backup_offsite.sh` | dump **every** schema, not a subset |
 | Sharadar bulk files | `fafnir source sharadar-bulk [--tables …] [--force]` | operator-run for SEP, SFP and SF1; the Sharadar night re-downloads TICKERS and ACTIONS. Downloads whole tables to `[sharadar] bulk_dir` (`<sha256>.csv.zip`) and records each in `landing.sharadar_file`; loads nothing into core. A table already on record is skipped unless `--force`. Runs are `source = sharadar`, `endpoint = bulk:<table>`. The files are **not** backed up (re-downloadable while subscribed) |
-| Sharadar deltas | `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` | step 2 of the Sharadar night. Rows stamped `lastupdated` from the newest file's fetch day less 3 days, as `<sha256>.csv` with `kind = 'delta'`. A fresh full SEP/SFP (`sharadar-bulk --force`) shortens what a newly minted security reads: every delta since the full file |
+| Sharadar deltas | `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` | step 2 of the Sharadar night. Rows stamped `lastupdated` from the newest file's fetch day less 3 days, as `<sha256>.csv` with `kind = 'delta'`. A newly minted security reads every delta still on disk, from its link's start |
+| Sharadar files on disk | `fafnir source sharadar-prune [--dry-run] [--keep-days N]` | step 7 of the Sharadar night. It keeps each table's current full file, the deltas the nightly has not applied, 45 days of applied ones, and superseded files for `[sharadar] keep_days` (7) plus the newest of each table. It deletes the rest, and a killed run's `.*.part` and `.sharadar-sort-*` after 24 hours. A deleted file's ledger row stays, `status = 'deleted'`. It refuses when a current file is missing from `bulk_dir`. `monitor.sh sharadar` warns past `FAFNIR_SHARADAR_WARN_GB` (8) |
 
 On backups, the trap worth knowing: skipping `mart` because it is derived and
 `meta` because it is "only bookkeeping" gives a restore that is not a working

@@ -15,6 +15,7 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,7 @@ esac
 STALE = "No successful Sharadar night"
 
 
-def _monitor(tmp_path, dsn, primary, *sections):
+def _monitor(tmp_path, dsn, primary, *sections, **extra_env):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     stub = bin_dir / "fafnir"
@@ -53,6 +54,7 @@ def _monitor(tmp_path, dsn, primary, *sections):
         FAFNIR_ENV_FILE=str(tmp_path / "absent.env"),
         STUB_PRIMARY=primary,
         STUB_BULK_DIR=str(bulk),
+        **extra_env,
     )
     return subprocess.run(
         ["bash", str(SCRIPT), *sections],
@@ -110,3 +112,24 @@ def test_fmps_budget_counts_fmps_bytes_alone(db, tmp_path):
     out = _monitor(tmp_path, db.dsn, "fmp", "bandwidth")
     assert out.returncode == 1
     assert "41.0 GB downloaded from FMP this month" in out.stdout
+
+
+def test_a_growing_bulk_dir_or_a_killed_runs_leftovers_warn(db, tmp_path):
+    bulk = tmp_path / "bulk"
+    bulk.mkdir()
+    (bulk / ("a" * 64 + ".csv")).write_bytes(b"x" * 4096)
+    out = _monitor(tmp_path, db.dsn, "fmp", "sharadar")
+    assert out.returncode == 0, out.stdout  # 4 KB, under the default 8 GB
+
+    out = _monitor(
+        tmp_path, db.dsn, "fmp", "sharadar", FAFNIR_SHARADAR_WARN_GB="0.000001"
+    )
+    assert out.returncode == 1
+    assert "is the nightly prune running?" in out.stdout  # in either mode
+
+    part = bulk / ".SEP-x.part"
+    part.write_bytes(b"y")
+    os.utime(part, (time.time() - 2 * 86400,) * 2)
+    out = _monitor(tmp_path, db.dsn, "fmp", "sharadar")
+    assert out.returncode == 1
+    assert "1 leftover(s) of a killed run" in out.stdout

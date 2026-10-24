@@ -99,13 +99,14 @@ validate stops it before anything loads.
   ```
 
   - **`fafnir ingest sharadar`** is the universe, prices and actions for the
-    securities Sharadar feeds, in six steps:
+    securities Sharadar feeds, in seven steps:
     1. TICKERS and ACTIONS downloaded whole;
     2. the SEP and SFP deltas;
     3. the vendor master;
     4. renames, delistings and new listings;
     5. the bars;
-    6. the splits and dividends.
+    6. the splits and dividends;
+    7. the prune of the files nothing reads any more, keeping a week of them.
 
     [ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98) has each
     step. It is the payload, so a failure stops the night before the marts, as a

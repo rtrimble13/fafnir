@@ -119,6 +119,11 @@ log_dir = "var/fafnir/log"
 # "var/fafnir/landing/sharadar", is relative to the working directory; on a host
 # make it absolute.
 # bulk_dir = "/var/lib/fafnir/landing/sharadar"
+# How long the nightly prune (`fafnir source sharadar-prune`) keeps a file nothing
+# reads any more: a superseded TICKERS/ACTIONS/SEP download, for triage. The
+# newest superseded file of each table is kept whatever its age, and deltas for
+# 45 days. 0 keeps only those.
+# keep_days = 7
 
 # --- data quality: the dorq engine (doc/dorq.md, ADR 0013) -------------------
 [dq]

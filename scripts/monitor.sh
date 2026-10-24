@@ -28,6 +28,7 @@ LOG_DIR="${FAFNIR_LOG_DIR:-/var/log/fafnir}"
 DISK_WARN_PCT="${FAFNIR_DISK_WARN_PCT:-85}"
 BACKUP_MAX_AGE_H="${FAFNIR_BACKUP_MAX_AGE_HOURS:-36}"
 JOURNAL_SINCE="${FAFNIR_JOURNAL_SINCE:-2 days ago}"
+SHARADAR_WARN_GB="${FAFNIR_SHARADAR_WARN_GB:-8}"
 QUIET="no"
 
 ALL_SECTIONS=(status dq disk timers journal backups runs bandwidth sharadar slow)
@@ -49,8 +50,10 @@ Sections (default: all, in this order):
   runs       ops.ingestion_run rows in status failed/partial.
   bandwidth  bytes_downloaded per month and vendor; FMP's against its 50 GB budget.
   sharadar   The Sharadar night: the newest successful delta fetch, nightly
-             price load and file download, and the file ledger. Warns, in
-             Sharadar mode only, when last weeknight's night did not succeed.
+             price load, file download and prune, and the file ledger. Warns, in
+             Sharadar mode only, when last weeknight's night did not succeed;
+             in either mode when bulk_dir passes FAFNIR_SHARADAR_WARN_GB (8) or
+             holds what a killed run left (.*.part, .sharadar-sort-*).
   slow       Top queries by total time from pg_stat_statements.
 
 Options:
@@ -324,7 +327,7 @@ SELECT endpoint,
 FROM ops.ingestion_run
 WHERE source = 'sharadar' AND status = 'success'
   AND (endpoint LIKE 'delta:%' OR endpoint LIKE 'bulk:%'
-       OR endpoint IN ('prices:nightly', 'universe', 'actions'))
+       OR endpoint IN ('prices:nightly', 'universe', 'actions', 'prune'))
 GROUP BY endpoint ORDER BY endpoint;
 SQL
 )"
@@ -337,10 +340,22 @@ WHERE status = 'downloaded'
 GROUP BY 1, 2 ORDER BY 1, 2;
 SQL
 )"
-    local dir size
+    local dir size bytes stale
     if dir=$(fafnir config get sharadar_bulk_dir 2>/dev/null) \
        && size=$(du -sh "${dir}" 2>/dev/null | cut -f1) && [[ -n "${size}" ]]; then
         say "    bulk_dir ${dir}: ${size}"
+        # The nightly prune keeps it bounded (`fafnir source sharadar-prune`);
+        # growth past the threshold means the prune is not running or not enough.
+        bytes=$(du -sb "${dir}" 2>/dev/null | cut -f1)
+        if [[ -n "${bytes}" ]] \
+           && awk -v b="${bytes}" -v g="${SHARADAR_WARN_GB}" 'BEGIN{exit !(b > g * 1073741824)}'; then
+            warn "${dir} holds ${size}, over ${SHARADAR_WARN_GB} GB -- is the nightly prune running? (fafnir source sharadar-prune --dry-run)"
+        fi
+        stale=$(find "${dir}" -maxdepth 1 \( -name '.sharadar-sort-*' -o -name '.*.part' \) \
+                -mmin +1440 2>/dev/null | wc -l)
+        if [[ "${stale}" -gt 0 ]]; then
+            warn "${stale} leftover(s) of a killed run in ${dir} (.*.part, .sharadar-sort-*) -- the next prune removes them"
+        fi
     fi
     [[ "${mode}" == "sharadar" ]] || return 0
     # The night runs Mon-Fri (install_timers.sh), so the night that should have

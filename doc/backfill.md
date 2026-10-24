@@ -659,6 +659,11 @@ price files came in as projected, and SF1 came in smaller (632 MB, at 3.2M rows 
   superseded, so allow **~4 GB** at peak (two 1.9 GB sets). `daily` and `metrics` are not in that
   figure; they are not needed before the fundamentals phase (P4), and each is of
   the order of `stocks`.
+  - **The night's files** are bounded by its prune
+    ([ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98)).
+    Each night downloads TICKERS and ACTIONS whole and two deltas. The prune keeps
+    a week of superseded files, the newest of each table, and 45 days of deltas,
+    so steady state is about 2.5 GB.
 - **`core`.** At most ~30M bars of delisted issuers (stocks and funds) are new to
   the warehouse. At 151 bytes a bar that is **~4.6 GB**, an upper bound: some of
   those issuers FMP already holds.

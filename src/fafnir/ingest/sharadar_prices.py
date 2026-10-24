@@ -599,11 +599,11 @@ def _nightly_run(
     def factor(day: date) -> Decimal:
         return recovery_factor(by_day[day], t.splits)[0] or Decimal(1)
 
-    wanted = [
-        r
-        for d, r in sorted(rows.items())
-        if d <= as_of and (t.is_feed or d >= t.valid_from)
-    ]
+    # From the link's start, fed or not: a minted security's link starts at its
+    # first price, so a row before it is another issuer's under a reused ticker
+    # (a listing reading old deltas), and a linked FMP security's earlier dates are
+    # another era (#68).
+    wanted = [r for d, r in sorted(rows.items()) if t.valid_from <= d <= as_of]
     result.counts["future_or_outside"] += len(rows) - len(wanted)
     if not wanted:
         return
@@ -756,8 +756,10 @@ def nightly(
     by_file, _, keys = prepare(db, bulk_dir, targets, result.counts, fulls=False)
 
     # A security with no bars yet (a listing the universe step minted tonight)
-    # missed the deltas applied before it existed: it reads every one since the
-    # full file. Its history before that file is `--backfill`'s.
+    # missed the deltas applied before it existed: it reads every one still on
+    # disk, whichever full file they follow. `sharadar-prune` keeps the universe
+    # step's window of them (DELTA_WINDOW_DAYS), and the step mints only listings
+    # first priced inside it. Older history is `--backfill`'s.
     fresh = {t["security_id"] for t in targets if t["last_trade_date"] is None}
 
     def rows_of(table: str) -> dict[str, dict[date, dict]]:
@@ -767,10 +769,7 @@ def nightly(
             db, bulk_dir, pending[table], [k for k in tickers if k not in new]
         )
         if new:
-            full = repo.current_sharadar_full(db, table)
-            every = repo.sharadar_deltas_after(
-                db, table, full["file_id"] if full else 0
-            )
+            every = repo.sharadar_deltas_after(db, table, 0)
             merged.update(merged_rows(db, bulk_dir, every, new))
         return merged
 
