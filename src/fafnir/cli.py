@@ -6227,6 +6227,90 @@ def source_probe_sharadar(ctx, sample_size, seed, as_json):
         )
 
 
+@source.command("probe-fundamentals")
+@click.option(
+    "--vendor",
+    type=click.Choice(["sharadar"]),
+    default="sharadar",
+    show_default=True,
+    help="The fundamentals vendor (SF1, the only one)",
+)
+@click.option(
+    "--symbols",
+    default=",".join(("AAPL", "MSFT", "GE", "KO", "JPM", "XOM")),
+    show_default=True,
+    help="Comma-separated probe set: long histories, two fiscal calendars, a bank",
+)
+@click.option(
+    "--dead",
+    default=20,
+    show_default=True,
+    type=click.IntRange(0, 500),
+    help="Random delisted issuers SF1 covers, added to the probe set",
+)
+@click.option(
+    "--foreign",
+    default=3,
+    show_default=True,
+    type=click.IntRange(0, 50),
+    help="Random listed issuers that report outside USD, for the currency item",
+)
+@click.option("--seed", default=0, show_default=True, type=int, help="Sample seed")
+@click.option(
+    "--from-api",
+    is_flag=True,
+    help="Read SF1 from the API, one request per ticker, instead of the ledger's "
+    "file (a machine with no ledger)",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print the full report, evidence rows included. It holds vendor data: "
+    "keep it on the host",
+)
+@click.pass_context
+def source_probe_fundamentals(
+    ctx, vendor, symbols, dead, foreign, seed, from_api, as_json
+):
+    """Measure SF1 before the fundamentals schema is written (plan #83).
+
+    Asks the SF1 rows of a probe set, random dead issuers and foreign reporters what the
+    knowledge-date model and the schema rest on -- coverage, filing dates,
+    restatements, the indicator inventory, quarterly completeness, nulls, currency,
+    identity, vendor metrics, share terms -- and gives each a PASS, NOTE or BLOCK
+    verdict. Reads the ledger's current SF1 and ACTIONS files under [sharadar]
+    bulk_dir and the vendor master; writes nothing. Exits non-zero on a BLOCK: the
+    knowledge-date model does not hold until it has a written mitigation.
+    """
+    import json
+
+    from fafnir.ingest import sf1_probe
+
+    cfg = ctx.obj["config"]
+    tickers = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    sample = {"symbols": tickers, "dead": dead, "foreign": foreign, "seed": seed}
+    try:
+        if from_api:
+            data = sf1_probe.from_api(_sharadar_client(cfg), **sample)
+        else:
+            with Database(cfg.dsn) as database:
+                data = sf1_probe.from_ledger(database, cfg.sharadar_bulk_dir, **sample)
+    except (sf1_probe.ProbeError, FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    report = sf1_probe.probe_fundamentals(data)
+    if as_json:
+        click.echo(json.dumps(report, indent=2, default=str))
+    else:
+        click.echo(sf1_probe.format_fundamentals_report(report))
+    blocks = sf1_probe.blocking(report)
+    if blocks:
+        raise click.ClickException(
+            f"{len(blocks)} blocking verdict(s): the knowledge-date model does not hold "
+            "until each has a mitigation in the plan's decision log."
+        )
+
+
 @source.command("probe-prices")
 @click.option("--symbol", default=None, help="Symbol to probe [default: AAPL]")
 @click.option(

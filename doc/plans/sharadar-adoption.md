@@ -325,6 +325,40 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-24 · P4, #83: the SF1 probe.** `fafnir source probe-fundamentals [--vendor sharadar]
+  [--symbols] [--dead N] [--foreign N] [--seed S] [--from-api] [--json]` asks the SF1 rows of the
+  probe set, 20 random dead issuers and 3 issuers that report outside USD the questions the
+  fundamentals design rests on. It gives each a PASS, NOTE or BLOCK verdict, as probe-sharadar does.
+  The verdict table is in [backfill.md](../backfill.md#confirming-the-sf1-feed).
+  - **Where it lives.** `ingest/sf1_probe.py`, not `fafnir.sources`, because it reads the ledger's
+    SF1 and ACTIONS files and the vendor master (ADR 0017 §1). `--from-api` reads the same rows from
+    the API, so this session could run it: there is no ledger here, and the bulk host is not
+    reachable. `sharadar_files.type_row` types an API row as the file reader types the same row.
+  - **First run** (2026-10-24, `--from-api`, 29 tickers, 6,439 rows, 60 requests): no BLOCK.
+    - AR `date` is the SEC filing date; two public-record 10-Ks agree, and no era looks imputed.
+    - MR `date` is the period end, so a restatement carries no knowledge date.
+    - Q4 is its own row, and quarters are discrete.
+    - **Share counts and per-share values are in today's share terms**, against the build prompt's
+      §4.7 rule 1.
+    - An absent item is 0 (41 indicators) and an inapplicable one NULL.
+    - The reporting currency is TICKERS'; `fxusd` is foreign units per USD.
+    - SF1 holds the primary share class only.
+  - **Departures from the issue:**
+    - item 10, *share terms*, was added, because the first measurement showed §4.7's premise does
+      not hold;
+    - the ADR sample became issuers that report outside USD, since a USD-reporting ADR answers
+      nothing about currency;
+    - EDGAR is not reachable from the session, so the five filings to compare are listed in the
+      evidence, and two public-record filing dates are checked in code.
+  - **API facts, now in the client's docstring.** A `ticker` list on SF1 returns only about the last
+    two years, and nothing for a dead issuer. TICKERS ignores `isdelisted`. An SF1 `lastupdated`
+    delta is small: 1,105 rows over four days.
+  - **For #85:** what knowledge date a restatement gets; what share terms the statement tables
+    store; whether a split's re-expression is a new version; whether rows before 1998 load; and how
+    a secondary share class reaches its issuer's statements.
+  - **Next.** On the host: `fafnir source probe-fundamentals` against the ledger's file, compare the
+    five filings with EDGAR, and post the counts on #83.
+
 - **2026-10-24 · P3, Sharadar file retention (no issue; asked for directly).** Nothing deleted a Sharadar
   file, so `bulk_dir` grew every night. The night downloads TICKERS and ACTIONS whole (up to 0.1 GB) and two
   deltas, and a killed sort can leave ~4 GB.

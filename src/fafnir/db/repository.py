@@ -7445,6 +7445,21 @@ def vendor_tickers(
     return {r["vendor_key"]: (r["vendor_table"], r["ticker"]) for r in rows}
 
 
+def vendor_listing(db: Database, vendor: str, vendor_table: str) -> list[dict]:
+    """The vendor master's rows for one of its tables, as TICKERS lists them:
+    ``vendor_key, ticker, category, is_delisted, currency, first_quarter``, in
+    key order. The SF1 probe (#83) draws its sample from ``fundamentals``."""
+    return db.fetchall(
+        """
+        SELECT vendor_key, ticker, category, is_delisted, currency, first_quarter
+          FROM core.vendor_security
+         WHERE vendor = %s AND vendor_table = %s
+         ORDER BY vendor_key
+        """,
+        (vendor, vendor_table),
+    )
+
+
 def price_dates(db: Database, security_id: int) -> set[date]:
     """Every date the security holds a bar for, whoever supplied it."""
     return {

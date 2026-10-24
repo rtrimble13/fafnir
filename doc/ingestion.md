@@ -265,6 +265,23 @@ ACTIONS would mis-state every earlier dividend as well as the recovered prices.
   returns everything it should have narrowed, so loaders assert their filters in the
   rows they get back.
 
+**Fundamentals (SF1)**, as `fafnir source probe-fundamentals` measured them on
+2026-10-24 (#83; the verdict table is in
+[backfill.md](backfill.md#confirming-the-sf1-feed)). No SF1 loader exists yet
+(#90).
+- **`date` is the SEC filing date on AR rows** (ARQ, ARY, ART: as first reported)
+  and the period end on MR rows (with restatements). A restatement in SF1 carries
+  no knowledge date of its own.
+- **Share counts and per-share values are in today's share terms**, re-expressed at
+  every later split. As reported is the value / the product of the splits after
+  `date`.
+- **An absent item is 0 and an inapplicable one NULL.** For 41 indicators, the
+  vendor writes 0 when a filing does not carry the item.
+- **No currency column.** The reporting currency is TICKERS' `currency`, and
+  `fxusd` is foreign units per USD.
+- **A `ticker` list on SF1 returns only about the last two years**, and nothing for
+  a dead issuer. One ticker per request returns the whole history.
+
 ### Sharadar field mapping
 
 The boundary is `fafnir.ingest.sharadar_map` (#56): pure functions with no database
