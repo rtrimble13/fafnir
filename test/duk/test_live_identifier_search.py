@@ -1,9 +1,9 @@
 """Live-mode identifier resolution: the FMP search call and its shaping.
 
-`requests` is mocked throughout -- what is under test is which endpoint and
-parameter each scheme uses, and that the vendor's rows are shaped into the same
-candidate dicts the warehouse produces, so one did-you-mean table serves both
-sources.
+HTTP is mocked at the client's session (duk requests through the warehouse's
+``FMPClient``, ADR 0017) -- what is under test is which endpoint and parameter
+each scheme uses, and that the vendor's rows are shaped into the same candidate
+dicts the warehouse produces, so one did-you-mean table serves both sources.
 """
 
 from __future__ import annotations
@@ -16,8 +16,17 @@ import requests
 from duk import identifiers as ids
 from duk.datasource import live as ds_live
 from duk.fmp_api import FMPAPIError, identifier_search_api
+from fafnir.sources import base as base_mod
 
 KEY = "test-key"
+GET = "requests.Session.get"
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(base_mod.time, "sleep", lambda s: None)
+
+
 FMP_ROW = {
     "symbol": "IBM",
     "companyName": "International Business Machines Corporation",
@@ -32,6 +41,8 @@ def _response(payload, status=200):
     response.json.return_value = payload
     response.raise_for_status.return_value = None
     response.status_code = status
+    response.content = b"[]"  # the client meters bytes
+    response.headers = {}
     return response
 
 
@@ -44,7 +55,7 @@ class TestEndpointSelection:
             ("cusip", "459200101", "search-cusip", "cusip"),
         ],
     )
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_each_scheme_calls_its_own_endpoint(
         self, mock_get, scheme, value, path, param
     ):
@@ -58,14 +69,14 @@ class TestEndpointSelection:
         with pytest.raises(ValueError):
             identifier_search_api("sedol", "0263494", KEY)
 
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_a_transport_failure_raises_without_leaking_the_key(self, mock_get):
         mock_get.side_effect = requests.exceptions.ConnectionError(f"boom apikey={KEY}")
         with pytest.raises(FMPAPIError) as excinfo:
             identifier_search_api("cik", "51143", KEY)
         assert KEY not in str(excinfo.value)
 
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_a_vendor_error_message_is_surfaced(self, mock_get):
         mock_get.return_value = _response({"Error Message": "Endpoint not available"})
         with pytest.raises(FMPAPIError) as excinfo:
@@ -74,7 +85,7 @@ class TestEndpointSelection:
 
 
 class TestCandidateShaping:
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_rows_are_shaped_like_the_warehouse_candidates(self, mock_get):
         mock_get.return_value = _response([FMP_ROW])
         found = ds_live.resolve_identifier(
@@ -94,7 +105,7 @@ class TestCandidateShaping:
             }
         ]
 
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_rows_without_a_ticker_are_dropped(self, mock_get):
         # A ticker is the whole point of live resolution: the price endpoint takes
         # nothing else, so a row without one is not a candidate.
@@ -104,7 +115,7 @@ class TestCandidateShaping:
         )
         assert [c["symbol"] for c in found] == ["IBM"]
 
-    @mock.patch("duk.fmp_api.requests.get")
+    @mock.patch(GET)
     def test_no_match_is_an_empty_list_not_an_error(self, mock_get):
         mock_get.return_value = _response([])
         assert (

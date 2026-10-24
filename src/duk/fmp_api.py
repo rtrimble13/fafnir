@@ -1,616 +1,203 @@
 """
-FMP (Financial Modeling Prep) API integration.
+FMP for ``duk``: the warehouse's client, shaped into duk's frames.
 
-This module provides functions for interacting with the FMP API
-to retrieve financial and market data.
+**No HTTP is made here** (ADR 0017). Every request goes through
+:class:`fafnir.sources.fmp.FMPClient`, the one FMP client in the repository: its
+throttle, retries, byte metering and redaction, its endpoint constants, and the
+window chunking that keeps a long ``from`` from being silently truncated at the
+vendor's 5000-bar cap. What this module owns is what ``duk`` does *with* the rows:
+the functions below keep the names and signatures the CLI, ``duk.ls_utils`` and
+``duk.datasource.live`` have always called, so a reader of a vendor payload is
+unchanged, and ``get_price_history`` / ``get_yield_curve`` build the frames the
+compute modules share.
+
+Pass ``client=`` to reuse one client across calls (one session, one byte count);
+otherwise each call builds one from ``api_key``.
 """
 
+from __future__ import annotations
+
 import logging
-import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-import requests
 
 from duk.date_utils import get_api_date_range
+from fafnir.sources.base import SourceError, redact_secrets  # noqa: F401 -- re-exported
+from fafnir.sources.fmp import FMPClient
 
 logger = logging.getLogger(__name__)
 
-# Query parameters whose values must never reach a log, an exception message or a
-# traceback. requests renders the *full* URL -- key included -- into the string
-# form of HTTPError and of the connection errors, so anything derived from an
-# upstream exception has to be scrubbed before it is re-raised or logged.
-SECRET_QUERY_PARAMS = ("apikey", "api_key", "token", "access_key", "secret")
-_SECRET_RE = re.compile(r"(?i)\b(" + "|".join(SECRET_QUERY_PARAMS) + r")=([^&\s'\"]+)")
+#: One ``duk`` invocation makes a handful of requests; the client's throttle exists
+#: for the loaders, which make thousands.
+RATE_PER_MIN = 600
 
 
-def redact_secrets(text: str) -> str:
-    """Mask API keys in any text bound for a log or an exception message."""
-    return _SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
+class FMPAPIError(SourceError):
+    """An FMP request failed or returned an unusable payload.
+
+    A :class:`~fafnir.sources.base.SourceError`, so one handler serves the
+    warehouse's client and duk's; kept under its old name for its importers.
+    """
 
 
-class FMPAPIError(Exception):
-    """Exception raised for FMP API errors."""
+def make_client(api_key: str) -> FMPClient:
+    """The warehouse's FMP client, configured for a shell session."""
+    if not api_key:
+        raise ValueError("API key cannot be empty")
+    return FMPClient(api_key, rate_per_min=RATE_PER_MIN)
 
-    pass
+
+def _iso(value: Any) -> Optional[str]:
+    """A ``from``/``to`` argument as the vendor wants it: callers pass a date, a
+    datetime or an ISO string, or nothing."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    return value.strftime("%Y-%m-%d")
+
+
+def _failed(what: str, exc: SourceError) -> FMPAPIError:
+    # The client's message is already redacted. Raised `from None` by the caller:
+    # the chained exception may hold the URL, key and all (the client's own rule).
+    return FMPAPIError(f"Failed to fetch {what}: {exc}")
+
+
+# -- prices -------------------------------------------------------------------
 
 
 def price_history_api(
     symbol: str,
-    api_key: str,
+    api_key: str = "",
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
+    *,
+    client: Optional[FMPClient] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Request security price history from FMP API.
+    """Unadjusted daily bars for ``symbol`` (:meth:`FMPClient.eod_raw`), ascending.
 
-    Retrieves end-of-day (EOD) historical price data for a given security
-    symbol from the Financial Modeling Prep API.
-
-    Args:
-        symbol: The ticker symbol for the security (e.g., "AAPL", "MSFT")
-        api_key: FMP API key for authentication
-        from_date: Optional start date for historical data (format: YYYY-MM-DD)
-        to_date: Optional end date for historical data (format: YYYY-MM-DD)
-
-    Returns:
-        List of dictionaries containing historical price data. Each dictionary
-        contains fields like date, open, high, low, close, volume, etc.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> history = price_history_api("AAPL", "your_api_key")
-        >>> history = price_history_api("AAPL", "your_api_key",
-        ...                            from_date="2023-01-01",
-        ...                            to_date="2023-12-31")
+    Unadjusted, not ``full``: FMP's ``full`` payload is split-adjusted, so it
+    would disagree with the warehouse's raw ``core.daily_price`` for any symbol
+    that has ever split. ``duk ph`` without ``--adj`` means the prices that
+    traded, which is what ``scripts/reconcile.sh`` depends on.
     """
     if not symbol:
         raise ValueError("Symbol cannot be empty")
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL.
-    #
-    # non-split-adjusted, not `full`: FMP's `full` payload is already adjusted for
-    # splits, so it would disagree with the warehouse's raw core.daily_price for any
-    # symbol that has ever split -- and `duk`'s unadjusted price history is defined
-    # as the prices that actually traded. This keeps `-S live` and `-S db` on the
-    # same footing, which is what scripts/reconcile.sh depends on.
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/historical-price-eod/non-split-adjusted?symbol={symbol}"
-
-    # Build query parameters
-    params = {"apikey": api_key}
-    if from_date:
-        params["from"] = from_date.strftime("%Y-%m-%d")
-    if to_date:
-        params["to"] = to_date.strftime("%Y-%m-%d")
-
+    client = client or make_client(api_key)
     logger.debug(f"Requesting price history for {symbol} from FMP API")
-
     try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch price history for {symbol}: {detail}")
-        raise FMPAPIError(
-            f"Failed to fetch price history for {symbol}: {detail}"
-        ) from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract historical data from response
-    if isinstance(data, dict) and "historical" in data:
-        historical_data = data["historical"]
-        logger.info(f"Retrieved {len(historical_data)} records for {symbol}")
-        return historical_data
-    elif isinstance(data, list):
-        # Some endpoints return a list directly
-        logger.info(f"Retrieved {len(data)} records for {symbol}")
-        return data
-    else:
-        logger.warning(f"Unexpected response format for {symbol}")
-        return []
+        bars = client.eod_raw(symbol, _iso(from_date), _iso(to_date))
+    except SourceError as exc:
+        raise _failed(f"price history for {symbol}", exc) from None
+    logger.info(f"Retrieved {len(bars)} records for {symbol}")
+    return bars
 
 
 def adjusted_price_history_api(
     symbol: str,
-    api_key: str,
+    api_key: str = "",
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
+    *,
+    client: Optional[FMPClient] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Request dividend-adjusted security price history from FMP API.
-
-    Retrieves end-of-day (EOD) dividend-adjusted historical price data for a
-    given security symbol from the Financial Modeling Prep API.
-
-    Args:
-        symbol: The ticker symbol for the security (e.g., "AAPL", "MSFT")
-        api_key: FMP API key for authentication
-        from_date: Optional start date for historical data (format: YYYY-MM-DD)
-        to_date: Optional end date for historical data (format: YYYY-MM-DD)
-
-    Returns:
-        List of dictionaries containing dividend-adjusted historical price data.
-        Each dictionary contains fields like date, open, high, low, close, volume, etc.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> history = adjusted_price_history_api("AAPL", "your_api_key")
-        >>> history = adjusted_price_history_api("AAPL", "your_api_key",
-        ...                                      from_date="2023-01-01",
-        ...                                      to_date="2023-12-31")
-    """
+    """Split- and dividend-adjusted daily bars
+    (:meth:`FMPClient.eod_dividend_adjusted`): ``duk ph --adj``."""
     if not symbol:
         raise ValueError("Symbol cannot be empty")
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/historical-price-eod/dividend-adjusted?symbol={symbol}"
-
-    # Build query parameters
-    params = {"apikey": api_key}
-    if from_date:
-        params["from"] = from_date.strftime("%Y-%m-%d")
-    if to_date:
-        params["to"] = to_date.strftime("%Y-%m-%d")
-
-    logger.debug(
-        f"Requesting dividend-adjusted price history for {symbol} from FMP API"
-    )
-
+    client = client or make_client(api_key)
+    logger.debug(f"Requesting dividend-adjusted price history for {symbol}")
     try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(
-            f"Failed to fetch dividend-adjusted price history for {symbol}: {detail}"
-        )
-        raise FMPAPIError(
-            f"Failed to fetch dividend-adjusted price history for {symbol}: {detail}"
-        ) from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract historical data from response
-    if isinstance(data, dict) and "historical" in data:
-        historical_data = data["historical"]
-        logger.info(
-            f"Retrieved {len(historical_data)} dividend-adjusted records for {symbol}"
-        )
-        return historical_data
-    elif isinstance(data, list):
-        # Some endpoints return a list directly
-        logger.info(f"Retrieved {len(data)} dividend-adjusted records for {symbol}")
-        return data
-    else:
-        logger.warning(f"Unexpected response format for {symbol}")
-        return []
+        bars = client.eod_dividend_adjusted(symbol, _iso(from_date), _iso(to_date))
+    except SourceError as exc:
+        raise _failed(f"dividend-adjusted price history for {symbol}", exc) from None
+    logger.info(f"Retrieved {len(bars)} dividend-adjusted records for {symbol}")
+    return bars
 
 
 def treasury_rates_api(
-    api_key: str,
+    api_key: str = "",
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    *,
+    client: Optional[FMPClient] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Request treasury rates from FMP API.
-
-    Retrieves historical US Treasury rates data from the Financial Modeling
-    Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-        start_date: Optional start date for historical data
-        end_date: Optional end date for historical data
-
-    Returns:
-        List of dictionaries containing treasury rates data. Each dictionary
-        contains fields like date and various treasury rate maturities.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> from datetime import date
-        >>> rates = treasury_rates_api("your_api_key")
-        >>> rates = treasury_rates_api("your_api_key",
-        ...                            start_date=date(2023, 1, 1),
-        ...                            end_date=date(2023, 12, 31))
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/treasury-rates"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-    if start_date:
-        params["from"] = start_date.strftime("%Y-%m-%d")
-    if end_date:
-        params["to"] = end_date.strftime("%Y-%m-%d")
-
+    """US Treasury par rates by date (:meth:`FMPClient.treasury_rates`)."""
+    client = client or make_client(api_key)
     logger.debug("Requesting treasury rates from FMP API")
-
     try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch treasury rates: {detail}")
-        raise FMPAPIError(f"Failed to fetch treasury rates: {detail}") from None
+        rows = client.treasury_rates(_iso(start_date), _iso(end_date))
+    except SourceError as exc:
+        raise _failed("treasury rates", exc) from None
+    logger.info(f"Retrieved {len(rows)} treasury rate records")
+    return rows
 
+
+# -- lists --------------------------------------------------------------------
+
+
+def company_list_api(
+    api_key: str = "", *, client: Optional[FMPClient] = None
+) -> List[Dict[str, Any]]:
+    """Every stock symbol FMP lists (:meth:`FMPClient.stock_list`)."""
+    client = client or make_client(api_key)
     try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} treasury rate records")
-        return data
-    else:
-        logger.warning("Unexpected response format for treasury rates")
-        return []
+        return client.stock_list()
+    except SourceError as exc:
+        raise _failed("company list", exc) from None
 
 
-def company_list_api(api_key: str) -> List[Dict[str, Any]]:
-    """
-    Request list of all company stocks from FMP API.
-
-    Retrieves a list of all available company stock symbols and their
-    information from the Financial Modeling Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-
-    Returns:
-        List of dictionaries containing company stock information. Each
-        dictionary typically contains fields like symbol, name, price,
-        exchange, and other company details.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> companies = company_list_api("your_api_key")
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/stock-list"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-
-    logger.debug("Requesting company list from FMP API")
-
+def etf_symbol_list_api(
+    api_key: str = "", *, client: Optional[FMPClient] = None
+) -> List[Dict[str, Any]]:
+    """Every ETF symbol FMP lists (:meth:`FMPClient.etf_list`)."""
+    client = client or make_client(api_key)
     try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch company list: {detail}")
-        raise FMPAPIError(f"Failed to fetch company list: {detail}") from None
+        return client.etf_list()
+    except SourceError as exc:
+        raise _failed("ETF symbol list", exc) from None
 
+
+def actively_trading_list_api(
+    api_key: str = "", *, client: Optional[FMPClient] = None
+) -> List[Dict[str, Any]]:
+    """Every symbol FMP marks actively trading
+    (:meth:`FMPClient.actively_trading_list`)."""
+    client = client or make_client(api_key)
     try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} company records")
-        return data
-    else:
-        logger.warning("Unexpected response format for company list")
-        return []
+        return client.actively_trading_list()
+    except SourceError as exc:
+        raise _failed("actively trading list", exc) from None
 
 
-def etf_symbol_list_api(api_key: str) -> List[Dict[str, Any]]:
-    """
-    Request list of all ETF symbols from FMP API.
-
-    Retrieves a list of all available ETF (Exchange Traded Fund) symbols
-    and their information from the Financial Modeling Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-
-    Returns:
-        List of dictionaries containing ETF information. Each dictionary
-        typically contains fields like symbol, name, price, exchange, and
-        other ETF details.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> etfs = etf_symbol_list_api("your_api_key")
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/etf-list"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-
-    logger.debug("Requesting ETF symbol list from FMP API")
-
+def sector_list_api(
+    api_key: str = "", *, client: Optional[FMPClient] = None
+) -> List[Dict[str, Any]]:
+    """FMP's sectors as ``[{"sector": name}, ...]``, the shape
+    :func:`duk.ls_utils.process_sectors` reads."""
+    client = client or make_client(api_key)
     try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch ETF symbol list: {detail}")
-        raise FMPAPIError(f"Failed to fetch ETF symbol list: {detail}") from None
+        return [{"sector": name} for name in client.sectors()]
+    except SourceError as exc:
+        raise _failed("sector list", exc) from None
 
+
+def industry_list_api(
+    api_key: str = "", *, client: Optional[FMPClient] = None
+) -> List[Dict[str, Any]]:
+    """FMP's industries as ``[{"industry": name}, ...]``, the shape
+    :func:`duk.ls_utils.process_industries` reads."""
+    client = client or make_client(api_key)
     try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} ETF records")
-        return data
-    else:
-        logger.warning("Unexpected response format for ETF symbol list")
-        return []
-
-
-def sector_list_api(api_key: str) -> List[Dict[str, Any]]:
-    """
-    Request list of all sectors from FMP API.
-
-    Retrieves a list of all available market sectors from the Financial
-    Modeling Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-
-    Returns:
-        List of dictionaries containing sector information. Each dictionary
-        typically contains the sector name and related details.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> sectors = sector_list_api("your_api_key")
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/available-sectors"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-
-    logger.debug("Requesting sector list from FMP API")
-
-    try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch sector list: {detail}")
-        raise FMPAPIError(f"Failed to fetch sector list: {detail}") from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} sector records")
-        return data
-    else:
-        logger.warning("Unexpected response format for sector list")
-        return []
-
-
-def industry_list_api(api_key: str) -> List[Dict[str, Any]]:
-    """
-    Request list of all industries from FMP API.
-
-    Retrieves a list of all available industries from the Financial
-    Modeling Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-
-    Returns:
-        List of dictionaries containing industry information. Each dictionary
-        typically contains the industry name and related details.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> industries = industry_list_api("your_api_key")
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/available-industries"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-
-    logger.debug("Requesting industry list from FMP API")
-
-    try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch industry list: {detail}")
-        raise FMPAPIError(f"Failed to fetch industry list: {detail}") from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} industry records")
-        return data
-    else:
-        logger.warning("Unexpected response format for industry list")
-        return []
-
-
-def actively_trading_list_api(api_key: str) -> List[Dict[str, Any]]:
-    """
-    Request list of actively trading securities from FMP API.
-
-    Retrieves a list of all actively trading securities from the Financial
-    Modeling Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-
-    Returns:
-        List of dictionaries containing actively trading security information.
-        Each dictionary typically contains fields like symbol, name, price,
-        exchange, and other details.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> active = actively_trading_list_api("your_api_key")
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/actively-trading-list"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-
-    logger.debug("Requesting actively trading list from FMP API")
-
-    try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch actively trading list: {detail}")
-        raise FMPAPIError(f"Failed to fetch actively trading list: {detail}") from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} actively trading records")
-        return data
-    else:
-        logger.warning("Unexpected response format for actively trading list")
-        return []
+        return [{"industry": name} for name in client.industries()]
+    except SourceError as exc:
+        raise _failed("industry list", exc) from None
 
 
 def screener_api(
-    api_key: str,
+    api_key: str = "",
     marketCapMoreThan: Optional[float] = None,
     marketCapLowerThan: Optional[float] = None,
     sector: Optional[str] = None,
@@ -629,137 +216,64 @@ def screener_api(
     isFund: Optional[bool] = None,
     isActivelyTrading: Optional[bool] = None,
     limit: Optional[int] = None,
+    *,
+    client: Optional[FMPClient] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Request stock screener results from FMP API.
-
-    Retrieves a list of stocks that match the specified screening criteria
-    from the Financial Modeling Prep API.
-
-    Args:
-        api_key: FMP API key for authentication
-        marketCapMoreThan: Optional minimum market capitalization
-        marketCapLowerThan: Optional maximum market capitalization
-        sector: Optional sector filter (e.g., "Technology")
-        industry: Optional industry filter (e.g., "Consumer Electronics")
-        betaMoreThan: Optional minimum beta value
-        betaLowerThan: Optional maximum beta value
-        priceMoreThan: Optional minimum stock price
-        priceLowerThan: Optional maximum stock price
-        dividendMoreThan: Optional minimum dividend
-        dividendLowerThan: Optional maximum dividend
-        volumeMoreThan: Optional minimum trading volume
-        volumeLowerThan: Optional maximum trading volume
-        exchange: Optional exchange filter (e.g., "NASDAQ")
-        country: Optional country filter (e.g., "US")
-        isEtf: Optional filter for ETFs (True/False)
-        isFund: Optional filter for funds (True/False)
-        isActivelyTrading: Optional filter for actively trading securities (True/False)
-        limit: Optional maximum number of results to return
-
-    Returns:
-        List of dictionaries containing stock screening results. Each dictionary
-        contains fields like symbol, name, price, market cap, sector, industry,
-        and other company details.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> # Screen for technology stocks with market cap > $1B
-        >>> results = screener_api(
-        ...     "your_api_key",
-        ...     sector="Technology",
-        ...     marketCapMoreThan=1000000000,
-        ...     limit=100
-        ... )
-        >>> # Screen for stocks on NASDAQ with price between $10 and $200
-        >>> results = screener_api(
-        ...     "your_api_key",
-        ...     exchange="NASDAQ",
-        ...     priceMoreThan=10,
-        ...     priceLowerThan=200,
-        ...     isActivelyTrading=True
-        ... )
-    """
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    # Construct the base URL
-    base_url = "https://financialmodelingprep.com/stable"
-    endpoint = f"{base_url}/company-screener"
-
-    # Build query parameters
-    params: Dict[str, Any] = {"apikey": api_key}
-
-    # Add optional parameters if provided
-    if marketCapMoreThan is not None:
-        params["marketCapMoreThan"] = marketCapMoreThan
-    if marketCapLowerThan is not None:
-        params["marketCapLowerThan"] = marketCapLowerThan
-    if sector is not None:
-        params["sector"] = sector
-    if industry is not None:
-        params["industry"] = industry
-    if betaMoreThan is not None:
-        params["betaMoreThan"] = betaMoreThan
-    if betaLowerThan is not None:
-        params["betaLowerThan"] = betaLowerThan
-    if priceMoreThan is not None:
-        params["priceMoreThan"] = priceMoreThan
-    if priceLowerThan is not None:
-        params["priceLowerThan"] = priceLowerThan
-    if dividendMoreThan is not None:
-        params["dividendMoreThan"] = dividendMoreThan
-    if dividendLowerThan is not None:
-        params["dividendLowerThan"] = dividendLowerThan
-    if volumeMoreThan is not None:
-        params["volumeMoreThan"] = volumeMoreThan
-    if volumeLowerThan is not None:
-        params["volumeLowerThan"] = volumeLowerThan
-    if exchange is not None:
-        params["exchange"] = exchange
-    if country is not None:
-        params["country"] = country
-    if isEtf is not None:
-        params["isEtf"] = str(isEtf).lower()
-    if isFund is not None:
-        params["isFund"] = str(isFund).lower()
-    if isActivelyTrading is not None:
-        params["isActivelyTrading"] = str(isActivelyTrading).lower()
-    if limit is not None:
-        params["limit"] = limit
-
+    """One screener request (:meth:`FMPClient.screen`). The parameters are FMP's
+    own names, passed through as given; ``None`` means not asked."""
+    client = client or make_client(api_key)
+    filters = {
+        "marketCapMoreThan": marketCapMoreThan,
+        "marketCapLowerThan": marketCapLowerThan,
+        "sector": sector,
+        "industry": industry,
+        "betaMoreThan": betaMoreThan,
+        "betaLowerThan": betaLowerThan,
+        "priceMoreThan": priceMoreThan,
+        "priceLowerThan": priceLowerThan,
+        "dividendMoreThan": dividendMoreThan,
+        "dividendLowerThan": dividendLowerThan,
+        "volumeMoreThan": volumeMoreThan,
+        "volumeLowerThan": volumeLowerThan,
+        "exchange": exchange,
+        "country": country,
+        "isEtf": isEtf,
+        "isFund": isFund,
+        "isActivelyTrading": isActivelyTrading,
+    }
     logger.debug("Requesting stock screener results from FMP API")
-
     try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to fetch stock screener results: {detail}")
-        raise FMPAPIError(f"Failed to fetch stock screener results: {detail}") from None
+        rows = client.screen(filters, limit=limit)
+    except SourceError as exc:
+        raise _failed("stock screener results", exc) from None
+    logger.info(f"Retrieved {len(rows)} stock screener records")
+    return rows
 
+
+# -- identifiers --------------------------------------------------------------
+
+
+def identifier_search_api(
+    scheme: str, value: str, api_key: str = "", *, client: Optional[FMPClient] = None
+) -> List[Dict[str, Any]]:
+    """The securities FMP knows under a CIK, ISIN or CUSIP
+    (:meth:`FMPClient.search_identifier`). An unknown scheme or an empty value is
+    refused before the key is looked at and before any request."""
+    if scheme not in FMPClient.EP_IDENTIFIER_SEARCH:
+        raise ValueError(f"Unknown identifier scheme '{scheme}'")
+    if not value:
+        raise ValueError("Identifier value cannot be empty")
+    client = client or make_client(api_key)
+    logger.debug(f"Searching FMP for {scheme}={value}")
     try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
+        rows = client.search_identifier(scheme, value)
+    except SourceError as exc:
+        raise FMPAPIError(f"Failed to search {scheme} {value}: {exc}") from None
+    logger.info(f"Retrieved {len(rows)} match(es) for {scheme} {value}")
+    return rows
 
-    # Check if the response contains an error message
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
 
-    # Extract data from response
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} stock screener records")
-        return data
-    else:
-        logger.warning("Unexpected response format for stock screener")
-        return []
+# -- frames -------------------------------------------------------------------
 
 
 def get_price_history(
@@ -1195,87 +709,3 @@ def get_yield_curve(
     # Multiple dates - return as-is with date index
     logger.info(f"Returning {len(df)} yield curve records")
     return df
-
-
-# ---------------------------------------------------------------------------
-# Identifier search (`cik:` / `isin:` / `cusip:`)
-# ---------------------------------------------------------------------------
-
-# FMP's stable identifier searches, one per scheme. The warehouse resolves these
-# against its own security master; live mode has no master, so it asks the vendor
-# and then reads prices for the ticker that comes back.
-#
-# NOTE ON ENDPOINTS: these mirror the note at the top of fafnir.sources.fmp -- the
-# stable paths are the documented ones, but a plan that does not carry them will
-# fail here rather than silently. That failure is loud and specific (an FMPAPIError
-# naming the endpoint), which is the point: the alternative was sending "CIK:51143"
-# to the price endpoint as if it were a ticker.
-_IDENTIFIER_SEARCH = {
-    "cik": ("search-cik", "cik"),
-    "isin": ("search-isin", "isin"),
-    "cusip": ("search-cusip", "cusip"),
-}
-
-
-def identifier_search_api(
-    scheme: str, value: str, api_key: str
-) -> List[Dict[str, Any]]:
-    """
-    Look a security up by CIK, ISIN or CUSIP.
-
-    Args:
-        scheme: One of "cik", "isin", "cusip"
-        value: The identifier value, already normalised by duk.identifiers
-        api_key: FMP API key for authentication
-
-    Returns:
-        List of dictionaries, each carrying at least ``symbol`` and ``companyName``.
-        Empty when the identifier matches nothing.
-
-    Raises:
-        FMPAPIError: If the API request fails or returns an error
-        ValueError: If required parameters are invalid
-
-    Example:
-        >>> identifier_search_api("cik", "51143", "your_api_key")
-    """
-    if scheme not in _IDENTIFIER_SEARCH:
-        raise ValueError(f"Unknown identifier scheme '{scheme}'")
-    if not value:
-        raise ValueError("Identifier value cannot be empty")
-    if not api_key:
-        raise ValueError("API key cannot be empty")
-
-    path, param = _IDENTIFIER_SEARCH[scheme]
-    endpoint = f"https://financialmodelingprep.com/stable/{path}"
-    params: Dict[str, Any] = {param: value, "apikey": api_key}
-
-    logger.debug(f"Searching FMP for {scheme}={value}")
-
-    try:
-        response = requests.get(endpoint, params=params, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        detail = redact_secrets(str(e))
-        logger.error(f"Failed to search {scheme} {value}: {detail}")
-        raise FMPAPIError(f"Failed to search {scheme} {value}: {detail}") from None
-
-    try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse JSON response: {e}")
-        raise FMPAPIError(f"Failed to parse JSON response: {e}") from e
-
-    if isinstance(data, dict) and "Error Message" in data:
-        error_msg = data["Error Message"]
-        logger.error(f"FMP API error: {error_msg}")
-        raise FMPAPIError(f"FMP API error: {error_msg}")
-
-    if isinstance(data, list):
-        logger.info(f"Retrieved {len(data)} match(es) for {scheme} {value}")
-        return data
-    if isinstance(data, dict):
-        # A single-object payload, which some FMP searches return for an exact key.
-        return [data]
-    logger.warning(f"Unexpected response format for {scheme} search")
-    return []

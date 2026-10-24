@@ -125,12 +125,13 @@ vendor diagnostic a standalone user would want.
 
 `duk`'s vendor sources are adapters that turn a shared client's rows into the
 DataFrame contract the CLI and the compute modules share. `duk/sharadar_api.py`
-calls `SharadarClient.query`; `duk/fmp_api.py` is replaced by adapters over
-`FMPClient`, after `FMPClient` gains the three endpoints only `duk` has today
-(treasury rates and the `search-cik` / `search-isin` / `search-cusip` lookups) and
-the screener parameters `duk ls -S fmp` passes. With that, one redaction list, one
-retry policy and one set of endpoint constants serve the warehouse, `duk` and the
-MCP server, and the probe (#49) corrects one module.
+calls `SharadarClient.query`; `duk/fmp_api.py` keeps its function names (the CLI,
+`duk.ls_utils` and `duk.datasource.live` call them) but every one of them calls
+`FMPClient`, which gained the endpoints only `duk` read: treasury rates, the
+`search-cik` / `search-isin` / `search-cusip` lookups, the dividend-adjusted bars,
+the actively-trading list and a filtered one-page screen. With that, one redaction
+list, one retry policy and one set of endpoint constants serve the warehouse,
+`duk` and the MCP server, and the probe (#49) corrects one module.
 
 ### 3. A vendor console script, if one is wanted, is an entry point in this distribution
 
@@ -175,9 +176,14 @@ and `fafi` versus `fafnir` is easier to confuse in an allowlist.
 
 - `duk -S sharadar` gains the client's retry, throttle and header-borne key; its
   error messages are `SourceError`'s, redacted the same way the warehouse's are.
-- `duk -S fmp` and `duk yc` gain the same once `FMPClient` carries their endpoints.
-  Until then the second FMP client remains, and the boundary test does not cover
-  `duk`.
+- `duk -S fmp`, `duk yc` and `duk ls -S fmp` gain the same: `FMPClient` carries
+  their five endpoints (dividend-adjusted bars, treasury rates, the actively-trading
+  list, the identifier searches, the filtered screen), `duk.fmp_api` keeps only the
+  frame shaping, and the boundary test asserts nothing under `duk` imports
+  `requests` or names a vendor host. One visible change: `duk -S fmp ph` now returns
+  one bar per date in ascending order, as the warehouse's reads always did, and a
+  long `--from` is chunked below the vendor's 5000-bar cap instead of silently
+  truncated.
 - `fafnir.sources` can be imported with the `requests` package alone, which is what
   §4 would need, and what a notebook needs today.
 - Callers of the three moved modules change their imports; the CLI commands under
@@ -191,10 +197,12 @@ Roughly in order, each independently useful:
 
 1. **This ADR**, the boundary test and the three moves in §1; `duk/sharadar_api.py`
    onto `SharadarClient` (§2, Sharadar half). *Started 2026-10-24.*
-2. `FMPClient.treasury_rates`, `FMPClient.search_identifier`, and the screener and
-   list parameters `duk ls -S fmp` needs; `duk/datasource/live.py` and `duk yc`
-   onto `FMPClient`; delete `duk/fmp_api.py`. Extend the boundary test to assert
-   `duk` imports neither `requests` nor a vendor URL.
-3. `redact_secrets` has one home, `fafnir.sources.base`.
+2. `FMPClient.treasury_rates`, `search_identifier`, `eod_dividend_adjusted`,
+   `actively_trading_list` and `screen`; `duk/fmp_api.py` loses its request code
+   and calls them; the boundary test asserts `duk` imports neither `requests` nor
+   a vendor URL. *Shipped 2026-10-24.*
+3. `redact_secrets` has one home, `fafnir.sources.base`; `duk.fmp_api` re-exports
+   it. *Shipped 2026-10-24, with 2.*
 4. The console scripts of §3, if and when wanted.
-5. Mark this ADR Accepted when 2 ships.
+5. Mark this ADR Accepted once 1-3 have run on the host and `duk -S fmp ph`,
+   `duk yc` and `duk -S fmp ls --sectors` answer as before.

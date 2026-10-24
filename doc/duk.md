@@ -8,8 +8,15 @@ adds a global `--source/-S` to choose between the warehouse and a vendor's API.
 | Source | Reads from | When to use |
 |---|---|---|
 | `db` (**default**) | fafnir PostgreSQL `mart` | normal use; fast, offline, point-in-time stable, every security the warehouse holds |
-| `fmp` | FMP API directly | a symbol not yet in the warehouse; checking a series against FMP; no-DB use. `live` is the older name and still works |
-| `sharadar` | Sharadar's SEP/SFP price tables directly | checking a series against Sharadar; reading a security before it is loaded. `ph` only |
+| `fmp` | FMP's API, through the warehouse's client | a symbol not yet in the warehouse; checking a series against FMP; no-DB use. `live` is the older name and still works |
+| `sharadar` | Sharadar's SEP/SFP price tables, through the warehouse's client | checking a series against Sharadar; reading a security before it is loaded. `ph` only |
+
+Both vendor sources request through the clients in `fafnir.sources`
+([ADR 0017](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md)):
+duk makes no HTTP request of its own, so it has the loaders' throttle, retries and
+redaction, and an endpoint corrected for the warehouse is corrected for duk. What
+duk owns is the shaping: which tables are tried, and how a vendor's rows become
+the frame every source returns.
 
 The source is a **group-level** option, so it comes before the subcommand:
 

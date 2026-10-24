@@ -7,6 +7,13 @@ security master and corporate actions. Each method returns the parsed payload;
 ``self.bytes_downloaded`` and ``self.request_count`` accumulate for lineage and
 the 50 GB/month bandwidth budget.
 
+This is the only FMP client (ADR 0017). ``duk -S fmp``, ``duk yc`` and ``duk ls``
+read through it (``duk.fmp_api`` shapes its rows into frames and makes no request
+of its own), so the endpoints only duk uses -- the treasury curve, the
+dividend-adjusted bars, the actively-trading list, the identifier searches and the
+filtered screen -- live here beside the warehouse's, under the same throttle,
+retries and redaction.
+
 NOTE ON ENDPOINTS: the split/dividend stable paths below should be confirmed
 against a live response for a known symbol before the first production backfill
 (see doc/ingestion.md). They are isolated here as constants so a correction is a
@@ -62,6 +69,20 @@ class FMPClient(BaseSource):
     EP_SCREENER = "company-screener"
     EP_DELISTED = "delisted-companies"
     EP_SYMBOL_CHANGE = "symbol-change"
+    # duk's reads (ADR 0017). Never ingested: the warehouse adjusts its own bars
+    # (ADR 0001), the curve comes from FRED once it lands, and a listing status is
+    # the security master's to decide.
+    EP_EOD_DIVIDEND_ADJUSTED = "historical-price-eod/dividend-adjusted"
+    EP_ACTIVELY_TRADING = "actively-trading-list"
+    EP_TREASURY_RATES = "treasury-rates"
+    # One search per identifier scheme: (path, query parameter). The warehouse
+    # resolves these against its own master; `duk -S fmp` has no master, so it
+    # asks the vendor and reads prices for the ticker that comes back.
+    EP_IDENTIFIER_SEARCH = {
+        "cik": ("search-cik", "cik"),
+        "isin": ("search-isin", "isin"),
+        "cusip": ("search-cusip", "cusip"),
+    }
 
     # Screener rows per request. Confirmed to return a full 5000-row page, but
     # 1000 keeps a single page small enough to retry cheaply.
@@ -120,6 +141,11 @@ class FMPClient(BaseSource):
 
     def etf_list(self) -> list[dict]:
         data, _, _ = self._call(self.EP_ETF_LIST)
+        return data if isinstance(data, list) else []
+
+    def actively_trading_list(self) -> list[dict]:
+        """Every symbol FMP marks actively trading (``duk ls -S fmp``)."""
+        data, _, _ = self._call(self.EP_ACTIVELY_TRADING)
         return data if isinstance(data, list) else []
 
     def _paged(
@@ -206,6 +232,24 @@ class FMPClient(BaseSource):
             page_size=self.SCREENER_PAGE_SIZE,
             max_pages=max_pages,
         )
+
+    def screen(
+        self, filters: Optional[dict] = None, *, limit: Optional[int] = None
+    ) -> list[dict]:
+        """One screener request with FMP's own filter names (``marketCapMoreThan``,
+        ``sector``, ``isEtf`` ...), as ``duk ls -S fmp`` asks it: one page, the
+        vendor's ``limit``, booleans spelled ``true``/``false``. For the whole
+        universe, paged, use :meth:`company_screener`.
+        """
+        params: dict[str, Any] = {}
+        for key, value in (filters or {}).items():
+            if value is None:
+                continue
+            params[key] = str(value).lower() if isinstance(value, bool) else value
+        if limit is not None:
+            params["limit"] = limit
+        data, _, _ = self._call(self.EP_SCREENER, params)
+        return data if isinstance(data, list) else []
 
     def delisted_companies(self, *, max_pages: int = 5) -> list[dict]:
         """Delisted companies, newest delisting first.
@@ -306,12 +350,23 @@ class FMPClient(BaseSource):
         would otherwise leave two bars for one day on this side of the comparison.
         """
         bars = self._eod_window(symbol, from_date, to_date, self.EP_EOD_SPLIT_ADJUSTED)
-        by_date: dict[str, dict] = {}
-        for bar in bars:
-            key = str(bar.get("date") or "")[:10]
-            if key:
-                by_date[key] = bar
-        return [by_date[k] for k in sorted(by_date)]
+        return _one_bar_per_date(bars)
+
+    def eod_dividend_adjusted(
+        self,
+        symbol: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> list[dict]:
+        """Split- and dividend-adjusted bars from
+        ``historical-price-eod/dividend-adjusted``: what ``duk -S fmp ph --adj``
+        prints. **Never ingested** -- the warehouse derives adjusted prices from
+        its own factors (ADR 0001). One request, deduplicated by date like
+        :meth:`eod_split_adjusted`."""
+        bars = self._eod_window(
+            symbol, from_date, to_date, self.EP_EOD_DIVIDEND_ADJUSTED
+        )
+        return _one_bar_per_date(bars)
 
     def eod_raw(
         self,
@@ -462,6 +517,49 @@ class FMPClient(BaseSource):
     def industries(self) -> list[str]:
         data, _, _ = self._call(self.EP_INDUSTRIES)
         return _flatten_names(data, "industry")
+
+    # -- duk's reads (ADR 0017) ---------------------------------------------
+    def treasury_rates(
+        self, from_date: Optional[str] = None, to_date: Optional[str] = None
+    ) -> list[dict]:
+        """US Treasury par rates by date, one row per day with a column per tenor
+        (``duk yc``). Rows as FMP sends them; ``duk.rates_utils`` shapes them."""
+        params: dict[str, Any] = {}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+        data, _, _ = self._call(self.EP_TREASURY_RATES, params)
+        return data if isinstance(data, list) else []
+
+    def search_identifier(self, scheme: str, value: str) -> list[dict]:
+        """The securities FMP knows under a CIK, ISIN or CUSIP, as rows. A
+        single-object payload (some searches answer an exact key that way) is one
+        row. An unknown scheme is a programming error, raised before any request:
+        the alternative was sending ``CIK:51143`` to the price endpoint as a ticker.
+        """
+        if scheme not in self.EP_IDENTIFIER_SEARCH:
+            raise ValueError(f"Unknown identifier scheme '{scheme}'")
+        if not value:
+            raise ValueError("Identifier value cannot be empty")
+        path, param = self.EP_IDENTIFIER_SEARCH[scheme]
+        data, _, _ = self._call(path, {param: value})
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+        return []
+
+
+def _one_bar_per_date(bars: list[dict]) -> list[dict]:
+    """Ascending by date, the last bar of any date the vendor repeated. Parity with
+    :meth:`FMPClient.eod_raw`, so the two sides of a comparison dedupe alike."""
+    by_date: dict[str, dict] = {}
+    for bar in bars:
+        key = str(bar.get("date") or "")[:10]
+        if key:
+            by_date[key] = bar
+    return [by_date[k] for k in sorted(by_date)]
 
 
 def _row_fingerprint(row: Any, key_fields: Sequence[str]) -> Optional[str]:

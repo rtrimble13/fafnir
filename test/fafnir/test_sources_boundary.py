@@ -75,10 +75,26 @@ def test_the_layer_is_not_empty():
     assert {"base", "fmp", "sharadar", "sharadar_files"} <= names
 
 
-def test_duk_sharadar_requests_through_the_shared_client():
-    """duk keeps no Sharadar HTTP code of its own (ADR 0017 §2)."""
-    import duk.sharadar_api as mod
+def test_duk_makes_no_request_of_its_own():
+    """duk keeps no HTTP code (ADR 0017 §2): its vendor modules shape the shared
+    clients' rows, and nothing under ``duk`` imports ``requests`` or names a vendor
+    URL. A second client is how the two FMP clients drifted."""
+    import duk
 
-    names = {name for name, _ in _imports(Path(mod.__file__))}
-    assert "requests" not in names
-    assert "fafnir.sources.sharadar" in names
+    duk_dir = Path(duk.__file__).parent
+    offending = []
+    for path in sorted(duk_dir.rglob("*.py")):
+        names = {name.split(".")[0] for name, _ in _imports(path)}
+        if "requests" in names:
+            offending.append(f"{path.relative_to(duk_dir)}: imports requests")
+        if "financialmodelingprep.com" in path.read_text():
+            offending.append(f"{path.relative_to(duk_dir)}: names the vendor's host")
+    assert not offending, "\n".join(offending)
+
+    import duk.fmp_api
+    import duk.sharadar_api
+
+    assert "fafnir.sources.fmp" in {n for n, _ in _imports(Path(duk.fmp_api.__file__))}
+    assert "fafnir.sources.sharadar" in {
+        n for n, _ in _imports(Path(duk.sharadar_api.__file__))
+    }
