@@ -411,6 +411,46 @@ def test_a_security_with_no_bars_reads_every_delta_since_the_full(db, tmp_path):
     }
 
 
+def test_a_new_listing_reads_every_delta_on_disk_from_its_first_price(db, tmp_path):
+    _fulls(db, tmp_path)
+    # A delta from before a full refresh files the ticker's previous holder too.
+    _record(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES
+        + _csv_bar("ZZR", "2026-10-02", "50")
+        + _csv_bar("ZZR", "2026-10-13", "5"),
+        kind="delta",
+        since="2026-10-01",
+    )
+    _record(db, tmp_path, "stocks", PRICES + _csv_bar("ZZFULL2", "2026-10-14", "1"))
+    _record(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES + _csv_bar("ZZR", "2026-10-16", "6"),
+        kind="delta",
+        since="2026-10-14",
+    )
+    # Minted tonight, first priced on 2026-10-13: its days before the refreshed full
+    # are read, and the bar before its first price is the previous holder's.
+    new = _security(
+        db,
+        "ZZR",
+        source="sharadar",
+        key="900120",
+        feed=True,
+        valid_from=Y(2026, 10, 13),
+    )
+    result = sp.nightly(db, tmp_path, as_of=Y(2026, 10, 17))
+    assert _bars(db, new) == {
+        Y(2026, 10, 13): (D(5), "sharadar"),
+        Y(2026, 10, 16): (D(6), "sharadar"),
+    }
+    assert result.counts["future_or_outside"] == 1
+
+
 def test_as_if_fed_compares_the_linked_fmp_securities(db, tmp_path):
     fmp = _security(
         db, "ZZA", source="fmp", key="900104", feed=False, valid_from=Y(2026, 10, 1)
@@ -536,7 +576,8 @@ def test_the_night_runs_in_order_and_waits_for_the_cutover(db, tmp_path, monkeyp
     out = night("--dry-run")
     assert out.exit_code == 0, out.output
     steps = [line for line in out.output.splitlines() if line.startswith("[")]
-    assert [s.split("]")[0] + "]" for s in steps] == [f"[{n}/6]" for n in range(1, 7)]
+    assert [s.split("]")[0] + "]" for s in steps] == [f"[{n}/7]" for n in range(1, 8)]
+    assert "[7/7] source sharadar-prune" in out.output  # it prunes in a dry run too
     assert "1 linked securities compared as if fed" in out.output
     assert "fmp_agrees 1" in out.output
     assert _bars(db, fmp) == {Y(2026, 10, 21): (D(22), "fmp")}

@@ -61,8 +61,9 @@ rows. To ask whether the screener still lists a name, read
 names a file under `[sharadar] bulk_dir` (`path` is relative to it), and the rows are
 in that file, not in the database. So a question about what Sharadar said is
 answered by reading the file (`fafnir.sources.sharadar_files.iter_rows`), and a
-ledger row whose `status` is `deleted`, or whose file is missing after a restore,
-has nothing behind it. A `kind = 'delta'` row is a nightly slice (#98): a plain
+ledger row whose `status` is `deleted` has nothing behind it, and nor has one whose
+file is missing after a restore. `deleted` is the nightly prune's mark: the file is
+gone, and the row stays as the lineage of the loads that read it. A `kind = 'delta'` row is a nightly slice (#98): a plain
 `<sha256>.csv` of the price rows stamped on or after `filters->>'lastupdated.gte'`.
 The last one the nightly applied is in the `prices:nightly` run's `params.through`.
 

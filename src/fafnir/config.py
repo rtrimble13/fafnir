@@ -18,7 +18,8 @@ Config sections
     log_level, log_dir, universe, request_rate_per_min, overlap_days,
     exclude_instruments, primary_price_vendor, fmp_secondary
 ``[sharadar]``
-    rate_per_min, bulk_dir -- see :mod:`fafnir.sources.sharadar`
+    rate_per_min, bulk_dir -- see :mod:`fafnir.sources.sharadar`; keep_days -- see
+    :mod:`fafnir.ingest.sharadar_prune`
 ``[prices]``
     restatement_max_ratio, restatement_max_volume_ratio, restatement_min_volume --
     see :mod:`fafnir.ingest.daily_price`
@@ -216,6 +217,16 @@ class FafnirConfig:
             self._get("sharadar", "bulk_dir", "var/fafnir/landing/sharadar")
             or "var/fafnir/landing/sharadar"
         )
+
+    @property
+    def sharadar_keep_days(self) -> int:
+        """How long `sharadar-prune` keeps a file nothing reads any more: a
+        superseded full file or an applied delta, for triage (#118's follow-up).
+        The newest superseded file of each table is kept whatever its age."""
+        value = int(self._get("sharadar", "keep_days", 7))
+        if value < 0:
+            raise ValueError(f"[sharadar] keep_days must be 0 or more, not {value}")
+        return value
 
     @property
     def primary_price_vendor(self) -> str:

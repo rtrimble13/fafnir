@@ -1085,6 +1085,7 @@ fafnir ingest sharadar             # after it ([general] primary_price_vendor = 
 | 4 | `ingest sharadar-universe` | Renames, delistings and new listings (#93). |
 | 5 | `ingest sharadar-prices --nightly` | Writes the deltas' bars (below). |
 | 6 | `ingest sharadar-actions --backfill --gap-fill` | Splits and dividends from the fresh ACTIONS file. |
+| 7 | `source sharadar-prune` | Deletes the files nothing reads any more, keeping a week of them (below). |
 
 A step that fails stops the night with a non-zero exit. Every step is safe to run
 again, so the next run picks up where the last one stopped. A real run refuses
@@ -1138,9 +1139,45 @@ security_id)` advances, and factors are recomputed for the securities that chang
 and hold actions.
 
 A security with no bars yet, such as a listing step 4 minted tonight, reads every
-delta since the full file, so the days before it existed are not lost. Its history
-before that file is `--backfill`'s: `fafnir ingest sharadar-prices --backfill
---symbols X`.
+delta still on disk, whichever full file they follow, so the days before it existed
+are not lost. The prune keeps the universe step's window of them, and step 4 mints
+only listings first priced inside it. Any older history is `--backfill`'s:
+`fafnir ingest sharadar-prices --backfill --symbols X`.
+
+Every bar the nightly reads is taken from the link's `valid_from` on, whether the
+security is fed or not. A minted security's link starts at its first price, so an
+earlier row under its ticker is another issuer's (a reused ticker in an old delta).
+For a linked FMP security, the earlier dates are another era (#68).
+
+**The files on disk.** Without a prune, `[sharadar] bulk_dir` grows every night:
+TICKERS and ACTIONS are downloaded whole, and the superseded copy stays. The
+deltas also accumulate. `fafnir source sharadar-prune [--dry-run] [--keep-days N]`,
+step 7, decides from the ledger what each file is still for:
+
+| File | Kept |
+|---|---|
+| The current full file of each table | always: every loader reads it |
+| A delta the nightly has not applied (after its `through`, or after the current full before the first nightly) | always |
+| An applied delta | for 45 days, the universe step's 30-day window and a margin: a new listing reads it |
+| A superseded full file | for `[sharadar] keep_days` (7), and the newest of each table whatever its age |
+| `.*.part`, `.sharadar-sort-*` (a killed download or sort) | 24 hours |
+| A `<sha256>.<ext>` file the ledger never recorded (a header that failed the check) | 14 days, for inspection |
+| Anything else | never touched; reported |
+
+- **Deleting a recorded file.** Its row is marked `status = 'deleted'` and kept,
+  as the lineage of the loads that read it. Only then is the file unlinked: one
+  that will not unlink is found again next time.
+- **When it refuses.** It refuses to run when a current full file is missing from
+  `bulk_dir`. That means a misconfigured directory, in which everything would look
+  deletable.
+- **In the night.** Step 7 runs only after steps 1 to 6 succeed, the dry-run
+  nights included. If it cannot run, it warns without failing the night.
+- **The record.** One run (`endpoint = prune`) records the counts, the bytes freed
+  and what was kept.
+
+The directory then stays about the size of one full set (1.9 GB), plus a week of
+TICKERS/ACTIONS versions and 45 days of deltas. `monitor.sh sharadar` warns past
+`FAFNIR_SHARADAR_WARN_GB` (8 GB), and on a killed run's leftovers.
 
 **The nightly actions.** Both modes run over the ACTIONS file step 1 downloaded. The
 near-duplicate guard now holds for fed securities too. An action within 7 days of

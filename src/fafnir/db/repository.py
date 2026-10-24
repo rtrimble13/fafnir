@@ -6646,6 +6646,35 @@ def supersede_sharadar_fulls(db: Database, vendor_table: str, keep_file_id: int)
     return len(rows)
 
 
+def sharadar_files_on_disk(db: Database) -> list[dict]:
+    """Every ledger row whose file should be on disk (not ``deleted``), oldest
+    first: what `sharadar-prune` decides about."""
+    return db.fetchall(
+        "SELECT * FROM landing.sharadar_file WHERE status <> 'deleted' "
+        "ORDER BY file_id"
+    )
+
+
+def sharadar_deleted_paths(db: Database) -> set[str]:
+    """The paths of the files the ledger marks deleted."""
+    return {
+        r["path"]
+        for r in db.fetchall(
+            "SELECT path FROM landing.sharadar_file WHERE status = 'deleted'"
+        )
+    }
+
+
+def mark_sharadar_file_deleted(db: Database, file_id: int) -> None:
+    """Mark a file deleted from disk. The row stays: it is the lineage of every
+    load that read the file (``landing.sharadar_file.status``)."""
+    db.execute(
+        "UPDATE landing.sharadar_file SET status = 'deleted', status_at = now() "
+        "WHERE file_id = %s",
+        (file_id,),
+    )
+
+
 def sharadar_file(db: Database, file_id: int) -> Optional[dict]:
     return db.fetchone(
         "SELECT * FROM landing.sharadar_file WHERE file_id = %s", (file_id,)

@@ -265,6 +265,24 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-24 · P3, Sharadar file retention (no issue; asked for directly).** Nothing deleted a Sharadar
+  file, so `bulk_dir` grew every night. The night downloads TICKERS and ACTIONS whole (up to 0.1 GB) and two
+  deltas, and a killed sort can leave ~4 GB.
+  - **`fafnir source sharadar-prune`** is step 7 of `ingest sharadar`, the dry-run nights included. It decides
+    from the ledger:
+    - always kept: each table's current full file and the deltas the nightly has not applied;
+    - applied deltas for 45 days (the universe window plus a margin);
+    - superseded files for `[sharadar] keep_days` (7), and the newest of each table;
+    - a killed run's `.part` and sort scratch after 24 hours, and an unrecorded `<sha256>` file after 14
+      days.
+
+    A deleted row stays, marked `deleted`. The prune refuses when a current file is missing. Steady state is
+    about 2.5 GB.
+  - **Departure from the proposal:** no 90-day full refresh of SEP/SFP. A new listing now reads every delta
+    still on disk, not only those after the current full. The 45-day window bounds the deltas, and a
+    refresh no longer hides a listing's first days. Its rows are taken from its link's `valid_from`, so an old
+    delta's rows for a reused ticker cannot be written to it. `monitor.sh sharadar` warns past 8 GB and on
+    leftovers.
 - **2026-10-22 · P3, #120: the cutover runbook.** The runbook is `doc/operations.md` › *Cutover to Sharadar
   as primary*:
   - preconditions (gate GO, release, no night in progress);
