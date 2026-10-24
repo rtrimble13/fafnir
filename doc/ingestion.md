@@ -600,6 +600,50 @@ fafnir vendor correct                    # after the volume decision
 fafnir vendor corrections list --limit 20
 ```
 
+**The split-bearing securities** (`--split-bearing`) are what the first correction
+left out: the FMP-minted securities linked to Sharadar, fed or not, that hold
+Sharadar's splits. Those are the splits FMP never listed, which `sharadar-actions`
+added. FMP's history before such a split is often already divided by it.
+
+CELG's 2003–2013 bars are an example. They are exactly half Sharadar's as-traded
+closes, and match after its 2014 2:1. The adjusted series then divides them twice.
+Of 149 such splits checked on 2026-10-23, 93 showed it with that one split's factor:
+Sharadar's own as-traded close jumps by the factor across the date, and FMP's price
+before it sits exactly that factor below. About nine more sit the product of
+several later splits below (GMCR's 1/13.5).
+
+- **A bar is explained** when FMP's close times Π, the product of the stored
+  Sharadar splits after it, meets Sharadar's recovered close within 0.5%, a cent,
+  or FMP's 6-dp rounding at Π.
+- **A stretch between two such splits** is corrected only when at least 90% of its
+  compared bars are explained. A stretch below that is counted
+  (`split_bearing:stretch_left`) and left. Its bars are split into `left_agree`
+  (FMP was as traded, so the split on file is right) and `left_differ` (an ADR's
+  ratio, another instrument: Sharadar is not always the right side of those). The
+  dry run lists the securities with `left_differ` bars.
+- **An explained stretch is corrected whole**, so it stays one series:
+  - Every compared bar is replaced by Sharadar's, the few unexplained ones too
+    (`bar_replaced_unexplained`). Left as they were, they would sit Π times off
+    their neighbours.
+  - FMP's bars on dates the vendor does not hold (before the link, in a gap, or a
+    vendor bar that will not recover) are rescaled by Π, and their volume by 1/Π.
+    This is one `prices rescale`-style edit per stretch (`uncovered_rescaled`),
+    undone whole by `fafnir override revoke <edit>`.
+  - If that edit would be refused, the stretch is left whole (`stretch_refused`). A
+    refusal is a bar the loader would quarantine at the new scale.
+- **The vendor's volume.** A corrected bar takes the vendor's recovered volume,
+  not FMP's: the exception to the `keep` convention. FMP's volume is pre-adjusted
+  with its prices. CELG's FMP median volume is 4.27M before the 2014 split and
+  4.35M after, where an as-traded series halves before. `--volume keep` is refused.
+- **Bars after the last such split** (`split_bearing:no_split_after`) are this
+  mode's to skip. The first correction already compared them.
+
+```bash
+fafnir ingest sharadar-actions --prune-outside-span     # first: only in-span splits count
+fafnir vendor correct --split-bearing --dry-run
+fafnir vendor correct --split-bearing
+```
+
 ### Splits and dividends from Sharadar (#73)
 
 `fafnir ingest sharadar-actions` reads the ledger's current ACTIONS file and writes
@@ -610,7 +654,7 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
 | Mode | For | What it writes |
 |---|---|---|
 | `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98) | every split and dividend, never within 7 days of an action of the same type another source holds |
-| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: an action inside the link's span (its `valid_from` to the last bar), and never within 7 days of an action of the same type another source holds |
+| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: an action after the link's `valid_from` and up to the last bar, and never within 7 days of an action of the same type another source holds |
 
 - **The conversions** are #56's: a split's value is new shares per old
   (`split_ratio`), and a dividend's is split-adjusted, so it is multiplied by the
@@ -622,6 +666,23 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
   (`near_existing`) rather than store it twice. Correcting it is #75's
   `vendor correct`.
 - **Never a future ex-date** (ADR 0007), the same guard as `ingest actions`.
+- **Only after the link's start, on a security another vendor minted.** Fed or not,
+  an FMP-minted security takes only the actions dated after its link's
+  `valid_from` (`outside_span` otherwise). The link starts where Sharadar's own
+  prices do, and an action on or before that date adjusts only FMP's bars, which no
+  Sharadar price confirms. COPR's 1:20 of 2025-12-15 is an example: Sharadar prices
+  COPR from 2026-07-02. A security Sharadar minted holds only its bars and takes
+  every action.
+  - **Before this held** (up to v2.0.1), the gap-fill counted the link's first day as
+    inside it. After the cutover fed every linked security, the backfill checked no
+    span at all. The first Sharadar night wrote 466 splits and 2,256 dividends
+    outside the span. 34 splits and 45 dividends reached a stored bar. The rest
+    raised 2,211 `dividend_no_prior_close` flags.
+  - **`--prune-outside-span` removes them.** Each goes through the override path
+    with reason `cleanup`: kept in `ops.operator_override`, with no label, because
+    nothing says the vendor's action was wrong. The dividend flags of a removed
+    dividend are closed with it, and the factors are recomputed. Its run is
+    `sharadar` / `actions:prune`.
 - **Spin-offs are not adjusted.** ACTIONS records them, and they are kept as events
   in `core.vendor_security_event`; fafnir has never adjusted for them, and does not
   start here.
@@ -633,6 +694,8 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
 ```bash
 fafnir ingest sharadar-actions --backfill --gap-fill --dry-run   # counts per reason
 fafnir ingest sharadar-actions --backfill --gap-fill
+fafnir ingest sharadar-actions --prune-outside-span --dry-run    # once, after deploying
+fafnir ingest sharadar-actions --prune-outside-span --by <you>
 ```
 
 One `ops.ingestion_run` (`sharadar` / `actions`), a commit per 1,000 securities. A
@@ -1103,13 +1166,23 @@ the table API for the rows stamped `lastupdated` on or after a date.
 - **Revisions reach far back.** The vendor restamps a security's history when it
   adjusts it, for a split or a dividend (the probe's item 9). One day of SFP
   (measured 2026-10-22) was 33,022 rows on four pages, dated across a year.
+- **The reads** go in date order, never by offset. The API orders one date's rows
+  differently on each request, so offset paging lost the rows of any date a page
+  boundary split, and repeated as many others: on the first night, 2,569 of SEP's
+  and 3,261 of SFP's rows dated 10-19 and 10-21. Each request now asks for the rows
+  from a date on, `sort=date`. It keeps every date before the last one a full page
+  reaches, and the next request starts at that last date, so one request reads each
+  date whole. The order and the window are checked in the rows that come back. A
+  single date of 10,000 rows or more cannot be read this way and fails the table.
 - **The file** is written as a plain CSV in the bulk file's column order, named
   `<sha256>.csv` under `[sharadar] bulk_dir`. It is recorded in
   `landing.sharadar_file` with `kind = 'delta'` and `filters = {"lastupdated.gte":
   …}`.
 - **Edge cases.** A row stamped before the date means the filter was not applied,
-  and the table fails. A delta with no rows is not recorded, and the same content
-  twice is one file. Each table is one run (`endpoint = delta:<table>`).
+  and the table fails. So does a (ticker, date) that comes back twice: reads that
+  overlapped, and as many rows missing. A delta with no rows is not recorded, and
+  the same content twice is one file. Each table is one run (`endpoint =
+  delta:<table>`).
 
 **The nightly price load.** `fafnir ingest sharadar-prices --nightly` reads the
 delta files recorded since the last successful nightly. Its run (`endpoint =
@@ -1128,6 +1201,13 @@ feeds:
 - **Another party's bar is left alone** (`kept:<source>`). A security `vendor feed`
   gave to Sharadar keeps the FMP history it had; replacing those bars is `vendor
   correct`'s job.
+
+Once the night is written, `unserved` counts the fed securities that the vendor's
+master (TICKERS' `lastpricedate`) says it priced on the newest date the files hold
+but that have no bar on it. The run's log names them. TICKERS can be ahead of the
+price tables: on 2026-10-23 it named 49 funds and a stock whose 10-22 rows SFP and
+SEP did not yet hold. So it is a count to watch from night to night, not a flag. A
+security that stays in it for several nights has stopped being served.
 
 The bars pass the backfill's gates. Raw prices are recovered from ACTIONS: on the
 capture day the vendor's ratio must be 1, or the security is flagged

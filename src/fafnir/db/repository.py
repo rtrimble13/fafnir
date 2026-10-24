@@ -7117,6 +7117,57 @@ def vendor_action_targets(
     )
 
 
+def vendor_actions_outside_span(
+    db: Database, vendor: str, security_ids: Optional[Sequence[int]] = None
+) -> list[dict]:
+    """The vendor's corporate actions on securities another vendor minted, dated on
+    or before the open link's start: what `ingest sharadar-actions
+    --prune-outside-span` removes. Each with the security's first bar (None without
+    bars), which says whether the action reaches a stored price."""
+    ids = list(security_ids) if security_ids is not None else None
+    return db.fetchall(
+        """
+        SELECT ca.corporate_action_id, ca.security_id, s.primary_symbol,
+               ca.action_type, ca.ex_date, l.valid_from, span.first_trade_date
+          FROM core.corporate_action ca
+          JOIN core.security s USING (security_id)
+          JOIN core.security_vendor_xref l
+            ON l.security_id = ca.security_id AND l.vendor = %s
+           AND l.valid_to IS NULL
+          LEFT JOIN LATERAL (
+                SELECT min(p.trade_date) AS first_trade_date
+                  FROM core.daily_price p
+                 WHERE p.security_id = ca.security_id) span ON true
+         WHERE ca.source = %s AND s.source <> %s AND ca.ex_date <= l.valid_from
+           AND (%s::bigint[] IS NULL OR ca.security_id = ANY(%s::bigint[]))
+         ORDER BY ca.security_id, ca.ex_date, ca.action_type
+        """,
+        (vendor, vendor, vendor, ids, ids),
+    )
+
+
+def open_flags_on_ex_dates(
+    db: Database, checks: Sequence[str], keys: Sequence[tuple[int, date]]
+) -> list[int]:
+    """The open flags of ``checks`` keyed ``{"ex_date": ...}`` on these
+    ``(security_id, ex_date)`` pairs: the flags an action's removal settles."""
+    if not keys:
+        return []
+    rows = db.fetchall(
+        """
+        SELECT f.dq_flag_id
+          FROM ops.data_quality_flag f
+          JOIN unnest(%s::bigint[], %s::date[]) AS k(security_id, ex_date)
+            ON f.security_id = k.security_id
+           AND f.record_key->>'ex_date' = k.ex_date::text
+         WHERE f.resolved_at IS NULL AND f.check_name = ANY(%s)
+         ORDER BY f.dq_flag_id
+        """,
+        ([k[0] for k in keys], [k[1] for k in keys], list(checks)),
+    )
+    return [int(r["dq_flag_id"]) for r in rows]
+
+
 def vendor_tickers(
     db: Database, vendor: str, keys: Sequence[str]
 ) -> dict[str, tuple[str, str]]:
@@ -7160,6 +7211,48 @@ def action_dates(db: Database, security_ids: Sequence[int]) -> list[dict]:
             )
         )
     return out
+
+
+def stored_split_values(
+    db: Database, security_ids: Sequence[int], source: str
+) -> dict[int, list[tuple[date, Decimal]]]:
+    """``security_id -> [(ex_date, new shares per old)]`` of the stored splits one
+    source wrote, in date order: on an FMP-minted security, Sharadar's are the
+    splits FMP never listed (`vendor correct --split-bearing`)."""
+    out: dict[int, list[tuple[date, Decimal]]] = {}
+    ids = list(security_ids)
+    for i in range(0, len(ids), 5000):
+        for r in db.fetchall(
+            """
+            SELECT security_id, ex_date, split_numerator / split_denominator AS value
+              FROM core.corporate_action
+             WHERE security_id = ANY(%s) AND action_type = 'split' AND source = %s
+               AND split_numerator > 0 AND split_denominator > 0
+             ORDER BY security_id, ex_date
+            """,
+            (ids[i : i + 5000], source),
+        ):
+            out.setdefault(int(r["security_id"]), []).append(
+                (r["ex_date"], Decimal(r["value"]))
+            )
+    return out
+
+
+def source_dates(
+    db: Database, security_id: int, source: str, start: date, end: date
+) -> set[date]:
+    """The dates in ``[start, end)`` on which ``source`` holds the bar."""
+    return {
+        r["trade_date"]
+        for r in db.fetchall(
+            """
+            SELECT trade_date FROM core.daily_price
+             WHERE security_id = %s AND source = %s
+               AND trade_date >= %s AND trade_date < %s
+            """,
+            (security_id, source, start, end),
+        )
+    }
 
 
 def vendor_events(

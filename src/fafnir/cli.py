@@ -768,6 +768,12 @@ def _echo_sharadar_prices(result) -> None:
     is_flag=True,
     help="Fill-only for the FMP securities linked to Sharadar.",
 )
+@click.option(
+    "--prune-outside-span",
+    is_flag=True,
+    help="Remove the Sharadar actions dated on or before a link's start, on "
+    "securities another vendor minted. Runs alone.",
+)
 @click.option("--symbols", help="Comma-separated tickers: only these securities.")
 @click.option("--dry-run", is_flag=True, help="Plan and print counts; write nothing.")
 @click.option(
@@ -775,28 +781,48 @@ def _echo_sharadar_prices(result) -> None:
     is_flag=True,
     help="Do not recompute the factors of the securities it changed.",
 )
+@click.option(
+    "--by",
+    "created_by",
+    help="With --prune-outside-span: who, on the overrides and the closed flags "
+    "[default: the OS user]",
+)
 @click.pass_context
-def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust):
+def ingest_sharadar_actions(
+    ctx, backfill, gap_fill, prune_outside_span, symbols, dry_run, no_adjust, created_by
+):
     """Load Sharadar's splits and dividends into core.corporate_action (#73).
 
     \b
       fafnir ingest sharadar-actions --backfill --dry-run
       fafnir ingest sharadar-actions --backfill --gap-fill
+      fafnir ingest sharadar-actions --prune-outside-span --dry-run
 
     Reads the ledger's current ACTIONS file under [sharadar] bulk_dir. --backfill
     loads every split and dividend of the securities Sharadar feeds (the minted
     dead issuers); --gap-fill adds, fill-only, what an FMP security linked to
-    Sharadar lacks: inside the link's span, and never within 7 days of an action
-    of the same type another source holds. Written as source sharadar under
-    precedence, never as a correction; a future ex-date is never stored. One
-    ops.ingestion_run (sharadar/actions); the factors of the securities it changed
-    are recomputed, for those with bars.
+    Sharadar lacks, up to its last bar. A security another vendor minted takes only
+    the actions dated after its link's start, fed or not, and never one within 7
+    days of an action of the same type another source holds. Written as source
+    sharadar under precedence, never as a correction; a future ex-date is never
+    stored. One ops.ingestion_run (sharadar/actions); the factors of the securities
+    it changed are recomputed, for those with bars.
+
+    --prune-outside-span removes the Sharadar actions such a security holds on or
+    before its link's start, written before that rule held. Each is deleted through
+    the override path, reason cleanup (kept in ops.operator_override, no label);
+    the dividend_no_prior_close and dividend_exceeds_price flags of a removed
+    dividend are closed with it. One ops.ingestion_run (sharadar/actions:prune).
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_actions as sa
 
-    if not (backfill or gap_fill):
-        raise click.ClickException("Give --backfill, --gap-fill or both.")
+    if prune_outside_span and (backfill or gap_fill):
+        raise click.ClickException("--prune-outside-span runs alone.")
+    if not (backfill or gap_fill or prune_outside_span):
+        raise click.ClickException(
+            "Give --backfill, --gap-fill or both, or --prune-outside-span."
+        )
     cfg = ctx.obj["config"]
     with Database(cfg.dsn) as database:
         ids = None
@@ -807,6 +833,16 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
                 (ids.append(sid) if sid is not None else missing.append(sym))
             if missing:
                 raise click.ClickException(f"No security for: {', '.join(missing)}")
+        if prune_outside_span:
+            pruned = sa.prune_outside_span(
+                database,
+                created_by=created_by or _os_user(),
+                security_ids=ids,
+                dry_run=dry_run,
+                adjust=not no_adjust,
+            )
+            _echo_sharadar_prune(pruned)
+            return
         try:
             result = sa.load(
                 database,
@@ -820,6 +856,27 @@ def ingest_sharadar_actions(ctx, backfill, gap_fill, symbols, dry_run, no_adjust
         except (sa.ActionsError, FileNotFoundError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
     _echo_sharadar_actions(result)
+
+
+def _echo_sharadar_prune(result) -> None:
+    c = result.counts
+    securities = len({r["security_id"] for r in result.rows})
+    head = "Dry run: nothing changed." if result.dry_run else f"Run {result.run_id}."
+    click.echo(
+        f"{head} {len(result.rows)} Sharadar actions outside the link's span on "
+        f"{securities} securities: {c['split:reaches_bars']} splits and "
+        f"{c['dividend:reaches_bars']} dividends reach a stored bar; "
+        f"{c['split:before_bars']} splits and {c['dividend:before_bars']} dividends "
+        "precede the first."
+    )
+    if result.dry_run or not result.rows:
+        return
+    click.echo(
+        f"  removed {len(result.override_ids)} (overrides "
+        f"{min(result.override_ids)}-{max(result.override_ids)}, reason cleanup); "
+        f"closed {len(result.closed_flags)} dividend flags; factors recomputed for "
+        f"{result.adjusted} securities"
+    )
 
 
 def _echo_sharadar_actions(result) -> None:
@@ -4946,9 +5003,15 @@ def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
 @click.option(
     "--volume",
     type=click.Choice(["keep", "sharadar"]),
-    default="keep",
-    show_default=True,
-    help="A corrected bar's volume: FMP's, or Sharadar's",
+    default=None,
+    help="A corrected bar's volume: FMP's, or Sharadar's [default: keep; "
+    "--split-bearing: sharadar]",
+)
+@click.option(
+    "--split-bearing",
+    is_flag=True,
+    help="The FMP-minted securities holding Sharadar's splits, fed or not: replace "
+    "only the bars FMP pre-adjusted for those splits.",
 )
 @click.option(
     "--no-adjust",
@@ -4956,12 +5019,13 @@ def vendor_link_reject(ctx, symbol, security_id, vendor_key, note, by, dry_run):
     help="Do not recompute the factors of the corrected securities.",
 )
 @click.pass_context
-def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
+def vendor_correct(ctx, symbols, dry_run, volume, split_bearing, no_adjust):
     """Replace the FMP bars that disagree with Sharadar's, audited (#75).
 
     \b
       fafnir vendor correct --dry-run       # the comparison report (#69's)
       fafnir vendor correct
+      fafnir vendor correct --split-bearing --dry-run
       fafnir vendor corrections list        # what it replaced; `revert` undoes one
 
     For every FMP security linked to Sharadar, compares its bars with Sharadar's,
@@ -4974,6 +5038,16 @@ def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
     every date it samples agrees. One ops.ingestion_run (sharadar/correct), its
     progress written every minute. The files are grouped by ticker on disk first,
     as for `ingest sharadar-prices`: allow about 4 GB free under bulk_dir.
+
+    --split-bearing takes the FMP-minted securities linked to Sharadar, fed or not,
+    that hold Sharadar's splits (the splits FMP never listed). It replaces a bar only
+    when FMP's close times the product of those splits after it meets Sharadar's
+    recovered close within 0.5%: FMP's history pre-adjusted for them. A stretch
+    between two such splits where 90% of the compared bars are explained is
+    corrected whole: every compared bar from the vendor, with its volume, and FMP's
+    bars on dates the vendor lacks rescaled by the same factor, as one revertible
+    edit (`fafnir override revoke`). Other stretches are counted and left; the dry
+    run lists the securities whose left bars differ from the vendor's.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_prices as sp
@@ -4997,6 +5071,7 @@ def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
                 dry_run=dry_run,
                 volume=volume,
                 adjust=not no_adjust,
+                split_bearing=split_bearing,
             )
         except (sp.PricesError, FileNotFoundError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
@@ -5033,6 +5108,19 @@ def vendor_correct(ctx, symbols, dry_run, volume, no_adjust):
             f"{100 * summary['within_1pct']:.1f}% within 1%, "
             f"{100 * summary['within_5pct']:.1f}% within 5%"
         )
+    left = sorted(
+        ((sym, c) for sym, c in result.split_bearing_by.items() if c["left_differ"]),
+        key=lambda x: (-x[1]["left_differ"], x[0]),
+    )
+    if left:
+        click.echo(
+            f"Left, differing from the vendor ({len(left)} securities; the first 25): "
+            "symbol, bars left, bars corrected, bars rescaled"
+        )
+        for sym, c in left[:25]:
+            click.echo(
+                f"  {sym:<8} {c['left_differ']:>8} {c['explained']:>8} {c['rescaled']:>8}"
+            )
     if not dry_run and result.corrected_security_ids:
         click.echo(f"  factors recomputed for {result.adjusted} securities")
 

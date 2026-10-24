@@ -446,6 +446,8 @@ the actual date.
    - `new` is about the fed active count.
    - `kept:fmp` is the FMP history the deltas reached back over.
    - `quarantined:*` is small.
+   - `unserved` is small, and its securities are not the same ones night after
+     night ([ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98)).
 6. **Flag deltas.** The flags raised since the cutover, by check:
 
    ```sql

@@ -234,8 +234,54 @@ def plan_rescale(
     if not bars:
         plan.refusals.append(f"No stored bars between {from_date} and {to_date}.")
         return plan
-    _refuse_operator_bars(db, plan, bars)
+    _add_rescaled(db, plan, bars, price_factor, volume_factor)
+    return plan
 
+
+def plan_rescale_bars(
+    db: Database,
+    security_id: int,
+    bars: Sequence[dict],
+    price_factor: Decimal,
+    volume_factor: Decimal = Decimal(1),
+) -> EditPlan:
+    """:func:`plan_rescale` over these stored bars only, not every bar in a range.
+
+    For a caller that knows which bars are at the wrong scale and which, in the same
+    range, are not: ``vendor correct --split-bearing`` rescales FMP's bars on the
+    dates the vendor does not hold, among bars that are the vendor's own. Each bar
+    is a :func:`repository.stored_bars` row. The checks and the edit are the same.
+    """
+    bars = sorted(bars, key=lambda b: b["trade_date"])
+    plan = EditPlan(
+        security_id=security_id,
+        symbol=_symbol(db, security_id),
+        kind="rescale",
+        from_date=bars[0]["trade_date"] if bars else date.min,
+        to_date=bars[-1]["trade_date"] if bars else date.min,
+        params={
+            "price_factor": format(price_factor, "f"),
+            "volume_factor": format(volume_factor, "f"),
+        },
+    )
+    if not bars:
+        plan.refusals.append("No bars to rescale.")
+        return plan
+    if price_factor <= 0 or volume_factor <= 0:
+        plan.refusals.append("Factors must be positive.")
+        return plan
+    _add_rescaled(db, plan, bars, price_factor, volume_factor)
+    return plan
+
+
+def _add_rescaled(
+    db: Database,
+    plan: EditPlan,
+    bars: list[dict],
+    price_factor: Decimal,
+    volume_factor: Decimal,
+) -> None:
+    _refuse_operator_bars(db, plan, bars)
     failures: dict[str, list[str]] = {}
     for bar in bars:
         new, reason = rescale_row(bar, price_factor, volume_factor)
@@ -248,7 +294,6 @@ def plan_rescale(
             f"{len(dates)} bar(s) would not survive the price loader's validation "
             f"({reason}): {_listed(dates)}."
         )
-    return plan
 
 
 def plan_shift(
