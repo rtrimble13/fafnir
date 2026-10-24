@@ -69,6 +69,7 @@ and they are not interchangeable:
 | `tracked_symbol_unknown_to_source` | `ingest tracked` | `add_dq_flag_once` | the next `ingest tracked`, if the vendor still won't serve it | yes | no |
 | `security_delisting_contradicted` | `ingest delisted` | `add_dq_flag_once` | the next sweep, while the vendor has bars after the date and the record is within 60 days. **Never a bare resolve**: `security venue-transfer` accepts it, `security delist` resolves it | yes — and an acceptance is how the sweep knows the record is a move | no |
 | `security_inactive_but_trading` (info) | `ingest securities` | `add_dq_flag_once` | the next load that turns the row inactive again within 5 sessions of a bar | yes | no |
+| `security_inactive_but_trading` (warn, `detail.source = 'sharadar'`) | `ingest sharadar-universe` step 4 | `add_dq_flag_once` | every nightly while the fed row stays inactive with the key live and bars arriving. **The step resolves it itself** once that stops; `security relist`, `venue-transfer` and `delist` resolve it | **no** — it is back tomorrow | no |
 | `dorq_*` | `dq run --engine dorq\|both` with `--no-shadow` | `dq.dorq.ingest` (the same two guards as `dq.checks`) | the next dorq run whose window still reports it — nightly, only dates within its `--since`, plus any date of a security whose history was new or rewritten since the night before (the backfill); a `--full` run, any date | yes | yes, by re-running dorq — except the Never three and the cross-sectional `dorq_cohort_gap`, `dorq_cohort_move` |
 
 **The two acceptance traps.** `corporate_action_drift` and
@@ -1058,7 +1059,7 @@ security (`vendor link show <SYM> --evaluate`).
 
 ## `security_inactive_but_trading` — the vendor turned a still-trading row inactive
 
-Info. The universe load copied the vendor's `isActivelyTrading: false` onto a row
+Info, from FMP's universe load (Sharadar's variant is below). The universe load copied the vendor's `isActivelyTrading: false` onto a row
 whose last bar is within 5 sessions. FMP did this to ET, and five others, the week
 they moved to TXSE, while quoting their prices. The security stays in the nightly
 price universe while it has a bar in the last 30 days, so nothing is frozen. This
@@ -1074,6 +1075,34 @@ promptly.
   against the next load;
 - a wind-down: `dq resolve` with the evidence once the bars have stopped. The
   security drops out of the price universe 30 days after its last bar.
+
+### The Sharadar variant: a fed row held inactive (warn)
+
+`detail.source = 'sharadar'`. `ingest sharadar-universe` step 4 raises it on a row
+Sharadar feeds and lists live, with a traded bar (volume > 0) in the last 5
+sessions, that fafnir holds inactive. Zero-volume rows do not count: Sharadar keeps
+printing them for a halted listing. Most
+are renames FMP's delisted feed called delistings (NLOK→GEN, LVHB→BUFF), fed by
+permaticker since the cutover. `detail.next` names the decision:
+
+| `next` | Meaning | Decide with |
+|---|---|---|
+| `relist` | nothing else holds the vendor's ticker (`vendor_ticker`; `rename` dates the move) | `security relist <id>`: dry run, then on an explicit yes |
+| `venue_transfer` | same ticker, another venue (`vendor_exchange`, e.g. TXSE) | `security venue-transfer`, as above |
+| `pending_decision` | a `security_delisting_contradicted` flag is open | that flag's decision first |
+| `earlier_issuer` | the row holds bars and a delisting from before its link (`link_from`): a reused ticker | `security split-history`, then relist |
+| `held` | `held_by`, another row with history, trades under the vendor's ticker | **report only** |
+
+**Never `dq resolve` it**: the next nightly raises it again (the matrix above), and
+the step closes it itself when its condition goes.
+
+**`held` is not yours to fix.** Usually `held_by` is the same company, minted again
+by FMP after the rename with FMP's whole history, and `security merge` refuses the
+pair: Sharadar's and FMP's copies of a session differ by half a cent on many days,
+and FMP's history under the new ticker can be pre-adjusted for a later split. Never
+`--force` it (rule 4). Where `held_by` holds two issuers (BUFF: Blue Buffalo, then a
+copy of the fund), separating them is the repair, and the fund's row then reads
+`relist` (operations.md, "A fed security held inactive").
 
 ---
 

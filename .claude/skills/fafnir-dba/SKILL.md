@@ -47,11 +47,13 @@ These are not style guidance. Each one is a way this system gets damaged.
 6. **`scripts/reset_data.sh`, `fafnir db rollback`, `fafnir db migrate` and
    `fafnir security descope` are operator commands.** Propose; never run. A
    descope deletes every security of a kind with all its history (ADR 0012), and
-   only a backup brings it back. **`fafnir security venue-transfer` and
-   `fafnir security delist` are not among them.** They record the decision on a
-   `security_delisting_contradicted` flag (ADR 0014), delete nothing, and each is
-   undone by the other. Like `security merge`, they are yours to run after showing
-   the dry run and getting an explicit yes.
+   only a backup brings it back. **`fafnir security venue-transfer`,
+   `fafnir security delist` and `fafnir security relist` are not among them.** The
+   first two record the decision on a `security_delisting_contradicted` flag
+   (ADR 0014), delete nothing, and each is undone by the other; `relist` lists a
+   fed row held inactive trading again, on the vendor's ticker, and `delist` takes
+   it back. Like `security merge`, they are yours to run after showing the dry run
+   and getting an explicit yes.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
    checkout the venv installs from. Editing it to fix tonight's problem is
    invisible to the repo, destroyed by the next `git pull`, and leaves the
