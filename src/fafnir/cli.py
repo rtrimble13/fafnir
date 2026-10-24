@@ -1148,7 +1148,7 @@ def ingest_sharadar(ctx, dry_run):
         # so, and the next night tries again (monitor.sh sharadar shows the size).
         step(7, "source sharadar-prune")
         try:
-            _echo_sharadar_prune(
+            _echo_sharadar_file_prune(
                 sharadar_prune.prune(
                     database, bulk_dir, keep_days=cfg.sharadar_keep_days
                 )
@@ -1166,7 +1166,7 @@ def _size_text(nbytes: int) -> str:
     return f"{nbytes:.1f} GB"
 
 
-def _echo_sharadar_prune(result) -> None:
+def _echo_sharadar_file_prune(result) -> None:
     head = "Dry run: nothing deleted." if result.dry_run else f"Run {result.run_id}."
     removed = len(result.removals) - len(result.failed)
     click.echo(
@@ -5718,7 +5718,7 @@ def source_sharadar_prune(ctx, keep_days, dry_run):
             )
         except sharadar_prune.PruneError as exc:
             raise click.ClickException(str(exc)) from exc
-    _echo_sharadar_prune(result)
+    _echo_sharadar_file_prune(result)
     if result.failed:
         raise click.ClickException(f"{len(result.failed)} file(s) could not be removed")
 
