@@ -85,10 +85,10 @@ from typing import Iterable, Optional, Protocol, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
+from fafnir.ingest import sharadar_ledger as ledger
 from fafnir.ingest.runlog import RunLog
 from fafnir.ingest.security_master import company_name_similarity
 from fafnir.logging_config import get_logger
-from fafnir.sources import sharadar_files as sf
 
 logger = get_logger("ingest.vendor_link")
 
@@ -215,7 +215,7 @@ class CloseSource(Protocol):
 class BulkCloses:
     """``closeunadj`` from the ledger's current full SEP/SFP files: one pass per
     table, parsing only the rows whose ticker and date are wanted
-    (:func:`sharadar_files.select`)."""
+    (:func:`sharadar_ledger.select`)."""
 
     name = "bulk"
 
@@ -236,7 +236,7 @@ class BulkCloses:
                 for (t, ticker), dates in wanted.items()
                 if t == table
             }
-            for r in sf.select(self.db, entry["file_id"], self.bulk_dir, want):
+            for r in ledger.select(self.db, entry["file_id"], self.bulk_dir, want):
                 if r["closeunadj"] is not None:
                     out[(table, r["ticker"], r["date"])] = r["closeunadj"]
         return out

@@ -261,7 +261,7 @@ exactly as on an equity, and is quarantined either way.
 | `src/fafnir/ingest/tracked.py` | new loader (`RunLog`, `land_payload`, `upsert_security`, `upsert_symbol_xref`) |
 | `src/fafnir/ingest/daily_price.py` | `nav_only` allowance in `_validate_bar` / `load_symbol_prices` |
 | `src/fafnir/dq/checks.py` | one-business-day freshness allowance for `asset_type = 'fund'` |
-| `src/fafnir/sources/probe.py` | fund NAV raw-vs-total-return probe |
+| `src/fafnir/ingest/fmp_probe.py` (was `sources/probe.py`; ADR 0017) | fund NAV raw-vs-total-return probe |
 | `src/fafnir/cli.py` | `fafnir track add\|list\|rm`; `fafnir ingest tracked`; `fafnir source probe-fund` |
 | `scripts/daily_update.sh`, `scripts/initial_backfill.sh` | `ingest tracked` after `ingest securities` |
 | Docs | data dictionary (`ref.tracked_symbol`), ingestion (endpoint map), architecture (ERD + universe section), README |

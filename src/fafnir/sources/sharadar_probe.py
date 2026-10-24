@@ -33,7 +33,8 @@ The items (the numbering of #49):
 9. Update behaviour -- whether ``lastupdated`` moves on historical rows when a
    split or dividend restates them.
 10. Row shapes -- null against zero.
-11. The API as :mod:`fafnir.sources.sharadar` and ``duk.sharadar_api`` implement it.
+11. The API as :mod:`fafnir.sources.sharadar` implements it (``duk -S sharadar``
+    requests through the same client, ADR 0017).
 
 Read-only: it writes nothing. Its report holds vendor rows (the worst cases, as
 evidence), so it stays on the host; post only verdicts and aggregates (the repo and

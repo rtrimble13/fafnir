@@ -4,8 +4,8 @@ Sharadar source client (plan SA-0106, #47).
 Everything Sharadar-facing goes through :class:`SharadarClient`, which inherits
 throttling, retry/backoff, byte metering and secret redaction from
 :class:`~fafnir.sources.base.BaseSource`, as :class:`~fafnir.sources.fmp.FMPClient`
-does. ``duk -S sharadar`` (``duk.sharadar_api``) takes its base URL, price tables
-and payload parser from here, so a correction is made once.
+does. ``duk -S sharadar`` (``duk.sharadar_api``) makes every request through this
+client and keeps only the frame shaping (ADR 0017), so a correction is made once.
 
 API MECHANICS -- what this module relies on, and on what evidence
 -----------------------------------------------------------------
@@ -15,7 +15,8 @@ The repository adopts an endpoint on a probe's evidence, not its documentation
 (supplied by the operator on 2026-10-19); none has yet been measured from this
 repository, because the build host's network could not reach the vendor.
 ``fafnir source probe-sharadar`` (SA-0201, #49) measures every item on the paid
-key and corrects this docstring, the constants and ``duk.sharadar_api`` together.
+key and corrects this docstring and the constants, which ``duk -S sharadar`` then
+uses as it stands.
 
 1. **Base URL** -- ``https://api.sharadar.com/v1.0``, tables at
    ``/data/{table}``. DOCUMENTED. It is the direct Sharadar API, *not* Nasdaq Data

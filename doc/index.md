@@ -93,6 +93,7 @@ read through the `duk` CLI.
   - [ADR 0014 — A venue transfer is not a delisting](adr/0014-venue-transfer-is-not-a-delisting.md)
   - [ADR 0015 — Multi-vendor provenance, precedence and audited corrections](adr/0015-multi-vendor-provenance-and-precedence.md)
   - [ADR 0016 — Sharadar's permaticker is the identity authority; survivorship floor 1998](adr/0016-sharadar-identity-and-survivorship-floor.md)
+  - [ADR 0017 — Vendor access is one library inside fafnir, not a distribution per vendor](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) *(proposed)*
 
 ## Reference
 

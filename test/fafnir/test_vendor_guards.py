@@ -17,10 +17,9 @@ from click.testing import CliRunner
 
 from fafnir import cli
 from fafnir.db import repository as repo
-from fafnir.ingest import adjustments, daily_price, tracked
+from fafnir.ingest import adjustments, daily_price, tracked, vendor_gaps
 from fafnir.ingest.daily_price import RESTATEMENT_CHECK, SPLIT_SCALE_CHECK
 from fafnir.ingest.runlog import RunLog
-from fafnir.sources import vendor_gaps
 
 pytestmark = pytest.mark.integration
 

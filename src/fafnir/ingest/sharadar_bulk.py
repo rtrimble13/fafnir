@@ -21,7 +21,7 @@ Each table is its own ``ops.ingestion_run`` (``source = sharadar``, ``endpoint =
 bulk:<table>``), with the bytes downloaded and, in ``params``, the rows, file and
 header findings. A table that fails does not undo the ones before it. Nothing is
 loaded into ``core`` here: the loaders (#55, #58, #75) read the files through
-:func:`fafnir.sources.sharadar_files.rows`.
+:func:`fafnir.ingest.sharadar_ledger.rows`.
 
 `fafnir source sharadar-delta` (#98) is the nightly half: a price table's rows the
 vendor stamped ``lastupdated`` on or after a date, from the table API

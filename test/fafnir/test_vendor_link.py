@@ -846,6 +846,7 @@ def test_bulk_closes_read_only_the_wanted_tickers(db, tmp_path):
 
 @pytestmark_integration
 def test_select_checks_the_file_and_parses_only_what_it_keeps(db, tmp_path):
+    from fafnir.ingest import sharadar_ledger as ledger
     from fafnir.sources import sharadar_files as sf
 
     def record(body: bytes) -> int:
@@ -867,17 +868,17 @@ def test_select_checks_the_file_and_parses_only_what_it_keeps(db, tmp_path):
         return entry["file_id"]
 
     ok = record(b"ticker,date,closeunadj\nZZA,2020-01-02,1.5\n\nZZA,2020-01-03,x\n")
-    assert list(sf.select(db, ok, tmp_path, {"ZZA": {"2020-01-02"}})) == [
+    assert list(ledger.select(db, ok, tmp_path, {"ZZA": {"2020-01-02"}})) == [
         {"ticker": "ZZA", "date": Y(2020, 1, 2), "closeunadj": D("1.5")}
     ]
     with pytest.raises(sf.SharadarFileError, match="line 4, column closeunadj"):
-        list(sf.select(db, ok, tmp_path, {"ZZA": {"2020-01-03"}}))
+        list(ledger.select(db, ok, tmp_path, {"ZZA": {"2020-01-03"}}))
     short = record(b"ticker,date,closeunadj\nZZA,2020-01-02\n")
     with pytest.raises(sf.SharadarFileError, match="line 2: 2 fields"):
-        list(sf.select(db, short, tmp_path, {}))
+        list(ledger.select(db, short, tmp_path, {}))
     nodate = record(b"ticker,closeunadj\nZZA,1\n")
     with pytest.raises(sf.SharadarFileError, match="needs ticker and date"):
-        list(sf.select(db, nodate, tmp_path, {}))
+        list(ledger.select(db, nodate, tmp_path, {}))
 
 
 def test_api_closes_check_what_came_back():

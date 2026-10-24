@@ -44,6 +44,7 @@ from typing import Iterable, Iterator, Optional
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
+from fafnir.ingest import sharadar_ledger as ledger
 from fafnir.ingest.runlog import RunLog
 from fafnir.logging_config import get_logger
 from fafnir.sources import sharadar_files as sf
@@ -211,9 +212,9 @@ def _name_order(event: dict) -> tuple:
 
 def _load_tickers(db: Database, file_id: int, bulk_dir, run: RunLog, result):
     skipped: Counter = Counter()
-    # Opened here, not inside the generator: sf.rows reads the ledger, and the
+    # Opened here, not inside the generator: ledger.rows reads the ledger, and the
     # generator runs while the upsert's COPY holds the connection.
-    source = sf.rows(db, file_id, bulk_dir)
+    source = ledger.rows(db, file_id, bulk_dir)
 
     def mapped() -> Iterator[dict]:
         for r in source:
@@ -238,7 +239,7 @@ def _load_actions(db: Database, file_id: int, bulk_dir, run: RunLog, result):
     skipped: Counter = Counter()
 
     def counted() -> Iterator[dict]:
-        for r in sf.rows(db, file_id, bulk_dir):
+        for r in ledger.rows(db, file_id, bulk_dir):
             result.rows += 1
             yield r
 

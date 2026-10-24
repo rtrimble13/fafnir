@@ -90,7 +90,7 @@ first production backfill" note in `doc/ingestion.md`) is that vendor behaviour 
 established empirically, not assumed. Do the same here.
 
 **Deliverable: `fafnir source probe-fundamentals`** — a read-only, few-request
-diagnostic in `src/fafnir/sources/probe.py` (mirroring `probe_prices` /
+diagnostic in `src/fafnir/ingest/fmp_probe.py` (mirroring `probe_prices` /
 `format_report`) that reports, for a probe symbol set of at least
 `AAPL, MSFT, GE, KO, JPM, XOM` (long histories, different fiscal calendars, one
 financial):

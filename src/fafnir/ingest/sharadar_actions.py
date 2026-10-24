@@ -51,12 +51,13 @@ from typing import Iterable, Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
-from fafnir.ingest import adjustments, sharadar_map
+from fafnir.ingest import adjustments
+from fafnir.ingest import sharadar_ledger as ledger
+from fafnir.ingest import sharadar_map
 from fafnir.ingest.corporate_actions import _within_horizon
 from fafnir.ingest.runlog import RunLog
 from fafnir.ingest.sharadar_master import SECURITY_TABLES
 from fafnir.logging_config import get_logger
-from fafnir.sources import sharadar_files as sf
 
 logger = get_logger("ingest.sharadar_actions")
 
@@ -199,7 +200,9 @@ def load(
     ]
     result.securities = len(targets)
     by_key = {t["vendor_key"]: t for t in targets}
-    actions = key_actions(sf.rows(db, entry["file_id"], bulk_dir), set(by_key), key_of)
+    actions = key_actions(
+        ledger.rows(db, entry["file_id"], bulk_dir), set(by_key), key_of
+    )
 
     foreign: dict[tuple, list[date]] = defaultdict(list)
     for a in repo.action_dates(db, [t["security_id"] for t in targets]):

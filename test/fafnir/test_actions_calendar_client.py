@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from fafnir.sources import probe
+from fafnir.ingest import fmp_probe as probe
 from fafnir.sources.fmp import FMPClient
 
 

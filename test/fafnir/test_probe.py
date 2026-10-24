@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 
-from fafnir.sources import probe
+from fafnir.ingest import fmp_probe as probe
 
 # AAPL: 2:1, 2:1, 7:1, 4:1 after 1990 -> 112:1 cumulative.
 SPLITS = [
