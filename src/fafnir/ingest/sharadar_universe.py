@@ -436,7 +436,7 @@ def _apply_listings(db, result, candidates, by_key, since, run_id, excluded) -> 
 
 #: What the step 4 flag's ``detail.next`` says decides it.
 NEXT_RELIST = "relist"  # `security relist`
-NEXT_HELD = "held"  # another row with history trades under the vendor's ticker
+NEXT_HELD = "held"  # a row with history on its ticker: `merge --across-vendors`
 NEXT_PENDING = "pending_decision"  # `security venue-transfer` or `security delist`
 NEXT_VENUE = "venue_transfer"  # same ticker, another venue: `security venue-transfer`
 NEXT_EARLIER = "earlier_issuer"  # an earlier issuer's bars too: `split-history`

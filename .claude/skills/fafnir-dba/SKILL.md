@@ -28,7 +28,9 @@ These are not style guidance. Each one is a way this system gets damaged.
    "resolved"`. The note is what the next person has instead of you.
 4. **Never `--force`.** `fafnir security merge-rename --force` overrides guards
    comparing CUSIP/ISIN and overlapping OHLC. If they trip, report the blockers
-   and stop.
+   and stop. `security merge --across-vendors` is not a force: it is the guard for
+   one company held by two vendors after a rename (identity from the vendor, the
+   fed row's bars kept), with blockers of its own.
 5. **Nine checks are never yours to auto-resolve**: `price_scale_collapse`,
    `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`,
    `price_subresolution_price`, `security_duplicate_identity`, and dorq's

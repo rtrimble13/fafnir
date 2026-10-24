@@ -226,9 +226,10 @@ def plan_relist(
             refusals.append(
                 f"{ticker} is held by security {holder}"
                 + (" with history" if repo.security_has_history(db, holder) else "")
-                + ". If it is this company held twice, the two rows must become one "
-                "first; if the ticker was reused, split or delist that row first "
-                "(operations.md, 'A fed security held inactive')."
+                + ". If it is this company held twice, fold it in with `security "
+                f"merge {holder} {security_id} --across-vendors`; if the ticker was "
+                "reused, split or delist that row first (operations.md, 'A fed "
+                "security held inactive')."
             )
 
     periods: list[dict] = []
