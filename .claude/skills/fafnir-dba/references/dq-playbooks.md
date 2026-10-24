@@ -1091,18 +1091,29 @@ permaticker since the cutover. `detail.next` names the decision:
 | `venue_transfer` | same ticker, another venue (`vendor_exchange`, e.g. TXSE) | `security venue-transfer`, as above |
 | `pending_decision` | a `security_delisting_contradicted` flag is open | that flag's decision first |
 | `earlier_issuer` | the row holds bars and a delisting from before its link (`link_from`): a reused ticker | `security split-history`, then relist |
-| `held` | `held_by`, another row with history, trades under the vendor's ticker | **report only** |
+| `held` | `held_by`, another row with history, trades under the vendor's ticker | `security merge <held_by> <id> --across-vendors`: dry run, then on an explicit yes |
 
 **Never `dq resolve` it**: the next nightly raises it again (the matrix above), and
 the step closes it itself when its condition goes.
 
-**`held` is not yours to fix.** Usually `held_by` is the same company, minted again
-by FMP after the rename with FMP's whole history, and `security merge` refuses the
-pair: Sharadar's and FMP's copies of a session differ by half a cent on many days,
-and FMP's history under the new ticker can be pre-adjusted for a later split. Never
-`--force` it (rule 4). Where `held_by` holds two issuers (BUFF: Blue Buffalo, then a
-copy of the fund), separating them is the repair, and the fund's row then reads
-`relist` (operations.md, "A fed security held inactive").
+**`held` is one company held twice, usually.** `held_by` is FMP's re-mint after
+the rename, with FMP's history; a plain `security merge` refuses the pair (half-cent
+rounding, FMP's adjusted re-serve of older history, a new CUSIP), and `--force` is
+never the answer (rule 4). `security merge <held_by> <id> --across-vendors` is: it
+proves identity from the vendor (the fed key listed under the re-mint's ticker, a
+matching CIK, today's closes within 1%), keeps the fed row's bars, and relists it.
+Read its dry run for:
+- **`BLOCKER: cik differs`**: another registrant (HHC/HHH, HTA/HR). Report it; it is
+  not a rename.
+- **Bars that do not join**: the re-mint's prefix on another scale. Do not pick
+  `--unjoined drop` or `carry` yourself: the choice is the operator's, with the
+  ratio and the span in front of them.
+- **A victim split before the survivor's first bar**: run `vendor correct
+  --split-bearing --dry-run` on the merged row afterwards.
+
+Where `held_by` holds two issuers (BUFF held Blue Buffalo, then a copy of the
+fund), separate them instead; the fund's row then reads `relist` (operations.md,
+"A fed security held inactive").
 
 ---
 

@@ -135,7 +135,8 @@ A live, liquid name is **never** a sweep resolve. The loader is failing for it.
 - **Never** the Sharadar variant (`detail.source = 'sharadar'`): its writer
   re-detects it nightly and resolves it itself. `security relist`,
   `venue-transfer` or `delist` decide it, each after a dry run and an explicit yes;
-  `next = held` is report-only.
+  `next = held` is `security merge --across-vendors`, the same way, and an
+  `--unjoined` choice is the operator's.
 
 ### `security_missing_classification`
 - The universe load has run **since** the fix that carries the screener's

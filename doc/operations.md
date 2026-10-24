@@ -1079,20 +1079,66 @@ first, the same way.
 **`next = held`**: another row with history trades under the vendor's ticker
 (`held_by`). Mostly that row is the same company, minted again by FMP's screener
 under the new ticker with FMP's whole history, while the inactive row holds the
-pre-rename years plus Sharadar's bars since the cutover. That is NLOK and GEN, NYCB
-and FLG, and 66 more. Relist refuses them, and `security merge` refuses them too:
-- **Half a cent apart.** Sharadar's and FMP's copies of a session often differ by
-  that much (NLOK and GEN disagree on 814 of 1,751 shared days).
-- **An old split.** FMP's history under the new ticker is pre-adjusted for a later
-  split (FLG's closes before its 2024 reverse split are three times NYCB's).
+pre-rename years plus Sharadar's bars since the cutover: NLOK and GEN, NYCB and FLG,
+68 pairs on 2026-10-24. Relist refuses them, and a plain `security merge` refuses
+them too. Its guard needs the overlap equal and the identifiers to match, and the
+two vendors differ for reasons that are not identity:
+- **Rounding.** Sharadar's and FMP's copies of a session often differ by half a cent
+  (NLOK and GEN disagree on 814 of 1,751 shared days).
+- **Adjusted history.** FMP re-serves a renamed company's older history scaled for
+  what came later: ALNT is 2/3 of AMOT before its 2021 3:2 split, BFH is 0.80 of
+  ADS before the 2021 spin-off, FLG three times NYCB before its reverse split.
+- **New identifiers.** A reverse split or a redomicile issues a new CUSIP.
 
-Leave these open, with the flag as the record: making the two rows one needs a
-vendor-aware merge, which is not built yet. Two exceptions are not one company held
-twice but two issuers on one row. BUFF holds Blue Buffalo until 2018 and FMP's copy
-of the Innovator fund after; CHGX holds the AXS fund until 2025 and a copy of
-Stance's. Separate them first ([Separating two issuers](#separating-two-issuers-held-on-one-security)
-or `prices delete`, then `security delist` at the old issuer's end), and the fund's
-own row becomes `next = relist`.
+Fold the re-mint into the fed row with `security merge --across-vendors`, naming
+`held_by` first:
+
+```bash
+fafnir security merge 893 992 --across-vendors --dry-run      # GEN into NLOK
+fafnir security merge 893 992 --across-vendors -m "Gen Digital: NLOK renamed GEN 2022-11-08" --yes
+fafnir db refresh-marts
+```
+
+- **The guard reads the vendor, not the whole overlap.**
+  - The survivor must be the fed row, and the vendor's master must list its key,
+    live, under the victim's ticker.
+  - The CIK must agree where both rows carry one: a new registrant is not a rename
+    (HHC and HHH, HTA and HR, MTMT and MPU, NCAC and PBM refuse).
+  - At least 90% of the last 20 shared sessions must close within 1% of each
+    other.
+  - A differing CUSIP or ISIN is reported, not a blocker.
+- **The fed row's bars win.** On a session both rows hold, the survivor's bar is
+  kept, so the victim's adjusted copy goes. Its corporate actions from the
+  survivor's first bar on go too, or a dividend would count twice. The dry run
+  classifies the overlap (identical, within 1%, scaled, other) for the record.
+- **Bars only the victim holds** move where they join the fed row's series: the
+  nearest shared sessions agree within 1%. That covers GEN's Symantec years before
+  NLOK's first bar.
+  - **Bars that do not join** sit on another scale (CSU's SNDA prefix meets at
+    0.94, IGAP's GCTK at 0.05). The merge refuses until you choose: `--unjoined drop`
+    leaves them out, `--unjoined carry` moves them as they are.
+  - **A split inside them** is not visible where the histories meet, so the dry run
+    names any victim split before the survivor's first bar. Check those bars after
+    the merge with `vendor correct --split-bearing --dry-run`.
+- **The survivor takes the victim's name, CUSIP and ISIN**, which describe the
+  instrument as it trades now; the run log keeps the old ones.
+- **Then the survivor is relisted** on the vendor's ticker in the same transaction,
+  by `security relist`'s own plan, so it refuses as relist does. The victim's
+  `vendor_xref_*` flags are resolved, its other flags, overrides, corrections and
+  watermarks move, and an `ops.ingestion_run` (operator,
+  `security-merge-across-vendors`) records the evidence.
+- **Not undoable.** The victim's id is retired, like any merge. The survivor keeps
+  the fed row's id, the `merge-rename` convention (the row on the old ticker
+  survives), so references to the re-mint's id (893 for GEN) must move to the
+  survivor's.
+- **`--force` does not apply.** The evidence is the guard.
+
+Two exceptions are not one company held twice but two issuers on one row. BUFF held
+Blue Buffalo until 2018 and FMP's copy of the Innovator fund after; CHGX held the
+AXS fund until 2025 and a copy of Stance's. Separate those first
+([Separating two issuers](#separating-two-issuers-held-on-one-security), or
+`prices delete` and then `security delist` at the old issuer's end), and the fund's
+own row becomes `next = relist`. Both were done on 2026-10-24.
 
 ## Resolving vendor links
 

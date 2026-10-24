@@ -1077,8 +1077,9 @@ late. `--since` sets it. Every step is safe to re-run over the same window.
    - `earlier_issuer`: the row also holds bars, and a delisting, from before its
      link starts: a reused ticker on one row, for `security split-history`;
    - `held`: another row with history trades under the vendor's ticker, usually
-     the same company FMP minted again after the rename (`held_by`). Not
-     relistable until the two rows are one.
+     the same company FMP minted again after the rename (`held_by`):
+     `security merge <held_by> <id> --across-vendors` folds it into the fed row and
+     relists that ([operations.md](operations.md#a-fed-security-held-inactive)).
 
    A flag this step raised is resolved by the run that no longer finds its
    condition. One FMP's universe load raised (no `detail.source`) is left alone.

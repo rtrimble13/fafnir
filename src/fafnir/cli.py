@@ -2061,8 +2061,41 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
     help="Merge despite blockers. Read them first; they mean the rows disagree "
     "about what they describe.",
 )
+@click.option(
+    "--across-vendors",
+    is_flag=True,
+    help="The survivor is the vendor-fed row and the victim FMP's re-mint of the "
+    "same company after a rename: identity from the vendor, the survivor's bars "
+    "kept, then relisted on the vendor's ticker (operations.md).",
+)
+@click.option(
+    "--unjoined",
+    type=click.Choice(["refuse", "drop", "carry"]),
+    default="refuse",
+    show_default=True,
+    help="With --across-vendors: what to do with bars only the victim holds that "
+    "do not join the survivor's series (another scale).",
+)
+@click.option(
+    "--rename-date",
+    metavar="YYYY-MM-DD",
+    help="With --across-vendors: date the relist's move to the vendor's ticker when "
+    "the vendor's events name none.",
+)
 @click.pass_context
-def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes, force):
+def security_merge(
+    ctx,
+    victim_id,
+    survivor_id,
+    note,
+    resolved_by,
+    dry_run,
+    yes,
+    force,
+    across_vendors,
+    unjoined,
+    rename_date,
+):
     """Fold one security row into another, by id, when both are one instrument.
 
     \b
@@ -2091,6 +2124,14 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
 
     Refuses on a populated identity mismatch (CUSIP/ISIN/CIK) or disagreeing OHLC.
     Run --dry-run first: the preview is the same comparison the guard reads.
+
+    --across-vendors is for one company held twice after a rename: SURVIVOR_ID the
+    row the vendor feeds (usually inactive, on the old ticker), VICTIM_ID FMP's
+    re-mint under the ticker the vendor lists it as. The guard reads the vendor's
+    identity, the CIK and today's prices instead of the whole overlap, the
+    survivor's bars win the overlap, and the survivor is relisted on the vendor's
+    ticker in the same transaction. See operations.md, "A fed security held
+    inactive".
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
@@ -2099,6 +2140,27 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         raise click.ClickException("VICTIM_ID and SURVIVOR_ID are the same security.")
     if resolved_by is None:
         resolved_by = _os_user()
+    if across_vendors:
+        if force:
+            raise click.ClickException(
+                "--force does not apply across vendors: its guard is the evidence."
+            )
+        _security_merge_across_vendors(
+            ctx,
+            victim_id=victim_id,
+            survivor_id=survivor_id,
+            note=note,
+            by=resolved_by,
+            dry_run=dry_run,
+            yes=yes,
+            unjoined=unjoined,
+            rename_date=_parse_date(rename_date) if rename_date else None,
+        )
+        return
+    if unjoined != "refuse" or rename_date:
+        raise click.ClickException(
+            "--unjoined and --rename-date need --across-vendors."
+        )
 
     with Database(ctx.obj["config"].dsn) as database:
         rows = {
@@ -2182,36 +2244,15 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         # single. The flag's condition is "this ticker has more than one row"; a
         # merge that leaves a third row behind has not made that untrue, and closing
         # it would free the slot for the next `dq run` to write it straight back.
-        closed: list[int] = []
         # Reported after the commit, not from inside the merge: a line printed
         # here is a write to stdout between the delete and the commit, and a
         # closed pipe at that moment rolls the whole merge back (see dq_resolve).
-        still_forked: list[str] = []
-        for symbol in {victim["primary_symbol"], survivor["primary_symbol"]}:
-            remaining = int(
-                database.fetchval(
-                    "SELECT count(*) FROM core.security WHERE primary_symbol = %s",
-                    (symbol,),
-                )
-            )
-            if remaining > 1:
-                still_forked.append(
-                    f"{symbol} still has {remaining} rows; leaving its "
-                    "security_duplicate_identity flag open."
-                )
-                continue
-            flag_ids = repo.open_dq_flag_ids_for_record(
-                database,
-                check_name="security_duplicate_identity",
-                record_key={"symbol": symbol},
-            )
-            if flag_ids:
-                closed += repo.resolve_dq_flags(
-                    database,
-                    repo.DqFilter(state="open", flag_ids=tuple(flag_ids)),
-                    note=note or f"merged duplicate {victim_id} into {survivor_id}",
-                    resolved_by=resolved_by,
-                )
+        closed, still_forked = _close_duplicate_identity(
+            database,
+            {victim["primary_symbol"], survivor["primary_symbol"]},
+            note=note or f"merged duplicate {victim_id} into {survivor_id}",
+            resolved_by=resolved_by,
+        )
         database.commit()
 
     for line in still_forked:
@@ -2230,6 +2271,242 @@ def security_merge(ctx, victim_id, survivor_id, note, resolved_by, dry_run, yes,
         )
     if closed:
         click.echo(f"Resolved {_plural(len(closed), 'DQ flag')} as {resolved_by}.")
+    click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
+
+
+def _close_duplicate_identity(database, symbols, *, note, resolved_by):
+    """Close `security_duplicate_identity` only for a ticker that is now actually
+    single. The flag's condition is "this ticker has more than one row"; a merge that
+    leaves a third row behind has not made that untrue, and closing it would free
+    the slot for the next `dq run` to write it straight back. Returns the closed ids
+    and a line for each ticker still forked."""
+    from fafnir.db import repository as repo
+
+    closed: list[int] = []
+    still_forked: list[str] = []
+    for symbol in sorted(symbols):
+        remaining = int(
+            database.fetchval(
+                "SELECT count(*) FROM core.security WHERE primary_symbol = %s",
+                (symbol,),
+            )
+        )
+        if remaining > 1:
+            still_forked.append(
+                f"{symbol} still has {remaining} rows; leaving its "
+                "security_duplicate_identity flag open."
+            )
+            continue
+        flag_ids = repo.open_dq_flag_ids_for_record(
+            database,
+            check_name="security_duplicate_identity",
+            record_key={"symbol": symbol},
+        )
+        if flag_ids:
+            closed += repo.resolve_dq_flags(
+                database,
+                repo.DqFilter(state="open", flag_ids=tuple(flag_ids)),
+                note=note,
+                resolved_by=resolved_by,
+            )
+    return closed, still_forked
+
+
+def _echo_cross_vendor_plan(plan) -> None:
+    """The evidence for a cross-vendor merge, in the order it should be read."""
+    from fafnir.ingest import cross_vendor_merge as cvm
+
+    b = plan.base
+    click.echo(
+        f"Survivor {b.survivor_id} ({b.survivor_symbol}): {b.survivor_bars} bars"
+        + (
+            f"; fed by {plan.vendor} {plan.vendor_key}, which it lists as "
+            f"{plan.vendor_ticker}"
+            if plan.vendor_key
+            else ""
+        )
+    )
+    click.echo(
+        f"Victim   {b.victim_id} ({b.victim_symbol}): {b.victim_bars} bars, "
+        f"{b.victim_actions} actions, {b.victim_flags} flags"
+    )
+    for line in plan.identifier_notes:
+        click.echo(f"Identifier differs (reported, not a blocker): {line}")
+    if plan.recent_sessions:
+        click.echo(
+            f"Today    : {plan.recent_agree} of the last {plan.recent_sessions} shared "
+            f"sessions close within {cvm.RECENT_TOLERANCE:.0%} "
+            f"(largest gap {plan.recent_max_dev:.2%})"
+        )
+    click.echo(
+        f"Overlap  : {b.shared_days} shared sessions: {plan.same} identical, "
+        f"{plan.within_1pct} within 1%, {plan.scaled} scaled, {plan.other} other. "
+        "The survivor's bars are kept."
+    )
+    click.echo(
+        f"Victim-only bars: {cvm.victim_dates_summary(plan.joined)} join the "
+        f"survivor's series; {cvm.victim_dates_summary(plan.unjoined)} do not"
+        + (
+            f" ({plan.unjoined_policy})"
+            if plan.unjoined and plan.unjoined_policy != cvm.UNJOINED_REFUSE
+            else ""
+        )
+        + (
+            f". Ratio where the histories meet: {plan.boundary_ratio:.4g}"
+            if plan.boundary_ratio
+            else ""
+        )
+    )
+    click.echo(
+        f"Actions  : the victim's {plan.victim_actions_from_first} from the "
+        f"survivor's first bar ({plan.survivor_first}) are dropped; the survivor "
+        f"holds {plan.survivor_actions_from_first} there."
+    )
+    moving_early = any(d < (plan.survivor_first or d) for d in plan.victim_dates)
+    if plan.victim_splits_before and moving_early:
+        _echo_wrapped(
+            f"Note: the victim holds {plan.victim_splits_before} split(s) before the "
+            "survivor's first bar, inside the bars it brings. Where the histories meet "
+            "cannot show whether those bars are pre-adjusted for them: check them "
+            "after the merge (`vendor correct --split-bearing --dry-run`)."
+        )
+    for line in plan.blockers:
+        _echo_wrapped(f"BLOCKER: {line}")
+
+
+def _security_merge_across_vendors(
+    ctx, *, victim_id, survivor_id, note, by, dry_run, yes, unjoined, rename_date
+):
+    from fafnir.db import repository as repo
+    from fafnir.ingest import cross_vendor_merge as cvm
+    from fafnir.ingest import relist as rl
+    from fafnir.ingest.runlog import RunLog
+
+    note = note or (
+        f"one company after a rename: {victim_id} folded into the vendor-fed "
+        f"{survivor_id}"
+    )
+    with Database(ctx.obj["config"].dsn) as database:
+        for sid in (victim_id, survivor_id):
+            if not database.fetchval(
+                "SELECT 1 FROM core.security WHERE security_id = %s", (sid,)
+            ):
+                raise click.ClickException(f"No such security: {sid}")
+        plan = cvm.plan_cross_vendor_merge(
+            database, victim_id=victim_id, survivor_id=survivor_id, unjoined=unjoined
+        )
+        _echo_cross_vendor_plan(plan)
+        if plan.blockers:
+            raise click.ClickException("Nothing was changed.")
+
+        def after(done) -> None:
+            row = database.fetchone(
+                "SELECT primary_symbol, is_actively_trading, delisted_date "
+                "FROM core.security WHERE security_id = %s",
+                (survivor_id,),
+            )
+            bars = database.fetchval(
+                "SELECT count(*) FROM core.daily_price WHERE security_id = %s",
+                (survivor_id,),
+            )
+            r = done.report
+            click.echo(
+                f"Moved {r.bars_moved} bars, {r.actions_moved} actions "
+                f"({r.actions_dropped} dropped), {r.flags_moved} flags; security "
+                f"{victim_id} deleted."
+            )
+            if done.relisted.rename:
+                day, old, new = done.relisted.rename
+                click.echo(f"Relisted: {old} -> {new} on {day}")
+            click.echo(
+                f"After: {row['primary_symbol']}, "
+                f"{'trading' if row['is_actively_trading'] else 'inactive'}, "
+                f"delisted {row['delisted_date'] or 'never'}, {bars} bars"
+            )
+
+        if dry_run:
+            with database.conn.transaction(force_rollback=True):
+                try:
+                    done = cvm.apply_cross_vendor_merge(
+                        database, plan, note=note, by=by, rename_date=rename_date
+                    )
+                except (repo.MergeRefused, rl.RelistRefused) as exc:
+                    raise click.ClickException(f"Would fail: {exc}") from exc
+                after(done)
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Merge {victim_id} into the {plan.vendor}-fed {survivor_id}, delete "
+                f"{victim_id} and relist {survivor_id} as {plan.vendor_ticker}?",
+                abort=True,
+            )
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-merge-across-vendors",
+            params={
+                "victim_id": victim_id,
+                "survivor_id": survivor_id,
+                "victim_symbol": plan.base.victim_symbol,
+                "survivor_symbol": plan.base.survivor_symbol,
+                "vendor": plan.vendor,
+                "vendor_key": plan.vendor_key,
+                "note": note,
+                "by": by,
+                "unjoined": unjoined,
+                "overlap": {
+                    "shared": plan.base.shared_days,
+                    "identical": plan.same,
+                    "within_1pct": plan.within_1pct,
+                    "scaled": plan.scaled,
+                    "other": plan.other,
+                },
+                "joined": len(plan.joined),
+                "unjoined_bars": len(plan.unjoined),
+                "identifier_notes": plan.identifier_notes,
+            },
+        ) as run:
+            try:
+                done = cvm.apply_cross_vendor_merge(
+                    database, plan, note=note, by=by, rename_date=rename_date
+                )
+            except (repo.MergeRefused, rl.RelistRefused) as exc:
+                raise click.ClickException(
+                    f"{exc} -- it changed since the plan above. Re-run to see the "
+                    "current one."
+                ) from exc
+            closed, still_forked = _close_duplicate_identity(
+                database,
+                {plan.base.victim_symbol, plan.base.survivor_symbol},
+                note=note,
+                resolved_by=by,
+            )
+            run.symbols_requested = 2
+            run.rows_inserted = done.report.bars_moved
+            run.params.update(
+                bars_moved=done.report.bars_moved,
+                actions_moved=done.report.actions_moved,
+                actions_dropped=done.report.actions_dropped,
+                identity_flags_resolved=done.identity_flags,
+                identity_before=done.identity_before,
+                identity_after=plan.victim_identity,
+                duplicate_flags_resolved=closed,
+                relisted=(
+                    {
+                        "date": done.relisted.rename[0],
+                        "old": done.relisted.rename[1],
+                        "new": done.relisted.rename[2],
+                    }
+                    if done.relisted.rename
+                    else None
+                ),
+            )
+            run_id = run.run_id
+        after(done)
+    for line in still_forked:
+        click.echo(line)
+    click.echo(f"ops.ingestion_run {run_id}. Adjustment factors recomputed.")
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 

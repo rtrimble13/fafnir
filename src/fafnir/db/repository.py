@@ -1171,6 +1171,40 @@ def mark_trading(db: Database, security_id: int) -> bool:
     return row is not None
 
 
+def adopt_identity(
+    db: Database,
+    security_id: int,
+    *,
+    company_name: Optional[str],
+    cusip: Optional[str],
+    isin: Optional[str],
+    cik: Optional[str],
+) -> Optional[dict]:
+    """Take another row's current name and instrument identifiers: the
+    cross-vendor merge's survivor adopting its victim's, which describe the
+    instrument as it trades today (a reverse split or redomicile issues a new
+    CUSIP). A CIK fills only an empty one; the merge refuses a differing CIK.
+    Returns the row as it was."""
+    before = db.fetchone(
+        "SELECT company_name, cusip, isin, cik FROM core.security "
+        "WHERE security_id = %s",
+        (security_id,),
+    )
+    db.execute(
+        """
+        UPDATE core.security
+           SET company_name = COALESCE(%s, company_name),
+               cusip = COALESCE(%s, cusip),
+               isin = COALESCE(%s, isin),
+               cik = COALESCE(cik, %s),
+               updated_at = now()
+         WHERE security_id = %s
+        """,
+        (company_name, cusip, isin, cik, security_id),
+    )
+    return before
+
+
 def end_periods_before_rename(
     db: Database,
     *,
@@ -1429,7 +1463,14 @@ class MergeReport(NamedTuple):
 
 
 def merge_security(
-    db: Database, *, victim_id: int, survivor_id: int, force: bool = False
+    db: Database,
+    *,
+    victim_id: int,
+    survivor_id: int,
+    force: bool = False,
+    blockers: Optional[Sequence[str]] = None,
+    victim_dates: Optional[Sequence[date]] = None,
+    actions_before: Optional[date] = None,
 ) -> MergeReport:
     """Absorb one security into another when BOTH carry history.
 
@@ -1452,13 +1493,18 @@ def merge_security(
 
     ``force`` overrides the guards and is for the case an operator has looked at the
     evidence and decided anyway -- it is not a retry.
+
+    The cross-vendor merge (:mod:`fafnir.ingest.cross_vendor_merge`) passes its own
+    guard as ``blockers``, in place of the exact-OHLC one, and narrows what moves:
+    only the victim's bars on ``victim_dates``, and none of its corporate actions
+    dated on or after ``actions_before`` (the survivor's history is the vendor's,
+    and the victim's copy of those actions is another vendor's view of the same
+    events).
     """
     plan = compare_securities(db, survivor_id=survivor_id, victim_id=victim_id)
-    if not force and plan.blockers:
-        raise MergeRefused(
-            "refusing to merge: " + "; ".join(plan.blockers),
-            plan,
-        )
+    guard = plan.blockers if blockers is None else list(blockers)
+    if not force and guard:
+        raise MergeRefused("refusing to merge: " + "; ".join(guard), plan)
     # Not a guard on the evidence, so force does not lift it: the merged security
     # could not hold both links (ADR 0015).
     links = vendor_link_conflicts(db, victim_id, survivor_id)
@@ -1470,24 +1516,33 @@ def merge_security(
     # Bars first. ON CONFLICT DO NOTHING is the survivor-wins rule: a session both
     # rows hold keeps the survivor's copy, and the guard has already established
     # the two copies say the same thing.
+    only = "" if victim_dates is None else "AND trade_date = ANY(%s)"
     bars_moved = db.execute(
-        """
+        f"""
         INSERT INTO core.daily_price
             (security_id, trade_date, open, high, low, close, volume, vwap,
              source, ingestion_run_id, loaded_at)
         SELECT %s, trade_date, open, high, low, close, volume, vwap,
                source, ingestion_run_id, loaded_at
-          FROM core.daily_price WHERE security_id = %s
+          FROM core.daily_price WHERE security_id = %s {only}
         ON CONFLICT (security_id, trade_date) DO NOTHING
         """,
-        (survivor_id, victim_id),
+        (survivor_id, victim_id)
+        + (() if victim_dates is None else (list(victim_dates),)),
     )
     db.execute("DELETE FROM core.daily_price WHERE security_id = %s", (victim_id,))
 
+    actions_dropped = 0
+    if actions_before is not None:
+        actions_dropped += db.execute(
+            "DELETE FROM core.corporate_action WHERE security_id = %s "
+            "AND ex_date >= %s",
+            (victim_id, actions_before),
+        )
     # Corporate actions carry UNIQUE (security_id, action_type, ex_date), so the
     # victim's duplicates of actions the survivor already has must go before the
     # repoint rather than aborting it.
-    actions_dropped = db.execute(
+    actions_dropped += db.execute(
         """
         DELETE FROM core.corporate_action v
          WHERE v.security_id = %s
