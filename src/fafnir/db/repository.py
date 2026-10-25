@@ -580,19 +580,23 @@ def active_security_for_symbol(
 def security_has_history(db: Database, security_id: int) -> bool:
     """True if anything irreplaceable hangs off this security_id.
 
-    "History" is the data a delete would destroy: bars, corporate actions, and the
-    factors derived from them. Attributes (name, sector, market cap) do not count
-    -- the next security-master load rewrites them from the source anyway.
+    "History" is the data a delete would destroy: bars, corporate actions, the
+    factors derived from them, and statements (#90; the foreign key would refuse
+    the delete anyway). Attributes (name, sector, market cap) do not count -- the
+    next security-master load rewrites them from the source anyway.
     """
-    return bool(
-        db.fetchval(
-            """
+    return (
+        bool(
+            db.fetchval(
+                """
             SELECT EXISTS (SELECT 1 FROM core.daily_price      WHERE security_id = %s)
                 OR EXISTS (SELECT 1 FROM core.corporate_action WHERE security_id = %s)
                 OR EXISTS (SELECT 1 FROM core.adjustment_factor WHERE security_id = %s)
             """,
-            (security_id, security_id, security_id),
+                (security_id, security_id, security_id),
+            )
         )
+        or has_statements(db, security_id)
     )
 
 
@@ -1460,6 +1464,7 @@ class MergeReport(NamedTuple):
     actions_dropped: int
     flags_moved: int
     flags_dropped: int
+    statements_moved: int = 0
 
 
 def merge_security(
@@ -1653,11 +1658,13 @@ def merge_security(
     )
     db.execute("DELETE FROM ops.load_watermark WHERE security_id = %s", (victim_id,))
 
-    # Then the remaining real FKs.
+    # Then the remaining real FKs. Statements follow the vendor links they were
+    # resolved through (#90).
     db.execute(
         "UPDATE core.symbol_change SET security_id = %s WHERE security_id = %s",
         (survivor_id, victim_id),
     )
+    statements_moved = _move_statements(db, from_id=victim_id, to_id=survivor_id)
     _move_vendor_links(db, from_id=victim_id, to_id=survivor_id)
     # The victim's xref rows are dropped rather than repointed: the ticker they name
     # is the one the caller is about to open a fresh period for against the
@@ -1686,7 +1693,17 @@ def merge_security(
         actions_dropped=actions_dropped,
         flags_moved=flags_moved,
         flags_dropped=flags_dropped,
+        statements_moved=statements_moved,
     )
+
+
+#: The statement tables (#90; ADR 0018). Not in SECURITY_FOOTPRINT_TABLES: the
+#: footprint lists them only where a security holds them.
+STATEMENT_TABLES = (
+    "core.income_statement",
+    "core.balance_sheet",
+    "core.cash_flow_statement",
+)
 
 
 #: Everything keyed to a security_id, in the order a purge clears it. The real FKs
@@ -1757,6 +1774,17 @@ def security_footprint(db: Database, security_ids: list[int]) -> dict[str, int]:
             )
             or 0
         )
+    # Statements (#90), listed only where held: SF1 covers none of the instruments a
+    # descope removes, so they are there only by mistake, and then they are shown.
+    for table in STATEMENT_TABLES:
+        held = int(
+            db.fetchval(
+                f"SELECT count(*) FROM {table} WHERE security_id = ANY(%s)", (ids,)
+            )
+            or 0
+        )
+        if held:
+            footprint[table] = held
     return footprint
 
 
@@ -1825,6 +1853,12 @@ def purge_securities(
                 resolved_by=removed_by,
             )
     removed: dict[str, int] = {UNRESOLVED_RENAMES: len(renames)}
+    # Statements go before core.security, whose foreign key would refuse the
+    # delete; listed only where held, as security_footprint lists them.
+    for table in STATEMENT_TABLES:
+        held = db.execute(f"DELETE FROM {table} WHERE security_id = ANY(%s)", (ids,))
+        if held:
+            removed[table] = held
     for table in SECURITY_FOOTPRINT_TABLES:
         if table == "core.symbol_change":
             removed[table] = db.execute(
@@ -5568,6 +5602,7 @@ def undo_history_split(
         and not still_edited
         and not left["bars"]
         and not left["actions"]
+        and not has_statements(db, destination_id)
         # A vendor identity linked to the split-off history keeps the row: deleting
         # it would drop the link, which no rule rebuilds.
         and not has_vendor_links(db, destination_id)
@@ -7753,4 +7788,157 @@ def refresh_open_flag_detail(
            AND detail IS DISTINCT FROM %s::jsonb
         """,
         (json.dumps(detail), ingestion_run_id, dq_flag_id, json.dumps(detail)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fundamentals (#90): the statement tables (ADR 0018)
+# ---------------------------------------------------------------------------
+
+
+def vendor_links(db: Database, vendor: str) -> list[dict]:
+    """Every link to ``vendor``, open and closed: ``security_id, vendor_key,
+    valid_from, valid_to``. What the SF1 loader resolves a period through (plan
+    §6.2: the link covering the period, else the open one)."""
+    return db.fetchall(
+        """
+        SELECT security_id, vendor_key, valid_from, valid_to
+          FROM core.security_vendor_xref
+         WHERE vendor = %s
+         ORDER BY vendor_key, valid_from
+        """,
+        (vendor,),
+    )
+
+
+def vendor_table_rows(db: Database, vendor: str, vendor_table: str) -> dict[str, dict]:
+    """``vendor_key -> {ticker, currency}`` for one of the vendor's tables: SF1's
+    ticker for a permaticker, and the currency it reports in."""
+    return {
+        r["vendor_key"]: r
+        for r in db.fetchall(
+            """
+            SELECT vendor_key, ticker, currency FROM core.vendor_security
+             WHERE vendor = %s AND vendor_table = %s
+            """,
+            (vendor, vendor_table),
+        )
+    }
+
+
+def statement_rows(db: Database, table: str, security_ids: Sequence[int]) -> list[dict]:
+    """The current rows (``superseded_at IS NULL``) of a statement table for these
+    securities, every version."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    return db.fetchall(
+        f"""
+        SELECT * FROM {table}
+         WHERE security_id = ANY(%s) AND superseded_at IS NULL
+         ORDER BY security_id, period_type, fiscal_date, version_no
+        """,
+        (list(security_ids),),
+    )
+
+
+def insert_statement_rows(db: Database, table: str, rows: Sequence[dict]) -> int:
+    """Insert versions of periods, one batch: every row has the first row's columns.
+    ``loaded_at`` is the transaction's time; ``extra`` is JSON text (the loader writes
+    SF1's numbers exactly). Returns rows inserted."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    if not rows:
+        return 0
+    cols = list(rows[0])
+    marks = ", ".join("%s::jsonb" if c == "extra" else "%s" for c in cols)
+    db.executemany(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({marks})",
+        [[r[c] for c in cols] for r in rows],
+    )
+    return len(rows)
+
+
+def close_statement_version(
+    db: Database,
+    table: str,
+    *,
+    security_id: int,
+    period_type: str,
+    fiscal_date: date,
+    version_no: int,
+    known_to: date,
+) -> int:
+    """Set the ``known_to`` of the version in force: the one update the knowledge
+    timeline makes, once, with the next version's insert."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    return db.execute(
+        f"""
+        UPDATE {table} SET known_to = %s
+         WHERE security_id = %s AND period_type = %s AND fiscal_date = %s
+           AND version_no = %s AND superseded_at IS NULL AND known_to IS NULL
+        """,
+        (known_to, security_id, period_type, fiscal_date, version_no),
+    )
+
+
+def supersede_statement_row(
+    db: Database,
+    table: str,
+    *,
+    security_id: int,
+    period_type: str,
+    fiscal_date: date,
+    version_no: int,
+) -> int:
+    """Mark a version's current row superseded: the one update the load timeline
+    makes, once, before the corrected row is inserted."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    return db.execute(
+        f"""
+        UPDATE {table} SET superseded_at = now()
+         WHERE security_id = %s AND period_type = %s AND fiscal_date = %s
+           AND version_no = %s AND superseded_at IS NULL
+        """,
+        (security_id, period_type, fiscal_date, version_no),
+    )
+
+
+def _move_statements(db: Database, *, from_id: int, to_id: int) -> int:
+    """Move a security's statements to the one that survives a merge. A period both
+    hold keeps the survivor's versions, as bars do: the victim's are dropped, every
+    row of the period, so no period is left with two vendors' version chains. They
+    come from SF1's file, which still holds them. Returns rows moved."""
+    moved = 0
+    for table in STATEMENT_TABLES:
+        db.execute(
+            f"""
+            DELETE FROM {table} v
+             WHERE v.security_id = %s
+               AND EXISTS (SELECT 1 FROM {table} s
+                            WHERE s.security_id = %s
+                              AND s.period_type = v.period_type
+                              AND s.fiscal_date = v.fiscal_date)
+            """,
+            (from_id, to_id),
+        )
+        moved += db.execute(
+            f"UPDATE {table} SET security_id = %s WHERE security_id = %s",
+            (to_id, from_id),
+        )
+    return moved
+
+
+def has_statements(db: Database, security_id: int) -> bool:
+    """Whether any statement row hangs off the security."""
+    return bool(
+        db.fetchval(
+            "SELECT "
+            + " OR ".join(
+                f"EXISTS (SELECT 1 FROM {t} WHERE security_id = %s)"
+                for t in STATEMENT_TABLES
+            ),
+            (security_id,) * len(STATEMENT_TABLES),
+        )
     )

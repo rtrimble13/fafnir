@@ -326,6 +326,34 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-25 · P4, #90: the SF1 loader.** `fafnir ingest fundamentals [--backfill] [--symbols]
+  [--period annual|quarter|both] [--limit N] [--dry-run]` writes the three statement tables from
+  the ledger's SF1 files, as [fundamentals-sf1.md](fundamentals-sf1.md) §4.5–4.7 and §6 specify
+  ([ingestion.md](../ingestion.md#statements-from-sf1-90)).
+  - **Reading:** `--backfill` reads the current full file grouped by ticker. The nightly reads
+    the SF1 deltas since its last run's `params.through`. #106 still has to fetch them and give
+    the prune the applied state, so until then the nightly finds nothing.
+  - **Versions:** first-reported rows are version 1 (`filed`). A changed one is a vendor
+    correction on the load timeline. A differing restated row is a new version from the load
+    day (`observed`). A period with no first-reported row is `estimated` from the next filing.
+  - **Share terms:** share counts are recovered with Sharadar's splits after `known_from`, so a
+    later split writes nothing.
+  - **Checks and flags:** §6.3's checks quarantine rows, not securities. Restatements and
+    corrections are flagged once per security and run. The watermark is
+    `(sharadar, SF1:<dimension>, security_id)`.
+  - **Merges:** `security merge` moves statements (the survivor's versions win a shared
+    period), and `security_has_history` counts them, so a fold refuses. A descope deletes them
+    with the security. The FK hand-off from #87 is closed.
+  - **Plan points settled:** five, in [fundamentals-sf1.md](fundamentals-sf1.md) §6.6: the
+    next filing, never-empty intervals, rounding is not a change, flags per security and run,
+    and merges.
+  - **Tests:** `test_fundamentals_loader.py` (40 unit tests: the map from a row, fiscal labels,
+    every `known_from` rule, share-term recovery, the hash, routing) and
+    `test_fundamentals_ingest.py` (9 integration tests: idempotency, a restatement, a
+    correction, a split after load, an estimated period, quarantine, the look-ahead and chain
+    invariants, merges, the command). Golden values and the upgrade path are #91.
+  - **Not measured yet:** the backfill's size and time on the host (#92).
+
 - **2026-10-25 · P4, #87: the statement schema, migration 0035.** `core.income_statement` (19 line
   items), `core.balance_sheet` (26) and `core.cash_flow_statement` (13), as
   [fundamentals-sf1.md](fundamentals-sf1.md) §4.2–4.4 and ADR 0018 specify. Each row is one version

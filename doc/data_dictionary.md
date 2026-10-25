@@ -326,8 +326,9 @@ Loading both files took 12.5 s; a re-run took 7.6 s and wrote nothing.
 
 ### Fundamentals (migration 0035, ADR 0018)
 
-Statements from Sharadar SF1, one table per statement. They arrive empty; the loader
-is #90 and the backfill #92. **Adjustment status: as reported, in the share terms of
+Statements from Sharadar SF1, one table per statement, written by `fafnir ingest
+fundamentals` (#90; [ingestion.md](ingestion.md#statements-from-sf1-90)). The
+backfill on the host is #92. **Adjustment status: as reported, in the share terms of
 `known_from`.** No column is split-adjusted to today, and no per-share value is
 stored (ADR 0019). The design is
 [plans/fundamentals-sf1.md](plans/fundamentals-sf1.md) §4.
@@ -347,28 +348,30 @@ Every table shares these columns, then its line items, then `content_hash`,
 
 | Column | Type | Notes |
 |---|---|---|
-| `security_id` | BIGINT FK | The security linked to the SF1 row's permaticker (primary share class only). The foreign key refuses deleting a security that holds statements. |
+| `security_id` | BIGINT FK | The security linked to the SF1 row's permaticker (primary share class only): the link covering `fiscal_date`, else the open one. The foreign key refuses deleting a security that holds statements; `security merge` moves them, keeping the survivor's versions of a period both hold. |
 | `vendor_key` | TEXT | The permaticker. |
 | `period_type` / `fiscal_period` | TEXT CHECK | `annual` with `FY`; `quarter` with `Q1`–`Q4`. From SF1's dimension and `fiscalperiod`. |
 | `fiscal_date` | DATE | SF1 `reportperiod`: the period's end (observation). |
 | `calendar_date` | DATE | SF1 `calendardate`: the vendor's normalized period, for comparing companies. |
 | `fiscal_year` | INTEGER | From `fiscalperiod` (`2025-Q4` → 2025), never derived from a date. |
-| `period_start_date` | DATE | NULL when not derivable; before `fiscal_date`. |
+| `period_start_date` | DATE | NULL: SF1 carries no period start. Before `fiscal_date` when set. |
 | `version_no` | INTEGER | 1 = as first reported; each restatement adds one, and only an `observed` version can be later than 1. |
 | `known_from` / `known_to` | DATE | The knowledge interval, half-open. `known_from >= fiscal_date`: the look-ahead tripwire. |
-| `knowledge_source` | TEXT CHECK | `filed` (the SEC filing, `known_from = filing_date`), `observed` (the day fafnir first loaded a restatement) or `estimated` (a period with no first-reported row: the issuer's next filing). |
+| `knowledge_source` | TEXT CHECK | `filed` (the SEC filing, `known_from = filing_date`), `observed` (the day fafnir first loaded a restatement, or the next day where the version it replaces became known that day) or `estimated` (a period with no first-reported row: the issuer's first filing for a period ending on or after it). |
 | `filing_date` | DATE | SF1 `date` of the first-reported row; NULL on any other version. |
 | `loaded_at` / `superseded_at` | TIMESTAMPTZ | The load timeline. `superseded_at` is set when a vendor correction replaced the row, which keeps its knowledge interval. |
 | `reported_currency` | TEXT | TICKERS' `currency`, per security. |
-| `content_hash` | TEXT CHECK | SHA-256 (64 hex) over the typed values; share counts at 1,000-share precision, so a split's re-expression is no change. |
-| `extra` | JSONB | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions), once per SF1 row, on `core.income_statement`. **Never read by mart.** Measured at about 965 bytes a row, about 1.35 GB at full scale. |
+| `content_hash` | TEXT CHECK | SHA-256 (64 hex) over the typed values and `filing_date`; share counts at 1,000-share precision, so a split's re-expression is no change. The loader also leaves a row whose share counts moved by no more than a recovery's rounding (1,000 shares, or a millionth). |
+| `extra` | JSONB | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions; `unmapped`: any column SF1 adds later), once per SF1 row, on `core.income_statement`, its numbers exactly as SF1 wrote them. `{}` on the other two tables. **Never read by mart.** Measured at about 965 bytes a row, about 1.35 GB at full scale. |
 | `ingestion_run_id` | BIGINT FK | The load. |
 
 **Line items:** 19 on the income statement, 26 on the balance sheet, 13 on the cash
 flow. Money is `NUMERIC(24,2)`; share counts (`weighted_average_shares`,
 `weighted_average_shares_diluted`, `shares_outstanding`) are `NUMERIC(24,4)`, in the
-version's share terms. Each column's SF1 indicator, class and sign are in
-`ref.statement_line_item`. Two conventions are SF1's own:
+version's share terms, recovered to the nearest share. `shares_outstanding` is the
+first-reported row's cover count: a restated version carries its predecessor's, in
+its own terms, and an estimated version has none. Each column's SF1 indicator, class
+and sign are in `ref.statement_line_item`. Two conventions are SF1's own:
 - **Absent and inapplicable.** An item the filing does not carry is **0** for 41
   indicators. An item that does not apply is NULL: for example, the current and
   non-current splits of a balance sheet that is not classified.

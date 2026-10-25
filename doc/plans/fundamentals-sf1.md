@@ -482,6 +482,28 @@ The FMP prompt's §6.4 table, with these changes:
 `run_all` stays backward compatible: keys are added, `include_fundamentals=True`, and the checks
 no-op without the tables.
 
+### 6.6 As built (#90)
+
+`fafnir ingest fundamentals` ([ingestion.md](../ingestion.md#statements-from-sf1-90)) settles
+five points this plan left open:
+
+- **The next filing** (§4.5, rule 3) is the issuer's earliest filing for a period ending on or
+  after the estimated one. A 10-K for the same period end counts, since it carries the fourth
+  quarter. A filing for an earlier period, filed late, does not.
+- **An interval is never empty.** A restatement of a version known from the load day itself is
+  known from the next day.
+- **Rounding is not a change.** A share count that moved by no more than a recovery's rounding is
+  unchanged: 1,000 shares, or a millionth of the count. This covers a count recovered across a
+  deep reverse split, which carries the vendor's rounding times the ratio. The 1,000-share hash
+  alone flips at a boundary.
+- **Flags are per security and run.** Restatements and corrections are flagged once per security
+  and run, with the largest moves. A restatement is `warn` from the nightly and `info` from a
+  backfill, which dates the whole of SF1's restated history to one day. A flag per period would
+  put the backfill's hundreds of thousands of restatements in the DQ queue.
+- **Merges move statements.** `security merge` moves a victim's statements, keeping the
+  survivor's versions of a period both hold. A fold refuses a security that holds statements,
+  and a descope deletes them with it.
+
 ---
 
 ## 7. Backfill (#92)

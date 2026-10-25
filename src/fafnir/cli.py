@@ -757,6 +757,109 @@ def _echo_sharadar_prices(result) -> None:
         click.echo(f"  factors recomputed for {result.adjusted} securities")
 
 
+@ingest.command("fundamentals")
+@click.option(
+    "--backfill",
+    is_flag=True,
+    help="The ledger's current SF1 full file; without it, the nightly's deltas.",
+)
+@click.option(
+    "--symbols", help="Comma-separated tickers: only these securities' statements."
+)
+@click.option(
+    "--period",
+    type=click.Choice(["annual", "quarter", "both"]),
+    default="both",
+    show_default=True,
+)
+@click.option("--limit", type=int, help="Only the first N vendor keys in scope.")
+@click.option("--dry-run", is_flag=True, help="Read and print counts; write nothing.")
+@click.pass_context
+def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
+    """Load SF1's statements into the three statement tables (#90; ADR 0018).
+
+    \b
+      fafnir ingest fundamentals --backfill --dry-run
+      fafnir ingest fundamentals --backfill --symbols AAPL,MSFT
+      fafnir ingest fundamentals
+
+    Reads the ledger's SF1 files under [sharadar] bulk_dir: with --backfill the
+    current full file, grouped by ticker on disk first (allow about four times the
+    zip's size free); without it, the SF1 delta files recorded since the last
+    nightly run (sharadar/fundamentals:nightly). Every security with a Sharadar
+    link, dead issuers included, through its permaticker.
+
+    First-reported rows (ARQ, ARY) are version 1, known from their filing date;
+    a restated row (MRQ, MRY) that differs is a new version, known from today. A
+    first-reported row SF1 changed is a vendor correction: the row is replaced and
+    keeps its knowledge interval. Share counts are stored in the share terms of
+    each version's knowledge date, so a later split writes nothing; a re-run writes
+    nothing either. Bad rows are quarantined (fundamentals_* flags) and the rest
+    load. One ops.ingestion_run, committed per vendor key.
+
+    A run for some securities, periods or keys leaves the delta files pending for
+    the rest. A security linked after the backfill gets its history from
+    --backfill --symbols.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest import fundamentals as fu
+    from fafnir.sources.sharadar_files import SharadarFileError
+
+    if limit is not None and limit < 1:
+        raise click.ClickException("--limit is a positive number of keys.")
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        ids = None
+        if symbols:
+            ids, missing = [], []
+            for sym in _split_symbols(symbols):
+                sid = repo.resolve_security_id(database, sym)
+                (ids.append(sid) if sid is not None else missing.append(sym))
+            if missing:
+                raise click.ClickException(f"No security for: {', '.join(missing)}")
+        try:
+            result = fu.load(
+                database,
+                cfg.sharadar_bulk_dir,
+                backfill=backfill,
+                security_ids=ids,
+                period=period,
+                limit=limit,
+                dry_run=dry_run,
+            )
+        except (fu.FundamentalsError, SharadarFileError, FileNotFoundError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    _echo_fundamentals(result)
+
+
+def _echo_fundamentals(result) -> None:
+    head = "Dry run: nothing written." if result.dry_run else f"Run {result.run_id}."
+    files = ", ".join(str(f) for f in result.files) or "none"
+    source = "SF1 file" if result.backfill else "SF1 delta file(s)"
+    click.echo(
+        f"{head} {source}: {files}. {result.keys} vendor keys in scope; "
+        f"{result.read} rows read; "
+        + (
+            f"{result.securities} securities would change"
+            if result.dry_run
+            else f"{result.written} rows written to {result.securities} securities"
+        )
+    )
+    for reason, n in sorted(result.counts.items()):
+        if n:
+            click.echo(f"  {reason:<44} {n}")
+    if result.by_decade:
+        click.echo("  versions by period decade and knowledge source:")
+        for decade, counts in sorted(result.by_decade.items()):
+            line = ", ".join(f"{k} {n:,}" for k, n in sorted(counts.items()))
+            click.echo(f"    {decade:<6} {line}")
+    if result.unmapped:
+        click.echo(
+            "  SF1 columns with no mapping, kept in extra: "
+            + ", ".join(sorted(result.unmapped))
+        )
+
+
 @ingest.command("sharadar-actions")
 @click.option(
     "--backfill",
