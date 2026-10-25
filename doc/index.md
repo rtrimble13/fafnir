@@ -74,6 +74,9 @@ read through the `duk` CLI.
     action considered and why COA 2-M was chosen (reference)
   - [Market-data vendor assessment](plans/fafnir-vendor-assessment.md) — the vendor
     comparison the adoption plan cites (reference)
+  - [Fundamentals on SF1](plans/fundamentals-sf1.md) — the fundamentals build plan,
+    retargeted to Sharadar SF1: knowledge intervals, share terms, the panel (#85; draft
+    for sign-off)
   - [Fundamentals build prompt (FMP era)](plans/fundamentals-build-prompt-fmp.md) —
     the original fundamentals build prompt, retargeted to SF1 in SA-0801 (reference)
 - Architecture Decision Records:
