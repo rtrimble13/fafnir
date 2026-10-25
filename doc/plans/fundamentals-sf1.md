@@ -1,7 +1,9 @@
 # Plan: fundamentals on Sharadar SF1
 
-- Status: **draft for sign-off** (#85, 2026-10-25). The five decisions in *A. Decisions* were taken by
-  the operator on 2026-10-25. Signing off this document is #85's gate: #87's schema starts after it.
+- Status: **signed off** (#85, GO on 2026-10-25). The five decisions in *A. Decisions* and the choices
+  listed after them were taken by the operator on 2026-10-25. They are recorded as
+  [ADR 0018](../adr/0018-bitemporal-fundamentals.md) and
+  [ADR 0019](../adr/0019-derived-metrics-not-vendor-metrics.md) (#86); the schema (#87) builds on them.
 - Retargets the FMP build prompt, [fundamentals-build-prompt-fmp.md](fundamentals-build-prompt-fmp.md)
   (2026-08-27). Its architecture carries over; its source, field map, timelines, share terms, cadence
   and numbering do not. This document follows its section numbers, restates every section SF1
@@ -10,7 +12,8 @@
   Related ADRs: [0015](../adr/0015-multi-vendor-provenance-and-precedence.md) (provenance and
   precedence), [0016](../adr/0016-sharadar-identity-and-survivorship-floor.md) (permaticker, the 1998
   floor), [0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) (vendor
-  code). The fundamentals ADRs this plan needs are #86's.
+  code), [0018](../adr/0018-bitemporal-fundamentals.md) (this plan's knowledge model) and
+  [0019](../adr/0019-derived-metrics-not-vendor-metrics.md) (derived metrics), both #86.
 - Tracking: [#41](https://github.com/rtrimble13/fafnir/issues/41), phase P4 of the
   [Sharadar adoption plan](sharadar-adoption.md).
 

@@ -2,6 +2,8 @@
 
 - Status: Accepted; extended by [ADR 0015](0015-multi-vendor-provenance-and-precedence.md)
   (several vendors write to one `security_id`; `source` says who supplied each row)
+  and by [ADR 0018](0018-bitemporal-fundamentals.md) (the fundamentals' bitemporal model:
+  knowledge intervals beside a load timeline)
 - Date: 2026-06-27
 
 ## Context
