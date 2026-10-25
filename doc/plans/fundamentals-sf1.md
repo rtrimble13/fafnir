@@ -69,6 +69,7 @@
 - **Vendor metrics, the columns measured on the row's `date`, per-share values and `*usd`
   conversions go to `extra`**, once per SF1 row (on `core.income_statement`), never read by mart.
   If #87 measures them above 2 GB, they are not stored at all: they stay in the ledger's file.
+  *Measured by #87:* about 965 bytes a row, about 1.35 GB at full scale, so they are stored.
 - **`shares_outstanding` (the cover-page count, `sharesbas`) comes from first-reported rows only.**
   A restated row's value is measured on another date (the period end), so it is not a restatement.
 - **Nightly, not weekly.** The SF1 delta is small (1,105 rows over four days), so fundamentals ride
@@ -232,8 +233,9 @@ equal to the next version's `known_from`, with only the last one open.
 
 SF1's indicators become the taxonomy (58 of the FMP prompt's 123 columns have a counterpart; the rest
 have none in SF1). Units: **money `NUMERIC(24,2)`, share counts `NUMERIC(24,4)`**. No per-share
-column (§4.7). All nullable, and a NULL stays NULL. The map lives in one module-level dict per
-statement, and in the seed.
+column (§4.7). All nullable, and a NULL stays NULL. The map lives in
+`fafnir.ingest.fundamentals_map`, one tuple per statement; migration 0035 inserts the same rows
+into `ref.statement_line_item`, and a test holds the two equal.
 
 **`core.income_statement`** (19): `revenue` (revenue), `cost_of_revenue` (cor), `gross_profit` (gp),
 `research_and_development` (rnd), `selling_general_and_administrative` (sgna), `operating_expenses`
@@ -273,8 +275,11 @@ As the FMP prompt's §4.4, with `vendor_field` (the SF1 code) beside a nullable 
 where the probe's map found a counterpart, for cross-vendor checks). `item_class` is load-bearing (TTM
 reads it): income and cash-flow items `flow`, balance-sheet items `stock`, share counts
 `share_count`. **Sign conventions, as measured:** cash-flow items are signed as cash moves (capex and
-dividends paid negative), so `signed`; expenses (cost of revenue, R&D, SG&A, interest, tax) are
-positive, `positive_is_outflow`, and a tax benefit is negative.
+dividends paid negative), so `positive_is_inflow`, like revenue; expenses (cost of revenue, R&D,
+SG&A, interest, tax) are positive, `positive_is_outflow`, and a tax benefit is negative; subtotals,
+balances and share counts are `signed`. The rows are inserted by the migration rather than a seed
+file: `fafnir db seed` does not re-run on an upgraded host (0019 and 0027 did the same for
+exchanges).
 
 ### 4.5 The three timelines
 

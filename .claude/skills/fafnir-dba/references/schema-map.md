@@ -40,6 +40,8 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `core.security_vendor_xref` | `(vendor, vendor_key, valid_from)`; open = `valid_to IS NULL`; one open link per key and per (security, vendor); `is_feed` = who loads new rows, one per security |
 | `core.security_vendor_rejection` | `(security_id, vendor, vendor_key)`; a person's "not this key" (`vendor link reject`), which the linking engine never proposes again |
 | `core.vendor_security_event` | `(vendor, vendor_key, event_date, action, contra_ticker)`; listings, delistings, renames, deals from ACTIONS |
+| `core.income_statement`, `core.balance_sheet`, `core.cash_flow_statement` | `(security_id, period_type, fiscal_date, version_no, loaded_at)`; one row per version of a period, per load (ADR 0018). In force at D: `superseded_at IS NULL AND known_from <= D AND (known_to IS NULL OR D < known_to)`. `knowledge_source`: `filed` (the SEC filing), `observed` (a restatement, dated the day fafnir loaded it: SF1 dates none), `estimated`. Share counts are in the share terms of `known_from`; no per-share column (ADR 0019). `extra` is never read by mart. Empty until #90 loads them |
+| `ref.statement_line_item` | `(statement, column_name)`; which SF1 indicator fills which column, and its `item_class` (TTM sums a `flow`, takes the latest `stock`) |
 | `ops.vendor_correction` | `correction_id`; one per row a higher-ranked vendor replaced (ADR 0015), `old_row` = the replaced row; active = `reverted_at IS NULL` |
 | `ops.dq_label` | `label_id`; a label a person stated (`dq label`, `--label`); `security_id` NULL for a cohort (`members`) |
 | `landing.fmp_raw` | `raw_id` — endpoint + symbol + `fetched_at` |

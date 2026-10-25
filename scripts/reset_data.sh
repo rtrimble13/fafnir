@@ -164,7 +164,9 @@ case "${SCOPE}" in
         TABLES="core.daily_price, core.corporate_action, core.adjustment_factor,
                 core.symbol_xref, core.symbol_change, core.company_profile,
                 core.security_vendor_xref, core.security_vendor_rejection,
-                core.vendor_security, core.vendor_security_event, core.security, ops.data_quality_flag,
+                core.vendor_security, core.vendor_security_event,
+                core.income_statement, core.balance_sheet, core.cash_flow_statement,
+                core.security, ops.data_quality_flag,
                 ops.load_watermark, ops.ingestion_run, landing.fmp_raw,
                 landing.sharadar_file"
         RESTART_IDENTITY="RESTART IDENTITY"
@@ -239,6 +241,12 @@ if [[ "${SCOPE}" == "vendor:sharadar" ]]; then
         "SELECT count(*) FROM core.symbol_change WHERE source = 'sharadar'"
     row "core.company_profile" \
         "SELECT count(*) FROM core.company_profile WHERE source = 'sharadar'"
+    row "core.income_statement (every row; ADR 0018)" \
+        "SELECT count(*) FROM core.income_statement WHERE source = 'sharadar'"
+    row "core.balance_sheet" \
+        "SELECT count(*) FROM core.balance_sheet WHERE source = 'sharadar'"
+    row "core.cash_flow_statement" \
+        "SELECT count(*) FROM core.cash_flow_statement WHERE source = 'sharadar'"
     echo
     echo "==> Rows that hold Sharadar's data (vendor = 'sharadar'):"
     row "core.vendor_security (its master)" \

@@ -156,6 +156,10 @@ production. Every query is parameterized.
           ├── core.daily_price                (raw OHLCV, partitioned)
           │       └► mart.v_daily_price_adjusted (× adjustment_factor)
           │
+          ├── core.income_statement           (SF1 statements: a row per version
+          ├── core.balance_sheet               of a period, known_from–known_to;
+          ├── core.cash_flow_statement         line items in ref.statement_line_item)
+          │
           └── core.corporate_action ──► core.adjustment_factor
 
  ops.ingestion_run ◄── every loader      landing.fmp_raw ◄── raw payloads

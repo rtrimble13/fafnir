@@ -216,6 +216,9 @@ CLIENT_MART_RELATIONS = (
     # research readers (MCP `sql_read`, notebooks): why a security stopped trading
     # and who acquired it, without core.vendor_* (#79).
     "mart.v_security_lifecycle",
+    # the same readers: the fundamentals taxonomy, so a mart reader can tell a flow
+    # from a stock in the statement views (#87, #95).
+    "ref.statement_line_item",
 )
 
 # What the seam must NOT reach. core.daily_price is the one that matters most: it
@@ -233,6 +236,10 @@ FORBIDDEN_TO_APP = (
     "core.security_vendor_xref",
     "core.vendor_security_event",
     "core.security_vendor_rejection",
+    # The statements (0035, #87): mart views expose them (#95), never the tables.
+    "core.income_statement",
+    "core.balance_sheet",
+    "core.cash_flow_statement",
 )
 
 
@@ -348,6 +355,10 @@ OPS_READABLE = (
     "core.security_vendor_xref",
     "core.vendor_security_event",
     "core.security_vendor_rejection",
+    "core.income_statement",
+    "core.balance_sheet",
+    "core.cash_flow_statement",
+    "ref.statement_line_item",
     "meta.schema_migration",
     # Everything fafnir_read reaches is included by design: triage starts from a
     # flag and ends in the bars and actions that explain it.
@@ -401,8 +412,9 @@ VENDOR_IDENTITY = (
 )
 
 
-def test_fafnir_read_can_read_the_vendor_identity_tables(least_privilege_dsn):
-    m.migrate(least_privilege_dsn)
+def _open_as_read_member(dsn: str):
+    """Migrate the LP database, then open it as a member of fafnir_read."""
+    m.migrate(dsn)
     with _admin() as admin:
         if admin.fetchval(
             "SELECT 1 FROM pg_roles WHERE rolname = %s", (READ_MEMBER_ROLE,)
@@ -416,17 +428,43 @@ def test_fafnir_read_can_read_the_vendor_identity_tables(least_privilege_dsn):
                 f"CREATE ROLE {READ_MEMBER_ROLE} LOGIN PASSWORD "
                 f"'{READ_MEMBER_PASSWORD}' IN ROLE fafnir_read"
             )
-    with Database(least_privilege_dsn, autocommit=True) as owner:
+    with Database(dsn, autocommit=True) as owner:
         owner.execute(f"GRANT CONNECT ON DATABASE {LP_DB} TO fafnir_read")
-    parts = conninfo_to_dict(least_privilege_dsn)
+    parts = conninfo_to_dict(dsn)
     parts.update(user=READ_MEMBER_ROLE, password=READ_MEMBER_PASSWORD)
+    return Database(make_conninfo(**parts), autocommit=True)
+
+
+def _unreadable(db, relations) -> list[str]:
     failures = []
-    with Database(make_conninfo(**parts), autocommit=True) as reader:
-        for relation in VENDOR_IDENTITY:
-            try:
-                reader.fetchval(f"SELECT count(*) FROM {relation}")
-            except Exception as exc:  # noqa: BLE001 -- the message is the report
-                failures.append(f"{relation}: {type(exc).__name__}: {exc}")
+    for relation in relations:
+        try:
+            db.fetchval(f"SELECT count(*) FROM {relation}")
+        except Exception as exc:  # noqa: BLE001 -- the message is the report
+            failures.append(f"{relation}: {type(exc).__name__}: {exc}")
+    return failures
+
+
+def test_fafnir_read_can_read_the_vendor_identity_tables(least_privilege_dsn):
+    with _open_as_read_member(least_privilege_dsn) as reader:
+        failures = _unreadable(reader, VENDOR_IDENTITY)
+    assert not failures, "fafnir_read cannot read:\n  " + "\n  ".join(failures)
+
+
+# The statement tables and their taxonomy (0035, #87) are core and ref: fafnir_read
+# reads them as it reads the rest, through 0035's explicit grants as well as the
+# default privileges.
+FUNDAMENTALS = (
+    "core.income_statement",
+    "core.balance_sheet",
+    "core.cash_flow_statement",
+    "ref.statement_line_item",
+)
+
+
+def test_fafnir_read_can_read_the_statement_tables(least_privilege_dsn):
+    with _open_as_read_member(least_privilege_dsn) as reader:
+        failures = _unreadable(reader, FUNDAMENTALS)
     assert not failures, "fafnir_read cannot read:\n  " + "\n  ".join(failures)
 
 

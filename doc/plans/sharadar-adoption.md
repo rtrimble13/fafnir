@@ -326,6 +326,33 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-25 · P4, #87: the statement schema, migration 0035.** `core.income_statement` (19 line
+  items), `core.balance_sheet` (26) and `core.cash_flow_statement` (13), as
+  [fundamentals-sf1.md](fundamentals-sf1.md) §4.2–4.4 and ADR 0018 specify. Each row is one version
+  of a period, on two timelines:
+  - **knowledge** (`known_from` / `known_to`, half-open), checked by
+    `known_from >= fiscal_date` and "only an `observed` version can be later than the first";
+  - **load** (`loaded_at` / `superseded_at`).
+
+  One current row per version and one version in force per period are unique indexes. There are no
+  per-share columns. `ref.statement_line_item` holds the taxonomy, 58 rows.
+  - **The map:** `fafnir.ingest.fundamentals_map` is the loader's map (#90), and a test holds the
+    migration's rows equal to it.
+  - **Privileges:** explicit grants beside the default privileges. `fafnir_app` reads the taxonomy
+    and no statement table; the least-privilege tests prove both.
+  - **`reset_data.sh`:** `--scope all` lists the three tables (it truncates without CASCADE), and the
+    `vendor:sharadar` report counts them.
+  - **Measured:** SF1's metrics in `extra` come to about 965 bytes a row, about 1.35 GB at full
+    scale (1.39M income rows from the probe's sample). That is under the plan's 2 GB, so they are
+    stored.
+  - **Departures from the issue:**
+    - the taxonomy's rows are inserted by the migration, not `sql/seeds/0002`: seeds do not re-run
+      on an upgraded host (0019 and 0027 did the same for exchanges);
+    - `source DEFAULT 'sharadar'` became a CHECK, since no other vendor writes statements;
+    - per-share columns are gone (ADR 0019).
+  - **Handed to #90:** the foreign key refuses deleting a security that holds statements, so
+    `security merge` and `dedupe` must move them.
+
 - **2026-10-25 · P4, #85 and #86: the fundamentals plan signed off, and its two ADRs.**
   [fundamentals-sf1.md](fundamentals-sf1.md) got GO on #85 (decision log, 2026-10-25). It records
   two ADRs at the next free numbers.
