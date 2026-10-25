@@ -50,7 +50,12 @@ uses as it stands.
    ``table`` filter takes the modern names (``stocks``, ``fundamentals``, ``funds``):
    ``table=SEP`` matches nothing. **An unknown parameter is ignored, not refused**,
    so a misspelt filter returns everything it should have narrowed; a loader
-   asserts its filters in the rows it gets back.
+   asserts its filters in the rows it gets back. MEASURED 2026-10-24 (``fafnir
+   source probe-fundamentals --from-api``): on SF1, a ``ticker`` *list* returns
+   only about the last two years of each ticker, and nothing for a dead issuer,
+   where one ticker per request returns the whole history; TICKERS ignores
+   ``isdelisted``; an SF1 ``lastupdated.gte`` slice is small (1,105 rows for four
+   days, nearly all of them 2025-2026 periods).
 6. **Paging** -- ``limit`` (default 10,000) and ``offset`` / ``skip``. DOCUMENTED.
    MEASURED: a JSON ``limit`` above 10,000 is an error (``limit too large``), not a
    silent cap; ``offset`` is honoured; ``SEP`` answers newest date first by

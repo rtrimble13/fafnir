@@ -43,10 +43,15 @@ Cross-cutting schemas:
 Market data lives on three separate clocks; fafnir keeps them distinct:
 
 - **observation date** — what period the data describes (`trade_date`, `ex_date`,
-  later `fiscal_date`).
-- **knowledge date** — when it became known (FMP feed timestamp; `filing_date`
-  for statements in the fundamentals fast-follow).
-- **load date** — when fafnir ingested it (`loaded_at`, `ops.ingestion_run`).
+  `fiscal_date` for statements).
+- **knowledge date** — when it became known. A statement is known from its SEC
+  filing date (`filing_date`, real for SF1's first-reported rows), and each version
+  of it holds over a knowledge interval, `known_from` to `known_to`: a restatement
+  starts a new version on the day fafnir first loads it, and closes the one before
+  ([ADR 0018](adr/0018-bitemporal-fundamentals.md)).
+- **load date** — when fafnir ingested it (`loaded_at`, `ops.ingestion_run`). A
+  statement row also has `superseded_at`, set when a vendor correction replaced it,
+  so a past state of the warehouse can be read back.
 
 ## Raw prices + derive-on-read adjustment (the key decision)
 
@@ -150,6 +155,10 @@ production. Every query is parameterized.
           │
           ├── core.daily_price                (raw OHLCV, partitioned)
           │       └► mart.v_daily_price_adjusted (× adjustment_factor)
+          │
+          ├── core.income_statement           (SF1 statements: a row per version
+          ├── core.balance_sheet               of a period, known_from–known_to;
+          ├── core.cash_flow_statement         line items in ref.statement_line_item)
           │
           └── core.corporate_action ──► core.adjustment_factor
 

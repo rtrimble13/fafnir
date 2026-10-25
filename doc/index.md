@@ -74,6 +74,9 @@ read through the `duk` CLI.
     action considered and why COA 2-M was chosen (reference)
   - [Market-data vendor assessment](plans/fafnir-vendor-assessment.md) — the vendor
     comparison the adoption plan cites (reference)
+  - [Fundamentals on SF1](plans/fundamentals-sf1.md) — the fundamentals build plan,
+    retargeted to Sharadar SF1: knowledge intervals, share terms, the panel (#85; signed
+    off 2026-10-25)
   - [Fundamentals build prompt (FMP era)](plans/fundamentals-build-prompt-fmp.md) —
     the original fundamentals build prompt, retargeted to SF1 in SA-0801 (reference)
 - Architecture Decision Records:
@@ -94,6 +97,8 @@ read through the `duk` CLI.
   - [ADR 0015 — Multi-vendor provenance, precedence and audited corrections](adr/0015-multi-vendor-provenance-and-precedence.md)
   - [ADR 0016 — Sharadar's permaticker is the identity authority; survivorship floor 1998](adr/0016-sharadar-identity-and-survivorship-floor.md)
   - [ADR 0017 — Vendor access is one library inside fafnir, not a distribution per vendor](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) *(proposed)*
+  - [ADR 0018 — Bitemporal fundamentals on Sharadar SF1](adr/0018-bitemporal-fundamentals.md)
+  - [ADR 0019 — fafnir derives its metrics; vendor metrics are not read](adr/0019-derived-metrics-not-vendor-metrics.md)
 
 ## Reference
 

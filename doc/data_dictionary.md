@@ -324,6 +324,69 @@ Measured on the 2026-10-19 full file: 718,464 rows → 142,852 events, after
 skipping 571,824 splits and dividends, 3,134 unresolved rows and 654 duplicates.
 Loading both files took 12.5 s; a re-run took 7.6 s and wrote nothing.
 
+### Fundamentals (migration 0035, ADR 0018)
+
+Statements from Sharadar SF1, one table per statement. They arrive empty; the loader
+is #90 and the backfill #92. **Adjustment status: as reported, in the share terms of
+`known_from`.** No column is split-adjusted to today, and no per-share value is
+stored (ADR 0019). The design is
+[plans/fundamentals-sf1.md](plans/fundamentals-sf1.md) §4.
+
+#### `core.income_statement`, `core.balance_sheet`, `core.cash_flow_statement`
+
+**Grain:** `(security_id, period_type, fiscal_date, version_no, loaded_at)`, one row
+per version of a period, per load. **Source:** `sharadar` only (a CHECK). **Cadence:**
+the SF1 backfill, then the nightly delta (#106).
+
+**A version in force at date D:** `superseded_at IS NULL AND known_from <= D AND
+(known_to IS NULL OR D < known_to)`. A period's versions chain: each `known_to` is
+the next version's `known_from`. Successive periods are not chained.
+
+Every table shares these columns, then its line items, then `content_hash`,
+`extra`, `source` and `ingestion_run_id`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `security_id` | BIGINT FK | The security linked to the SF1 row's permaticker (primary share class only). The foreign key refuses deleting a security that holds statements. |
+| `vendor_key` | TEXT | The permaticker. |
+| `period_type` / `fiscal_period` | TEXT CHECK | `annual` with `FY`; `quarter` with `Q1`–`Q4`. From SF1's dimension and `fiscalperiod`. |
+| `fiscal_date` | DATE | SF1 `reportperiod`: the period's end (observation). |
+| `calendar_date` | DATE | SF1 `calendardate`: the vendor's normalized period, for comparing companies. |
+| `fiscal_year` | INTEGER | From `fiscalperiod` (`2025-Q4` → 2025), never derived from a date. |
+| `period_start_date` | DATE | NULL when not derivable; before `fiscal_date`. |
+| `version_no` | INTEGER | 1 = as first reported; each restatement adds one, and only an `observed` version can be later than 1. |
+| `known_from` / `known_to` | DATE | The knowledge interval, half-open. `known_from >= fiscal_date`: the look-ahead tripwire. |
+| `knowledge_source` | TEXT CHECK | `filed` (the SEC filing, `known_from = filing_date`), `observed` (the day fafnir first loaded a restatement) or `estimated` (a period with no first-reported row: the issuer's next filing). |
+| `filing_date` | DATE | SF1 `date` of the first-reported row; NULL on any other version. |
+| `loaded_at` / `superseded_at` | TIMESTAMPTZ | The load timeline. `superseded_at` is set when a vendor correction replaced the row, which keeps its knowledge interval. |
+| `reported_currency` | TEXT | TICKERS' `currency`, per security. |
+| `content_hash` | TEXT CHECK | SHA-256 (64 hex) over the typed values; share counts at 1,000-share precision, so a split's re-expression is no change. |
+| `extra` | JSONB | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions), once per SF1 row, on `core.income_statement`. **Never read by mart.** Measured at about 965 bytes a row, about 1.35 GB at full scale. |
+| `ingestion_run_id` | BIGINT FK | The load. |
+
+**Line items:** 19 on the income statement, 26 on the balance sheet, 13 on the cash
+flow. Money is `NUMERIC(24,2)`; share counts (`weighted_average_shares`,
+`weighted_average_shares_diluted`, `shares_outstanding`) are `NUMERIC(24,4)`, in the
+version's share terms. Each column's SF1 indicator, class and sign are in
+`ref.statement_line_item`. Two conventions are SF1's own:
+- **Absent and inapplicable.** An item the filing does not carry is **0** for 41
+  indicators. An item that does not apply is NULL: for example, the current and
+  non-current splits of a balance sheet that is not classified.
+- **No minority interest in the balance sheet.** `total_equity_parent` excludes
+  noncontrolling interest, and there is no balance item for it.
+
+**Indexes:**
+- `ux_<table>_current`: one current row per version;
+- `ux_<table>_in_force`: one version in force per period;
+- `ix_<table>_pit`, `ix_<table>_known`: point-in-time reads and panel sweeps;
+- `ix_<table>_restated`: versions after the first.
+
+Gaps and overlaps between a period's versions are checked by a standing test and a
+DQ check, since the warehouse has no exclusion constraints.
+
+**Privileges:** `fafnir_read` and `fafnir_ops` read them, `fafnir_ingest` writes
+them, and `fafnir_app` reaches them only through mart views (#95).
+
 ## Schema: `mart`
 
 ### `mart.v_daily_price_adjusted` — adjusted OHLCV (VIEW)
@@ -516,6 +579,22 @@ rather than forking. See [ADR 0006](adr/0006-curated-fund-universe.md).
 
 ### `ref.sector` / `ref.industry` — FMP taxonomy.
 `sector_id`/`industry_id` (IDENTITY PK), `*_name` (UNIQUE), `created_at`.
+
+### `ref.statement_line_item` — the fundamentals taxonomy. **Grain:** `(statement, column_name)`.
+**Source:** migration 0035, equal to `fafnir.ingest.fundamentals_map` (a test holds
+them equal). One row per typed line item of the statement tables:
+
+| Column | Notes |
+|---|---|
+| `statement` | `income`, `balance_sheet`, `cash_flow`. |
+| `column_name` | The typed column. |
+| `vendor_field` | The SF1 indicator (UNIQUE per statement). |
+| `fmp_field` | The FMP spelling of its FMP build-prompt counterpart, where one exists, for a cross-vendor check. |
+| `item_class` | `flow`, `stock`, `share_count` (`per_share` and `memo` are allowed and unused). **Load-bearing:** TTM sums a flow and takes the latest stock or share count. |
+| `sign_convention` | `positive_is_inflow` (revenue; every cash-flow line, signed as cash moves, so capex is negative), `positive_is_outflow` (expenses), `signed` (subtotals, balances, share counts). |
+| `is_subtotal`, `description` | |
+
+`fafnir_app` reads it, as it reads the rest of `ref`.
 
 ### `ref.trading_calendar` — **Grain:** `(exchange_code, trade_date)`.
 Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,

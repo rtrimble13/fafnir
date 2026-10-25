@@ -268,6 +268,29 @@ def iter_rows(
             yield row
 
 
+def type_row(table: str, row: Mapping[str, object]) -> dict:
+    """An API row (JSON values) typed as :func:`iter_rows` types the same row read
+    from a file, so a reader of either sees the same values. A JSON number becomes
+    a :class:`~decimal.Decimal` through its text (``0.52`` stays ``0.52``), and an
+    empty string or ``None`` is ``None``. Raises :class:`SharadarFileError` on a
+    value that does not parse as its column's type."""
+    out = {}
+    for col, value in row.items():
+        if value is None or value == "":
+            out[col] = None
+            continue
+        conv = _CONVERTERS.get(column_type(table, col) or "text", str)
+        text = value if isinstance(value, str) else repr(value)
+        try:
+            out[col] = conv(text[:10] if conv is _to_date else text)
+        except (ValueError, InvalidOperation) as exc:
+            raise SharadarFileError(
+                f"{table} column {col}: {value!r} is not a "
+                f"{column_type(table, col)} ({exc})"
+            ) from None
+    return out
+
+
 def count_rows(path: str | Path, member: Optional[str] = None) -> int:
     """Data rows in the file (the header excluded), for the ledger's ``rows``."""
     with open_text(path, member) as fh:

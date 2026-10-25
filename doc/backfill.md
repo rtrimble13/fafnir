@@ -481,6 +481,56 @@ the host's egress must allow both hosts. The probe did not measure the zips; #52
 did, and its sizes and timings are under
 [Sharadar initial population](#sharadar-initial-population).
 
+## Confirming the SF1 feed
+
+```bash
+fafnir source probe-fundamentals                  # the ledger's SF1 file; seed 0
+fafnir source probe-fundamentals --dead 50 --seed 7
+fafnir source probe-fundamentals --from-api       # no ledger: one request a ticker
+fafnir source probe-fundamentals --json > /var/lib/fafnir/probe-sf1-$(date +%F).json
+```
+
+Run it before the fundamentals schema is written (#85, #87), and again after a
+change to SF1's loader. It reads the ledger's current SF1 and ACTIONS files under
+`[sharadar] bulk_dir` and draws its sample from the vendor master
+(`core.vendor_security`, so `ingest sharadar-master` comes first):
+
+- the probe set, `AAPL, MSFT, GE, KO, JPM, XOM`, for long histories, two fiscal
+  calendars and a bank;
+- 20 random delisted issuers SF1 covers;
+- 3 random listed issuers that report outside USD.
+
+It writes nothing. Its verdicts are probe-sharadar's (PASS, NOTE, BLOCK). A BLOCK
+here means the knowledge-date model does not hold: a filing dated before its period
+end, filing dates that look imputed, or one that disagrees with the public record.
+`--from-api` reads the same rows from the API, for a machine with no ledger: about
+two requests a ticker, 60 for the default sample. It asks one ticker per request,
+because a list of tickers returns only about the last two years.
+
+**The `--json` report holds vendor rows** as evidence. Keep it on the host and post
+only the verdicts and aggregates the terminal report prints.
+
+What the first run found (2026-10-24, `--from-api`, 29 tickers, 6,439 rows):
+
+| # | Item | Verdict | What it means for the fundamentals build |
+|---|---|---|---|
+| 1 | Coverage | NOTE `history_before_floor` | All six dimensions (ARQ/ARY/ART first-reported, MRQ/MRY/MRT with restatements) for all 29 tickers, back to 1991. 11.7% of rows report a period before 1998-01-01, the survivorship floor (ADR 0016): whether the loader keeps them is #85's call. |
+| 2 | Knowledge dates | NOTE `ar_filed_mr_undated` | On AR rows, `date` is the SEC filing date: AAPL's FY2020 10-K (2020-10-30) and MSFT's FY2015 (2015-07-31) agree with EDGAR. None of 1,731 AR rows precedes its period end, and no era's filings sit on one lag, so they are not imputed. On MR rows, `date` is the period end (3,331 of 3,331), so **a restatement carries no knowledge date**. `lastupdated` is restamped on a ticker's whole history (28 of 29): a delta trigger, never a knowledge date. EDGAR is not reachable from a session, so the five filings in the evidence are compared by hand. |
+| 3 | Restatements | NOTE `mr_carries_restatements` | MSFT FY2015: 11 statement fields differ between first-reported and restated. 73% of quarterly AR/MR pairs differ in some statement field: mostly later filings reclassifying their comparatives (operating expenses, gross profit, revenue). 135 pairs differ only in share counts and per-share values. |
+| 4 | Indicator inventory | NOTE `sf1_taxonomy` | 112 columns: 66 statement indicators (income 25, balance sheet 28, cash flow 13), 36 vendor metrics and 10 entity fields, all in the vendor's own classification. 58 of the build prompt's 123 §4.3 columns have an SF1 counterpart, so SF1's indicators become the taxonomy. |
+| 5 | Quarterly completeness | PASS `discrete_quarters_with_q4` | Q4 is its own ARQ row (no year has Q1–Q3 without it); the 42 short years are coverage edges. Quarterly flows sum to the year within 1% in 97.7% of comparisons: TTM sums four ARQ rows, with no Q4 derivation and no year-to-date de-cumulation. |
+| 6 | Null against zero | NOTE `zero_for_absent` | Two conventions. For 41 indicators, an item the filing does not carry is **0**, by the vendor's documentation: GE's R&D is 0 in all 8 years 1998–2005. An item that does not apply is **NULL**, such as the current/non-current splits of a bank's balance sheet. SF1 cannot tell an absent item from a reported zero, so ratios guard zero denominators and #102's `fundamentals_suspicious_zero` watches. |
+| 7 | Currency | NOTE `currency_from_tickers` | SF1 has no currency column: the reporting currency is TICKERS' `currency`, per ticker (1,019 of 17,872 tickers report outside USD). `fxusd` is foreign units per USD: `revenueusd = revenue / fxusd` on all 122 rows tested. The `*usd` columns are vendor conversions. |
+| 8 | Identity | NOTE `primary_class_only` | Every SF1 ticker reaches a permaticker through TICKERS. SF1 holds the primary share class only (GOOGL, not GOOG; BRK.B, not BRK.A), and a secondary class has a permaticker of its own, so attaching it to the issuer's statements is #85's call. Dead tickers carry SEP's numeric suffix. |
+| 9 | Vendor metrics | PASS `vendor_metrics_identified` | 36 metric columns, and 12 measured on the row's `date` (price, market cap, EV, P/E, cover-page shares, …): they differ between AR and MR rows only because the dates differ. All go to `extra`. EBITDA, EBT and FCF are tagged metrics but are aggregates the field map may type. |
+| 10 | Share terms | NOTE `share_terms_today` | **Share counts and per-share values are in today's share terms**, re-expressed at every later split: 18 of 18 splits show no jump in weighted shares. That breaks the build prompt's §4.7 rule 1 (store as reported). As reported is SF1's value / the product of the splits after `date`. Each later split rewrites every earlier period's shares, which a content hash would read as a restatement. EPS has 3 decimals, so a recovered EPS loses precision: aggregate ratios first (§4.7 rule 3). |
+
+No blocking verdict. Items 2, 3 and 10 are the open questions #85 must answer
+before the schema (#87):
+- what knowledge date a restatement gets;
+- what share terms the statement tables store;
+- whether a split's re-expression is a new version.
+
 ---
 
 ## Sharadar initial population

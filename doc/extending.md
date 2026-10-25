@@ -63,6 +63,12 @@ patterns to add new sources, tables, and consumers.
 
 ## Adding fundamentals (bitemporal)
 
+> **The build plan is [plans/fundamentals-sf1.md](plans/fundamentals-sf1.md)** (#85):
+> statements from Sharadar SF1, each version with a knowledge interval (`known_from` /
+> `known_to`) and a load timeline, stored in the share terms of its `known_from`. The
+> sketch below is the original idea, kept for its history; where it differs, the plan
+> wins.
+
 Model statements **bitemporally** so restatements version rather than overwrite:
 
 ```

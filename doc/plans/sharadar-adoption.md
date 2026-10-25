@@ -3,6 +3,9 @@
 - Status: **in progress — plan v2, revised 2026-10-18.** Plan v1 (2026-09-23, seventeen weekly
   sprints S01–S17) is superseded; its calendar and status tables are in git history
   (`git show 1d26d82:doc/plans/sharadar-adoption.md`).
+- **Sharadar has been the primary nightly vendor since 2026-10-22** (#125). P0–P2 are closed, P3 is open,
+  P4 and P5 have not started. The open issues were reconciled with the build on 2026-10-24 (*Issue
+  dispositions (applied 2026-10-24)*).
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -91,9 +94,9 @@ Phases are ordered by dependency, not by calendar week. Each closes with a short
 |---|---|---|---|
 | **P0** | Subscribe, client, probe, safety rails | #42, #43, #44, #45, #46, #47, #49, #50, #52, #57 | `probe-sharadar` passes on the paid key; FMP loaders cannot touch a non-FMP-fed security; precedence write path merged |
 | **P1** | Land, link, mint | #55, #56, #58, #59, #62, #63, #64, #67, #68, #71 | ≥ 99% of active non-fund securities linked or explained; dead issuers minted (empty) |
-| **P2** | Backfill, compare, correct | #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** |
-| **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** |
-| **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; release **v2.1.0** |
+| **P2** | Backfill, compare, correct | #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** (shipped as v1.8.x; closed on v1.8.4) |
+| **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** (tagged 2026-10-22) |
+| **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; a **minor** release (v2.1.0 went to `security relist` on 2026-10-24) |
 | **P5** | Funds, FRED, close-out | #88, #97, #104, #114, #116, #117, #131 | Eight funds on one vendor; `duk yc -S db`; plan marked implemented |
 
 P3 and P4 are independent once P2 is done; run them in whichever order the comparison report and the SF1
@@ -117,6 +120,14 @@ reconcile are dropped, and #66 is folded into #75.*
    by a reason code (4.8% unlinked on 2026-10-20, #64); the Sharadar nightly has run in dry-run mode on
    production for five sessions and proposed the same renames, delistings and listings the FMP sweeps made
    (or each difference is explained).
+
+*Superseded 2026-10-22.* The operator cut over before #122 recorded a decision and before any dry-run night
+had run. #122 is closed with where each criterion stood:
+1. partly met: run 415 corrected the securities with no split on file, and the split-bearing ones were
+   corrected after the cutover (#197, #198);
+2. held: 198 unlinked, every one with a reason code;
+3. waived: 0 of the 5 dry-run nights;
+4. not recorded.
 
 ### Migrations (expected numbers — take the next free number at merge time)
 
@@ -208,12 +219,57 @@ SELECT symbol, count(*) FROM mart.security_latest GROUP BY 1 HAVING count(*) > 1
 Close if it no longer reproduces. If rows remain, each pair is either a reused ticker (one live, one
 delisted — correct, and `duk ls` list mode shows both by design) or a `dedupe` candidate.
 
+*Closed 2026-10-24 without the host check* (the 2026-10-24 dispositions below); the query is on the issue.
+
 ### Milestones
 
 The seventeen `S01`–`S17` milestones map onto the phases above (S01–S02 → P0, S03–S05 → P1, S06–S07 → P2,
 S08–S12 → P4, S13–S17 → P3/P5). Recommended: rename six of them to `P0`–`P5`, move each kept issue to its
 phase, close the rest. The GitHub API tools available to a session cannot create or delete milestones, so
 this step is the operator's.
+
+## Issue dispositions (applied 2026-10-24)
+
+Thirty-three issues were open. The cutover (2026-10-22) had overtaken some of them. The ADR numbers had
+moved under others: plan v1 called provenance ADR 0012, identity ADR 0013 and the fundamentals ADRs 0014
+and 0015, and those numbers went to instrument scope, dorq and venue transfers before the ADRs were
+written. Four issues were closed and 18 bodies revised, each with a *Revised 2026-10-24* note on top. In
+each revised body, `docs-gate` and the status-row items were taken out of the definition of done. 29 remain
+open.
+
+### Close
+
+| Issue | Reason |
+|---|---|
+| #93 universe maintenance | **Completed**: shipped in #188, in production since the cutover. Its five dry-run nights were overtaken by the cutover; the comparison after it is #126's |
+| #98 nightly prices and actions, `vendor feed` | **Completed**: shipped in #190 and #191, used at the cutover (run 426), rollback tested (#111). The SF1 delta it absorbed from #53 goes to #106 |
+| #122 cutover gate | **Superseded** by the cutover (*The verification that replaces the parallel run*, above); closed with the criteria record |
+| #24 duk ls shows 2 rows per ticker | **No longer relevant** as filed: duplicates are folded by `security dedupe` / `merge`, and a reused ticker lists a live and a dead row by design. Closed without the host check |
+
+### Edit
+
+| Issue | Change |
+|---|---|
+| #41 tracking | Phase log (P1 and P2 closed, P3 started), #122's outcome, the decisions since 2026-10-20, P4's release |
+| #124 release v2.0.0 | The release is done (a version bump, 2026-10-22); re-scoped to the docs rewrite, since README still names FMP as the nightly feed |
+| #128 FMP tier | `fmp_secondary` and `-S fmp`. The lower tier must also serve FMP's secondary night (198 unlinked securities, about 3,945 funds) and the five endpoints ADR 0017 moved into `FMPClient` |
+| #109 attributes | A live gap since the cutover: the screener is not in the Sharadar night. ADR 0012 → ADR 0015 §4. Part 1, sector and industry, now; part 2, market cap and beta, with #100 |
+| #130 legacy notes | ADR 0015 and 0016 and the cutover date in the status note; FMP's probes in `ingest/fmp_probe.py`; which FMP loaders do not run in Sharadar mode |
+| #131 close-out | No parallel run to review; estimates by phase; #129's dependency dropped; ADR 0017's acceptance |
+| #126 five sessions | Counted from the first Sharadar night; what the first nights turned up (#195, #196, #199, #201, #202) |
+| #86 fundamentals ADRs | The next free numbers (0018 and 0019 today); ADR 0016 cited for the floor |
+| #85 SF1 build prompt | The prompt's path in the repository; migrations 0035–0038; the delta never paged by offset |
+| #83 SF1 probe | Reads the ledger's SF1 file, so it lives under `ingest/` (ADR 0017); #49 answered part of item 8 |
+| #92 fundamentals backfill | No shadow step; re-download the SF1 file if it is stale |
+| #106 fundamentals cadence | Owns the SF1 delta #98 deferred, and the prune's applied state for it; measured on production |
+| #107 `duk fs` / `fa` | `-S fmp` and `-S sharadar` refuse; `TICKER@date` shipped with #80 |
+| #88, #116 Tiingo and FRED clients | Clients only (ADR 0017 §1); the caller passes the key |
+| #97 Tiingo loader | No `ingest/bars.py` and no `owner=`; the funds' feed moves in #104, not at the cutover |
+| #104 Tiingo production | Step 6: `vendor feed --vendor tiingo --funds` after the first load |
+| #117 reconcile.sh | No divergence categories and no `vendor reconcile`; corrected dates are expected differences; the fallback is `duk -S sharadar` |
+
+#87, #90, #91, #95, #96, #100, #101, #102, #108, #114 and #125 were left as written. #125 stays open for its
+step-6 verification comment.
 
 ## Costs
 
@@ -263,9 +319,98 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-21 | **The first correction is limited to linked securities with no split on file.** That is 11,088 securities, and 589,256 bars corrected (run 415). A sample of the dry run's differing bars showed whole-split-factor and ADR-ratio differences where Sharadar is not always the right side. The 4,470 split-bearing securities wait for a bar-level rule, and their 763 `vendor_history_disagrees` flags stay open | #75, #77 |
 | 2026-10-23 | **The split-bearing rule** (`vendor correct --split-bearing`). An FMP bar is replaced only when its close times the product of the stored Sharadar splits after it meets Sharadar's recovered close within 0.5%, and only in a stretch between two such splits where 90% of the compared bars are explained. Such a stretch is corrected whole: its few unexplained bars from the vendor too, and FMP's bars on dates the vendor lacks rescaled by the same factor as one revertible edit. Otherwise the first dry run (2026-10-23) would have left 501 spikes and 13,910 bars a level apart. The rule is the evidence of 2026-10-23: of 149 Sharadar splits with no raw jump in FMP's bars, 93 had Sharadar's as-traded close jump by the factor while FMP's sat exactly that factor below, and about nine more a product of later splits below. A corrected bar takes the vendor's volume, the exception to `keep`, because FMP's volume is pre-adjusted with its prices | #75, #77 |
 | 2026-10-22 | **Dead-history outliers beyond §2k are accepted by an operator bulk rule.** One rule covers a move that comes back within 10 bars; the other a move that does not, but fails the §2d unreported-split test with no split within 120 days. 19,703 were accepted, and 699 stay open for split or dividend review. This is a decision for this population, recorded in the sweep policy, not a standing licence | #81 |
+| 2026-10-22 | **Cutover: Sharadar is the primary nightly vendor.** The switch took effect at 17:41 UTC, on v2.0.0, ahead of its gate by the operator's decision: no dry-run night had run. `vendor feed --vendor sharadar --all-linked` (run 426) moved 15,567 securities, so all 27,494 open Sharadar links feed. FMP stays the secondary (`fmp_secondary = true`) for the funds and the 198 unlinked securities. The first Sharadar-primary night ran from the timer at 22:34 ET (2026-10-23 UTC). **The vendor seam of a fed series is 2026-10-22** (data-semantics §25); a rollback would add a second. #122 is closed with where its criteria stood | #125, #122 |
 | 2026-10-24 | **Vendor access stays one library inside fafnir** ([ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md), proposed). A rename of `duk`, a standalone Sharadar CLI and a standalone FMP CLI were weighed; the CLIs are not built as separate distributions. `fafnir.sources` is the only vendor code and may not import the warehouse (a test enforces it); `duk -S sharadar` requests through `SharadarClient` and `duk -S fmp` / `duk yc` / `duk ls` through `FMPClient`, which took over the five endpoints only `duk` read; `duk` keeps no HTTP code. The rename is a separate decision | ADR 0017 |
+| 2026-10-24 | **Issues reconciled with the build.** Four closed and 18 bodies revised (*Issue dispositions (applied 2026-10-24)*). Plan v1's ADR numbers are retired: the fundamentals ADRs (#86) take the next free numbers, and P4's release is the next minor, since v2.1.0 went to `security relist` | #41 |
+| 2026-10-25 | **Fundamentals on SF1: five decisions** ([fundamentals-sf1.md](fundamentals-sf1.md), from #83's probe). (1) A restatement is known from the day fafnir first loads it, since SF1 gives no restatement date; each version carries a knowledge interval, closed by the next version's start, so history before the backfill reads as first reported. (2) A version is stored in the share terms of its knowledge date: first-reported values are SF1's ÷ Sharadar's splits after the filing; per-share values are derived in the mart. (3) A split's re-expression is not a version. (4) Rows before 1998 load; the factor panel starts on 1998-01-01. (5) Statements attach to the primary share class only. The document, with the choices it lists, was signed off the same day (GO on #85) | #85 |
 
 ## [built] notes
+
+- **2026-10-25 · P4, #87: the statement schema, migration 0035.** `core.income_statement` (19 line
+  items), `core.balance_sheet` (26) and `core.cash_flow_statement` (13), as
+  [fundamentals-sf1.md](fundamentals-sf1.md) §4.2–4.4 and ADR 0018 specify. Each row is one version
+  of a period, on two timelines:
+  - **knowledge** (`known_from` / `known_to`, half-open), checked by
+    `known_from >= fiscal_date` and "only an `observed` version can be later than the first";
+  - **load** (`loaded_at` / `superseded_at`).
+
+  One current row per version and one version in force per period are unique indexes. There are no
+  per-share columns. `ref.statement_line_item` holds the taxonomy, 58 rows.
+  - **The map:** `fafnir.ingest.fundamentals_map` is the loader's map (#90), and a test holds the
+    migration's rows equal to it.
+  - **Privileges:** explicit grants beside the default privileges. `fafnir_app` reads the taxonomy
+    and no statement table; the least-privilege tests prove both.
+  - **`reset_data.sh`:** `--scope all` lists the three tables (it truncates without CASCADE), and the
+    `vendor:sharadar` report counts them.
+  - **Measured:** SF1's metrics in `extra` come to about 965 bytes a row, about 1.35 GB at full
+    scale (1.39M income rows from the probe's sample). That is under the plan's 2 GB, so they are
+    stored.
+  - **Departures from the issue:**
+    - the taxonomy's rows are inserted by the migration, not `sql/seeds/0002`: seeds do not re-run
+      on an upgraded host (0019 and 0027 did the same for exchanges);
+    - `source DEFAULT 'sharadar'` became a CHECK, since no other vendor writes statements;
+    - per-share columns are gone (ADR 0019).
+  - **Handed to #90:** the foreign key refuses deleting a security that holds statements, so
+    `security merge` and `dedupe` must move them.
+
+- **2026-10-25 · P4, #85 and #86: the fundamentals plan signed off, and its two ADRs.**
+  [fundamentals-sf1.md](fundamentals-sf1.md) got GO on #85 (decision log, 2026-10-25). It records
+  two ADRs at the next free numbers.
+  - [ADR 0018](../adr/0018-bitemporal-fundamentals.md), bitemporal fundamentals on SF1:
+    - three timelines bound to columns: `fiscal_date`; `known_from` / `known_to`;
+      `loaded_at` / `superseded_at`;
+    - restatements known from the day fafnir loads them;
+    - vendor corrections on the load timeline;
+    - versions stored in the share terms of their `known_from`;
+    - every year loads, and cross-sections start at 1998;
+    - the primary share class only.
+  - [ADR 0019](../adr/0019-derived-metrics-not-vendor-metrics.md), derived metrics:
+    - SF1's metrics kept in `extra`, never read by mart;
+    - EPS and DPS derived;
+    - one share-terms expression;
+    - aggregate ratios and yields first;
+    - market cap from raw close × shares;
+    - denominator discipline.
+  - **Also updated:** ADR 0002 gains a status note pointing to 0018; `architecture.md`'s three
+    timelines describe statements as built; `doc/index.md` lists both ADRs.
+  - **Departure from #86.** Its text predates the probe. "SCD-2 on the load timeline" became knowledge
+    intervals beside a load timeline, and "MR = restatements with a knowledge date" became restatements
+    known from the load day, since SF1 dates none.
+  - **Next:** the schema, migration 0035 (#87).
+
+- **2026-10-24 · P4, #83: the SF1 probe.** `fafnir source probe-fundamentals [--vendor sharadar]
+  [--symbols] [--dead N] [--foreign N] [--seed S] [--from-api] [--json]` asks the SF1 rows of the
+  probe set, 20 random dead issuers and 3 issuers that report outside USD the questions the
+  fundamentals design rests on. It gives each a PASS, NOTE or BLOCK verdict, as probe-sharadar does.
+  The verdict table is in [backfill.md](../backfill.md#confirming-the-sf1-feed).
+  - **Where it lives.** `ingest/sf1_probe.py`, not `fafnir.sources`, because it reads the ledger's
+    SF1 and ACTIONS files and the vendor master (ADR 0017 §1). `--from-api` reads the same rows from
+    the API, so this session could run it: there is no ledger here, and the bulk host is not
+    reachable. `sharadar_files.type_row` types an API row as the file reader types the same row.
+  - **First run** (2026-10-24, `--from-api`, 29 tickers, 6,439 rows, 60 requests): no BLOCK.
+    - AR `date` is the SEC filing date; two public-record 10-Ks agree, and no era looks imputed.
+    - MR `date` is the period end, so a restatement carries no knowledge date.
+    - Q4 is its own row, and quarters are discrete.
+    - **Share counts and per-share values are in today's share terms**, against the build prompt's
+      §4.7 rule 1.
+    - An absent item is 0 (41 indicators) and an inapplicable one NULL.
+    - The reporting currency is TICKERS'; `fxusd` is foreign units per USD.
+    - SF1 holds the primary share class only.
+  - **Departures from the issue:**
+    - item 10, *share terms*, was added, because the first measurement showed §4.7's premise does
+      not hold;
+    - the ADR sample became issuers that report outside USD, since a USD-reporting ADR answers
+      nothing about currency;
+    - EDGAR is not reachable from the session, so the five filings to compare are listed in the
+      evidence, and two public-record filing dates are checked in code.
+  - **API facts, now in the client's docstring.** A `ticker` list on SF1 returns only about the last
+    two years, and nothing for a dead issuer. TICKERS ignores `isdelisted`. An SF1 `lastupdated`
+    delta is small: 1,105 rows over four days.
+  - **For #85:** what knowledge date a restatement gets; what share terms the statement tables
+    store; whether a split's re-expression is a new version; whether rows before 1998 load; and how
+    a secondary share class reaches its issuer's statements.
+  - **Next.** On the host: `fafnir source probe-fundamentals` against the ledger's file, compare the
+    five filings with EDGAR, and post the counts on #83.
 
 - **2026-10-24 · P3, Sharadar file retention (no issue; asked for directly).** Nothing deleted a Sharadar
   file, so `bulk_dir` grew every night. The night downloads TICKERS and ACTIONS whole (up to 0.1 GB) and two
