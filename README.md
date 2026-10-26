@@ -91,6 +91,8 @@ duk ph AAPL --adj
 duk ph cik:51143                          # or name a security by CIK/ISIN/CUSIP
 duk ph CC@2008-06-30                      # the security that traded as CC that day
 duk ls --sector Technology
+duk fs AAPL --as-of 2015-06-30            # a statement as known on a date
+duk fa AAPL                               # the security's factor row
 duk -S fmp ph AAPL                        # the same series straight from a vendor
 duk -S sharadar ph AAPL
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
