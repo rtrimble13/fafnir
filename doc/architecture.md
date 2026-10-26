@@ -16,18 +16,23 @@ Provenance flows one direction; every downstream layer is rebuildable from the
 one upstream.
 
 ```
- sources (FMP, later FRED/BLS/BEA)
+ sources (Sharadar, FMP; later FRED/BLS/BEA)
      │   throttled, retrying, bandwidth-metered loaders
      ▼
- landing   raw immutable payloads (landing.fmp_raw)  ── ground truth
+ landing   raw immutable payloads (landing.fmp_raw) and the ledger of Sharadar's
+     │      files on disk (landing.sharadar_file)  ── ground truth
      │   validate + type at the boundary; quarantine failures
      ▼
  core      modeled, constrained source of truth
      │      security, symbol_xref, symbol_change, company_profile,
-     │      daily_price (raw OHLCV), corporate_action, adjustment_factor
+     │      vendor_security, security_vendor_xref,
+     │      daily_price (raw OHLCV), corporate_action, adjustment_factor,
+     │      income_statement, balance_sheet, cash_flow_statement (versioned, ADR 0018)
      ▼
- mart      derived read views/matviews
-            v_daily_price_adjusted (adjusted-on-read), security_latest
+ mart      derived read views/matviews and functions
+            v_daily_price_adjusted (adjusted-on-read), security_latest,
+            fn_statements_as_of, fn_fundamentals_ttm (point in time),
+            fundamental_panel, security_fundamentals_latest (the factors, ADR 0019)
 ```
 
 Cross-cutting schemas:

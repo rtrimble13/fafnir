@@ -9,7 +9,7 @@ patterns to add new sources, tables, and consumers.
 |---|---|---|
 | **Initial release** | security master, daily OHLCV, corporate actions, dual-mode duk | ✅ shipped |
 | **Sharadar** | permaticker identity, dead-issuer history from 1998, corrections to FMP history, nightly feed; `duk -S sharadar` | in progress — [plan](plans/sharadar-adoption.md) |
-| **Fundamentals** | bitemporal statements on Sharadar SF1, point-in-time panel; derived metrics; `duk fs` / `fa` | in progress — Sharadar plan, phase 4 |
+| **Fundamentals** | bitemporal statements on Sharadar SF1, point-in-time panel; derived metrics; `duk fs` / `fa` | ✅ shipped — [guide](fundamentals.md); the production load is #92 |
 | **Economic series** | FRED, BLS, BEA time series; treasury curve for `duk yc` (db) | planned |
 | **MCP server** | agentic read access over `mart`, plus an on-host ops tier | ✅ shipped |
 | **Intraday** | `core.intraday_bar` (TIMESTAMPTZ) | planned |
