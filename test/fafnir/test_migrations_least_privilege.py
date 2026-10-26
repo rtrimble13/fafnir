@@ -351,6 +351,21 @@ def test_fafnir_app_can_read_the_factor_panel(least_privilege_dsn):
         assert app.fetchval("SELECT count(*) FROM mart.fundamental_panel") >= 0
 
 
+def test_fafnir_app_can_read_the_fundamentals_aggregates(least_privilege_dsn):
+    """The industry aggregates read the panel, and the latest snapshot is a matview of
+    its own (0038, #101): once the owner has refreshed them, a mart-only role reads
+    both."""
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        with Database(least_privilege_dsn, autocommit=True) as owner:
+            owner.execute("REFRESH MATERIALIZED VIEW mart.fundamental_panel")
+            owner.execute("REFRESH MATERIALIZED VIEW mart.security_fundamentals_latest")
+        for relation in (
+            "mart.v_industry_fundamentals",
+            "mart.security_fundamentals_latest",
+        ):
+            assert app.fetchval(f"SELECT count(*) FROM {relation}") >= 0, relation
+
+
 def test_the_statement_functions_are_not_executable_by_public(least_privilege_dsn):
     """PostgreSQL grants EXECUTE on a new function to PUBLIC; 0036 revokes it, so
     only the read roles may call them."""

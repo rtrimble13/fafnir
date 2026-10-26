@@ -27,6 +27,18 @@ SELECT * FROM mart.fn_fundamental_panel(
 SELECT * FROM mart.fn_fundamental_snapshot('2020-06-15');
 ```
 
+### By sector, and now
+
+- **`mart.v_industry_fundamentals`** summarizes the panel per month-end, by sector and by
+  sector and industry: how many securities, and for sixteen of the factors their count and
+  quartiles. A group of fewer than three securities has no row, and a factor with fewer than
+  three values has no quartiles, so a median of two companies is never read as a sector norm.
+  The [data dictionary](data_dictionary.md#martv_industry_fundamentals--the-panel-by-sector-and-industry-view)
+  lists the factors.
+- **`mart.security_fundamentals_latest`** is each security's row as of the last refresh, with
+  its symbol and name: for screens. `mart.security_latest`, which duk's screener reads, is
+  unchanged.
+
 ### What a row reads
 
 - **The basis.** The security's latest period known at the date: the trailing twelve months of
@@ -161,7 +173,7 @@ invented.
 | `test/fafnir/test_fundamentals_ingest.py` | integration | `fafnir ingest fundamentals` against the ledger. A backfill on both timelines, then a re-run that writes nothing. A nightly restatement, correction and split. Quarantine, unlinked keys, merges and the command |
 | `test/fafnir/test_fundamentals_integration.py` | integration | End to end (#91): the golden values, read point in time. NULL is kept apart from 0. Loading twice is identical, and one moved value restates. The upgrade and the first load leave every existing table byte-identical |
 | `test/fafnir/test_fundamentals_pit.py` | integration | Migration 0036 (#95): the versions views, `fn_statements_as_of` on both axes, and `fn_fundamentals_ttm`'s contiguity, NULLs and share terms |
-| `test/fafnir/test_fundamental_panel.py` | integration | Migration 0037 (#100): every factor's arithmetic, the denominator rule, currency mismatch, the extra lag, survivorship, the two-year horizon, the look-ahead invariant on a refreshed panel, and the split-era trap through the loader. The panel's TTM meets `fn_fundamentals_ttm` at every month-end of a history with a restatement, a late filing and a missing quarter, and one date or sixty give the same rows |
+| `test/fafnir/test_fundamental_panel.py` | integration | Migration 0037 (#100): every factor's arithmetic, the denominator rule, currency mismatch, the extra lag, survivorship, the two-year horizon, the look-ahead invariant on a refreshed panel, and the split-era trap through the loader. The panel's TTM meets `fn_fundamentals_ttm` at every month-end of a history with a restatement, a late filing and a missing quarter, and one date or sixty give the same rows. Migration 0038 (#101): the aggregates' quartiles over non-NULLs and both suppression rules, and the latest snapshot as today's, refreshed after the panel |
 
 **Golden values** (`test_fundamentals_integration.py`):
 - **AAPL FY2020:** revenue 274,515,000,000, known from the 10-K of 2020-10-30 and not the day

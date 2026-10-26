@@ -415,7 +415,7 @@ As the FMP prompt's §5.3, with these changes:
 
 ### 5.4-5.6
 
-Unchanged: industry aggregates (#101); `mart.security_latest` untouched by this build (#109 re-defines
+Unchanged: industry aggregates (#101, built: §5.9); `mart.security_latest` untouched by this build (#109 re-defines
 it separately, with the same columns); `refresh_marts` iterates a list and stops swallowing real
 failures (#96, which can merge before any of this). *Built (#96):* `maintenance.MATVIEWS`, to which
 #100 appends the panel.
@@ -483,6 +483,22 @@ FMP prompt's §5.3, or adds a rule it did not have:
   gives.
 - **#96's test** expected one view in `MATVIEWS`. It now expects both; the first refresh of the
   empty panel is plain.
+
+### 5.9 As built: the aggregates and the latest snapshot (#101)
+
+Migration 0038 builds §5.4–5.5
+([data dictionary](../data_dictionary.md#martv_industry_fundamentals--the-panel-by-sector-and-industry-view)):
+
+- **`mart.v_industry_fundamentals`** is a view over the panel, by sector and by sector and
+  industry. Names, not ids: the panel carries the names. An industry is grouped under its
+  sector, so the two levels nest.
+- **The named subset** is sixteen factors: one or two per family, and market cap for size.
+- **Suppression.** A group of fewer than three securities has no row, as §5.4 says. The same
+  rule applies per factor: fewer than three values give NULL quartiles, with `_n` still shown.
+- **`mart.security_fundamentals_latest`** is `fn_fundamental_snapshot(current_date)` joined to
+  `core.security` for symbol and name, refreshed after the panel. `mart.security_latest` is not
+  touched; #109 re-defines it separately.
+- **#96's refresh test** now expects the third view, as it did the second for #100.
 
 ---
 

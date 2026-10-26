@@ -326,6 +326,18 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #101: the industry aggregates and the latest snapshot, migration 0038.**
+  - **`mart.v_industry_fundamentals`** summarizes the panel per month-end, by sector and by
+    sector and industry: `n_securities`, and for sixteen factors their non-NULL count and
+    quartiles (`percentile_cont`). A group of fewer than three has no row; a factor with fewer
+    than three values has NULL quartiles.
+  - **`mart.security_fundamentals_latest`** is each security's factors as of the last refresh,
+    appended to `MATVIEWS` after the panel. `mart.security_latest` and duk's screener are
+    unchanged.
+  - **Measured** on the synthetic thousand securities: one month-end of the aggregates reads in
+    16 ms, and the latest snapshot refreshes in 3 s.
+  - **Detail:** [fundamentals-sf1.md §5.9](fundamentals-sf1.md#59-as-built-the-aggregates-and-the-latest-snapshot-101).
+
 - **2026-10-26 · P4, #100: the factor panel, migration 0037.** `mart.fundamental_panel` holds
   the factors at each month-end from 1998, one row per security while it traded.
   `mart.fn_fundamental_panel(dates[], lag)` defines every factor once; the matview and

@@ -1,6 +1,6 @@
 """
-The factor panel (#100, migration 0037): integration tests (FAFNIR_TEST_DSN). Every row
-is synthetic.
+The factor panel (#100, migration 0037) and its aggregates and latest snapshot (#101,
+migration 0038): integration tests (FAFNIR_TEST_DSN). Every row is synthetic.
 
 The plan's §5.3 and ADR 0019: every input known at the as-of date (the standing
 invariant), market cap from the raw close and a share count in the same terms (the
@@ -84,9 +84,9 @@ def _put(
     )
 
 
-def _year(db, sid, year, filed, *, currency="USD", **over):
-    """A fiscal year ending 31 December, all three statements."""
-    end = D(year, 12, 31)
+def _year(db, sid, year, filed, *, currency="USD", end=None, **over):
+    """A fiscal year ending 31 December (or ``end``), all three statements."""
+    end = end or D(year, 12, 31)
     inc = {
         "revenue": 1000,
         "gross_profit": 400,
@@ -720,3 +720,170 @@ def test_market_cap_meets_the_price_in_its_own_share_terms(db, tmp_path):
     for r in (dec, jul):
         pe = 1 / r["earnings_yield"]
         assert 5 < pe < 100, pe
+
+
+# ---------------------------------------------------------------------------
+# The aggregates and the latest snapshot (#101, migration 0038)
+# ---------------------------------------------------------------------------
+
+#: The panel factors mart.v_industry_fundamentals summarizes (0038).
+AGGREGATED = (
+    "market_cap",
+    "earnings_yield",
+    "book_to_price",
+    "sales_to_price",
+    "fcf_yield",
+    "ev_to_ebitda",
+    "roe",
+    "gross_profitability",
+    "operating_margin",
+    "accruals",
+    "debt_to_equity",
+    "interest_coverage",
+    "revenue_growth_yoy",
+    "asset_growth_1y",
+    "dividend_yield_ttm",
+    "shareholder_yield",
+)
+
+
+def _classify(db, sid, sector, industry):
+    for table, column, name in (
+        ("ref.sector", "sector_name", sector),
+        ("ref.industry", "industry_name", industry),
+    ):
+        db.execute(
+            f"INSERT INTO {table} ({column}) VALUES (%s) ON CONFLICT DO NOTHING",
+            (name,),
+        )
+    db.execute(
+        "UPDATE core.security SET"
+        " sector_id = (SELECT sector_id FROM ref.sector WHERE sector_name = %s),"
+        " industry_id = (SELECT industry_id FROM ref.industry WHERE industry_name = %s)"
+        " WHERE security_id = %s",
+        (sector, industry, sid),
+    )
+
+
+def test_the_aggregates_are_quartiles_over_what_is_there(db):
+    # Five in a sector, four of them in one industry: earnings 100 to 180 on a market
+    # cap of 2,000, and interest expense for only two.
+    for i, ni in enumerate((100, 120, 140, 160, 180)):
+        sid = _security(db, f"ZZS{i}")
+        _classify(db, sid, "ZTech", "ZSoftware" if i < 4 else "ZHardware")
+        _year(
+            db,
+            sid,
+            2010,
+            D(2011, 2, 18),
+            net_income=ni,
+            net_income_common=ni,
+            interest_expense=20 if i < 2 else 0,
+        )
+        _price(db, sid, D(2011, 3, 31), 20)
+    _refresh(db)
+    with db.conn.cursor() as cur:
+        cur.execute("SELECT * FROM mart.v_industry_fundamentals LIMIT 0")
+        columns = [d.name for d in cur.description]
+    assert columns == [
+        "group_level",
+        "as_of_date",
+        "sector_name",
+        "industry_name",
+        "n_securities",
+    ] + [f"{m}_{s}" for m in AGGREGATED for s in ("n", "p25", "median", "p75")]
+    rows = {
+        r["group_level"]: r
+        for r in db.fetchall(
+            "SELECT * FROM mart.v_industry_fundamentals"
+            " WHERE as_of_date = '2011-03-31' AND sector_name = 'ZTech'"
+        )
+    }
+    sector = rows["sector"]
+    assert sector["industry_name"] is None and sector["n_securities"] == 5
+    # percentile_cont over the five yields 0.05 ... 0.09.
+    assert sector["earnings_yield_n"] == 5
+    assert sector["earnings_yield_p25"] == pytest.approx(0.06)
+    assert sector["earnings_yield_median"] == pytest.approx(0.07)
+    assert sector["earnings_yield_p75"] == pytest.approx(0.08)
+    assert sector["market_cap_median"] == pytest.approx(2000)
+    # Two values are counted, but too few for a quartile: NULL, not a two-company median.
+    assert sector["interest_coverage_n"] == 2
+    assert sector["interest_coverage_median"] is None
+    # ZSoftware has four securities; ZHardware's one is suppressed.
+    industry = db.fetchall(
+        "SELECT industry_name, n_securities FROM mart.v_industry_fundamentals"
+        " WHERE as_of_date = '2011-03-31' AND group_level = 'industry'"
+    )
+    assert [(r["industry_name"], r["n_securities"]) for r in industry] == [
+        ("ZSoftware", 4)
+    ]
+
+
+def test_a_group_of_fewer_than_three_has_no_row(db):
+    for i in range(2):
+        sid = _security(db, f"ZZP{i}")
+        _classify(db, sid, "ZPair", "ZPairs")
+        _year(db, sid, 2010, D(2011, 2, 18))
+        _price(db, sid, D(2011, 3, 31), 20)
+    _refresh(db)
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM mart.v_industry_fundamentals WHERE sector_name = 'ZPair'"
+        )
+        == 0
+    )
+    # The two are in the panel; only their aggregate is withheld.
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM mart.fundamental_panel WHERE sector_name = 'ZPair'"
+        )
+        == 2
+    )
+
+
+def test_the_latest_snapshot_is_todays_and_refreshes_after_the_panel(db):
+    today = date.today()
+    sid = _security(db, "ZZNOW")
+    _year(
+        db,
+        sid,
+        (today - timedelta(days=200)).year,
+        today - timedelta(days=100),
+        end=today - timedelta(days=200),
+    )
+    _price(db, sid, today - timedelta(days=1), 20)
+    assert maintenance.MATVIEWS == (
+        "mart.security_latest",
+        "mart.fundamental_panel",
+        "mart.security_fundamentals_latest",
+    )
+    # Plain if this session has not filled it yet, else concurrently: either way, after
+    # the panel.
+    refreshed = [view for view, _ in maintenance.refresh_marts(db)]
+    assert refreshed.index("mart.security_fundamentals_latest") > refreshed.index(
+        "mart.fundamental_panel"
+    )
+    with db.conn.cursor() as cur:
+        cur.execute("SELECT * FROM mart.security_fundamentals_latest LIMIT 0")
+        columns = [d.name for d in cur.description]
+        cur.execute("SELECT * FROM mart.fn_fundamental_snapshot(current_date) LIMIT 0")
+        snapshot = [d.name for d in cur.description]
+    assert columns == ["security_id", "symbol", "company_name"] + snapshot[1:]
+    row = db.fetchone(
+        "SELECT * FROM mart.security_fundamentals_latest WHERE security_id = %s", (sid,)
+    )
+    assert (row["symbol"], row["company_name"]) == ("ZZNOW", "ZZNOW Inc")
+    assert {k: v for k, v in row.items() if k not in ("symbol", "company_name")} == (
+        _snapshot(db, today)[sid]
+    )
+    assert row["as_of_date"] == today and row["market_cap"] == 2000
+    assert db.fetchval(
+        "SELECT indisunique FROM pg_index WHERE indexrelid = "
+        "'mart.ux_security_fundamentals_latest'::regclass"
+    )
+    # A later refresh runs concurrently.
+    assert (
+        dict(maintenance.refresh_marts(db))["mart.security_fundamentals_latest"]
+        == "concurrently"
+    )
