@@ -601,6 +601,90 @@ functions as of `current_date`: for screening and dashboards, **not for backtest
 - **EXECUTE** is granted to `fafnir_read`, `fafnir_app` and `fafnir_ops`, and revoked from
   PUBLIC.
 
+### The factor panel (MATERIALIZED VIEW and FUNCTIONS)
+Added by migration 0037 (#100; plan
+[§5.3](plans/fundamentals-sf1.md#53-the-factor-panel-100), ADR 0018, ADR 0019). The
+factor definitions and their literature are in
+[fundamentals.md](fundamentals.md#the-factor-panel-100).
+
+**`mart.fundamental_panel`** (MATERIALIZED VIEW). **Grain:** `(security_id,
+as_of_date)`, unique (`ux_fundamental_panel`); also indexed on `(as_of_date)` and
+`(sector_name, as_of_date)`. **Cadence:** `fafnir db refresh-marts`
+(`maintenance.MATVIEWS`, after `mart.security_latest`).
+- **`as_of_date`** is the last trading day of each month from 1998-01 (decision 4):
+  NYSE's in `ref.trading_calendar`, or the month's last weekday where the calendar
+  does not reach.
+- **A row** is a security that traded in the week to `as_of_date` (a raw close > 0) and
+  had a basis period then. Dead issuers keep their rows while they traded. A secondary
+  share class has no statements and no row.
+- **Created empty.** A read is refused until the first refresh, which runs plainly;
+  later ones run concurrently.
+- **The standing invariant:** `count(*) WHERE known_from > as_of_date` is 0.
+
+**`mart.fn_fundamental_panel(as_of_dates DATE[], extra_lag_days INTEGER DEFAULT 0)`**
+(FUNCTION) is the panel at any dates. Every factor is defined in it once; the
+matview and the snapshot select it.
+- **Statements** are read as known at `as_of_date - extra_lag_days`; prices at
+  `as_of_date`. A negative lag returns no rows.
+- **The basis** is the security's latest period known then: the TTM of four contiguous
+  quarters (`mart.fn_fundamentals_ttm`'s rule), or a fiscal year with its income
+  statement where that is newer. The TTM wins a tie. A basis that ended more than 730
+  days before gives no row.
+- **Year-ago and three-years-ago** periods are the same basis labelled 4 and 12 quarters
+  back, as known at the same date, within 730 and 1,826 days of the basis. Growth
+  compares versions in force at one date.
+
+**`mart.fn_fundamental_snapshot(as_of DATE, extra_lag_days INTEGER DEFAULT 0)`**
+(FUNCTION) is the panel function at one date, for daily as-of reads.
+
+**`mart.fn_ratio(num, den)`** and **`mart.fn_growth(cur, prior)`** (FUNCTIONS) are the
+denominator rule, written once: `num / den` when `den > 0`, else NULL; `cur / prior - 1`
+when `prior > 0`, else NULL. A numerator keeps its sign. Nothing is winsorized,
+clipped or filled.
+
+**Columns** (the panel's and both functions'):
+
+| Group | Columns |
+|---|---|
+| Keys, context | `security_id, as_of_date, exchange_code, sector_name, industry_name, trading_currency, reported_currency, currency_mismatch` |
+| The basis | `basis` (`ttm` or `annual`), `fiscal_date, fiscal_year, fiscal_period, known_from, knowledge_source, days_since_filing` (`as_of_date - known_from`), `ttm_quarters_used` (4, or NULL for a year) |
+| Market state | `price_date` (the close's day, at most 6 days before), `close_raw, close_adjusted, shares_outstanding_as_of, market_cap, enterprise_value` |
+| Value | `earnings_yield, book_to_price, sales_to_price, cash_flow_to_price, fcf_yield, ev_to_ebitda, ev_to_sales, ev_to_ebit, ev_to_fcf` |
+| Quality | `roe, roa, roic, gross_profitability, gross_margin, operating_margin, net_margin, asset_turnover, accruals, net_operating_assets` |
+| Safety | `debt_to_equity, net_debt_to_ebitda, interest_coverage, current_ratio, quick_ratio, altman_z, piotroski_f` (0–9) |
+| Growth | `revenue_growth_yoy, eps_growth_yoy, revenue_cagr_3y, net_income_growth_yoy` |
+| Investment, issuance | `asset_growth_1y, capex_to_sales, net_share_issuance_1y` |
+| Payout | `dividend_yield_ttm, buyback_yield_ttm, shareholder_yield` |
+
+- **Share terms** (ADR 0019 §3). `shares_outstanding_as_of` is the basis's count put in
+  `as_of_date`'s terms with the warehouse's splits (`mart.v_corporate_action`), the list
+  the raw prices follow. `market_cap` is the raw close times it: never a vendor
+  snapshot. EPS and dividends per share are in the same terms.
+- **`enterprise_value`** is market cap plus total debt less cash. It omits minority
+  interest and preferred stock: SF1 carries no balance for either.
+- **`currency_mismatch`**: the statements are not in the trading currency. Every ratio
+  of a statement figure to the price is then NULL, as are `enterprise_value` and
+  `altman_z`. Ratios within the statements stand.
+- **The ratios are doubles**; the money columns are `numeric`.
+
+**How they run.**
+- **Rights.** Plain SQL with the caller's rights, reading only definer-rights mart
+  views. EXECUTE goes to `fafnir_read`, `fafnir_app` and `fafnir_ops`, and is revoked
+  from PUBLIC.
+- **Once per state.** A TTM, or a joined year, changes only when a version under it
+  starts or ends. The panel function computes each once per such state and reads every
+  date from it, so many dates cost about what one does. A test holds its TTM equal to
+  `mart.fn_fundamentals_ttm`'s at every month-end of a history with a restatement, a
+  late filing and a missing quarter.
+- **Planner settings.** The panel function runs with `enable_nestloop = off` and
+  `jit = off` (function-level `SET`). Its materialized steps hide their row counts, and
+  nested loops over them were quadratic. Steering off them lifts the plan's cost over
+  the JIT thresholds, and compiling would take longer than running. Being `SET`, it is
+  not inlined: a filter on `security_id` applies to its result.
+- **Cost, on a synthetic load** of 1,000 securities, 1998–2026, 6.6 million daily bars
+  and a third of quarters restated: the full refresh took **45 s** (291,430 rows), and
+  one date about 3 s. Production's is recorded on #100 after its first refresh.
+
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
 

@@ -443,6 +443,47 @@ settles these points:
 - **Not built:** a two-axis TTM. The two-axis read is `fn_statements_as_of`'s. Average
   balances for ROE-like ratios are the panel's (#100).
 
+### 5.8 As built: the factor panel (#100)
+
+Migration 0037 ([data dictionary](../data_dictionary.md#the-factor-panel-materialized-view-and-functions),
+[definitions](../fundamentals.md#the-factor-panel-100)) builds §5.3. Where it departs from the
+FMP prompt's §5.3, or adds a rule it did not have:
+
+- **One function, any dates.** `mart.fn_fundamental_panel(as_of_dates[], extra_lag_days)`
+  defines every factor. The matview and `fn_fundamental_snapshot(as_of, extra_lag_days)` select
+  it. The prompt's one-date function would have been evaluated once per month-end, and each
+  evaluation rebuilds every TTM in history: the cost grows with months times history.
+- **Once per state.** A TTM, or a joined year, changes only when a version under it starts or
+  ends. Each is computed once per such state, from the quarters it can reach, and every date
+  reads the state it falls in. The same synthetic load refreshes in 45 s. A test holds the TTM
+  equal to `mart.fn_fundamentals_ttm`'s at every month-end of a history with a restatement, a
+  late filing and a missing quarter.
+- **The extra lag is an argument, not a config key.** A matview cannot read `fafnir.toml`. The
+  panel is built at 0; a researcher calls the function with a lag. A negative lag returns
+  nothing.
+- **A two-year horizon (new).** A basis that ended more than 730 days before the knowledge date
+  gives no row: the company has stopped reporting, and its figures against today's price would
+  mislead. It also bounds what one date reads. Stricter staleness rules are a research choice
+  downstream (`fiscal_date`, `days_since_filing`).
+- **The basis** is a TTM, or a fiscal year where that is newer (a filer of annual reports only);
+  the TTM wins a tie. Year-ago and three-years-ago periods are the same basis labelled 4 and 12
+  quarters back, within 730 and 1,826 days of it.
+- **Rows** need a raw close in the week to `as_of_date`. A month whose calendar NYSE does not
+  cover takes its last weekday.
+- **Columns.**
+  - Dropped: `is_derived_q4` (§5.3); `is_actively_trading`, which is today's flag, so a
+    look-ahead in a history; and `version_no`, since a TTM basis rests on up to nine versions.
+    `known_from` and `knowledge_source` describe them all.
+  - `period_type` becomes `basis` (`ttm` or `annual`).
+  - `sector_id` and `industry_id` become the names, as `mart.v_security_profile` exposes them.
+    They are the security master's current classification, not point in time.
+  - Added: `trading_currency`, `fiscal_year`, `fiscal_period`, `price_date`.
+- **Planner settings.** The panel function runs with `enable_nestloop = off` and `jit = off`,
+  for the reasons the [data dictionary](../data_dictionary.md#the-factor-panel-materialized-view-and-functions)
+  gives.
+- **#96's test** expected one view in `MATVIEWS`. It now expects both; the first refresh of the
+  empty panel is plain.
+
 ---
 
 ## 6. Ingestion: `src/fafnir/ingest/fundamentals.py` (#90)

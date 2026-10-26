@@ -403,3 +403,29 @@ What else changes across the seam:
   securities Sharadar feeds.
 - **Older bars are never re-vendored.** A bar FMP wrote before the seam stays FMP's
   (`kept:fmp`): the nightly never overwrites another vendor's row.
+
+## 26. The factor panel is point in time, except its classification
+
+`mart.fundamental_panel` (#100) holds, at each month-end from 1998, the factors from the
+statements known then, against that day's raw close, with share counts in that day's
+terms. It is materialized: refreshed by `fafnir db refresh-marts`, and refused until the
+first refresh after the migration. `mart.fn_fundamental_snapshot(as_of)` and
+`mart.fn_fundamental_panel(dates[], lag)` compute the same rows live.
+
+> **Wrong answer:** a sector-neutral backtest built on `sector_name`. The panel's
+> `sector_name`, `industry_name` and `exchange_code` are the security master's
+> **current** values: a company that moved sector is in its new one in 1999 too.
+
+> **Wrong answer:** "no row, so no data". A security has no row in a month when it did
+> not trade that week, when its latest period known ended more than two years before,
+> or when it has no statements at all (a secondary share class, an ETF). The statement
+> tables say which.
+
+How to check a row:
+- **Its basis:** `basis`, `fiscal_date`, `known_from`, `knowledge_source`; the TTM it
+  rests on is `mart.fn_fundamentals_ttm(as_of_date)` at `fiscal_date`.
+- **The invariant:** `SELECT count(*) FROM mart.fundamental_panel WHERE known_from >
+  as_of_date` is 0, always.
+- **Its market cap** is `close_raw × shares_outstanding_as_of`, the count put in
+  `as_of_date`'s terms with `mart.v_corporate_action`'s splits. A P/E that is 2, 7 or
+  112 times off means a split is missing from the warehouse's list (ADR 0019).
