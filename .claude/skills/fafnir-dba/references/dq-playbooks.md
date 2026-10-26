@@ -914,15 +914,33 @@ flags — in 2026-08 an `upsert_security` that assigned `sector_id` from `EXCLUD
 without `COALESCE` blanked 26,393 rows over eight days, and every night reported
 success. Resolving those individually would have been the worst possible response.
 
+Since #109 the check reads the classification readers see,
+`core.v_security_classification`. That is the feeding vendor's: for a security
+Sharadar feeds, Sharadar's TICKERS names mapped onto fafnir's, else `core.security`'s
+pair. Split the count by who supplies it:
+
 ```sql
-SELECT count(*) FILTER (WHERE sector_id IS NULL) AS unclassified,
+SELECT c.attributes_source,
+       count(*) FILTER (WHERE c.sector_id IS NULL OR c.industry_id IS NULL) AS unclassified,
        count(*) AS listed
-  FROM core.security WHERE is_actively_trading AND delisted_date IS NULL;
+  FROM core.security s JOIN core.v_security_classification c USING (security_id)
+ WHERE s.is_actively_trading AND s.delisted_date IS NULL
+ GROUP BY 1;
 ```
 
-**Repair** by running `fafnir ingest securities` on a build that carries the
-screener classification through `upsert_security`, then `fafnir db refresh-marts`
-so `mart.security_latest` — and therefore `screen_securities` — agrees.
+**Repair** depends on the source:
+- **`sharadar` with no industry:** a Sharadar name fafnir's vocabulary lacks. Find it
+  in `core.vendor_security` (`sector`, `industry` of the linked key). The fix is an
+  alias in `sharadar_map.INDUSTRY_ALIASES` and in migration 0039's list, which a test
+  holds equal. That is a code change: propose it.
+- **`fmp`, or Sharadar's sector did not map:** the pair is `core.security`'s. In FMP's
+  night, run `fafnir ingest securities` on a build that carries the screener
+  classification through `upsert_security`. In Sharadar's night that loader does not
+  run, so the gap is Sharadar's (its sector is missing or unmapped).
+
+Then `fafnir db refresh-marts`, so `mart.security_latest`, and therefore
+`screen_securities`, agrees. `dq recheck` closes the flag once the classification is
+there.
 
 **Resolve when** the universe load has run since and the security is still
 unclassified: that is the vendor's gap, not the warehouse's. Say which in the note.

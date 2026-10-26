@@ -144,8 +144,9 @@ screens, never for a backtest, since they know every restatement since.
    or `delisted_date IS NULL` throws them out and biases every return upward.
 8. **Join statements on `fiscal_date`,** never on knowledge dates: the three statements of
    one period can become known on different days.
-9. **Classification is today's.** `sector_name` and `industry_name` are the security master's
-   current values, not as they were at the date.
+9. **Classification is today's.** `sector_name` and `industry_name` are the current
+   classification, not as it was at the date: the feeding vendor's
+   (`core.v_security_classification`, #109), Sharadar's for a security Sharadar feeds.
 
 **Deferred: an estimated restatement timeline.** One research mode would date each restated
 value from the filing of the same period a year later, giving growth rates a consistent basis.

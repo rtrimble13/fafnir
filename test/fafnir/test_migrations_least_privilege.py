@@ -478,6 +478,45 @@ def _migrate_and_open_as_ops(dsn: str):
     return Database(_as_ops_dsn(dsn), autocommit=True)
 
 
+def test_fafnir_app_can_read_the_attribute_precedence(least_privilege_dsn):
+    """0039 (#109): a mart-only role reads the precedence view, the re-created
+    screener and the re-defined profile; the classification under them is core's,
+    out of its reach."""
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        for relation in (
+            "mart.v_security_attributes",
+            "mart.security_latest",
+            "mart.v_security_profile",
+        ):
+            assert app.fetchval(f"SELECT count(*) FROM {relation}") >= 0, relation
+        with pytest.raises(Exception, match="permission denied"):
+            app.fetchval("SELECT count(*) FROM core.v_security_classification")
+    with Database(least_privilege_dsn, autocommit=True) as owner:
+        can = owner.fetchone("""
+            SELECT has_function_privilege('public', f, 'EXECUTE') AS public_can,
+                   has_function_privilege('fafnir_app', f, 'EXECUTE') AS app_can,
+                   has_function_privilege('fafnir_ingest', f, 'EXECUTE') AS ingest_can
+              FROM CAST('mart.fn_security_betas(date)' AS regprocedure) f
+            """)
+    assert (can["public_can"], can["app_can"], can["ingest_can"]) == (
+        False,
+        True,
+        False,
+    )
+
+
+def test_fafnir_read_and_ingest_can_read_the_classification(least_privilege_dsn):
+    """fafnir_read reads core; the DQ check that reads the classification runs as
+    the ingest role."""
+    with _open_as_read_member(least_privilege_dsn) as reader:
+        assert not _unreadable(reader, ("core.v_security_classification",))
+    with Database(least_privilege_dsn, autocommit=True) as owner:
+        assert owner.fetchval(
+            "SELECT has_table_privilege('fafnir_ingest', "
+            "'core.v_security_classification', 'SELECT')"
+        )
+
+
 # The vendor identity tables (0031, #55) are core: fafnir_read reads them, as it
 # reads the rest of core, and no mart view exposes them yet (a mart view is a
 # grant, #79). The read member is created here because no other test needs one.

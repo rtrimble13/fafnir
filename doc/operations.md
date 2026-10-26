@@ -1392,6 +1392,13 @@ back exactly and recomputes the security's factors. See
   `mart.security_latest`, then the factor panel `mart.fundamental_panel` (#100), then
   `mart.security_fundamentals_latest` (#101), and the views later builds append. It prints
   each view and how it was refreshed.
+  - **The screener** (`mart.security_latest`) reads `mart.v_security_attributes` since
+    #109: the feeding vendor's sector and industry, and a market cap and beta derived
+    where they can be. Its refresh computes every security's beta from a year of
+    returns, so it takes longer than it did. Record its time with #106's. To set FMP's
+    frozen values against the new ones, run
+    `psql "$FAFNIR_DSN" -X -f scripts/attributes_report.sql`, which prints aggregates
+    only, and post the output on #109.
   - **The panel** is created empty by migration 0037, and the latest snapshot by 0038, so
     the first refresh after deploying them is plain and every read before then is refused. It recomputes every month-end from
     1998: 45 s on a synthetic thousand securities; production's is recorded on #92 and,
