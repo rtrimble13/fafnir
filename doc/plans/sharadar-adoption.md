@@ -334,8 +334,8 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
     share counts put in the date's terms with the warehouse's splits. The look-ahead invariant
     and the split-era P/E band are standing tests.
   - **Cost:** each TTM is computed once per knowledge state, not once per month. A synthetic
-    thousand securities over 28 years refreshes in 45 s; production's time is recorded on
-    #100 after the first refresh there.
+    thousand securities over 28 years refreshes in 45 s; production's time and invariant are
+    recorded on #92, after the backfill (its runbook's step 9).
   - **Decided here** ([fundamentals-sf1.md §5.8](fundamentals-sf1.md#58-as-built-the-factor-panel-100)):
     the lag is a function argument, not a config key, and a basis more than two years old
     gives no row.

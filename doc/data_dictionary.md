@@ -683,7 +683,7 @@ clipped or filled.
   not inlined: a filter on `security_id` applies to its result.
 - **Cost, on a synthetic load** of 1,000 securities, 1998–2026, 6.6 million daily bars
   and a third of quarters restated: the full refresh took **45 s** (291,430 rows), and
-  one date about 3 s. Production's is recorded on #100 after its first refresh.
+  one date about 3 s. Production's is recorded on #92, after the backfill (step 9).
 
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
