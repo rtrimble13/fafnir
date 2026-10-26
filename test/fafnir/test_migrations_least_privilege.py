@@ -219,6 +219,20 @@ CLIENT_MART_RELATIONS = (
     # the same readers: the fundamentals taxonomy, so a mart reader can tell a flow
     # from a stock in the statement views (#87, #95).
     "ref.statement_line_item",
+    # the statements, point in time and TTM (0036, #95): every version, and today's.
+    "mart.v_income_statement_versions",
+    "mart.v_balance_sheet_versions",
+    "mart.v_cash_flow_statement_versions",
+    "mart.v_statements_current",
+    "mart.v_fundamentals_ttm",
+)
+
+# The statement functions (0036, #95). Not relations, so not in the lists above: a
+# mart reader calls them, and EXECUTE is granted to the read roles, not to PUBLIC.
+STATEMENT_FUNCTIONS = (
+    "mart.fn_statements_as_of(current_date)",
+    "mart.fn_statements_as_of(current_date, now())",
+    "mart.fn_fundamentals_ttm(current_date)",
 )
 
 # What the seam must NOT reach. core.daily_price is the one that matters most: it
@@ -307,6 +321,39 @@ def test_fafnir_app_still_cannot_reach_core_ops_or_landing(least_privilege_dsn):
             except Exception:  # noqa: BLE001 -- denial is the expected outcome
                 pass
     assert not reachable, f"fafnir_app should not reach: {reachable}"
+
+
+def test_fafnir_app_can_call_the_statement_functions(least_privilege_dsn):
+    """A mart-only role reads the statements point in time through the functions:
+    they run with its rights and read only definer-rights mart views (0036)."""
+    failures = []
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        for call in STATEMENT_FUNCTIONS:
+            try:
+                app.fetchval(f"SELECT count(*) FROM {call}")
+            except Exception as exc:  # noqa: BLE001 -- the message is the report
+                failures.append(f"{call}: {type(exc).__name__}: {exc}")
+    assert not failures, "fafnir_app cannot call:\n  " + "\n  ".join(failures)
+
+
+def test_the_statement_functions_are_not_executable_by_public(least_privilege_dsn):
+    """PostgreSQL grants EXECUTE on a new function to PUBLIC; 0036 revokes it, so
+    only the read roles may call them."""
+    m.migrate(least_privilege_dsn)
+    with Database(least_privilege_dsn, autocommit=True) as owner:
+        rows = owner.fetchall("""
+            SELECT p.oid::regprocedure::text AS fn,
+                   has_function_privilege('public', p.oid, 'EXECUTE') AS public_can,
+                   has_function_privilege('fafnir_app', p.oid, 'EXECUTE') AS app_can,
+                   has_function_privilege('fafnir_ingest', p.oid, 'EXECUTE')
+                       AS ingest_can
+              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'mart'
+               AND p.proname IN ('fn_statements_as_of', 'fn_fundamentals_ttm')
+            """)
+    assert len(rows) == len(STATEMENT_FUNCTIONS)
+    assert all(r["app_can"] and not r["public_can"] for r in rows), rows
+    assert not any(r["ingest_can"] for r in rows), rows
 
 
 def test_dq_seam_exposes_no_resolution_provenance(least_privilege_dsn):

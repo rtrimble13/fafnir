@@ -527,6 +527,80 @@ acquirer_ticker, acquirer_name, acquirer_security_id, survivorship_complete_from
 The vendor keys, the link evidence and the other lifecycle events stay in `core`.
 Like every `mart` view it is a grant to every reader (ADR 0009).
 
+### The statements, point in time (VIEWS and FUNCTIONS)
+Added by migration 0036 (#95; [ADR 0018](adr/0018-bitemporal-fundamentals.md), plan
+[§5.1–5.2](plans/fundamentals-sf1.md#5-the-mart-migrations-0036-0038)). The design and
+the rules for reading the statements are ADR 0018's; these are its read seam.
+
+**`mart.v_income_statement_versions`, `mart.v_balance_sheet_versions`,
+`mart.v_cash_flow_statement_versions`** (VIEWS). **Grain:** the core table's: one row
+per version of a period, per load.
+- **Columns:** `security_id, period_type, fiscal_date, calendar_date, fiscal_year,
+  fiscal_period, version_no, known_from, known_to, knowledge_source, filing_date,
+  loaded_at, superseded_at, reported_currency`, then the table's line items.
+- **Left out:** `extra` (SF1's vendor metrics are never read through mart: ADR 0019),
+  `vendor_key`, `content_hash`, `source` and `ingestion_run_id`.
+
+**`mart.fn_statements_as_of(as_of DATE)`** (FUNCTION) returns, per
+`(security_id, period_type)`, the latest `fiscal_date` with a version in force at
+`as_of`.
+- **Joining.** The three statements join on `fiscal_date`, never on knowledge dates. Each
+  is read at its own version in force. A statement the period lacks is NULL.
+- **Columns:**
+  - `security_id, period_type, fiscal_date, calendar_date, fiscal_year, fiscal_period,
+    reported_currency`;
+  - `known_from`: the latest of the three, since the row was not knowable before it;
+  - `knowledge_source`: the weakest of the three, `estimated` then `observed` then
+    `filed`;
+  - `has_income, has_balance_sheet, has_cash_flow`;
+  - per statement, `<statement>_version_no, <statement>_known_from,
+    <statement>_knowledge_source`, with prefixes `income`, `balance_sheet`, `cash_flow`;
+  - then every line item.
+- **Share counts** are in the terms of their statement's `_known_from` (ADR 0019).
+- **For backtests:** nothing in it was knowable after `as_of`.
+
+**`mart.fn_statements_as_of(as_of DATE, load_as_of TIMESTAMPTZ)`** is the same read, as
+fafnir held the statements at `load_as_of`:
+- the rows loaded by then and not yet superseded;
+- a version loaded later is ignored, and its predecessor read as open.
+
+It reproduces a past run.
+
+**`mart.fn_fundamentals_ttm(as_of DATE)`** (FUNCTION) gives the trailing twelve months
+for every quarter-end of the income statement in force at `as_of`.
+- **Flows** sum four contiguous quarters, each at its version in force at `as_of`, or
+  are NULL. A flow NULL in any of the four is NULL. There is never a partial sum.
+- **Contiguous** means consecutive fiscal labels, each period end 8 to 18 weeks after the
+  one before. A retailer's 16-week first quarter is included.
+- **Stocks and share counts** take the latest quarter: a balance-sheet item is never
+  summed.
+- **No derived Q4 and no year-to-date de-cumulation:** SF1 files Q4 and its quarters are
+  discrete (#83).
+- **Columns:**
+  - `security_id, fiscal_date, calendar_date, fiscal_year, fiscal_period,
+    reported_currency`;
+  - `ttm_quarters_used` (1–4, from the income statement) and `cash_flow_quarters_used`;
+  - `has_balance_sheet`;
+  - `known_from`: the latest of every constituent, since a TTM figure is not knowable
+    before its last quarter;
+  - `knowledge_source`: the weakest;
+  - `income_known_from` and `balance_sheet_known_from`: the latest quarter's, the share
+    terms of its counts;
+  - then every line item.
+- **Average balances** for ROE-like ratios are the panel's (#100).
+
+**`mart.v_statements_current`** and **`mart.v_fundamentals_ttm`** (VIEWS) are the two
+functions as of `current_date`: for screening and dashboards, **not for backtests**.
+
+**How they run.**
+- **Rights.** The functions are plain SQL, `STABLE`, and run with their caller's
+  rights. They read only the definer-rights views above, so a mart-only role needs no
+  `core`.
+- **Inlining.** The planner inlines them, so a filter on `security_id` reaches the
+  statement tables' indexes.
+- **EXECUTE** is granted to `fafnir_read`, `fafnir_app` and `fafnir_ops`, and revoked from
+  PUBLIC.
+
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
 
