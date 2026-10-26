@@ -271,11 +271,21 @@ def db_ensure_horizon(ctx, through_year, floor_year):
 @db.command("refresh-marts")
 @click.pass_context
 def db_refresh_marts(ctx):
-    """Refresh derived materialized views."""
+    """Refresh derived materialized views.
+
+    Each view in turn, CONCURRENTLY where it holds data (readers keep the old rows
+    meanwhile), each committed on its own. A view that fails does not stop the
+    others; the command then exits non-zero naming it.
+    """
     from fafnir.db import maintenance
 
     with Database(ctx.obj["config"].dsn) as database:
-        maintenance.refresh_marts(database)
+        try:
+            done = maintenance.refresh_marts(database)
+        except maintenance.MartRefreshError as exc:
+            raise click.ClickException(f"Refreshing marts failed: {exc}") from exc
+    for view, mode in done:
+        click.echo(f"  {view}: refreshed {mode}")
     click.echo("Marts refreshed.")
 
 

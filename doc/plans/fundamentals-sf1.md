@@ -417,7 +417,8 @@ As the FMP prompt's §5.3, with these changes:
 
 Unchanged: industry aggregates (#101); `mart.security_latest` untouched by this build (#109 re-defines
 it separately, with the same columns); `refresh_marts` iterates a list and stops swallowing real
-failures (#96, which can merge before any of this).
+failures (#96, which can merge before any of this). *Built (#96):* `maintenance.MATVIEWS`, to which
+#100 appends the panel.
 
 ### 5.7 As built: point-in-time access and TTM (#95)
 

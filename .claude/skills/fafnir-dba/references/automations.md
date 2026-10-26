@@ -221,7 +221,7 @@ the evidence the switch was right, and until then it is only a reasonable bet.
 | Task | Command | Notes |
 |---|---|---|
 | Partitions & calendar horizon | `fafnir db ensure-horizon` | in the nightly; rolls automatically |
-| Mart refresh | `fafnir db refresh-marts` | after any repair that changes core |
+| Mart refresh | `fafnir db refresh-marts` | after any repair that changes core. Refreshes every view in `maintenance.MATVIEWS`, each committed on its own; since #96 a view that fails makes it exit non-zero naming the view (and fails the nightly), where it used to retry plainly and report success |
 | Re-adjust | `fafnir adjust [--symbol X]` | **also after a price reload** — dividend factors are valued against the prior raw close, so new prices change them |
 | Reconciliation | `scripts/reconcile.sh AAPL,MSFT,SPY` | weekly, rotating sample; reports, never overwrites |
 | Backups | `scripts/backup_dump.sh`, `backup_offsite.sh` | dump **every** schema, not a subset |
