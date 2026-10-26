@@ -326,6 +326,22 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #100: the factor panel, migration 0037.** `mart.fundamental_panel` holds
+  the factors at each month-end from 1998, one row per security while it traded.
+  `mart.fn_fundamental_panel(dates[], lag)` defines every factor once; the matview and
+  `fn_fundamental_snapshot` select it.
+  - **Point in time:** statements as known at the date (less the lag), prices at the date,
+    share counts put in the date's terms with the warehouse's splits. The look-ahead invariant
+    and the split-era P/E band are standing tests.
+  - **Cost:** each TTM is computed once per knowledge state, not once per month. A synthetic
+    thousand securities over 28 years refreshes in 45 s; production's time and invariant are
+    recorded on #92, after the backfill (its runbook's step 9).
+  - **Decided here** ([fundamentals-sf1.md §5.8](fundamentals-sf1.md#58-as-built-the-factor-panel-100)):
+    the lag is a function argument, not a config key, and a basis more than two years old
+    gives no row.
+  - **Tests:** twelve in `test_fundamental_panel.py`, the least-privilege test extended, and
+    #96's refresh test expecting the second view.
+
 - **2026-10-26 · P4, #96: `refresh_marts` refreshes a list and stops swallowing failures.**
   `fafnir.db.maintenance.MATVIEWS` (`mart.security_latest`; #100 appends the panel) is
   refreshed in order, each view committed on its own.

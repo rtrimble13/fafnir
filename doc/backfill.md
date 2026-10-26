@@ -698,13 +698,14 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
 | Step | Command | Notes |
 |---|---|---|
 | 1. Dump | `scripts/backup_dump.sh` | Record the path on #92 before anything writes |
-| 2. Deploy | `git pull && fafnir --version && fafnir db migrate` | Applies 0035; add `pip install` if `pyproject.toml` changed ([releasing.md](releasing.md#deploying-it)) |
+| 2. Deploy | `git pull && fafnir --version && fafnir db migrate` | Applies 0035–0037; add `pip install` if `pyproject.toml` changed ([releasing.md](releasing.md#deploying-it)) |
 | 3. A current file | `fafnir source sharadar-bulk --tables SF1 --force` | The ledger's SF1 file is from 2026-10-19: refresh it, so the deltas take over from a current one. About 0.6 GB |
 | 4. The probe | `fafnir source probe-fundamentals` | Its verdicts against the 2026-10-24 table; `--json` stays on the host |
 | 5. Dry run | `time fafnir ingest fundamentals --backfill --dry-run` | Reads everything and writes nothing. Its `<table>:inserted` and `<table>:restated` counts are the rows the run will write |
 | 6. The backfill | `time fafnir ingest fundamentals --backfill` | One run, committed per vendor key, so a stopped run resumes where it stood: re-run the same command |
 | 7. The report | `psql "$FAFNIR_DSN" -X -f scripts/fundamentals_report.sql` | Aggregates only: post it on #92 as it is |
 | 8. A no-op | `fafnir ingest fundamentals --backfill --dry-run` | `0 securities would change`: the load is idempotent on production data too |
+| 9. The panel | `time fafnir db refresh-marts`, then `psql "$FAFNIR_DSN" -Atc "SELECT count(*), count(*) FILTER (WHERE known_from > as_of_date) FROM mart.fundamental_panel"` | The factor panel's first full refresh (#100). Record its time, its rows and the invariant, which must be 0. Past 15 minutes the panel moves to its own timer (#106) |
 
 - **Disk.** The run groups the file by ticker on disk first, under `[sharadar] bulk_dir`.
   Allow about four times the zip's size free there, about 2.5 GB, until it ends. For the
@@ -716,7 +717,7 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
   ```
 - **What to record on #92** (aggregates only, never a vendor value):
   - the dump's path;
-  - steps 3, 5 and 6's times;
+  - steps 3, 5, 6 and 9's times, and step 9's rows and invariant;
   - the disk free before and after;
   - the report's eight sections;
   - the run's counts (`fafnir` prints them; they are also in its `params`);

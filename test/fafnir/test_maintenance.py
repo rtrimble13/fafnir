@@ -75,10 +75,15 @@ def scratch_views(db):
 
 @pytest.mark.integration
 def test_refresh_marts_refreshes_the_list_concurrently_where_it_can(db):
-    assert maintenance.MATVIEWS[0] == "mart.security_latest"
-    assert maintenance.refresh_marts(db) == [("mart.security_latest", "concurrently")]
+    assert maintenance.MATVIEWS == ("mart.security_latest", "mart.fundamental_panel")
+    maintenance.refresh_marts(db)  # the panel is created empty: the first fills it
+    assert maintenance.refresh_marts(db) == [
+        ("mart.security_latest", "concurrently"),
+        ("mart.fundamental_panel", "concurrently"),
+    ]
     assert maintenance.refresh_marts(db, concurrently=False) == [
-        ("mart.security_latest", "plain")
+        ("mart.security_latest", "plain"),
+        ("mart.fundamental_panel", "plain"),
     ]
 
 

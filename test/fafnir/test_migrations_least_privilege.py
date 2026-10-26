@@ -227,12 +227,17 @@ CLIENT_MART_RELATIONS = (
     "mart.v_fundamentals_ttm",
 )
 
-# The statement functions (0036, #95). Not relations, so not in the lists above: a
-# mart reader calls them, and EXECUTE is granted to the read roles, not to PUBLIC.
+# The statement functions (0036, #95) and the factor panel's (0037, #100). Not
+# relations, so not in the lists above: a mart reader calls them, and EXECUTE is
+# granted to the read roles, not to PUBLIC.
 STATEMENT_FUNCTIONS = (
     "mart.fn_statements_as_of(current_date)",
     "mart.fn_statements_as_of(current_date, now())",
     "mart.fn_fundamentals_ttm(current_date)",
+    "mart.fn_fundamental_panel(ARRAY[current_date])",
+    "mart.fn_fundamental_snapshot(current_date)",
+    "mart.fn_ratio(1, 2)",
+    "mart.fn_growth(2, 1)",
 )
 
 # What the seam must NOT reach. core.daily_price is the one that matters most: it
@@ -336,6 +341,16 @@ def test_fafnir_app_can_call_the_statement_functions(least_privilege_dsn):
     assert not failures, "fafnir_app cannot call:\n  " + "\n  ".join(failures)
 
 
+def test_fafnir_app_can_read_the_factor_panel(least_privilege_dsn):
+    """The panel is created empty and filled by `fafnir db refresh-marts` as the
+    owner (0037, #100); then a mart-only role reads it. Not in
+    CLIENT_MART_RELATIONS: before the first refresh a read of it is refused."""
+    with _migrate_and_open_as_app(least_privilege_dsn) as app:
+        with Database(least_privilege_dsn, autocommit=True) as owner:
+            owner.execute("REFRESH MATERIALIZED VIEW mart.fundamental_panel")
+        assert app.fetchval("SELECT count(*) FROM mart.fundamental_panel") >= 0
+
+
 def test_the_statement_functions_are_not_executable_by_public(least_privilege_dsn):
     """PostgreSQL grants EXECUTE on a new function to PUBLIC; 0036 revokes it, so
     only the read roles may call them."""
@@ -349,7 +364,9 @@ def test_the_statement_functions_are_not_executable_by_public(least_privilege_ds
                        AS ingest_can
               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
              WHERE n.nspname = 'mart'
-               AND p.proname IN ('fn_statements_as_of', 'fn_fundamentals_ttm')
+               AND p.proname IN ('fn_statements_as_of', 'fn_fundamentals_ttm',
+                                 'fn_fundamental_panel', 'fn_fundamental_snapshot',
+                                 'fn_ratio', 'fn_growth')
             """)
     assert len(rows) == len(STATEMENT_FUNCTIONS)
     assert all(r["app_can"] and not r["public_can"] for r in rows), rows
