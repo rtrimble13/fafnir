@@ -38,9 +38,11 @@ They are refreshed with the security master and overwritten each time. There is 
 time series behind them.
 
 > **Wrong answer:** "market cap over time" — a series that does not exist. Any
-> such request has to be built from adjusted price × shares outstanding, and
-> shares outstanding is not in the warehouse yet (fundamentals is a planned
-> milestone).
+> such request has to be built from the raw close × shares outstanding in the same
+> share terms (ADR 0019). `core.balance_sheet.shares_outstanding` holds each
+> period's cover count in the terms of its `known_from`, so it is multiplied by the
+> splits after that day first; the mart's derived market cap is still to come
+> (#100, #109).
 
 ## 4. Delisted securities are retained, deliberately
 

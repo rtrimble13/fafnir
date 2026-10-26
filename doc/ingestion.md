@@ -66,6 +66,7 @@ Sharadar (plan v2): files on disk and a ledger, read by the loaders still to com
 | `ingest sharadar-master` | none: reads the ledger's current `tickers` and `actions` files | `core.vendor_security`, `core.vendor_security_event` | `(vendor, vendor_table, vendor_key)`; the event grain |
 | `ingest sharadar-prices` | none: reads the current `stocks` and `funds` files (and `actions` for the splits) | `core.daily_price` (`source = 'sharadar'`), raw recovered | (security_id, trade_date) |
 | `ingest sharadar-actions` | none: reads the current `actions` file | `core.corporate_action` (`source = 'sharadar'`) | (security_id, action_type, ex_date) |
+| `ingest fundamentals` | none: reads the current `fundamentals` (SF1) file with `--backfill`, else its deltas since the last nightly (and `actions` for the splits) | `core.income_statement`, `core.balance_sheet`, `core.cash_flow_statement` | (security_id, period_type, fiscal_date, version_no, loaded_at) |
 | `source ping`, `source probe-sharadar` | slices of `tickers`, `SEP`, `actions`, `SF1` | nothing (read-only) | — |
 
 > **Verify before the first production backfill:** the `symbol-change` payload
@@ -267,8 +268,8 @@ ACTIONS would mis-state every earlier dividend as well as the recovered prices.
 
 **Fundamentals (SF1)**, as `fafnir source probe-fundamentals` measured them on
 2026-10-24 (#83; the verdict table is in
-[backfill.md](backfill.md#confirming-the-sf1-feed)). No SF1 loader exists yet
-(#90).
+[backfill.md](backfill.md#confirming-the-sf1-feed)). `ingest fundamentals` loads
+them ([Statements from SF1](#statements-from-sf1-90)).
 - **`date` is the SEC filing date on AR rows** (ARQ, ARY, ART: as first reported)
   and the period end on MR rows (with restatements). A restatement in SF1 carries
   no knowledge date of its own.
@@ -1326,6 +1327,65 @@ securities it minted. Set `primary_price_vendor` back to `"fmp"` and the real ni
 refuses again. Sharadar's rows stay under precedence, and FMP's loaders resume from
 their watermarks.
 
+### Statements from SF1 (#90)
+
+`fafnir ingest fundamentals` loads SF1's statement indicators into the three
+statement tables, as [plans/fundamentals-sf1.md](plans/fundamentals-sf1.md) §4 and
+§6 and [ADR 0018](adr/0018-bitemporal-fundamentals.md) set out.
+
+```bash
+fafnir ingest fundamentals --backfill --dry-run    # counts only
+fafnir ingest fundamentals --backfill              # the ledger's current SF1 file
+fafnir ingest fundamentals                         # the SF1 deltas since the last nightly
+```
+
+- **What it reads.** First-reported rows (ARQ, ARY) and restated rows (MRQ, MRY), for
+  every security with a Sharadar link, dead issuers included. SF1's trailing rows
+  (ART, MRT) are not read. `--backfill` groups the full file by ticker on disk
+  first, so allow about four times the zip's size free under `bulk_dir`. Without it,
+  the run reads the SF1 delta files recorded since the last nightly run
+  (`sharadar/fundamentals:nightly`). Its `params.through` names the last file
+  applied, so a failed night is read again the next. `source sharadar-delta` does not
+  fetch SF1 yet (#106), so for now the nightly finds nothing to apply.
+- **Identity.** A row's ticker resolves to its permaticker through `core.vendor_security`
+  (`fundamentals`). The permaticker resolves to the security whose link covers the
+  row's `reportperiod`, else to its open link; a period another key's link covers is
+  that key's. A key fafnir does not link is not read. A row of a linked key that no
+  link reaches is counted and flagged `fundamentals_unlinked` (`info`), once per key.
+- **Versions.**
+  - **First reported.** A first-reported row is version 1, known from its filing
+    date (`filed`). Where SF1 changed one, the row is replaced on the load timeline
+    and keeps its knowledge interval: a vendor correction.
+  - **Restated.** A restated row that differs from the version in force is a new
+    version, known from the load day (`observed`). It is compared in the version's
+    share terms and without `shares_outstanding`.
+  - **No first-reported row.** Such a period is known from the issuer's first filing
+    for a period ending on or after it (`estimated`), or with none from the load day.
+- **Share terms.** Share counts are divided by Sharadar's splits after the version's
+  `known_from`, so a later split writes nothing.
+- **No-ops.** A re-run writes nothing: equal hash, or equal values, with share counts
+  equal within a recovery's rounding (1,000 shares, or a millionth).
+- **Quarantine.** These rows are set aside, the rest load, and each is flagged once
+  with its `fundamentals_*` check (`warn`):
+  - a malformed period label;
+  - a value its column cannot hold;
+  - a filing before its period ended;
+  - two rows for one period in one file.
+- **Flags.** Restatements are flagged `fundamentals_restatement` and corrections
+  `fundamentals_vendor_correction`, once per security and run, with the largest moves.
+  A restatement is `warn` from the nightly and `info` from a backfill, which observes
+  the whole of SF1's restated history in one day. `fundamentals_estimated_knowledge_date`
+  (`info`) stands once per security.
+- **Unit of work.** A vendor key's writes are committed together. The run's
+  `params` record the counts, the versions by decade and `knowledge_source` (§7),
+  and any SF1 column with no mapping (kept in `extra` under `unmapped`).
+- **Scope options.** `--symbols`, `--period annual|quarter` and `--limit` narrow the
+  run. A nightly narrowed by any of them leaves the delta files pending for the rest.
+  A security linked after the backfill gets its history from `--backfill --symbols`.
+- **Merges.** `security merge` moves a victim's statements to the survivor. A period
+  both hold keeps the survivor's versions, as bars do. A fold refuses a security that
+  holds statements, and a descope deletes them with the security.
+
 ### Who may write a row: precedence (ADR 0015)
 
 Every row of `core.daily_price` and `core.corporate_action` carries the party that
@@ -1494,6 +1554,7 @@ feed that is not fetched one security at a time. Corporate actions use both halv
 |---|---|
 | `('fmp', 'corporate-actions', <id>)` | this security's full history has been pulled |
 | `('fmp', 'corporate-actions-calendar', 0)` | the market-wide calendar has been read through this date |
+| `('sharadar', 'SF1:<dimension>', <id>)` | the latest `reportperiod` of this SF1 dimension (ARQ, ARY, MRQ, MRY) applied to this security (#90) |
 
 The per-security row is a *presence* flag as much as a date — its absence is what puts
 a newly minted security on the full-history path — so it is stamped with the run date
