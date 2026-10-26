@@ -7165,6 +7165,55 @@ def vendor_status(db: Database, vendor: str, order: Sequence[str] = ()) -> dict:
     return {"tables": tables, "events": int(events or 0), "last_run": last}
 
 
+def fundamentals_status(db: Database) -> dict:
+    """What ``fafnir status`` says about the statements (#102): per table its rows,
+    current versions, versions in force, restatements and the fiscal-date range,
+    the knowledge sources of the current versions, and the factor panel's rows and
+    latest date. Empty tables without the statements (a database mid-migration),
+    and no panel until it is created and refreshed."""
+    tables = []
+    sources: dict[str, int] = {}
+    labels = {
+        "core.income_statement": "income",
+        "core.balance_sheet": "balance",
+        "core.cash_flow_statement": "cash",
+    }
+    for table in STATEMENT_TABLES:
+        statement = labels[table]
+        if db.fetchval("SELECT to_regclass(%s) IS NOT NULL", (table,)) is not True:
+            return {"tables": [], "sources": {}, "panel": None}
+        row = db.fetchone(f"""
+            SELECT count(*) AS rows,
+                   count(*) FILTER (WHERE superseded_at IS NULL) AS versions,
+                   count(*) FILTER (WHERE superseded_at IS NULL AND known_to IS NULL)
+                       AS in_force,
+                   count(*) FILTER (WHERE superseded_at IS NULL AND version_no > 1)
+                       AS restated,
+                   min(fiscal_date) AS first_fiscal, max(fiscal_date) AS last_fiscal
+              FROM {table}
+            """)
+        tables.append({"statement": statement, **row})
+        by_source = db.fetchall(f"""
+            SELECT knowledge_source, count(*) AS n FROM {table}
+             WHERE superseded_at IS NULL GROUP BY 1
+            """)
+        for r in by_source:
+            source = r["knowledge_source"]
+            sources[source] = sources.get(source, 0) + int(r["n"])
+    panel = None
+    if db.fetchval(
+        "SELECT ispopulated FROM pg_matviews"
+        " WHERE schemaname = 'mart' AND matviewname = 'fundamental_panel'"
+    ):
+        panel = db.fetchone(
+            "SELECT count(*) AS rows, max(as_of_date) AS latest"
+            " FROM mart.fundamental_panel"
+        )
+    elif db.fetchval("SELECT to_regclass('mart.fundamental_panel') IS NOT NULL"):
+        panel = {"rows": None, "latest": None}
+    return {"tables": tables, "sources": sources, "panel": panel}
+
+
 # ---------------------------------------------------------------------------
 # core.security_vendor_xref -- the linking engine (#62)
 # ---------------------------------------------------------------------------

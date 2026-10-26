@@ -29,6 +29,9 @@ resolving anything of that kind.
 
 What changes once Sharadar is primary is in [After the cutover](#after-the-cutover) at the end.
 
+**The statement checks** (SF1, #90 and #102) are their own family: [The fundamentals
+flags](#the-fundamentals-flags--statements-from-sf1), before the cutover notes.
+
 ---
 
 ## Durability: what happens to a flag after you close it
@@ -1425,6 +1428,175 @@ round away, it is `price_scale_collapse`'s case: report it, and do not resolve.
 first night's 16,272 were thin ETFs printing one 100-share lot a day, where a
 single trade makes a flat bar. That is a dorq defect, to be fixed in dorq. Do not
 work those one by one, and do not filter them in fafnir.
+
+---
+
+## The fundamentals flags — statements from SF1
+
+Two writers. **The loader** (`fafnir ingest fundamentals`, #90) writes what it sees
+row by row: quarantines and the version events. **`fafnir dq run`** (#102) writes the
+set-based checks over the three statement tables. Every one is once per open
+condition. A statement condition's `record_key` names the period
+(`period_type`, `fiscal_date`), plus the `version_no` where the check reads every
+current version, and the `statement` where the check reads more than one table. So
+a restated version that still fails is a new condition, and one that passes leaves
+the old flag to be resolved.
+
+| Check | From | Severity | Closes by |
+|---|---|---|---|
+| `fundamentals_restatement` | loader | `warn` nightly, `info` backfill | judgement: operations.md › *What a restatement flag means* |
+| `fundamentals_vendor_correction` | loader | `info` | judgement |
+| `fundamentals_estimated_knowledge_date` | loader | `info` | judgement |
+| `fundamentals_unlinked`, `fundamentals_missing_period_label`, `fundamentals_filing_before_period`, `fundamentals_value_out_of_range`, `fundamentals_duplicate_period` | loader quarantine | as the loader sets | the row was not stored: fix the link or wait for the vendor |
+| `balance_sheet_identity` | `dq run` | `error`; `info` with NCI | judgement: operations.md › *Investigating a balance-sheet-identity failure* |
+| `cash_flow_tie`, `cash_balance_tie` | `dq run` | `warn` | judgement |
+| `fundamentals_gap` | `dq run` | `info` | judgement |
+| `fundamentals_stale` | `dq run` | `warn` | **`dq recheck`** |
+| `fundamentals_coverage` | `dq run` | `info` | **`dq recheck`** |
+| `fundamentals_currency_mismatch` | `dq run` | `info` | judgement |
+| `fundamentals_unmapped_fields` | `dq run` | `info` | a map change and a migration |
+| `fundamentals_ttm_incomplete` | `dq run` | `info` | judgement |
+| `fundamentals_negative_impossible` | `dq run` | `error` | judgement |
+| `fundamentals_suspicious_zero` | `dq run` | `info` | judgement |
+| `fundamentals_implausible_filing_lag` | `dq run` | `warn` | judgement |
+| `fundamentals_ytd_suspect` | `dq run` | `warn` | judgement |
+| `fundamentals_version_chain` | `dq run` | `error` | a repair, then resolve |
+
+**Read the versions before anything else.** Every statement question starts here:
+
+```sql
+SELECT version_no, known_from, known_to, knowledge_source, loaded_at, superseded_at,
+       revenue, net_income
+  FROM mart.v_income_statement_versions
+ WHERE security_id = … AND period_type = 'quarter' AND fiscal_date = '…'
+ ORDER BY loaded_at, version_no;
+```
+
+**The vendor is SF1, and the evidence is EDGAR.** The warehouse never edits a
+statement value. A figure SF1 has wrong is fixed by SF1, and arrives as a correction
+(the same version, a new row) or a restatement (a new version). So the outcomes are
+two: **accept** a condition that is real in the filing (`dq accept`, saying what the
+filing shows), or **resolve** one the vendor has since fixed, naming the run.
+
+### `fundamentals_restatement` — a restated row differs from the version in force
+
+The loader made a new knowledge version, known from the day it loaded it
+(`observed`). One flag per security and run, listing the largest moves. A backfill
+dates all of SF1's restated history to its own day, so those are `info`; from the
+nightly, a restatement is news, so `warn`. What it means, and what to check, is in
+operations.md › *What a restatement flag means*. Resolve once read: the version is
+the record.
+
+### `fundamentals_vendor_correction` — SF1 changed a first-reported row
+
+The filing did not change; Sharadar fixed its own record. The old row is
+`superseded_at`, and the new one has the same `version_no` and knowledge dates. A read
+with `load_as_of` before the run reproduces what fafnir held. Resolve once read. A
+correction that moves `known_from` (a corrected filing date) moves what a backtest
+could know, so say so in the note.
+
+### `fundamentals_estimated_knowledge_date` — a restated period with no first report
+
+SF1 holds only the restated row, so the period is known from the issuer's next
+filing (plan §4.5, rule 3). It is `estimated` in every point-in-time read and in the
+panel, where a researcher can exclude it. Resolve once counted. A count by decade is
+in `scripts/fundamentals_report.sql`.
+
+### `balance_sheet_identity` — assets ≠ liabilities + parent equity
+
+Per current version, beyond the larger of 0.5% of assets and 1M of the reporting
+currency. SF1 has no balance for noncontrolling interest, so where the period's income
+statement shows NCI income the gap is that interest: `info`. Elsewhere `error`.
+operations.md › *Investigating a balance-sheet-identity failure* has the steps; the
+usual causes are temporary (mezzanine) equity and redeemable NCI, which SF1 leaves
+out of both liabilities and equity. Accept when the filing shows it.
+
+### `cash_flow_tie`, `cash_balance_tie` — the cash flow does not add up
+
+`cash_flow_tie`: operating + investing + financing + FX ≠ the net change in cash, per
+current version, beyond 0.5% of the largest component or 1M. `cash_balance_tie`: the
+change in `cash_and_equivalents` between consecutive balance sheets in force ≠ the
+period's net change, beyond 2% of the balance or 1M. Restricted cash, which SF1's
+balance leaves out and US GAAP's cash flow has included since 2018, makes the second
+fire; discontinued operations make both. Accept with the filing's reason.
+
+### `fundamentals_gap` — traded, with no statement for over 400 days
+
+Between two periods in force, or before the first (counting from 1998). `info`: SF1's
+coverage of the security has a hole. Compare the vendor master's `first_quarter` and
+`last_quarter` (`core.vendor_security`, `vendor_table = 'fundamentals'`). A hole SF1
+also has is accepted; one it does not is a load to re-run for that security.
+
+### `fundamentals_stale` — an active security's latest period ended over 200 days ago
+
+Keyed by the latest `fiscal_date`, so a later stale period is a new condition.
+**`fafnir dq recheck --check fundamentals_stale`** closes it once the security has filed
+since, or stopped trading. Still open after a recheck: a delinquent filer (accept, if
+so), a load that missed the security (`ingest fundamentals --symbols`), or a link
+pointing at the wrong permaticker (`vendor link`).
+
+### `fundamentals_coverage` — SF1 covers it, the warehouse has nothing
+
+An active security linked to an SF1 entry with a `first_quarter`, and no statement in
+force. **`dq recheck --check fundamentals_coverage`** closes it once statements load or
+the security stops being one SF1 covers. Coverage by sector is in the `dq run` log.
+Still open: the link is newer than the last load (re-run for the symbol), or the
+loader quarantined its rows (`fundamentals_unlinked` for the same key).
+
+### `fundamentals_currency_mismatch` — statements in another currency
+
+One flag per security and reporting currency. Not an error: an ADR reports in its home
+currency. The panel's price ratios are NULL for it, by design (ADR 0019). Accept.
+
+### `fundamentals_unmapped_fields` — a column SF1 added that the map does not know
+
+One flag per column name, for no security, counting rows and securities. **The
+taxonomy's growth signal.** The values are kept in `extra.unmapped`. Deciding whether
+it is a statement line item is a map change (`fundamentals_map.py`) and a migration
+to type it; until then, accept, naming the decision.
+
+### `fundamentals_ttm_incomplete` — a break in the quarterly series
+
+Per security and fiscal year, the quarters in force whose trailing four are not
+contiguous (labels consecutive, 8 to 18 weeks apart), past the series' first three. A
+missing quarter, a mislabelled one, or a fiscal-year change. The panel falls back to
+the fiscal year there. Accept a fiscal-year change; a missing quarter is a coverage
+question for SF1.
+
+### `fundamentals_negative_impossible` — a negative revenue, total assets or share count
+
+`error`, per current version and statement. Almost always a vendor sign or unit
+error: check the filing, and report it to Sharadar; the fix arrives as a correction.
+Resolve after it does.
+
+### `fundamentals_suspicious_zero` — a zero between two reported values
+
+Revenue, net income, weighted shares, total assets, liabilities, parent equity, cash,
+shares outstanding or operating cash flow is 0 in force, and the periods either side
+report it. SF1 writes 0 for an absent value (#83 item 6), so this is usually "not
+reported in that filing" rather than zero. The panel reads 0 as a value. Check the
+filing; accept a real zero, report a missing one.
+
+### `fundamentals_implausible_filing_lag` — known within 5 days of its period end
+
+A filed version whose filing date is under five days after the period ended: likely
+the period end itself recorded as the filing date, which would let a backtest know the
+figures too early. Check EDGAR's filing date. A wrong one is reported to Sharadar and
+arrives as a correction that moves `known_from`.
+
+### `fundamentals_ytd_suspect` — four quarters sum to more than 1.5 years
+
+Revenue, or operating cash flow, in the quarters in force against the fiscal year: the
+quarters were stored year to date, not discretely, and every TTM over them is wrong.
+SF1's quarters are discrete (#83), so this should be rare; report it.
+
+### `fundamentals_version_chain` — a period's knowledge intervals do not chain
+
+`error`: each `known_to` must equal the next version's `known_from`, and only the last
+is open (ADR 0018). The loader keeps this, so a break means a write went around it: a
+manual edit, or a failed transaction that committed half. Repair it on the host
+(close or reopen the interval so it chains), then resolve. Never resolve without the
+repair: point-in-time reads over the break see two versions, or none.
 
 ---
 

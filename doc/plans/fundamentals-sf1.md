@@ -585,6 +585,46 @@ five points this plan left open:
   survivor's versions of a period both hold. A fold refuses a security that holds statements,
   and a descope deletes them with it.
 
+### 6.7 As built: the DQ checks and `status` (#102)
+
+`fafnir dq run` runs §6.5's checks after the price and security checks
+([playbooks](../../.claude/skills/fafnir-dba/references/dq-playbooks.md#the-fundamentals-flags--statements-from-sf1),
+[operations](../operations.md#the-fundamentals-flags)). These points are settled here:
+
+- **What each reads.**
+  - Identities, ties, negatives and the filing lag read every current version
+    (`superseded_at IS NULL`).
+  - Gaps, staleness, coverage, currency, zeros, YTD and the TTM series read the versions
+    in force today.
+  - The chain check reads every current version of a period.
+- **Thresholds.**
+  - The two ties take §6.4's tolerance: the larger of 0.5% (of assets, or of the largest
+    cash-flow component) and 1M of the reporting currency. The cash-balance tie takes 2%
+    of the balance, for restricted cash.
+  - A gap is 400 days without a period end while the security traded. A leading gap
+    counts from 1998.
+  - Stale is 200 days, the filing lag 5 days, and YTD four quarters over 1.5 years.
+- **Coverage** is an active security linked to an SF1 entry with a `first_quarter`
+  (`core.vendor_security`) and no statement in force: a per-security flag. Coverage by
+  sector is logged.
+- **`fundamentals_ttm_incomplete`** is one flag per security and fiscal year, listing
+  the quarters whose trailing four are not contiguous past the series' first three
+  (0036's rule).
+- **`fundamentals_suspicious_zero`** watches nine items that a reporting company never
+  leaves absent: revenue, net income, weighted shares, total assets, liabilities, parent
+  equity, cash, shares outstanding and operating cash flow.
+- **Record keys.**
+  - The open-flag index ignores `table_name`, so a check that reads more than one table
+    names the statement in its `record_key`.
+  - A restated version is its own condition.
+  - `fundamentals_unmapped_fields` is one flag per column, for no security.
+- **`dq recheck`** re-evaluates `fundamentals_stale` and `fundamentals_coverage`, the
+  conditions that clear as the warehouse catches up. The rest judge vendor values.
+- **`status`** appends a statements block and a panel line after every existing line,
+  and prints nothing until statements exist.
+- **The one existing test changed** is the dedupe test's exact `run_all` dict. It now
+  holds the five keys and requires the new ones at 0 (no statements in its fixture).
+
 ---
 
 ## 7. Backfill (#92)

@@ -493,7 +493,8 @@ The two steps under [Primary vendor switch and rollback](#primary-vendor-switch-
 ## Monitoring
 
 ```bash
-fafnir status                 # securities, price rows, latest date, open DQ flags, Sharadar
+fafnir status                 # securities, price rows, latest date, open DQ flags, Sharadar,
+                              # then the statements and the panel once SF1 is loaded
 fafnir dq list                # the open queue, by check and severity
 scripts/run_dq_checks.sh      # gaps/outliers/freshness + open-flag summary
 scripts/monitor.sh            # all of the below in one pass; non-zero if any tripped
@@ -506,6 +507,26 @@ bandwidth by vendor, the Sharadar night, `pg_stat_statements` — and reports; i
 changes nothing. Narrow it
 with section names (`scripts/monitor.sh disk timers backups`) or `--quiet` to see
 only what tripped.
+
+`fafnir status` appends a block once statements are loaded (#102), after every
+existing line, which stays byte for byte as it was:
+
+```
+Statements : income 2000000, balance 2000000, cash 2000000 rows (fiscal 1990-03-31 to 2026-09-30)
+             versions 5990000, in force 3600000; restated 2390000, corrected 10000
+             known filed 3590000, observed 2390000, estimated 10000
+Panel      : 2400000 rows  (latest 2026-09-30)
+```
+
+- **rows** per table, every row on both timelines; the fiscal-date range across them;
+- **versions**: the rows not superseded (each a knowledge version), **in force**
+  today, **restated** (version 2 on), and **corrected** (rows a vendor correction
+  replaced);
+- **known**: the current versions by `knowledge_source`;
+- **Panel**: its rows and latest month-end, or `not refreshed` until the first
+  `fafnir db refresh-marts` after migration 0037.
+
+The figures are round and invented, not production's.
 
 Things to watch:
 - **Open DQ is a count of problems, not of runs** — a standing condition is flagged
@@ -1139,6 +1160,75 @@ AXS fund until 2025 and a copy of Stance's. Separate those first
 ([Separating two issuers](#separating-two-issuers-held-on-one-security), or
 `prices delete` and then `security delist` at the old issuer's end), and the fund's
 own row becomes `next = relist`. Both were done on 2026-10-24.
+
+### The fundamentals flags
+
+`fafnir dq run` runs fourteen checks over the SF1 statements (#102), after the price
+and security checks. `run_all` keeps its five keys and adds one per check; with no
+statement tables (a database mid-migration) the new ones report 0 and run nothing.
+The loader writes its own flags as it loads (#90). Every one has a playbook in
+`.claude/skills/fafnir-dba/references/dq-playbooks.md` (*The fundamentals flags*).
+`fafnir dq recheck` closes the two that clear as the warehouse catches up:
+`fundamentals_stale` (the security has filed since) and `fundamentals_coverage` (its
+statements have loaded). Coverage by sector is in the `dq run` log.
+
+#### What a restatement flag means
+
+`fundamentals_restatement` says SF1's restated row for a period (MRQ, MRY) differs
+from the version in force, so the loader added a version
+([ADR 0018](adr/0018-bitemporal-fundamentals.md)):
+
+- **Known from the load day.** SF1 does not date a restatement. The new version is
+  `observed`, known from the day fafnir loaded it. The previous version's `known_to`
+  is the same day. A read as of an earlier date still sees the figures as first
+  reported, which is what a backtest should see.
+- **One flag per security and run,** listing the periods and the fields that moved
+  most, old against new. From the nightly it is `warn`: something was restated this
+  week. From a backfill it is `info`: the backfill dates all of SF1's restated
+  history to its own day, and most of it is a later filing's reclassified comparatives.
+- **Nothing to repair.** The version is the record. Read the moves; an implausible one
+  (a factor of 1,000, a sign) is a vendor error to check against EDGAR and report. Its
+  fix arrives as a correction. Then resolve, saying what you read.
+- **Not a correction.** `fundamentals_vendor_correction` is SF1 fixing its own
+  first-reported row: the filing did not change, so no version is added. The row is
+  replaced on the load timeline (`superseded_at`), and `fn_statements_as_of(as_of,
+  load_as_of)` before the run reproduces what fafnir held.
+
+```sql
+-- A period's versions, both timelines.
+SELECT version_no, known_from, known_to, knowledge_source, loaded_at, superseded_at,
+       revenue, net_income
+  FROM mart.v_income_statement_versions
+ WHERE security_id = … AND period_type = 'annual' AND fiscal_date = '…'
+ ORDER BY loaded_at, version_no;
+```
+
+#### Investigating a balance-sheet-identity failure
+
+`balance_sheet_identity` compares total assets with total liabilities plus parent
+equity, per current version, beyond the larger of 0.5% of assets and 1M of the
+reporting currency. `detail` carries the three figures, the gap and the tolerance.
+
+1. **NCI or not.** SF1 has no balance for noncontrolling interest. Where the period's
+   income statement shows NCI income (`detail.noncontrolling_income`), the gap is
+   that interest, and the flag is `info`: accept it.
+2. **Read the filing.** Find the balance sheet in the 10-K or 10-Q on EDGAR, and the
+   line between liabilities and equity. Temporary (mezzanine) equity, such as
+   redeemable preferred stock or redeemable NCI, sits outside both, and SF1 follows
+   the filing. If the gap is that line, accept the flag and name it.
+3. **One period or all.** Check the other versions of the period, and its neighbours:
+   - a gap in one restated version and not the first-reported one is a restatement's
+     reclassification;
+   - a gap in every period is the company's structure, as in step 2;
+   - a gap in one period alone, unexplained by the filing, is a vendor error.
+     Report it.
+4. **After a vendor fix.** A correction replaces the row under the same `version_no`,
+   so the flag's `record_key` still names it. Re-run `fafnir dq run`: a fixed row is
+   not flagged again, but the old flag stays open. Resolve it, naming the correction's
+   run.
+
+The share that balances is in `scripts/fundamentals_report.sql`. The plan expects
+over 99% (§13); a drop after a load is a load problem, not a hundred companies.
 
 ## Resolving vendor links
 
