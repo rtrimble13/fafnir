@@ -10,6 +10,10 @@ corrupting research data.
   * freshness -- securities whose latest price lags the market's latest date
   * identity  -- one ticker carrying more than one security row
   * profile   -- actively-traded securities with no sector/industry
+  * fundamentals -- the SF1 statements (#102): identities and ties, gaps and
+                staleness, coverage, impossible or suspicious values, the TTM's
+                quarterly series and the knowledge-interval chains. The loader
+                writes the rest (restatements, corrections, estimated dates).
 
 These are deliberately set-based SQL so they scale across the universe.
 
@@ -619,10 +623,648 @@ def check_missing_classification(db: Database) -> int:
     return int(row["flagged"])
 
 
+# ---------------------------------------------------------------------------
+# Fundamentals (#102; plan doc/plans/fundamentals-sf1.md §6.5)
+# ---------------------------------------------------------------------------
+#
+# Each check is a SELECT of the conditions it finds -- security_id, table_name,
+# record_key, severity, detail -- written through _write_flags, which applies the
+# same once-per-condition rule as every check above: no second row while one is
+# open, none at all once one is accepted. A statement condition's record_key names
+# the period, and the version where the check reads every version, so a restated
+# version that still fails is a new condition and one that passes leaves the old
+# flag to be resolved.
+#
+# "Current" is the load timeline's (superseded_at IS NULL): every knowledge version
+# fafnir holds. "In force" is today's version of each period, the one a read as of
+# today sees (ADR 0018).
+
+STATEMENT_TABLES = (
+    "core.income_statement",
+    "core.balance_sheet",
+    "core.cash_flow_statement",
+)
+CURRENT = "superseded_at IS NULL"
+IN_FORCE = "superseded_at IS NULL AND known_to IS NULL"
+#: A balance sheet balances within the larger of 0.5% of total assets and 1M of the
+#: reporting currency (the build prompt's §6.4).
+IDENTITY_SHARE, TIE_FLOOR = 0.005, 1_000_000
+#: Cash: the period's change against the cash flow's, within 2% of the balance
+#: (restricted cash, which SF1's balance leaves out, makes small gaps).
+CASH_TIE_SHARE = 0.02
+#: Consecutive periods: a quarter 8 to 18 weeks after the last (TTM contiguity,
+#: 0036), a year 300 to 430 days.
+QUARTER_GAP = (56, 126)
+YEAR_GAP = (300, 430)
+#: No period end in this many days while the security traded is a gap.
+GAP_DAYS = 400
+#: The panel's survivorship floor (decision 4): a leading gap counts from here.
+COVERAGE_FLOOR = "1998-01-01"
+#: An actively trading security whose latest period ended this long ago is stale.
+FUNDAMENTALS_STALE_DAYS = 200
+#: A filing this soon after its period end is implausible.
+FILING_LAG_MIN_DAYS = 5
+#: Four discrete quarters sum to the year; this many years' worth is a quarter
+#: reported year to date.
+YTD_RATIO = 1.5
+#: Items that are never absent for a reporting company, by table: a zero between
+#: two non-zero neighbours is suspect (probe item 6).
+NEVER_ZERO = {
+    "core.income_statement": ("revenue", "net_income", "weighted_average_shares"),
+    "core.balance_sheet": (
+        "total_assets",
+        "total_liabilities",
+        "total_equity_parent",
+        "cash_and_equivalents",
+        "shares_outstanding",
+    ),
+    "core.cash_flow_statement": ("net_cash_operating",),
+}
+#: Items that cannot be negative, by table.
+NEVER_NEGATIVE = {
+    "core.income_statement": (
+        "revenue",
+        "weighted_average_shares",
+        "weighted_average_shares_diluted",
+    ),
+    "core.balance_sheet": ("total_assets", "shares_outstanding"),
+}
+
+_VERSION_KEY = (
+    "jsonb_build_object('period_type', t.period_type, "
+    "'fiscal_date', t.fiscal_date::text, 'version_no', t.version_no)"
+)
+_PERIOD_KEY = (
+    "jsonb_build_object('period_type', t.period_type, "
+    "'fiscal_date', t.fiscal_date::text)"
+)
+#: A check that reads more than one table names the statement in its record_key:
+#: the open-condition index is (check_name, security_id, record_key), so one period
+#: failing in two tables would otherwise be one condition.
+_STATEMENT = {
+    "core.income_statement": "income",
+    "core.balance_sheet": "balance_sheet",
+    "core.cash_flow_statement": "cash_flow",
+}
+
+
+def _keyed(key: str, table: str) -> str:
+    """``key`` (a jsonb_build_object) with the table's statement added."""
+    return key.replace(
+        "jsonb_build_object(",
+        f"jsonb_build_object('statement', '{_STATEMENT[table]}', ",
+        1,
+    )
+
+
+def statements_exist(db: Database) -> bool:
+    """Whether the statement tables are there: a database mid-migration has none."""
+    return bool(
+        db.fetchval(
+            "SELECT bool_and(to_regclass(t) IS NOT NULL) FROM unnest(%s::text[]) t",
+            (list(STATEMENT_TABLES),),
+        )
+    )
+
+
+def _write_flags(
+    db: Database, check: str, detected: str, params: tuple = (), *, what: str
+) -> int:
+    """Insert the conditions ``detected`` selects as ``check`` flags, once each.
+
+    ``detected`` selects ``security_id, table_name, record_key, severity, detail``.
+    Returns the number of new flags; the detected count is logged.
+    """
+    row = db.fetchone(
+        f"""
+        WITH detected AS ({detected}),
+        written AS (
+            INSERT INTO ops.data_quality_flag
+                (security_id, table_name, record_key, check_name, severity,
+                 detail, detected_at)
+            SELECT d.security_id, d.table_name, d.record_key, %s, d.severity,
+                   d.detail, now()
+              FROM detected d
+             WHERE NOT EXISTS (
+                    SELECT 1 FROM ops.data_quality_flag f
+                     WHERE f.check_name = %s
+                       AND f.security_id IS NOT DISTINCT FROM d.security_id
+                       AND f.record_key = d.record_key
+                       AND f.resolved_at IS NULL)
+               AND NOT EXISTS (
+                    SELECT 1 FROM ops.data_quality_flag f
+                     WHERE f.check_name = %s
+                       AND f.security_id IS NOT DISTINCT FROM d.security_id
+                       AND f.record_key = d.record_key
+                       AND f.accepted_at IS NOT NULL)
+            RETURNING 1
+        )
+        SELECT (SELECT count(*) FROM detected) AS detected,
+               (SELECT count(*) FROM written)  AS flagged
+        """,
+        (*params, check, check, check),
+    )
+    logger.info(
+        "%s check: %d %s, %d newly flagged",
+        check,
+        row["detected"],
+        what,
+        row["flagged"],
+    )
+    return int(row["flagged"])
+
+
+def check_balance_sheet_identity(db: Database) -> int:
+    """Assets against liabilities and parent equity, per current version.
+
+    SF1 carries no balance for noncontrolling interest, so where the period's income
+    statement shows NCI income the gap is that interest: ``info`` there, ``error``
+    elsewhere (plan §6.5).
+    """
+    return _write_flags(
+        db,
+        "balance_sheet_identity",
+        f"""
+        SELECT t.security_id, 'core.balance_sheet' AS table_name,
+               {_VERSION_KEY} AS record_key,
+               CASE WHEN nci.has THEN 'info' ELSE 'error' END AS severity,
+               jsonb_build_object(
+                   'total_assets', t.total_assets::float8,
+                   'total_liabilities', t.total_liabilities::float8,
+                   'total_equity_parent', t.total_equity_parent::float8,
+                   'gap', x.gap::float8, 'tolerance', x.tol::float8,
+                   'noncontrolling_income', nci.has) AS detail
+          FROM core.balance_sheet t
+          CROSS JOIN LATERAL (
+                SELECT t.total_assets - t.total_liabilities - t.total_equity_parent
+                           AS gap,
+                       greatest(abs(t.total_assets) * {IDENTITY_SHARE},
+                                {TIE_FLOOR}) AS tol) x
+          CROSS JOIN LATERAL (
+                SELECT EXISTS (
+                    SELECT 1 FROM core.income_statement i
+                     WHERE i.security_id = t.security_id
+                       AND i.period_type = t.period_type
+                       AND i.fiscal_date = t.fiscal_date
+                       AND i.{CURRENT}
+                       AND coalesce(i.net_income_noncontrolling, 0) <> 0) AS has) nci
+         WHERE t.{CURRENT}
+           AND t.total_assets IS NOT NULL AND t.total_liabilities IS NOT NULL
+           AND t.total_equity_parent IS NOT NULL
+           AND abs(x.gap) > x.tol
+        """,
+        what="balance sheets that do not balance",
+    )
+
+
+def check_cash_flow_tie(db: Database) -> int:
+    """Operating, investing and financing cash flows and FX against the net change
+    in cash, per current version (``warn``)."""
+    return _write_flags(
+        db,
+        "cash_flow_tie",
+        f"""
+        SELECT t.security_id, 'core.cash_flow_statement' AS table_name,
+               {_VERSION_KEY} AS record_key, 'warn' AS severity,
+               jsonb_build_object(
+                   'components', x.s::float8,
+                   'net_change_in_cash', t.net_change_in_cash::float8,
+                   'gap', (x.s - t.net_change_in_cash)::float8,
+                   'tolerance', x.tol::float8) AS detail
+          FROM core.cash_flow_statement t
+          CROSS JOIN LATERAL (
+                SELECT t.net_cash_operating + t.net_cash_investing
+                       + t.net_cash_financing + coalesce(t.fx_effect_on_cash, 0) AS s,
+                       greatest(greatest(abs(t.net_cash_operating),
+                                         abs(t.net_cash_investing),
+                                         abs(t.net_cash_financing)) * {IDENTITY_SHARE},
+                                {TIE_FLOOR}) AS tol) x
+         WHERE t.{CURRENT}
+           AND t.net_cash_operating IS NOT NULL AND t.net_cash_investing IS NOT NULL
+           AND t.net_cash_financing IS NOT NULL AND t.net_change_in_cash IS NOT NULL
+           AND abs(x.s - t.net_change_in_cash) > x.tol
+        """,
+        what="cash flows that do not sum to the change in cash",
+    )
+
+
+def check_cash_balance_tie(db: Database) -> int:
+    """The change in cash between consecutive balance sheets against the cash flow's
+    net change, as in force today (``warn``)."""
+    return _write_flags(
+        db,
+        "cash_balance_tie",
+        f"""
+        WITH b AS (
+            SELECT security_id, period_type, fiscal_date,
+                   cash_and_equivalents AS cash,
+                   lag(fiscal_date) OVER w AS prev_fd,
+                   lag(cash_and_equivalents) OVER w AS prev_cash
+              FROM core.balance_sheet
+             WHERE {IN_FORCE}
+            WINDOW w AS (PARTITION BY security_id, period_type ORDER BY fiscal_date)
+        )
+        SELECT t.security_id, 'core.cash_flow_statement' AS table_name,
+               {_PERIOD_KEY} AS record_key, 'warn' AS severity,
+               jsonb_build_object(
+                   'cash', b.cash::float8, 'previous_cash', b.prev_cash::float8,
+                   'previous_fiscal_date', b.prev_fd::text,
+                   'net_change_in_cash', t.net_change_in_cash::float8,
+                   'gap', ((b.cash - b.prev_cash) - t.net_change_in_cash)::float8)
+                   AS detail
+          FROM b
+          JOIN core.cash_flow_statement t
+            ON t.security_id = b.security_id AND t.period_type = b.period_type
+           AND t.fiscal_date = b.fiscal_date AND t.{IN_FORCE}
+         WHERE b.cash IS NOT NULL AND b.prev_cash IS NOT NULL
+           AND t.net_change_in_cash IS NOT NULL
+           AND b.fiscal_date - b.prev_fd BETWEEN
+               CASE b.period_type WHEN 'quarter' THEN {QUARTER_GAP[0]}
+                                  ELSE {YEAR_GAP[0]} END
+               AND CASE b.period_type WHEN 'quarter' THEN {QUARTER_GAP[1]}
+                                      ELSE {YEAR_GAP[1]} END
+           AND abs((b.cash - b.prev_cash) - t.net_change_in_cash)
+               > greatest(greatest(abs(b.cash), abs(b.prev_cash)) * {CASH_TIE_SHARE},
+                          {TIE_FLOOR})
+        """,
+        what="periods whose change in cash does not meet the cash flow",
+    )
+
+
+def check_fundamentals_gap(db: Database) -> int:
+    """A security that traded through more than ``GAP_DAYS`` without a period end in
+    force, between two of its periods or before its first (``info``)."""
+    return _write_flags(
+        db,
+        "fundamentals_gap",
+        f"""
+        WITH p AS (
+            SELECT security_id, fiscal_date,
+                   lag(fiscal_date) OVER (PARTITION BY security_id
+                                          ORDER BY fiscal_date) AS prev_fd
+              FROM (SELECT DISTINCT security_id, fiscal_date
+                      FROM core.income_statement WHERE {IN_FORCE}) d
+        ),
+        inner_gaps AS (
+            SELECT p.security_id, p.prev_fd AS from_d, p.fiscal_date AS to_d
+              FROM p
+             WHERE p.fiscal_date - p.prev_fd > {GAP_DAYS}
+               AND EXISTS (SELECT 1 FROM core.daily_price d
+                            WHERE d.security_id = p.security_id
+                              AND d.trade_date > p.prev_fd
+                              AND d.trade_date < p.fiscal_date)
+        ),
+        leading_gaps AS (
+            SELECT p.security_id, ft.d AS from_d, p.fiscal_date AS to_d
+              FROM p
+              CROSS JOIN LATERAL (
+                    SELECT greatest(min(d.trade_date), DATE '{COVERAGE_FLOOR}') AS d
+                      FROM core.daily_price d
+                     WHERE d.security_id = p.security_id) ft
+             WHERE p.prev_fd IS NULL AND p.fiscal_date - ft.d > {GAP_DAYS}
+        )
+        SELECT g.security_id, 'core.income_statement' AS table_name,
+               jsonb_build_object('from', g.from_d::text, 'to', g.to_d::text)
+                   AS record_key,
+               'info' AS severity,
+               jsonb_build_object('days', g.to_d - g.from_d) AS detail
+          FROM (SELECT * FROM inner_gaps UNION ALL SELECT * FROM leading_gaps) g
+        """,
+        what="stretches traded without a statement",
+    )
+
+
+def check_fundamentals_stale(db: Database) -> int:
+    """An actively trading security whose latest period in force ended more than
+    ``FUNDAMENTALS_STALE_DAYS`` ago (``warn``). A later filing is a new occurrence;
+    ``dq recheck`` closes the old one."""
+    return _write_flags(
+        db,
+        "fundamentals_stale",
+        f"""
+        SELECT l.security_id, 'core.income_statement' AS table_name,
+               jsonb_build_object('latest_fiscal_date', l.fd::text) AS record_key,
+               'warn' AS severity,
+               jsonb_build_object('days', current_date - l.fd) AS detail
+          FROM (SELECT security_id, max(fiscal_date) AS fd
+                  FROM core.income_statement WHERE {IN_FORCE}
+                 GROUP BY security_id) l
+          JOIN core.security s ON s.security_id = l.security_id
+         WHERE s.is_actively_trading AND s.delisted_date IS NULL
+           AND current_date - l.fd > {FUNDAMENTALS_STALE_DAYS}
+        """,
+        what="trading securities with stale statements",
+    )
+
+
+def check_fundamentals_currency_mismatch(db: Database) -> int:
+    """Statements in force reported in a currency other than the security's trading
+    currency (``info``): the panel's price ratios are NULL for them."""
+    return _write_flags(
+        db,
+        "fundamentals_currency_mismatch",
+        f"""
+        SELECT t.security_id, 'core.income_statement' AS table_name,
+               jsonb_build_object('reported_currency', t.reported_currency)
+                   AS record_key,
+               'info' AS severity,
+               jsonb_build_object('trading_currency', coalesce(s.currency, 'USD'),
+                                  'periods', count(*)) AS detail
+          FROM core.income_statement t
+          JOIN core.security s ON s.security_id = t.security_id
+         WHERE t.{IN_FORCE} AND t.reported_currency IS NOT NULL
+           AND t.reported_currency <> coalesce(s.currency, 'USD')
+         GROUP BY t.security_id, t.reported_currency, s.currency
+        """,
+        what="securities reporting in another currency",
+    )
+
+
+def check_fundamentals_unmapped_fields(db: Database) -> int:
+    """SF1 columns the map does not know, landed in ``extra.unmapped``: one flag per
+    column name, for no security (``info``). The taxonomy's growth signal."""
+    return _write_flags(
+        db,
+        "fundamentals_unmapped_fields",
+        f"""
+        SELECT NULL::bigint AS security_id, 'core.income_statement' AS table_name,
+               jsonb_build_object('field', k.key) AS record_key,
+               'info' AS severity,
+               jsonb_build_object('rows', count(*),
+                                  'securities', count(DISTINCT t.security_id))
+                   AS detail
+          FROM core.income_statement t
+          CROSS JOIN LATERAL jsonb_object_keys(t.extra -> 'unmapped') AS k(key)
+         WHERE t.{CURRENT} AND jsonb_typeof(t.extra -> 'unmapped') = 'object'
+         GROUP BY k.key
+        """,
+        what="unmapped SF1 columns",
+    )
+
+
+def _contiguous(a: str, b: str, da: str, db_: str) -> str:
+    lo, hi = QUARTER_GAP
+    return f"({a} - {b} = 1 AND {da} - {db_} BETWEEN {lo} AND {hi})"
+
+
+def check_fundamentals_ttm_incomplete(db: Database) -> int:
+    """Quarters in force whose trailing four are not contiguous, past a security's
+    first three: a missing or mislabelled quarter. One flag per security and fiscal
+    year, listing the quarters (``info``)."""
+    c3 = " AND ".join(
+        (
+            _contiguous("qn", "qn1", "fiscal_date", "d1"),
+            _contiguous("qn1", "qn2", "d1", "d2"),
+            _contiguous("qn2", "qn3", "d2", "d3"),
+        )
+    )
+    return _write_flags(
+        db,
+        "fundamentals_ttm_incomplete",
+        f"""
+        WITH q AS (
+            SELECT security_id, fiscal_date, fiscal_year, fiscal_period,
+                   fiscal_year * 4 + substr(fiscal_period, 2)::int AS qn
+              FROM core.income_statement
+             WHERE period_type = 'quarter' AND {IN_FORCE}
+        ),
+        w AS (
+            SELECT q.*, row_number() OVER w AS rn,
+                   lag(qn, 1) OVER w AS qn1, lag(fiscal_date, 1) OVER w AS d1,
+                   lag(qn, 2) OVER w AS qn2, lag(fiscal_date, 2) OVER w AS d2,
+                   lag(qn, 3) OVER w AS qn3, lag(fiscal_date, 3) OVER w AS d3
+              FROM q
+            WINDOW w AS (PARTITION BY security_id ORDER BY fiscal_date)
+        )
+        SELECT security_id, 'core.income_statement' AS table_name,
+               jsonb_build_object('fiscal_year', fiscal_year) AS record_key,
+               'info' AS severity,
+               jsonb_build_object('quarters',
+                                  jsonb_agg(fiscal_period ORDER BY fiscal_date))
+                   AS detail
+          FROM w
+         WHERE rn >= 4 AND NOT coalesce({c3}, false)
+         GROUP BY security_id, fiscal_year
+        """,
+        what="security-years with an incomplete TTM",
+    )
+
+
+def check_fundamentals_negative_impossible(db: Database) -> int:
+    """A negative total assets, revenue or share count in a current version
+    (``error``)."""
+    parts = []
+    for table, items in NEVER_NEGATIVE.items():
+        cond = " OR ".join(f"t.{c} < 0" for c in items)
+        found = ", ".join(
+            f"'{c}', CASE WHEN t.{c} < 0 THEN t.{c}::float8 END" for c in items
+        )
+        parts.append(f"""
+        SELECT t.security_id, '{table}' AS table_name,
+               {_keyed(_VERSION_KEY, table)} AS record_key,
+               'error' AS severity, jsonb_strip_nulls(jsonb_build_object({found}))
+                   AS detail
+          FROM {table} t
+         WHERE t.{CURRENT} AND ({cond})""")
+    return _write_flags(
+        db,
+        "fundamentals_negative_impossible",
+        "\n        UNION ALL".join(parts),
+        what="versions with an impossible negative",
+    )
+
+
+def check_fundamentals_coverage(db: Database) -> int:
+    """An actively trading security SF1 has statements for (its master's
+    ``first_quarter``) with none in force here (``info``). Logs coverage by sector:
+    the share of such securities with a statement."""
+    eligible = f"""
+        SELECT DISTINCT s.security_id, s.sector_id,
+               EXISTS (SELECT 1 FROM core.income_statement t
+                        WHERE t.security_id = s.security_id AND t.{IN_FORCE})
+                   AS covered
+          FROM core.security s
+          JOIN core.security_vendor_xref x
+            ON x.security_id = s.security_id AND x.vendor = 'sharadar'
+           AND x.valid_to IS NULL
+          JOIN core.vendor_security v
+            ON v.vendor = 'sharadar' AND v.vendor_table = 'fundamentals'
+           AND v.vendor_key = x.vendor_key AND v.first_quarter IS NOT NULL
+         WHERE s.is_actively_trading AND s.delisted_date IS NULL
+    """
+    by_sector = db.fetchall(f"""
+        SELECT coalesce(r.sector_name, '(none)') AS sector, count(*) AS n,
+               count(*) FILTER (WHERE e.covered) AS covered
+          FROM ({eligible}) e
+          LEFT JOIN ref.sector r ON r.sector_id = e.sector_id
+         GROUP BY 1 ORDER BY 1
+        """)
+    for r in by_sector:
+        logger.info(
+            "fundamentals coverage: %s %d of %d (%.1f%%)",
+            r["sector"],
+            r["covered"],
+            r["n"],
+            100.0 * r["covered"] / r["n"],
+        )
+    return _write_flags(
+        db,
+        "fundamentals_coverage",
+        f"""
+        SELECT e.security_id, 'core.income_statement' AS table_name,
+               '{{}}'::jsonb AS record_key, 'info' AS severity,
+               '{{}}'::jsonb AS detail
+          FROM ({eligible}) e
+         WHERE NOT e.covered
+        """,
+        what="SF1-covered securities without statements",
+    )
+
+
+def check_fundamentals_suspicious_zero(db: Database) -> int:
+    """A zero, in force, between two in-force neighbours that report the item: SF1's
+    zero for an absent value where the company does report it (``info``)."""
+    parts = []
+    for table, items in NEVER_ZERO.items():
+        lags = ", ".join(
+            f"lag({c}) OVER w AS {c}_prev, lead({c}) OVER w AS {c}_next" for c in items
+        )
+        hits = " OR ".join(
+            f"({c} = 0 AND {c}_prev <> 0 AND {c}_next <> 0)" for c in items
+        )
+        listed = ", ".join(
+            f"CASE WHEN {c} = 0 AND {c}_prev <> 0 AND {c}_next <> 0 " f"THEN '{c}' END"
+            for c in items
+        )
+        parts.append(f"""
+        SELECT t.security_id, '{table}' AS table_name,
+               {_keyed(_PERIOD_KEY, table)} AS record_key,
+               'info' AS severity,
+               jsonb_build_object('items', to_jsonb(array_remove(ARRAY[{listed}],
+                                                                 NULL))) AS detail
+          FROM (SELECT *, {lags}
+                  FROM {table} WHERE {IN_FORCE}
+                WINDOW w AS (PARTITION BY security_id, period_type
+                             ORDER BY fiscal_date)) t
+         WHERE {hits}""")
+    return _write_flags(
+        db,
+        "fundamentals_suspicious_zero",
+        "\n        UNION ALL".join(parts),
+        what="periods with a suspicious zero",
+    )
+
+
+def check_fundamentals_implausible_filing_lag(db: Database) -> int:
+    """A filed version known less than ``FILING_LAG_MIN_DAYS`` after its period
+    ended (``warn``): a filing date that is probably the period's. Read on the income
+    statement, which every SF1 row carries."""
+    return _write_flags(
+        db,
+        "fundamentals_implausible_filing_lag",
+        f"""
+        SELECT t.security_id, 'core.income_statement' AS table_name,
+               {_VERSION_KEY} AS record_key, 'warn' AS severity,
+               jsonb_build_object('known_from', t.known_from::text,
+                                  'days', t.known_from - t.fiscal_date) AS detail
+          FROM core.income_statement t
+         WHERE t.{CURRENT} AND t.knowledge_source = 'filed'
+           AND t.known_from - t.fiscal_date < {FILING_LAG_MIN_DAYS}
+        """,
+        what="filings implausibly close to their period end",
+    )
+
+
+def check_fundamentals_ytd_suspect(db: Database) -> int:
+    """A fiscal year whose four quarters in force sum to more than ``YTD_RATIO``
+    times the year: quarters reported year to date, not discretely (``warn``).
+    Revenue, and operating cash flow, which 10-Qs report year to date."""
+    parts = []
+    for table, item in (
+        ("core.income_statement", "revenue"),
+        ("core.cash_flow_statement", "net_cash_operating"),
+    ):
+        parts.append(f"""
+        SELECT q.security_id, '{table}' AS table_name,
+               jsonb_build_object('fiscal_year', q.fiscal_year, 'item', '{item}')
+                   AS record_key,
+               'warn' AS severity,
+               jsonb_build_object('quarters', q.s::float8, 'year', a.v::float8)
+                   AS detail
+          FROM (SELECT security_id, fiscal_year, count({item}) AS n,
+                       sum({item}) AS s
+                  FROM {table} WHERE period_type = 'quarter' AND {IN_FORCE}
+                 GROUP BY security_id, fiscal_year) q
+          JOIN (SELECT security_id, fiscal_year, {item} AS v
+                  FROM {table} WHERE period_type = 'annual' AND {IN_FORCE}) a
+            ON a.security_id = q.security_id AND a.fiscal_year = q.fiscal_year
+         WHERE q.n = 4 AND a.v <> 0 AND abs(q.s) > {YTD_RATIO} * abs(a.v)""")
+    return _write_flags(
+        db,
+        "fundamentals_ytd_suspect",
+        "\n        UNION ALL".join(parts),
+        what="years whose quarters look year to date",
+    )
+
+
+def check_fundamentals_version_chain(db: Database) -> int:
+    """A period whose current versions do not chain: each ``known_to`` the next
+    ``known_from``, only the last open (ADR 0018; ``error``). The loader keeps this;
+    a break means a write went around it."""
+    parts = []
+    for table in STATEMENT_TABLES:
+        parts.append(f"""
+        SELECT security_id, '{table}' AS table_name,
+               jsonb_build_object('statement', '{_STATEMENT[table]}',
+                                  'period_type', period_type,
+                                  'fiscal_date', fiscal_date::text) AS record_key,
+               'error' AS severity,
+               jsonb_build_object('versions', jsonb_agg(
+                   jsonb_build_object('version_no', version_no,
+                                      'known_from', known_from::text,
+                                      'known_to', known_to::text)
+                   ORDER BY known_from, version_no)) AS detail
+          FROM (SELECT security_id, period_type, fiscal_date, version_no,
+                       known_from, known_to,
+                       lead(known_from) OVER w AS next_from
+                  FROM {table} WHERE {CURRENT}
+                WINDOW w AS (PARTITION BY security_id, period_type, fiscal_date
+                             ORDER BY known_from, version_no)) v
+         GROUP BY security_id, period_type, fiscal_date
+        HAVING bool_or(CASE WHEN next_from IS NULL THEN known_to IS NOT NULL
+                            ELSE known_to IS DISTINCT FROM next_from END)""")
+    return _write_flags(
+        db,
+        "fundamentals_version_chain",
+        "\n        UNION ALL".join(parts),
+        what="periods whose versions do not chain",
+    )
+
+
+#: The fundamentals checks, in the order ``run_all`` runs them: its keys.
+FUNDAMENTALS_CHECKS = {
+    "balance_sheet_identity": check_balance_sheet_identity,
+    "cash_flow_tie": check_cash_flow_tie,
+    "cash_balance_tie": check_cash_balance_tie,
+    "fundamentals_gap": check_fundamentals_gap,
+    "fundamentals_stale": check_fundamentals_stale,
+    "fundamentals_currency_mismatch": check_fundamentals_currency_mismatch,
+    "fundamentals_unmapped_fields": check_fundamentals_unmapped_fields,
+    "fundamentals_ttm_incomplete": check_fundamentals_ttm_incomplete,
+    "fundamentals_negative_impossible": check_fundamentals_negative_impossible,
+    "fundamentals_coverage": check_fundamentals_coverage,
+    "fundamentals_suspicious_zero": check_fundamentals_suspicious_zero,
+    "fundamentals_implausible_filing_lag": check_fundamentals_implausible_filing_lag,
+    "fundamentals_ytd_suspect": check_fundamentals_ytd_suspect,
+    "fundamentals_version_chain": check_fundamentals_version_chain,
+}
+
+
 def run_all(
     db: Database,
     exchange_code: str = "NASDAQ",
     outlier_threshold: float = DEFAULT_OUTLIER_THRESHOLD,
+    include_fundamentals: bool = True,
 ) -> dict:
     """Run every check and return a summary dict of NEW flag counts.
 
@@ -630,11 +1272,22 @@ def run_all(
     that is the check working, not the check finding nothing. The standing totals
     are in ops.data_quality_flag (and `fafnir status`); the per-check detected
     counts are logged.
+
+    The price and security checks' five keys come first and never change (#102);
+    the fundamentals checks' keys follow, one per check. They are 0 without
+    ``include_fundamentals`` or without the statement tables (a database
+    mid-migration), and then nothing runs against them.
     """
-    return {
+    out = {
         "gaps": check_gaps(db, exchange_code),
         "outliers": check_outliers(db, outlier_threshold),
         "stale": check_freshness(db, exchange_code),
         "duplicate_identity": check_duplicate_identity(db),
         "missing_classification": check_missing_classification(db),
     }
+    run = include_fundamentals and statements_exist(db)
+    if include_fundamentals and not run:
+        logger.info("fundamentals checks skipped: no statement tables")
+    for key, check in FUNDAMENTALS_CHECKS.items():
+        out[key] = check(db) if run else 0
+    return out

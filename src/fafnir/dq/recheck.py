@@ -46,6 +46,7 @@ from fafnir.db.connection import Database
 from fafnir.dq.checks import (
     DEFAULT_OUTLIER_THRESHOLD,
     FRESHNESS_CUTOFF_CTES,
+    FUNDAMENTALS_STALE_DAYS,
     GAP_MIN_SESSION_DENSITY,
     GAP_MIN_SESSIONS_FOR_DENSITY,
     NAV_LAGGING_ASSET_TYPES,
@@ -226,6 +227,46 @@ SELECT f.dq_flag_id
 """
 
 
+# The two fundamentals conditions that clear as the warehouse catches up (#102):
+# the security has filed since, or SF1's statements for it have loaded. The rest of
+# the fundamentals checks judge vendor values, which a new version re-judges under
+# its own record_key.
+_FUNDAMENTALS_STALE_SQL = """
+SELECT f.dq_flag_id
+  FROM ops.data_quality_flag f
+ WHERE f.check_name = 'fundamentals_stale' AND f.resolved_at IS NULL
+   AND NOT EXISTS (
+        SELECT 1 FROM core.security s
+         WHERE s.security_id = f.security_id
+           AND s.is_actively_trading AND s.delisted_date IS NULL
+           AND current_date - (f.record_key->>'latest_fiscal_date')::date
+               > {stale_days}
+           AND (SELECT max(i.fiscal_date) FROM core.income_statement i
+                 WHERE i.security_id = s.security_id
+                   AND i.superseded_at IS NULL AND i.known_to IS NULL)
+               = (f.record_key->>'latest_fiscal_date')::date)
+""".format(stale_days=FUNDAMENTALS_STALE_DAYS)
+
+_FUNDAMENTALS_COVERAGE_SQL = """
+SELECT f.dq_flag_id
+  FROM ops.data_quality_flag f
+ WHERE f.check_name = 'fundamentals_coverage' AND f.resolved_at IS NULL
+   AND (EXISTS (SELECT 1 FROM core.income_statement i
+                 WHERE i.security_id = f.security_id
+                   AND i.superseded_at IS NULL AND i.known_to IS NULL)
+        OR NOT EXISTS (
+            SELECT 1 FROM core.security s
+              JOIN core.security_vendor_xref x
+                ON x.security_id = s.security_id AND x.vendor = 'sharadar'
+               AND x.valid_to IS NULL
+              JOIN core.vendor_security v
+                ON v.vendor = 'sharadar' AND v.vendor_table = 'fundamentals'
+               AND v.vendor_key = x.vendor_key AND v.first_quarter IS NOT NULL
+             WHERE s.security_id = f.security_id
+               AND s.is_actively_trading AND s.delisted_date IS NULL))
+"""
+
+
 class _Rule(NamedTuple):
     sql: str
     # Which settings the SQL takes, in the order its placeholders appear. Named
@@ -272,6 +313,18 @@ RECHECKABLE: dict[str, _Rule] = {
         (),
         "the security now carries a sector and industry, or is no longer a listed "
         "security",
+    ),
+    "fundamentals_stale": _Rule(
+        _FUNDAMENTALS_STALE_SQL,
+        (),
+        "the security has a later period in force than the one this flag records, "
+        "or is no longer actively trading",
+    ),
+    "fundamentals_coverage": _Rule(
+        _FUNDAMENTALS_COVERAGE_SQL,
+        (),
+        "the security now has a statement in force, or is no longer an actively "
+        "trading security SF1 covers",
     ),
 }
 

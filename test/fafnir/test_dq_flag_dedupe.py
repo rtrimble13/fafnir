@@ -241,20 +241,23 @@ def test_dq_run_twice_over_unchanged_data_leaves_the_open_count_unchanged(db):
     # sector, as the nightly load did before the screener carried one -- so
     # `missing_classification` finds two. That is the check working, and it obeys
     # the same once-per-condition rule as the rest.
-    assert first == {
+    # The five price and security keys; the fundamentals checks (#102) add theirs
+    # after them, and find nothing here: there are no statements.
+    assert {k: first[k] for k in list(first)[:5]} == {
         "gaps": 2,
         "outliers": 1,
         "stale": 1,
         "duplicate_identity": 0,
         "missing_classification": 2,
     }
-    assert second == {
+    assert {k: second[k] for k in list(second)[:5]} == {
         "gaps": 0,
         "outliers": 0,
         "stale": 0,
         "duplicate_identity": 0,
         "missing_classification": 0,
     }
+    assert not any(list(first.values())[5:] + list(second.values())[5:])
     assert _open_flags(db) == after_first == 6
 
 

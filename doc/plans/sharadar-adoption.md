@@ -326,6 +326,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #102: fundamentals DQ checks and `status` lines.**
+  - **Fourteen set-based checks** in `dq/checks.py`, written once per condition like
+    every other: the balance-sheet identity (`info` where noncontrolling interest
+    explains the gap), the two cash ties, gaps, staleness, coverage, currency, unmapped
+    SF1 columns, the TTM series, impossible negatives, suspicious zeros, the filing lag,
+    year-to-date quarters, and the knowledge-interval chain.
+  - **`run_all`** keeps its five keys and adds one per check. With no statement tables
+    the new keys report 0 and nothing runs.
+  - **`dq recheck`** closes stale and coverage flags once the warehouse catches up.
+  - **`fafnir status`** appends the statements and the panel after its existing lines,
+    byte for byte unchanged.
+  - **Measured:** the checks take 9 s on the synthetic thousand securities.
+  - **Detail:** [fundamentals-sf1.md §6.7](fundamentals-sf1.md#67-as-built-the-dq-checks-and-status-102).
+
 - **2026-10-26 · P4, #101: the industry aggregates and the latest snapshot, migration 0038.**
   - **`mart.v_industry_fundamentals`** summarizes the panel per month-end, by sector and by
     sector and industry: `n_securities`, and for sixteen factors their non-NULL count and

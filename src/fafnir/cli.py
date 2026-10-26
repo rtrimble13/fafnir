@@ -8440,6 +8440,7 @@ def status(ctx):
         sharadar = repo.vendor_status(
             database, "sharadar", order=("stocks", "funds", "fundamentals", "insiders")
         )
+        fundamentals = repo.fundamentals_status(database)
     click.echo(f"Primary    : {_primary_line(ctx.obj['config'])}")
     click.echo(
         f"Securities : {counts.get('securities', 0)} "
@@ -8470,6 +8471,43 @@ def status(ctx):
             )
     for line in _vendor_status_lines("Sharadar", sharadar):
         click.echo(line)
+    for line in _fundamentals_status_lines(fundamentals):
+        click.echo(line)
+
+
+def _fundamentals_status_lines(st: dict) -> list[str]:
+    """The `status` block for the statements and the factor panel (#102), after
+    every existing line. Nothing without statements, so a host that has not loaded
+    SF1 prints what it always did."""
+    tables = st["tables"]
+    if not tables or not sum(t["rows"] for t in tables):
+        return []
+    first = min(t["first_fiscal"] for t in tables if t["first_fiscal"])
+    last = max(t["last_fiscal"] for t in tables if t["last_fiscal"])
+    versions = sum(t["versions"] for t in tables)
+    lines = [
+        "Statements : "
+        + ", ".join(f"{t['statement']} {t['rows']}" for t in tables)
+        + f" rows (fiscal {first} to {last})",
+        f"             versions {versions}, in force "
+        f"{sum(t['in_force'] for t in tables)}; restated "
+        f"{sum(t['restated'] for t in tables)}, corrected "
+        f"{sum(t['rows'] for t in tables) - versions}",
+        "             known "
+        + ", ".join(
+            f"{s} {st['sources'][s]}"
+            for s in ("filed", "observed", "estimated")
+            if s in st["sources"]
+        ),
+    ]
+    panel = st["panel"]
+    if panel is not None:
+        lines.append(
+            "Panel      : not refreshed -- fafnir db refresh-marts"
+            if panel["rows"] is None
+            else f"Panel      : {panel['rows']} rows  (latest {panel['latest']})"
+        )
+    return lines
 
 
 def _primary_line(cfg) -> str:

@@ -24,7 +24,8 @@ incremental and idempotent — a missed day is caught up on the next run.
    ```
 
 2. **DQ**, `fafnir-dq` (`scripts/run_dq_checks.sh`, `dq.log`): `dq run` (the SQL
-   checks, then dorq per `[dq] engine`), then `dq list`. Its timer is 23:00 ET, but
+   checks, the fundamentals checks since #102, then dorq per `[dq] engine`), then
+   `dq list`. Its timer is 23:00 ET, but
    the unit is `After=fafnir-daily.service`, so it starts when the load ends. A
    DQ failure (dorq exiting) does not mark the load failed.
 
