@@ -625,6 +625,39 @@ five points this plan left open:
 - **The one existing test changed** is the dedupe test's exact `run_all` dict. It now
   holds the five keys and requires the new ones at 0 (no statements in its fixture).
 
+### 6.8 As built: the nightly (#106)
+
+§6.1's nightly and §6.4's cadence, in the night ([operations](../operations.md#fundamentals-in-the-night)).
+These points are settled here:
+
+- **The delta.** SF1 is the third table of `source sharadar-delta`, read by
+  `lastupdated` in filing-date order, never by offset, from the newest SF1 file's
+  fetch day less 3 days. A row read twice fails it, and for SF1 that is the whole row:
+  SF1 can hold twins (§6.3), which pass to the loader. SF1's metrics are numeric by
+  default, so they are not reported as unknown columns.
+- **Step 2 of `ingest sharadar` does not stop for SF1.** A failed SF1 delta warns and
+  is a failed run on record; the next night reads from the same date.
+- **`daily_update.sh`** runs `fafnir ingest fundamentals` after `ingest sharadar`,
+  `upkeep`-wrapped, and before `refresh-marts`, which refreshes the panel. FMP's night
+  has no fundamentals step: it fetches no SF1 delta.
+- **The nightly waits for a backfill.** Until a backfill has succeeded and the
+  statements hold rows, it reads nothing and records no run. Without the wait, a
+  night between this deploy and #92 would load the latest filings alone, before the
+  backfill.
+- **Applied state.** A backfill of every key and period records `params.whole`. The
+  nightly's `through` is the newer of its last run's and the file the last whole
+  backfill read, so a re-run from a fresh file takes over from the deltas before it
+  rather than having older rows laid over it. `sharadar-prune` reads the same state:
+  an applied SF1 delta ages out after the 45-day window, and a pending one is kept.
+- **`scripts/backfill_fundamentals.sh`** is the re-run: a fresh SF1 file (unless
+  `--keep-file` or `--symbols`), the backfill, the marts, and the report. `--dry-run`
+  stops after the loader's dry run. CI runs its `--help`.
+- **Measured on production, not here.** The added wall-clock (the delta, the load,
+  and the panel's refresh) is recorded on #106. Past 15 minutes the panel moves to a
+  timer of its own.
+- **Existing tests changed:** the Sharadar night's pinned sequence in
+  `test/scripts/test_daily_update_modes.py`, which now has the fundamentals step.
+
 ---
 
 ## 7. Backfill (#92)

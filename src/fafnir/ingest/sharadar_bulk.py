@@ -23,16 +23,17 @@ header findings. A table that fails does not undo the ones before it. Nothing is
 loaded into ``core`` here: the loaders (#55, #58, #75) read the files through
 :func:`fafnir.ingest.sharadar_ledger.rows`.
 
-`fafnir source sharadar-delta` (#98) is the nightly half: a price table's rows the
-vendor stamped ``lastupdated`` on or after a date, from the table API
-(:func:`fetch_delta`). The date defaults to when the table's newest file was
-fetched, less ``DELTA_OVERLAP_DAYS``, so a revision stamped the day the last file
-was fetched is read again rather than missed. The rows are read in date order,
-never by offset (:meth:`SharadarClient.query_by_date`), and a (ticker, date) that
-comes back twice fails the table: it is how rows lost to paging show. The rows are
-written as a plain CSV in the bulk file's column order, named by its content, and
-recorded with ``kind = 'delta'``: one run per table (``endpoint = delta:<table>``).
-A delta with no rows is not recorded.
+`fafnir source sharadar-delta` (#98) is the nightly half: a table's rows the vendor
+stamped ``lastupdated`` on or after a date, from the table API (:func:`fetch_delta`):
+the price tables (#98) and SF1 (#106). The date defaults to when the table's newest
+file was fetched, less ``DELTA_OVERLAP_DAYS``, so a revision stamped the day the last
+file was fetched is read again rather than missed. The rows are read in date order
+(SF1's ``date`` is the filing date), never by offset
+(:meth:`SharadarClient.query_by_date`), and a row that comes back twice fails the
+table: it is how rows lost to paging show. The rows are written as a plain CSV in the
+bulk file's column order, named by its content, and recorded with ``kind =
+'delta'``: one run per table (``endpoint = delta:<table>``). A delta with no rows is
+not recorded.
 """
 
 from __future__ import annotations
@@ -61,10 +62,14 @@ logger = get_logger("ingest.sharadar_bulk")
 #: What the initial population downloads (plan v2, P1). Legacy codes are
 #: accepted and recorded under the modern name.
 DEFAULT_TABLES = ("tickers", "actions", "SEP", "SFP", "SF1")
-#: What the nightly fetches as deltas (#98): the price tables, by ``lastupdated``.
-DELTA_TABLES = ("SEP", "SFP")
-#: The API's code for each price table the ledger names in the modern way.
-API_TABLE = {"stocks": "SEP", "funds": "SFP"}
+#: What the nightly fetches as deltas, by ``lastupdated``: the price tables (#98)
+#: and SF1 (#106).
+DELTA_TABLES = ("SEP", "SFP", "SF1")
+#: The API's code for each delta table the ledger names in the modern way.
+API_TABLE = {"stocks": "SEP", "funds": "SFP", "fundamentals": "SF1"}
+#: The tables a night's prices are read from: a failed delta of one stops the
+#: night, and SF1's does not (`fafnir ingest sharadar`, step 2).
+PRICE_TABLES = ("stocks", "funds")
 #: How far a delta reaches back before its table's newest file was fetched.
 DELTA_OVERLAP_DAYS = 3
 #: Where a delta's date window starts. A revision restamps a security's whole
@@ -259,6 +264,15 @@ def write_delta(
     return final, sha, len(data)
 
 
+def _row_key(vendor_table: str, row: dict) -> tuple:
+    """What a row read twice repeats. A price row is one (ticker, date). SF1 can hold
+    twins, rows that share a ticker, dimension and reportperiod, which the loader
+    quarantines (fundamentals-sf1.md §6.3), so there it is the whole row."""
+    if vendor_table in PRICE_TABLES:
+        return (row.get("ticker"), str(row.get("date"))[:10])
+    return tuple(sorted((k, str(v)) for k, v in row.items()))
+
+
 def fetch_delta(
     db: Database,
     client: SharadarClient,
@@ -267,7 +281,7 @@ def fetch_delta(
     *,
     since: Optional[date] = None,
 ) -> TableResult:
-    """Fetch, check and record one price table's rows stamped on or after ``since``
+    """Fetch, check and record one table's rows stamped on or after ``since``
     (default :func:`delta_since`). Never raises for the table's own failure, as
     :func:`download_table`."""
     vendor_table = sf.canonical_table(table)
@@ -318,12 +332,13 @@ def fetch_delta(
                     f"before {since} (first {stale[0].get('ticker')} "
                     f"{stale[0].get('date')}): the lastupdated filter was not applied"
                 )
-            keys = {(r.get("ticker"), str(r.get("date"))[:10]) for r in rows}
+            keys = {_row_key(vendor_table, r) for r in rows}
             if len(keys) < len(rows):
+                what = "a (ticker, date)" if vendor_table in PRICE_TABLES else "a row"
                 raise SourceError(
                     f"{vendor_table}: {len(rows) - len(keys)} of {len(rows)} rows "
-                    "repeat a (ticker, date): the reads overlapped, so as many rows "
-                    "may be missing"
+                    f"repeat {what}: the reads overlapped, so as many rows may be "
+                    "missing"
                 )
             run.params["rows"] = len(rows)
             if not rows:
@@ -346,14 +361,15 @@ def _record_delta(db, run, vendor_table, rows, filters, bulk_dir) -> TableResult
             f"{vendor_table}: the delta's rows lack expected column(s) {missing}; "
             f"they have {seen}. Nothing was recorded."
         )
-    unmapped = [c for c in seen if c not in expected]
+    # SF1's metrics are numeric by default: known, though not listed.
+    unmapped = sf.unknown_columns(vendor_table, seen)
     if unmapped:
         logger.warning(
             "%s delta: column(s) the schema does not know, kept as text: %s",
             vendor_table,
             unmapped,
         )
-    columns = expected + unmapped
+    columns = expected + [c for c in seen if c not in expected]
     path, sha, nbytes = write_delta(rows, columns, bulk_dir, vendor_table)
     entry, created = repo.record_sharadar_file(
         db,

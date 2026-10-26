@@ -56,6 +56,7 @@ jobs:
           duk --help
           duk ph --help
           fafnir-mcp --help
+          scripts/backfill_fundamentals.sh --help
       - name: MCP refuses a writable role
         # The tier boundary ADR 0010 rests on, checked against a real server. The
         # CI DSN is the owning role, so this MUST fail -- a zero exit here means

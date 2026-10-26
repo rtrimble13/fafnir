@@ -16,8 +16,9 @@
 # Two modes, by [general] primary_price_vendor (#111):
 #   fmp       -- FMP's night, below, unchanged since before Sharadar.
 #   sharadar  -- `fafnir ingest sharadar` (universe, prices, actions for what
-#                Sharadar feeds), then, while [general] fmp_secondary is true,
-#                FMP's loaders for what FMP still feeds (funds, unlinked names).
+#                Sharadar feeds), the fundamentals from SF1's delta, then, while
+#                [general] fmp_secondary is true, FMP's loaders for what FMP still
+#                feeds (funds, unlinked names).
 # Rolling back is the setting flipped to "fmp": FMP's loaders resume from their
 # watermarks and, under precedence, never overwrite a row Sharadar wrote.
 #
@@ -115,12 +116,20 @@ fmp_night() {
 }
 
 sharadar_night() {
-    # TICKERS and ACTIONS downloaded whole, the SEP/SFP deltas, the vendor master,
+    # TICKERS and ACTIONS downloaded whole, the SEP/SFP/SF1 deltas, the vendor master,
     # renames/delistings/listings, then bars and actions for what Sharadar feeds. The
     # payload, so fatal, as `ingest prices` is in FMP's night. It recomputes the
     # factors it changes itself. See doc/ingestion.md, "Sharadar as primary".
     echo "==> Sharadar night"
     fafnir ingest sharadar
+
+    # The statements from the SF1 delta the step above fetched (#106). Upkeep: a
+    # fundamentals failure never costs the night's prices, and the deltas it did
+    # not apply stay pending for the next night. Until the backfill has run
+    # (doc/backfill.md) it says so and loads nothing. The factor panel it feeds is
+    # refreshed with the other marts below.
+    echo "==> Fundamentals (SF1 delta)"
+    upkeep fafnir ingest fundamentals
 
     # FMP as the secondary vendor: only what it still feeds (repo.fmp_fed -- the funds
     # and the securities with no Sharadar link), while the reduced tier serves them

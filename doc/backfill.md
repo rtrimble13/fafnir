@@ -682,7 +682,9 @@ What differed from the issue's plan:
 `fafnir ingest fundamentals --backfill` loads SF1's statements into the three statement
 tables from the ledger's SF1 file ([ingestion.md](ingestion.md#statements-from-sf1-90)). On
 the production host it runs once, after migration 0035. The night's SF1 deltas take over
-from it (#106).
+from it (#106): until it has run, the night's fundamentals step says so and loads nothing.
+A later re-run is `scripts/backfill_fundamentals.sh`
+([operations.md](operations.md#fundamentals-in-the-night)).
 
 **Before it** (plan [§2](plans/fundamentals-sf1.md#2-the-probe)):
 - **The probe on the host's file.** Run `fafnir source probe-fundamentals` against the
@@ -705,7 +707,7 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
 | 6. The backfill | `time fafnir ingest fundamentals --backfill` | One run, committed per vendor key, so a stopped run resumes where it stood: re-run the same command |
 | 7. The report | `psql "$FAFNIR_DSN" -X -f scripts/fundamentals_report.sql` | Aggregates only: post it on #92 as it is |
 | 8. A no-op | `fafnir ingest fundamentals --backfill --dry-run` | `0 securities would change`: the load is idempotent on production data too |
-| 9. The panel | `time fafnir db refresh-marts`, then `psql "$FAFNIR_DSN" -Atc "SELECT count(*), count(*) FILTER (WHERE known_from > as_of_date) FROM mart.fundamental_panel"` | The factor panel's first full refresh (#100). Record its time, its rows and the invariant, which must be 0. Past 15 minutes the panel moves to its own timer (#106) |
+| 9. The panel | `time fafnir db refresh-marts`, then `psql "$FAFNIR_DSN" -Atc "SELECT count(*), count(*) FILTER (WHERE known_from > as_of_date) FROM mart.fundamental_panel"` | The factor panel's first full refresh (#100). Record its time, its rows and the invariant, which must be 0. Past 15 minutes the panel moves to its own timer ([#106](operations.md#fundamentals-in-the-night)) |
 
 - **Disk.** The run groups the file by ticker on disk first, under `[sharadar] bulk_dir`.
   Allow about four times the zip's size free there, about 2.5 GB, until it ends. For the
@@ -730,7 +732,8 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
   - the size runs beyond what the disk can take.
 - **To undo it,** `scripts/reset_data.sh --scope fundamentals` (preview), then `--yes`. It
   empties the three tables and their watermarks, and nothing else reads them yet. A reload
-  dates every restatement it finds from the day it runs.
+  dates every restatement it finds from the day it runs. Until the reload, the night's
+  fundamentals step waits.
 
 **The projection.** It was measured on the test database on 2026-10-26, with a synthetic SF1
 of 2,000 tickers over 31 years. That is 930,000 rows, about a quarter of SF1's, with all 112

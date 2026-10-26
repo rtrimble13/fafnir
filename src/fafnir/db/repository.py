@@ -7165,6 +7165,12 @@ def vendor_status(db: Database, vendor: str, order: Sequence[str] = ()) -> dict:
     return {"tables": tables, "events": int(events or 0), "last_run": last}
 
 
+def statements_loaded(db: Database) -> bool:
+    """Whether the income statement holds a row: what the fundamentals nightly
+    applies its deltas to (#106). A reset empties it and keeps the runs."""
+    return bool(db.fetchval("SELECT EXISTS (SELECT 1 FROM core.income_statement)"))
+
+
 def fundamentals_status(db: Database) -> dict:
     """What ``fafnir status`` says about the statements (#102): per table its rows,
     current versions, versions in force, restatements and the fiscal-date range,
@@ -7683,15 +7689,19 @@ def insert_symbol_period(
     )
 
 
-def last_successful_run(db: Database, source: str, endpoint: str) -> Optional[dict]:
-    """The newest successful ``ops.ingestion_run`` of ``source``/``endpoint``."""
+def last_successful_run(
+    db: Database, source: str, endpoint: str, *, params: Optional[dict] = None
+) -> Optional[dict]:
+    """The newest successful ``ops.ingestion_run`` of ``source``/``endpoint``; with
+    ``params``, the newest whose ``params`` hold those keys and values."""
     return db.fetchone(
         """
         SELECT ingestion_run_id, started_at, params FROM ops.ingestion_run
          WHERE source = %s AND endpoint = %s AND status = 'success'
+           AND (%s::jsonb IS NULL OR params @> %s::jsonb)
          ORDER BY ingestion_run_id DESC LIMIT 1
         """,
-        (source, endpoint),
+        (source, endpoint, *[json.dumps(params) if params is not None else None] * 2),
     )
 
 

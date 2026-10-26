@@ -15,6 +15,14 @@ Templates for the scheduled jobs described in
 | `fafnir-dump` | Mon–Sat 04:00 | `scripts/backup_dump.sh` |
 | `fafnir-backup-offsite` | Mon–Sat 04:45 | `scripts/backup_offsite.sh` |
 
+`fafnir-daily` carries the fundamentals too (#106). In Sharadar mode it loads SF1's
+nightly delta after the Sharadar step and refreshes the factor panel with the other
+marts, so there is no fundamentals unit. If the panel's refresh passes 15 minutes on
+production, it moves to a pair of its own, `fafnir-fundamentals.service.in` and
+`.timer.in`, ordered `After=fafnir-daily.service` as `fafnir-dq` is, and
+[operations.md](../../doc/operations.md#fundamentals-in-the-night) says why.
+`scripts/backfill_fundamentals.sh` is never scheduled: it is a by-hand re-run.
+
 `OnCalendar` carries an explicit `America/New_York`, so the slots stay on market
 time across DST while the host clock stays UTC. That is the whole reason to
 prefer these over the fixed-UTC `crontab.example`.

@@ -44,7 +44,9 @@ The daily job performs, in order:
 ingest delisted → ingest prices → vendor link --new → ingest actions → adjust →
 refresh-marts`. `vendor link --new` links tonight's new listings to Sharadar
 ([ingestion.md](ingestion.md#linking-to-a-vendors-identity)). Like the universe
-steps, it warns and carries on if it fails.
+steps, it warns and carries on if it fails. That is FMP's night; in Sharadar mode
+the job runs `ingest sharadar`, then the fundamentals from SF1's delta, then the
+marts ([FMP mode and Sharadar mode](#fmp-mode-and-sharadar-mode)).
 
 Data quality is a second job, `fafnir-dq` (`scripts/run_dq_checks.sh`), which runs
 once the daily has finished; the cron example chains it in the same entry. It is
@@ -93,7 +95,7 @@ validate stops it before anything loads.
 - **Sharadar mode (`"sharadar"`, from the cutover, #125):**
 
   ```
-  ensure-horizon → ingest sharadar
+  ensure-horizon → ingest sharadar → ingest fundamentals
     → [fmp_secondary] ingest tracked, prices, actions --allow-secondary → adjust --changed
     → db refresh-marts → status
   ```
@@ -101,7 +103,8 @@ validate stops it before anything loads.
   - **`fafnir ingest sharadar`** is the universe, prices and actions for the
     securities Sharadar feeds, in seven steps:
     1. TICKERS and ACTIONS downloaded whole;
-    2. the SEP and SFP deltas;
+    2. the SEP, SFP and SF1 deltas (a failed SF1 delta warns and the night goes
+       on: it feeds the fundamentals, not the prices);
     3. the vendor master;
     4. renames, delistings and new listings;
     5. the bars;
@@ -111,6 +114,10 @@ validate stops it before anything loads.
     [ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98) has each
     step. It is the payload, so a failure stops the night before the marts, as a
     failed `ingest prices` does in FMP mode.
+  - **`fafnir ingest fundamentals`** applies the SF1 delta step 2 fetched to the
+    statement tables, and the marts refreshed after it carry the change into the
+    factor panel. It warns and carries on if it fails, so the fundamentals never
+    cost the night's prices; see [Fundamentals in the night](#fundamentals-in-the-night).
   - **FMP as secondary**, while `[general] fmp_secondary` is true (the default).
     - **What it loads.** FMP's loaders load only what FMP still feeds
       (`repo.fmp_fed`): the funds, and the securities with no Sharadar link.
@@ -142,6 +149,62 @@ fafnir ingest sharadar --dry-run 2>&1 | tee -a sharadar-dry-run.log
 - **Sizes.** The download is under 0.1 GB of TICKERS and ACTIONS, plus the deltas.
   One day of SFP was 2.3 MB, because the vendor restamps a fund's history when it
   distributes.
+
+### Fundamentals in the night
+
+Since #106 the fundamentals ride the Sharadar night: they used to be a weekly job
+because FMP's statements cost 126k requests, and SF1's delta is one small file
+(1,105 rows over four days when it was measured).
+
+1. **Step 2 of `fafnir ingest sharadar`** fetches SF1's rows stamped `lastupdated`
+   since the last SF1 file, as a delta file in the ledger (`sharadar/delta:fundamentals`).
+2. **`fafnir ingest fundamentals`** applies the deltas its last run did not
+   (`sharadar/fundamentals:nightly`, `params.through`).
+3. **`fafnir db refresh-marts`** refreshes the factor panel and the latest snapshot.
+4. **`fafnir-dq`**, after the night, runs the fundamentals checks (#102).
+
+What can go wrong, and what happens then:
+- **The SF1 delta fails.** Step 2 prints `!! fundamentals delta failed` and the night
+  goes on. The run is `failed` on record (`monitor.sh` lists failed runs), and the
+  next night's delta starts from the same date, so nothing is lost.
+- **The load fails.** `daily_update.sh` prints `!! 'fafnir ingest fundamentals'
+  failed` and carries on to the marts. The deltas stay pending, and the next night
+  applies them.
+- **No backfill yet.** Until `fafnir ingest fundamentals --backfill` has loaded the
+  statements ([backfill.md](backfill.md#the-fundamentals-backfill-92)), the step
+  prints `No fundamentals backfill yet` and loads nothing. The deltas wait for it.
+  So does a night after `reset_data.sh --scope fundamentals`.
+- **Its wall-clock.** #106 adds the SF1 delta and its load to the night. The panel's
+  refresh, in `refresh-marts` since #100, recomputes every month-end and is the larger
+  part. Measure both on production, as there is no staging, and record them on #106:
+
+  ```bash
+  psql "$FAFNIR_DSN" -c "SELECT endpoint, finished_at - started_at AS took
+    FROM ops.ingestion_run WHERE endpoint IN ('delta:fundamentals', 'fundamentals:nightly')
+    ORDER BY ingestion_run_id DESC LIMIT 2;"
+  grep 'Refreshed mart' /var/log/fafnir/daily.log | tail -3   # the panel: its line less the one before
+  ```
+
+  Past 15 minutes the panel moves to a timer of its own,
+  `etc/systemd/fafnir-fundamentals.*.in`, and this section says why.
+
+**A re-run** of the backfill, after a reset, a loader fix or a security linked
+after it, is `scripts/backfill_fundamentals.sh`:
+
+```bash
+scripts/backfill_fundamentals.sh --dry-run          # what it would write
+scripts/backfill_fundamentals.sh                    # fresh SF1 file, backfill, marts, report
+scripts/backfill_fundamentals.sh --keep-file        # resume, reading the same file
+scripts/backfill_fundamentals.sh --symbols ZZA,ZZB  # securities with no statements yet
+```
+
+- **A whole run starts from a fresh SF1 file.** The nightly then takes over from it:
+  the deltas recorded before the file count as applied, since the file holds them. A
+  whole run from an old file would put the values of the deltas applied since back
+  to the old ones, so `--keep-file` is for resuming, or a file fetched today.
+- **`--symbols`** reads the current file and leaves the deltas pending, for
+  securities that hold no statements yet.
+- **When.** Run it in the day, inside `tmux`, never across the night's timer.
 
 ### Primary vendor switch and rollback
 
@@ -1331,8 +1394,9 @@ back exactly and recomputes the security's factors. See
   each view and how it was refreshed.
   - **The panel** is created empty by migration 0037, and the latest snapshot by 0038, so
     the first refresh after deploying them is plain and every read before then is refused. It recomputes every month-end from
-    1998: 45 s on a synthetic thousand securities; production's is recorded on #92. Past
-    15 minutes it moves to its own timer (#106).
+    1998: 45 s on a synthetic thousand securities; production's is recorded on #92 and,
+    in the night, on #106. Past 15 minutes it moves to its own timer
+    ([Fundamentals in the night](#fundamentals-in-the-night)).
   - **CONCURRENTLY** where the view holds data, so readers keep the old rows meanwhile. A
     view that has never been populated gets a plain refresh.
   - **The fallback.** If PostgreSQL still refuses CONCURRENTLY because the view is

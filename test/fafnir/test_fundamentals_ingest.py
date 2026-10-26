@@ -20,6 +20,8 @@ from click.testing import CliRunner
 from fafnir import cli
 from fafnir.db import repository as repo
 from fafnir.ingest import fundamentals as fu
+from fafnir.ingest import sharadar_bulk as bulk
+from fafnir.sources.sharadar import SharadarClient
 
 pytestmark = pytest.mark.integration
 
@@ -397,6 +399,113 @@ def test_a_nightly_for_some_securities_leaves_the_deltas_pending(db, tmp_path):
     )
     quarters = fu.load(db, tmp_path, backfill=False, period="quarter", as_of=NIGHT)
     assert quarters.through == full
+
+
+class _FakeSF1(SharadarClient):
+    """Answers SF1 as the table API does (``lastupdated.gte``, ``from``/``to`` on
+    the filing date, ``sort=date``) from ``rows``, written as :func:`_row` writes
+    them."""
+
+    def __init__(self, *rows):
+        super().__init__("synthetic-key", rate_per_min=100_000)
+        self.rows = [
+            {c: v or None for c, v in zip(COLUMNS, r.rstrip("\n").split(","))}
+            for r in rows
+        ]
+
+    def _call(self, table, params=None):
+        assert table == "SF1" and params["sort"] == "date"
+        rows = sorted(
+            (
+                r
+                for r in self.rows
+                if r["lastupdated"] >= params["lastupdated.gte"]
+                and params["from"] <= r["date"] <= params["to"]
+            ),
+            key=lambda r: r["date"],
+        )[: params["limit"]]
+        payload = {
+            "datatable": {
+                "data": [[r[c] for c in COLUMNS] for r in rows],
+                "columns": [{"name": c} for c in COLUMNS],
+            }
+        }
+        return payload, 200, 100
+
+
+def test_the_nights_sf1_delta_is_what_the_nightly_applies(db, tmp_path):
+    sid, _ = _backfilled(db, tmp_path)
+    today = date.today().isoformat()
+    client = _FakeSF1(
+        _row("MRY", "2019-12-31", "", "2019-FY", stamp=today, revenue=3850),
+        _row("ARQ", "2020-03-31", "2020-05-01", "2020-Q1"),  # an old stamp
+    )
+    fetched = bulk.fetch_delta(db, client, "SF1", tmp_path)
+    assert (fetched.outcome, fetched.rows) == ("recorded", 1)
+    assert fu.pending_deltas(db)[0] == [repo.sharadar_file(db, fetched.file_id)]
+
+    result = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert (result.files, result.through) == ([fetched.file_id], fetched.file_id)
+    (fy,) = [
+        r
+        for r in _rows(db, sid=sid)
+        if r["fiscal_period"] == "FY"
+        and r["fiscal_year"] == 2019
+        and r["superseded_at"] is None
+        and r["known_to"] is None
+    ]
+    assert (fy["version_no"], fy["revenue"], fy["known_from"]) == (
+        3,
+        D("3850.00"),
+        NIGHT,
+    )
+    assert fu.pending_deltas(db) == ([], fetched.file_id)
+
+
+def test_the_nightly_waits_for_a_backfill(db, tmp_path):
+    sid = _security(db, "ZZA", KEY)
+    _record(db, tmp_path, "fundamentals", _history())
+    _record(db, tmp_path, "actions", ACTIONS)
+    delta = _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(_row("ARQ", "2020-06-30", "2020-08-01", "2020-Q2")),
+        kind="delta",
+        since="2026-10-24",
+    )
+    runs = "SELECT count(*) FROM ops.ingestion_run"
+
+    def waits():
+        before = db.fetchval(runs)
+        result = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+        assert (result.waiting, result.read, result.run_id) == (True, 0, None)
+        assert db.fetchval(runs) == before  # no run, so no through
+        return fu.pending_deltas(db)[0] == [repo.sharadar_file(db, delta)]
+
+    # Before any backfill: its delta waits for one.
+    assert waits()
+    assert not _rows(db)
+
+    # A backfill for some periods is a backfill, and not a whole one.
+    some = fu.load(db, tmp_path, backfill=True, period="annual", as_of=BACKFILL_DAY)
+    whole = fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
+    flags = {
+        r["ingestion_run_id"]: r["params"]["whole"]
+        for r in db.fetchall(
+            "SELECT ingestion_run_id, params FROM ops.ingestion_run "
+            "WHERE endpoint = 'fundamentals'"
+        )
+    }
+    assert flags == {some.run_id: False, whole.run_id: True}
+    applied = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert not applied.waiting and applied.files == [delta]
+
+    # A reset empties the statements and keeps the runs: it waits again.
+    for table in ("cash_flow_statement", "balance_sheet", "income_statement"):
+        db.execute(f"DELETE FROM core.{table}")
+    result = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert result.waiting and not _rows(db, sid=sid)
 
 
 def test_bad_rows_are_quarantined_once_and_the_rest_loads(db, tmp_path):

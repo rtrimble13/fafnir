@@ -809,7 +809,8 @@ def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
 
     A run for some securities, periods or keys leaves the delta files pending for
     the rest. A security linked after the backfill gets its history from
-    --backfill --symbols.
+    --backfill --symbols. Until a backfill has loaded the statements, the nightly
+    says so and does nothing: daily_update.sh runs it every night (#106).
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import fundamentals as fu
@@ -843,6 +844,13 @@ def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
 
 
 def _echo_fundamentals(result) -> None:
+    if result.waiting:
+        click.echo(
+            "No fundamentals backfill yet: the nightly waits for "
+            "`fafnir ingest fundamentals --backfill` (doc/backfill.md). Nothing read; "
+            "the SF1 deltas stay pending."
+        )
+        return
     head = "Dry run: nothing written." if result.dry_run else f"Run {result.run_id}."
     files = ", ".join(str(f) for f in result.files) or "none"
     source = "SF1 file" if result.backfill else "SF1 delta file(s)"
@@ -1160,7 +1168,7 @@ def ingest_sharadar(ctx, dry_run):
 
     \b
       1. source sharadar-bulk --tables tickers,actions --force
-      2. source sharadar-delta                  (SEP, SFP)
+      2. source sharadar-delta                  (SEP, SFP, SF1)
       3. ingest sharadar-master
       4. ingest sharadar-universe
       5. ingest sharadar-prices --nightly
@@ -1168,9 +1176,11 @@ def ingest_sharadar(ctx, dry_run):
       7. source sharadar-prune
 
     TICKERS and ACTIONS are small, so they are downloaded whole each night; the
-    price tables come as deltas. A step that fails stops the night with a non-zero
-    exit. Every step is safe to run again, so the next run picks up where it
-    stopped. Factors are recomputed for the securities whose bars or actions
+    price tables and SF1 come as deltas. A step that fails stops the night with a
+    non-zero exit, except SF1's delta: it is for `ingest fundamentals`, which
+    daily_update.sh runs after this, and a failed one warns and is fetched again
+    the next night. Every step is safe to run again, so the next run picks up where
+    it stopped. Factors are recomputed for the securities whose bars or actions
     changed. Step 7 deletes the files nothing reads any more, keeping [sharadar]
     keep_days of them; it runs only after the rest succeeded, and if it cannot
     run it warns without failing the night.
@@ -1219,8 +1229,16 @@ def ingest_sharadar(ctx, dry_run):
                 database, client, sharadar_bulk.DELTA_TABLES, bulk_dir
             )
         )
-        if failed:
+        # SF1's delta feeds the fundamentals, not tonight's prices: it never stops
+        # the night. Its failed run is on record, and the next night's delta starts
+        # from the same date.
+        if any(t in sharadar_bulk.PRICE_TABLES for t in failed):
             stop(2, ", ".join(failed))
+        if failed:
+            click.echo(
+                f"!! {', '.join(failed)} delta failed: the fundamentals wait for the "
+                "next night; the prices go on"
+            )
         step(3, "ingest sharadar-master")
         try:
             failed = _echo_sharadar_master(sharadar_master.load(database, bulk_dir))
@@ -6213,9 +6231,9 @@ def _report_sharadar_files(results, cfg, client) -> None:
 @source.command("sharadar-delta")
 @click.option(
     "--tables",
-    default="SEP,SFP",
+    default="SEP,SFP,SF1",
     show_default=True,
-    help="Comma-separated price tables: SEP, SFP (or stocks, funds)",
+    help="Comma-separated tables: SEP, SFP, SF1 (or stocks, funds, fundamentals)",
 )
 @click.option(
     "--since",
@@ -6226,14 +6244,15 @@ def _report_sharadar_files(results, cfg, client) -> None:
 )
 @click.pass_context
 def source_sharadar_delta(ctx, tables, since):
-    """Fetch the price rows Sharadar changed since its last file (the nightly slice).
+    """Fetch the rows Sharadar changed since its last file (the nightly slice).
 
     Asks the table API for each table's rows with lastupdated on or after --since:
-    the new day's bars and the vendor's revisions of past ones. They land in
-    [sharadar] bulk_dir as <sha256>.csv and get one row in landing.sharadar_file
-    (kind delta); nothing is loaded into core (`ingest sharadar-prices --nightly`
-    does that). A delta with no rows is not recorded. One ops.ingestion_run per
-    table (endpoint delta:<table>). Exits non-zero if any table failed.
+    the new day's bars and filings, and the vendor's revisions of past ones. They
+    land in [sharadar] bulk_dir as <sha256>.csv and get one row in
+    landing.sharadar_file (kind delta); nothing is loaded into core (`ingest
+    sharadar-prices --nightly` and `ingest fundamentals` do that). A delta with no
+    rows is not recorded. One ops.ingestion_run per table (endpoint
+    delta:<table>). Exits non-zero if any table failed.
     """
     from fafnir.ingest import sharadar_bulk
 
