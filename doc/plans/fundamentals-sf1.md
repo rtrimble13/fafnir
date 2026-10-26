@@ -419,6 +419,29 @@ Unchanged: industry aggregates (#101); `mart.security_latest` untouched by this 
 it separately, with the same columns); `refresh_marts` iterates a list and stops swallowing real
 failures (#96, which can merge before any of this).
 
+### 5.7 As built: point-in-time access and TTM (#95)
+
+Migration 0036 ([data dictionary](../data_dictionary.md#the-statements-point-in-time-views-and-functions))
+settles these points:
+
+- **The seam.** Three definer-rights `mart` views hold every version of every period. They
+  leave out `extra`, the vendor key and the hash. The functions are plain SQL with the caller's
+  rights, reading only those views. They are inlined, so a filter on `security_id` reaches
+  the indexes. `EXECUTE` goes to the read roles, not PUBLIC (an ADR 0009 status note).
+- **The latest period** is the latest any statement knows at `as_of`. A statement that does
+  not yet have it is NULL for it, rather than an older period's.
+- **A joined row** is known from the latest of its statements' `known_from`. Its
+  `knowledge_source` is the weakest of theirs: `estimated`, then `observed`, then `filed`.
+- **TTM rows** are per income-statement quarter-end. The cash flow is counted on its own
+  (`cash_flow_quarters_used`).
+- **TTM contiguity** means consecutive fiscal labels, with period ends 8 to 18 weeks apart.
+  The FMP prompt's 80–100 days would drop a retailer's 16-week first quarter.
+- **A NULL flow** in any of the four quarters makes the TTM NULL.
+- **Share terms.** Share counts take the latest quarter, in the terms of
+  `income_known_from` / `balance_sheet_known_from`.
+- **Not built:** a two-axis TTM. The two-axis read is `fn_statements_as_of`'s. Average
+  balances for ROE-like ratios are the panel's (#100).
+
 ---
 
 ## 6. Ingestion: `src/fafnir/ingest/fundamentals.py` (#90)

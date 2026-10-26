@@ -326,6 +326,27 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #95: point-in-time access and TTM, migration 0036.**
+  [fundamentals-sf1.md §5.7](fundamentals-sf1.md#57-as-built-point-in-time-access-and-ttm-95)
+  has the detail.
+  - **The versions views:** `mart.v_income_statement_versions`, `mart.v_balance_sheet_versions`
+    and `mart.v_cash_flow_statement_versions`, every version of every period. They are
+    definer-rights views and leave out `extra` and the vendor key.
+  - **`mart.fn_statements_as_of(as_of [, load_as_of])`:** the three statements joined on
+    `fiscal_date`, each at its own version in force. The two-axis form reproduces what
+    fafnir held.
+  - **`mart.fn_fundamentals_ttm(as_of)`:** flows over four contiguous quarters or NULL,
+    stocks at the latest quarter, known from the last constituent.
+  - **The current views:** `mart.v_statements_current` and `mart.v_fundamentals_ttm`, for
+    screening.
+  - **The functions** are plain SQL over the views, inlined so a filter on `security_id`
+    reaches the indexes. `EXECUTE` goes to the read roles, not PUBLIC: an
+    [ADR 0009](../adr/0009-mart-is-the-read-seam.md) status note.
+  - **Generated:** 0036 is generated from `fundamentals_map`, as 0035 was, and a test holds
+    every object's columns to the map.
+  - **Tests:** `test_fundamentals_pit.py` (19). The least-privilege tests cover the views,
+    the functions as `fafnir_app`, and no `EXECUTE` for PUBLIC.
+
 - **2026-10-26 · P4, #92 prepared: the fundamentals backfill runbook.** The run itself is the
   operator's, on the host. What it needs is in place:
   - **The runbook:** [backfill.md › The fundamentals backfill](../backfill.md#the-fundamentals-backfill-92),

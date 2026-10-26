@@ -4,6 +4,14 @@
 - Date: 2026-09-02
 - Depends on: [ADR 0008 §4](0008-remote-duk-access-and-mcp.md)
 - Implemented by: `sql/migrations/0020_company_summary_marts.up.sql`
+- Status note (2026-10-26, #95): **functions in `mart`.** A read that takes a parameter
+  (the statements as of a date, 0036) is a plain SQL function, `STABLE`, that runs with
+  its caller's rights and reads only definer-rights `mart` views. It is never `SECURITY
+  DEFINER`: the views carry the definer rights, as this ADR decides, and the planner can
+  inline the function, so a caller's filter still reaches the indexes. Default privileges
+  do not cover functions and PostgreSQL grants `EXECUTE` to PUBLIC, so a `mart` function
+  revokes that and grants `EXECUTE` to the read roles. Adding a function is a grant, as
+  adding a view is.
 
 ## Context
 

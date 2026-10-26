@@ -82,6 +82,10 @@ The last one the nightly applied is in the `prices:nightly` run's `params.throug
 | `mart.v_security_action_summary` | split/dividend counts and boundaries, factor state | live |
 | `mart.v_corporate_action` | splits and dividends, one row per event (passthrough of `corporate_action`, no lineage) | live |
 | `mart.v_security_lifecycle` | first/last trade date, who minted it, and for a dead security the vendor's terminal event and acquirer (#79) | live |
+| `mart.v_*_versions` (income, balance sheet, cash flow) | every version of every period, both timelines; no `extra`, no vendor key (#95) | live |
+| `mart.fn_statements_as_of(as_of [, load_as_of])` | per security and period type, the latest period in force at `as_of`, three statements joined on `fiscal_date`; the two-axis form reproduces a past load | live — **the backtest read** |
+| `mart.fn_fundamentals_ttm(as_of)` | TTM per quarter-end: flows over four contiguous quarters or NULL, stocks at the latest quarter, `known_from` the latest constituent | live |
+| `mart.v_statements_current`, `mart.v_fundamentals_ttm` | the two functions as of today: screening, **not backtests** | live |
 | `mart.v_security_dq_open` | open flags: counts, keys, dates — **never `detail`** | live |
 
 **`core.daily_price` is partitioned by year.** A per-security probe of it —
