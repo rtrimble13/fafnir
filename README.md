@@ -7,27 +7,29 @@ client.
 
 - **Runs on Linux** with PostgreSQL 16 (schema designed to adopt TimescaleDB later
   without a grain change).
-- **Sources:** Financial Modeling Prep (FMP) built the warehouse and still feeds it
-  nightly; **Sharadar** is being adopted as the system of record (identity, dead-issuer
-  history from 1998, corrections, fundamentals, then the nightly feed) under
-  [doc/plans/sharadar-adoption.md](doc/plans/sharadar-adoption.md). Economic
-  sources (FRED, BLS, BEA) are fast-follows.
+- **Sources:** **Sharadar** is the system of record: identity, dead-issuer history
+  from 1998, the nightly prices and actions since the cutover of 2026-10-22, and the
+  fundamentals ([doc/plans/sharadar-adoption.md](doc/plans/sharadar-adoption.md)).
+  Financial Modeling Prep (FMP) built the warehouse and now feeds only what Sharadar
+  does not: funds and unlinked securities. Economic sources (FRED, BLS, BEA) are
+  fast-follows.
 - **Correct by construction:** money is exact `NUMERIC`; prices are ingested
   *unadjusted* (FMP's `historical-price-eod/non-split-adjusted`, so fafnir's own
   factors are the only adjustment ever applied), raw OHLCV is immutable, and
   adjusted prices are *derived on read* (point-in-time stable); delisted securities
   are retained (no survivorship bias); every load is idempotent and logged.
 
-> Status: **initial release** — self-maintaining security master (new listings and
-> ticker renames reconciled nightly), daily OHLCV, corporate actions, the
-> dual-mode `duk` CLI, and an MCP server for agentic access
-> (`doc/agent.md`). Fundamentals and economic time series are the next
-> milestones (see `doc/extending.md`).
+> Status: a self-maintaining security master (new listings and ticker renames
+> reconciled nightly), daily OHLCV with the dead issuers from 1998, corporate actions,
+> **point-in-time fundamentals** from Sharadar SF1 with a monthly factor panel
+> (`doc/fundamentals.md`), the dual-mode `duk` CLI, and an MCP server for agentic
+> access (`doc/agent.md`). Economic time series are the next milestone (see
+> `doc/extending.md`).
 
 ## Architecture at a glance
 
 ```
-FMP / FRED / BLS / BEA
+Sharadar · FMP  (FRED / BLS / BEA next)
         │  (throttled, retrying loaders)
         ▼
    landing  ──►  core (constrained truth)  ──►  mart (derived read views)
@@ -36,8 +38,9 @@ FMP / FRED / BLS / BEA
                                               duk (db mode) · apps · MCP
 ```
 
-Schemas: `landing` (raw immutable payloads) → `core` (security master, raw daily
-prices, corporate actions) → `mart` (adjusted prices, screening snapshot), with
+Schemas: `landing` (raw immutable payloads, the Sharadar file ledger) → `core`
+(security master, raw daily prices, corporate actions, versioned statements) → `mart`
+(adjusted prices, screening snapshot, point-in-time statements, the factor panel), with
 `ref` (exchanges/sectors/calendar, and the declared universe), `ops` (ingestion
 runs, DQ flags, watermarks), and `meta` (migrations). See **[doc/architecture.md](doc/architecture.md)** and the
 **[data dictionary](doc/data_dictionary.md)**.
@@ -152,6 +155,7 @@ than guessing. See **[doc/duk.md](doc/duk.md)**.
 | [backfill.md](doc/backfill.md) | Initial setup & historical backfill (bandwidth, chunking, resumability) |
 | [operations.md](doc/operations.md) | Daily upkeep runbook, cron, backfill, recovery |
 | [duk.md](doc/duk.md) | CLI usage: the warehouse (`db`) vs a vendor (`fmp`, `sharadar`) |
+| [fundamentals.md](doc/fundamentals.md) | The statements and the factor panel: reading them point in time, without look-ahead |
 | [agent.md](doc/agent.md) | Run an operations agent on the host: DQ triage, automations, data questions |
 | [extending.md](doc/extending.md) | Add a source (FRED/BLS/BEA), a table, or an MCP tool |
 | [adr/](doc/adr/) | Architecture decision records |

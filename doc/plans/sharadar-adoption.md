@@ -326,6 +326,22 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #108: the researcher's guide.**
+  - **[fundamentals.md](../fundamentals.md) is no longer a stub.** It covers:
+    - what the statements hold, with the three `knowledge_source` values;
+    - coverage, and the 1998 floor and why;
+    - the point-in-time reads, with one rule;
+    - nine look-ahead rules, including the as-first-reported convention, what it does to
+      growth, and the deferred research mode;
+    - the factor definitions and references (from #100);
+    - a worked value-decile example over the panel with the dead issuers kept.
+  - **The worked example is a standing test.** `test_fundamentals_guide.py` reads the block
+    from the page and runs it on a synthetic universe.
+  - **Still to come:** its production output, and the coverage by decade, are posted on #108
+    and #92 once the backfill has run.
+  - **Also updated:** the roadmap (Fundamentals ✅), `architecture.md`'s layer diagram, and
+    the README's status line, sources and docs table.
+
 - **2026-10-26 · P4, #107: `duk fs` / `duk fa` and the MCP read tools.**
   - **`duk fs SYMBOL [--statement] [--period] [--as-of] [-n]`** prints a statement, one row per
     period, each at its version in force on `--as-of`: a later filing or restatement does not
