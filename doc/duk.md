@@ -138,7 +138,8 @@ duk ph AAPL --start-date 1990-01-01 -n 5
 # Prices print at 2dp by default; -p widens it
 duk ph AAPL --adj -p 4
 
-# Screen tech names by market cap (warehouse snapshot, actively trading)
+# Screen tech names by market cap (warehouse snapshot, actively trading; market cap
+# derived from SF1's shares where it can be, #109)
 duk ls --sector Technology --market-cap ">1000000000"
 
 # The same sector with the companies that stopped trading

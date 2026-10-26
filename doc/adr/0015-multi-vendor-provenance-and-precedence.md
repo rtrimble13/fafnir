@@ -135,6 +135,31 @@ Sharadar's names, sectors, identifiers, category and delisting reasons live in
 written over the FMP-sourced descriptive columns of `core.security`. Which vendor's
 attributes a reader sees is decided by a precedence view (#109), not by overwriting.
 
+*Addendum 2026-10-26 (#109, migration 0039): attribute precedence.* After the cutover
+(2026-10-22) FMP's screener no longer runs. `core.security`'s sector, industry, market
+cap and beta therefore froze for every security Sharadar feeds. The precedence views
+decide what readers see:
+
+- **Classification is the feeding vendor's.** For a security Sharadar feeds,
+  `core.v_security_classification` maps Sharadar's TICKERS sector and industry onto
+  fafnir's names, as the minting code does (`sharadar_map.map_classification`).
+  - **Sector and industry come as a pair**, from Sharadar when its sector maps.
+    Otherwise, and for every other security, both come from `core.security`.
+  - **`attributes_source`** names the vendor.
+  - **Who reads it:** `mart.v_security_profile`, `mart.security_latest` (through
+    `mart.v_security_attributes`) and the classification check. The panel and the
+    industry aggregates therefore follow it.
+- **Market cap and beta are derived where they can be** (`mart.v_security_attributes`):
+  - **market cap:** the last raw close × SF1's shares in force that day, in its terms
+    (ADR 0019 §5);
+  - **beta:** a year of daily adjusted returns on SPY's.
+  - **Otherwise** the screener shows `core.security`'s vendor snapshot. Each value says
+    which it is and as of when.
+  - **`mart.v_security_profile`** keeps the vendor snapshot for both, as its comment says.
+- **`core.security` is not written,** and FMP's values stay there. A rollback to FMP's
+  night (#111) refreshes them, and the views keep reading them for the securities FMP
+  feeds.
+
 ### 5. Separability is a report, not a guarantee
 
 Because corrections replace rows in place, a series can hold rows from more than one

@@ -579,14 +579,19 @@ def check_missing_classification(db: Database) -> int:
     Actively-traded only. Delisted rows legitimately predate the classification
     and cannot be refreshed: the universe load no longer sees them, and enriching
     them through `upsert_security` would insert rather than update.
+
+    The classification is the one readers see (#109): the feeding vendor's, from
+    ``core.v_security_classification``. A security Sharadar feeds is flagged when
+    neither Sharadar's names nor core.security's give it a sector and industry.
     """
     row = db.fetchone("""
         WITH detected AS (
-            SELECT security_id, primary_symbol
-              FROM core.security
-             WHERE is_actively_trading
-               AND delisted_date IS NULL
-               AND (sector_id IS NULL OR industry_id IS NULL)
+            SELECT s.security_id, s.primary_symbol
+              FROM core.security s
+              JOIN core.v_security_classification c ON c.security_id = s.security_id
+             WHERE s.is_actively_trading
+               AND s.delisted_date IS NULL
+               AND (c.sector_id IS NULL OR c.industry_id IS NULL)
         ),
         written AS (
             INSERT INTO ops.data_quality_flag
@@ -1077,13 +1082,15 @@ def check_fundamentals_negative_impossible(db: Database) -> int:
 def check_fundamentals_coverage(db: Database) -> int:
     """An actively trading security SF1 has statements for (its master's
     ``first_quarter``) with none in force here (``info``). Logs coverage by sector:
-    the share of such securities with a statement."""
+    the share of such securities with a statement, by the sector readers see
+    (#109)."""
     eligible = f"""
-        SELECT DISTINCT s.security_id, s.sector_id,
+        SELECT DISTINCT s.security_id, c.sector_id,
                EXISTS (SELECT 1 FROM core.income_statement t
                         WHERE t.security_id = s.security_id AND t.{IN_FORCE})
                    AS covered
           FROM core.security s
+          JOIN core.v_security_classification c ON c.security_id = s.security_id
           JOIN core.security_vendor_xref x
             ON x.security_id = s.security_id AND x.vendor = 'sharadar'
            AND x.valid_to IS NULL

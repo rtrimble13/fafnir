@@ -221,9 +221,11 @@ SELECT f.dq_flag_id
   FROM ops.data_quality_flag f
  WHERE f.check_name = 'security_missing_classification' AND f.resolved_at IS NULL
    AND NOT EXISTS (SELECT 1 FROM core.security s
+                      JOIN core.v_security_classification c
+                        ON c.security_id = s.security_id
                     WHERE s.security_id = f.security_id
                       AND s.is_actively_trading AND s.delisted_date IS NULL
-                      AND (s.sector_id IS NULL OR s.industry_id IS NULL))
+                      AND (c.sector_id IS NULL OR c.industry_id IS NULL))
 """
 
 

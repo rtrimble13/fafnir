@@ -140,8 +140,8 @@ had run. #122 is closed with where each criterion stood:
 | ~~0033~~ | ~~#66~~ | ~~`ops.vendor_bar_comparison`~~: dropped on 2026-10-20 (#66 folded into #75); later migrations take the next free number |
 | 0033 | #174 | `mart.v_corporate_action`, outside this plan (a mart-only reader's corporate actions) — so #79's view takes the next free number after it |
 | 0034 | #79 | `mart.v_security_lifecycle` — **built** |
-| 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates |
-| 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) |
+| 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates — **built** |
+| 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) — **built** |
 | (optional) | #114, #116 | fund distribution types; FRED economic series |
 
 ## Issue dispositions (applied 2026-10-18)
@@ -325,6 +325,36 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-25 | **Fundamentals on SF1: five decisions** ([fundamentals-sf1.md](fundamentals-sf1.md), from #83's probe). (1) A restatement is known from the day fafnir first loads it, since SF1 gives no restatement date; each version carries a knowledge interval, closed by the next version's start, so history before the backfill reads as first reported. (2) A version is stored in the share terms of its knowledge date: first-reported values are SF1's ÷ Sharadar's splits after the filing; per-share values are derived in the mart. (3) A split's re-expression is not a version. (4) Rows before 1998 load; the factor panel starts on 1998-01-01. (5) Statements attach to the primary share class only. The document, with the choices it lists, was signed off the same day (GO on #85) | #85 |
 
 ## [built] notes
+
+- **2026-10-26 · P3, #109: security attributes after the cutover, migration 0039.** Both
+  parts at once, since the panel (#100) had shipped.
+  - **Classification:** `core.v_security_classification` gives the feeding vendor's.
+    - **For a security Sharadar feeds:** Sharadar's TICKERS sector and industry mapped
+      onto fafnir's names exactly as `map_classification` maps them; a test holds the SQL
+      and the Python equal.
+    - **A pair:** sector and industry come together from Sharadar when its sector maps,
+      else from `core.security`.
+    - **`core.security` is not written.**
+  - **`mart.v_security_attributes`:** the screener's attributes with their sources and
+    dates.
+    - **Market cap:** derived (ADR 0019 §5, the panel's expression) where SF1 holds the
+      shares.
+    - **Beta:** derived from a year of daily adjusted returns on SPY's, from 120 or more.
+    - **Otherwise** the vendor's last snapshot, said to be one.
+  - **Re-defined, columns unchanged:**
+    - **`mart.security_latest`** reads the attributes view. The duk and MCP screener
+      tests pass unmodified.
+    - **`mart.v_security_profile`** reads the classification. The panel and the industry
+      aggregates, which take their sector from it, follow.
+  - **`security_missing_classification`** and its recheck read the classification
+    readers see. So every Sharadar-fed listed security has a sector or a flag.
+  - **The comparison:** `scripts/attributes_report.sql` sets FMP's frozen values against
+    the new ones, by column, in aggregates. Its production output goes on #109.
+  - **Measured:** the migration and refresh on the test database only. Production's
+    refresh time is recorded with #106's night, since `security_latest` now computes every
+    beta.
+  - **Detail:** [ADR 0015 §4's addendum](../adr/0015-multi-vendor-provenance-and-precedence.md);
+    the [data dictionary](../data_dictionary.md).
 
 - **2026-10-26 · P4, #108: the researcher's guide.**
   - **[fundamentals.md](../fundamentals.md) is no longer a stub.** It covers:

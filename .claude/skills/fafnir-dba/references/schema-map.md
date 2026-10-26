@@ -40,6 +40,7 @@ Two rules about `mart` that matter when you are tempted to add a view:
 | `core.security_vendor_xref` | `(vendor, vendor_key, valid_from)`; open = `valid_to IS NULL`; one open link per key and per (security, vendor); `is_feed` = who loads new rows, one per security |
 | `core.security_vendor_rejection` | `(security_id, vendor, vendor_key)`; a person's "not this key" (`vendor link reject`), which the linking engine never proposes again |
 | `core.vendor_security_event` | `(vendor, vendor_key, event_date, action, contra_ticker)`; listings, delistings, renames, deals from ACTIONS |
+| `core.v_security_classification` | (VIEW, #109) per security the sector and industry readers see: Sharadar's names mapped onto fafnir's for a security Sharadar feeds, else `core.security`'s; `attributes_source` says which |
 | `core.income_statement`, `core.balance_sheet`, `core.cash_flow_statement` | `(security_id, period_type, fiscal_date, version_no, loaded_at)`; one row per version of a period, per load (ADR 0018). In force at D: `superseded_at IS NULL AND known_from <= D AND (known_to IS NULL OR D < known_to)`. `knowledge_source`: `filed` (the SEC filing), `observed` (a restatement, dated the day fafnir loaded it: SF1 dates none), `estimated`. Share counts are in the share terms of `known_from`; no per-share column (ADR 0019). `extra` is never read by mart. Written by `fafnir ingest fundamentals` (#90): restatements and corrections are flagged `fundamentals_restatement` / `fundamentals_vendor_correction`, once per security and run |
 | `ref.statement_line_item` | `(statement, column_name)`; which SF1 indicator fills which column, and its `item_class` (TTM sums a `flow`, takes the latest `stock`) |
 | `ops.vendor_correction` | `correction_id`; one per row a higher-ranked vendor replaced (ADR 0015), `old_row` = the replaced row; active = `reverted_at IS NULL` |
@@ -76,8 +77,9 @@ The last one the nightly applied is in the `prices:nightly` run's `params.throug
 | `mart.v_daily_price_raw` | unadjusted OHLCV, as traded | live |
 | `mart.v_daily_price_adjusted` | split/dividend adjusted, point-in-time stable | live |
 | `mart.v_symbol_lookup` | ticker → `security_id` over time (passthrough of `symbol_xref`) | live |
-| `mart.v_security_profile` | descriptive facts, one row per security | **live** |
-| `mart.security_latest` | the screening contract; `duk ls` and `screen_securities` filter it to actively trading unless asked (#79) | **materialized, lagged** |
+| `mart.v_security_profile` | descriptive facts, one row per security; sector and industry the feeding vendor's, market cap and beta the vendor snapshot (#109) | **live** |
+| `mart.security_latest` | the screening contract; `duk ls` and `screen_securities` filter it to actively trading unless asked (#79). Since #109: the feeding vendor's classification, market cap and beta derived where they can be | **materialized, lagged** |
+| `mart.v_security_attributes` | what the screener shows, with `attributes_source`, `market_cap_source`/`_as_of`, `beta_source`/`_as_of`/`_returns` (#109) | live, but **computes every beta when read**: query `security_latest` for screens |
 | `mart.v_security_price_coverage` | span, bar count, close range, zero-volume bars | live — **use this, not a per-security probe** |
 | `mart.v_security_action_summary` | split/dividend counts and boundaries, factor state | live |
 | `mart.v_corporate_action` | splits and dividends, one row per event (passthrough of `corporate_action`, no lineage) | live |
@@ -89,7 +91,7 @@ The last one the nightly applied is in the `prices:nightly` run's `params.throug
 | `mart.fn_fundamental_panel(dates[], lag)`, `mart.fn_fundamental_snapshot(as_of, lag)` | the factors at any dates, or one: basis TTM or fiscal year as known then, prices that day, one row per security that traded that week (#100) | live |
 | `mart.fundamental_panel` | the same at each month-end from 1998; sector and industry are **today's** | **materialized, lagged** |
 | `mart.v_industry_fundamentals` | the panel by sector and by industry per month-end: counts and quartiles; groups under three suppressed (#101) | live over the panel, so **as lagged as it** |
-| `mart.security_fundamentals_latest` | each security's factors as of the last refresh, with symbol and name; screens opt into it, `security_latest` is unchanged (#101) | **materialized, lagged** |
+| `mart.security_fundamentals_latest` | each security's factors as of the last refresh, with symbol and name; screens opt into it by joining on `security_id` (#101) | **materialized, lagged** |
 | `mart.v_security_dq_open` | open flags: counts, keys, dates — **never `detail`** | live |
 
 **`core.daily_price` is partitioned by year.** A per-security probe of it —

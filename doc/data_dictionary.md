@@ -439,15 +439,19 @@ reads `mart.v_security_profile`, which is why resolution reads two views.
 
 ### `mart.v_security_profile` — descriptive profile (VIEW)
 **Grain:** one row per `security_id`. **Source:** `core.security` + `ref.exchange` +
-`ref.sector` + `ref.industry` + `core.company_profile`. Read live, unlike
-`security_latest`.
+`core.v_security_classification` (with `ref.sector`, `ref.industry`) +
+`core.company_profile`. Read live, unlike `security_latest`. Since 0039 (#109),
+`sector_name` and `industry_name` are the feeding vendor's, as in `security_latest`;
+the columns are unchanged.
 
 Adds over `security_latest`: `exchange_name`, `cik`/`isin`/`cusip`, `ipo_date`,
 `delisted_date`, `source`, `first_seen_at`, `updated_at`, `description`. It is also
 the relation `duk` resolves `cik:`/`isin:`/`cusip:` arguments against, which is why
-the identifier columns belong on this view and not only on `core.security`. As with
-`security_latest`, `market_cap_usd` and `beta` are a company-screener snapshot
-refreshed with the security master — **not** history; do not use them in a backtest.
+the identifier columns belong on this view and not only on `core.security`. Its
+`market_cap_usd` and `beta` are `core.security`'s: the vendor's company-screener
+snapshot as last loaded (FMP's, frozen at the cutover for the securities Sharadar
+feeds). **Not** history; do not use them in a backtest. `security_latest` derives its
+own (#109).
 
 ### `mart.v_security_price_coverage` — what is held per security (VIEW)
 **Grain:** one row per `security_id` with prices. **Source:** `core.daily_price`.
@@ -715,9 +719,9 @@ db refresh-marts`, after the panel (`maintenance.MATVIEWS`).
 - **Columns:** `security_id, symbol, company_name`, then the snapshot's columns after
   `security_id` (the panel's, above).
 - **A row** is a security that traded in the week to the refresh and has a basis then.
-- **For screens, not backtests:** it is as of the last refresh. **`mart.security_latest` is
-  untouched**: duk's screener reads it, and a screen opts into fundamentals by joining this
-  on `security_id`.
+- **For screens, not backtests:** it is as of the last refresh. `mart.security_latest`
+  keeps its own columns (re-defined by 0039, #109): duk's screener reads it, and a screen
+  opts into the factors by joining this on `security_id`.
 - **Created empty.** A read is refused until the first refresh, which runs plainly; later
   ones run concurrently. About 3 s on the synthetic thousand securities.
 
@@ -736,12 +740,72 @@ excluded because `adjustment_failed` writes a raw Python exception string into i
 means excluding those columns explicitly. Full triage stays with `fafnir dq list`.
 
 ### `mart.security_latest` — screening snapshot (MATERIALIZED VIEW)
-**Grain:** one row per `security_id`. **Source:** `core.security` + `company_profile`
-+ latest `daily_price`. **Cadence:** refreshed on schedule (`fafnir db refresh-marts`).
+**Grain:** one row per `security_id`. **Source:** `mart.v_security_attributes` (since
+0039, #109; before it, `core.security` and the latest `daily_price`). **Cadence:**
+refreshed on schedule (`fafnir db refresh-marts`), first of the matviews. duk's screener
+and the MCP `screen_securities` read it.
 
-Columns: `security_id, symbol, company_name, asset_type, exchange_code,
-sector_name, industry_name, currency, country, is_actively_trading, is_etf,
-is_fund, market_cap_usd, beta, last_trade_date, last_close, last_volume`.
+The columns, names, types and order are as they were before #109 (duk's screener
+contract). Where each comes from:
+
+| Column | Source |
+|---|---|
+| `security_id`, `symbol`, `company_name`, `asset_type`, `exchange_code`, `currency`, `country`, `is_actively_trading`, `is_etf`, `is_fund` | `core.security` |
+| `sector_name`, `industry_name` | the feeding vendor's: `core.v_security_classification` |
+| `market_cap_usd` | **derived** where SF1 holds the shares (`mart.v_security_attributes`), else `core.security`'s vendor snapshot |
+| `beta` | **derived** from a year of daily returns on SPY's where there are 120 of them, else `core.security`'s |
+| `last_trade_date`, `last_close`, `last_volume` | the latest raw bar in `core.daily_price` |
+
+Which values are derived, and as of when, is in `mart.v_security_attributes`.
+
+### `mart.v_security_attributes` — the screener's attributes by precedence (VIEW)
+Added by 0039 (#109; [ADR 0015 §4](adr/0015-multi-vendor-provenance-and-precedence.md),
+[ADR 0019 §5](adr/0019-derived-metrics-not-vendor-metrics.md)). **Grain:** one row per
+`security_id`. **Source:** `core.security`, `core.v_security_classification`,
+`core.daily_price`, `core.balance_sheet`, `mart.v_corporate_action` and
+`mart.v_daily_price_adjusted`. Read live, so it computes every security's beta when read:
+for screens, read `mart.security_latest`, which holds it as of the last refresh. No column
+of `core.security` is written.
+
+- **Classification:** `sector_name`, `industry_name` and `attributes_source` (`sharadar`,
+  or the `core.security.source` that wrote the pair), from the classification view below.
+- **`market_cap_usd`:**
+  - **How it is derived** (ADR 0019 §5, the panel's expression): the last raw close ×
+    `shares_outstanding` of the latest balance sheet in force on that day, ended within
+    730 days, put in that day's share terms with the warehouse's splits. It is derived
+    for USD-traded securities only.
+  - **The record:** `market_cap_source` is `derived`, `market_cap_as_of` the close's date,
+    `market_cap_fiscal_date` the balance sheet's period.
+  - **Otherwise** (no SF1 shares: funds, ETFs, secondary share classes, names Sharadar
+    does not cover) it is `core.security.market_cap_usd`, and `market_cap_source` names
+    its vendor. That is the vendor's last snapshot, frozen since the cutover for the
+    securities Sharadar feeds.
+- **`beta`:**
+  - **How it is derived:** the slope of the security's daily adjusted returns over the
+    last 365 days on SPY's over the same intervals. A security that skipped days is
+    matched to the market's move over the same span.
+  - **The record:** `beta_source` is `derived`, `beta_as_of` the last return's date,
+    `beta_returns` how many there were.
+  - **Otherwise:** with fewer than 120 returns, or no SPY in the warehouse, it is
+    `core.security.beta`, and `beta_source` names its vendor.
+- **`last_trade_date`, `last_close`, `last_volume`:** the latest raw bar.
+
+### `core.v_security_classification` — the classification readers see (VIEW)
+Added by 0039 (#109). **Grain:** one row per `security_id`. Columns: `security_id,
+sector_id, industry_id, attributes_source`.
+
+- **The feeding vendor's.** A security Sharadar feeds (an open `is_feed` link in
+  `core.security_vendor_xref`) takes Sharadar's TICKERS sector and industry
+  (`core.vendor_security`, the `stocks` row, else `funds`). They are mapped onto fafnir's
+  names as `sharadar_map.map_classification` maps them when it mints: case, commas and
+  spacing ignored, and its industry aliases. A test holds the two equal.
+- **A pair.** Sector and industry come together from Sharadar when its sector maps, else
+  from `core.security`, so a sector and an industry from different vendors are never
+  mixed. Sharadar's industry may then be NULL, which the classification check flags.
+- **Every other security** reads `core.security`'s pair.
+- **Readers.** `mart.v_security_profile`, `mart.v_security_attributes` and the
+  `security_missing_classification` check (`dq run`) read it. It is plain joins, so a
+  filter on `security_id` reaches the indexes.
 
 ---
 

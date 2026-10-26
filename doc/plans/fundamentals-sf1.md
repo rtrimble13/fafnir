@@ -797,7 +797,7 @@ As the FMP prompt's §11, with these changes:
 | 9 | #102 | DQ checks, `fafnir status` | Existing DQ keys unchanged |
 | 10 | #106 | The nightly: SF1 delta, prune, cadence | Timing recorded |
 | 11 | #107, #108 | `duk fs/fa`, MCP tools, `doc/fundamentals.md` | `duk` regression green |
-| 12 | #109 part 2 | Market cap and beta derived | |
+| 12 | #109 part 2 | Market cap and beta derived (built with part 1, migration 0039) | Screener tests unchanged |
 
 A minor release closes P4 (the plan's P4 row).
 

@@ -32,17 +32,40 @@ the nightly job. Everything `screen_securities` returns comes from it.
 `security_profile`) when currency matters. If a screen looks stale, check whether
 `refresh-marts` ran: `ingestion_runs` and the journal will say.
 
-## 3. `market_cap_usd` and `beta` are a screener snapshot, not history
+## 3. `market_cap_usd` and `beta`: derived in the screener, a snapshot in the profile
 
-They are refreshed with the security master and overwritten each time. There is no
-time series behind them.
+Since #109 (migration 0039) there are two kinds, and neither is history:
 
-> **Wrong answer:** "market cap over time" — a series that does not exist. Any
-> such request has to be built from the raw close × shares outstanding in the same
-> share terms (ADR 0019). `core.balance_sheet.shares_outstanding` holds each
-> period's cover count in the terms of its `known_from`, so it is multiplied by the
-> splits after that day first; the mart's derived market cap is still to come
-> (#100, #109).
+- **`mart.security_latest` (what `screen_securities` returns) derives them where it
+  can.**
+  - **Market cap:** the last raw close × SF1's `shares_outstanding` in force that day,
+    put in that day's share terms (ADR 0019 §5, the panel's expression), for USD-traded
+    securities.
+  - **Beta:** the slope of a year of daily adjusted returns on SPY's, from at least
+    120 of them.
+  - **Where neither can be derived** (no SF1 shares: funds, ETFs, secondary classes,
+    names Sharadar does not cover; or too few returns), it shows `core.security`'s
+    vendor snapshot instead.
+  - **Which applies to a value:** `mart.v_security_attributes` says, in
+    `market_cap_source` / `market_cap_as_of` and `beta_source` / `beta_as_of` /
+    `beta_returns`.
+- **`mart.v_security_profile` (`security_profile`) keeps `core.security`'s snapshot.**
+  That is FMP's last screener value, frozen since the cutover (2026-10-22) for every
+  security Sharadar feeds, because FMP's screener runs only in FMP's night.
+
+> **Wrong answer:** "market cap over time" — a series that does not exist in either.
+> The panel has one at month-ends (`mart.fundamental_panel.market_cap`), or build it
+> from the raw close × shares outstanding in the same share terms (ADR 0019).
+> `core.balance_sheet.shares_outstanding` holds each period's cover count in the
+> terms of its `known_from`, so it is multiplied by the splits after that day first.
+
+> **Wrong answer:** quoting the profile's market cap or beta for a Sharadar-fed
+> security as current. Read the screener's, and say whether it was derived.
+
+**Sector and industry** follow the same precedence (`core.v_security_classification`):
+the feeding vendor's. For a security Sharadar feeds, that is Sharadar's names mapped
+onto fafnir's, and `attributes_source` says so. Both views, the panel and the
+industry aggregates read it. `core.security`'s columns are never overwritten.
 
 ## 4. Delisted securities are retained, deliberately
 
