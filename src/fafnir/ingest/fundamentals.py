@@ -53,7 +53,9 @@ date. Equal hash, or equal values: nothing is written, not even ``loaded_at``.
 
 **Validation** (§6.3). A row with a malformed period label, a value its column cannot
 hold, a filing before its period ended, or a twin in the same file is quarantined
-(``ops.data_quality_flag``, once per row), and the rest loads. SF1's metrics,
+(``ops.data_quality_flag``, once per row), and the rest loads. A first-reported period
+SF1 lists once per filing (a 10-K and its 10-K/A) is not a twin: its earliest filing
+loads, and the later ones are counted (``later_filing``). SF1's metrics,
 per-share values and ``*usd`` conversions go to the income row's ``extra``
 (``vendor_metric``), and a column SF1 adds later to ``unmapped``: mart reads neither.
 
@@ -860,29 +862,63 @@ def pending_deltas(db: Database) -> tuple[list[dict], int]:
     return repo.sharadar_deltas_after(db, VENDOR_TABLE, through), through
 
 
-def _twins(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
-    """The rows of one file split into those alone on their (ticker, dimension,
-    reportperiod) and those that share it (§6.3: neither is loaded)."""
+def _twins(rows: Iterable[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """The rows of one file split on their (ticker, dimension, reportperiod) into
+    those to load, the later filings of a first-reported period, and twins.
+
+    SF1 lists a first-reported period once per filing that reported it: a 10-K and its
+    10-K/A, a quarter filed again. The earliest filing is the first report and loads;
+    the later ones are set apart and counted, since what they change reaches the
+    period through its restated row. Rows that cannot be told apart are twins
+    (§6.3: neither is loaded): a restated period listed twice, or two different first
+    reports on the earliest day."""
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:
         groups[(r.get("ticker"), r.get("dimension"), r.get("reportperiod"))].append(r)
-    alone, twins = [], []
-    for group in groups.values():
-        (alone if len(group) == 1 else twins).extend(group)
-    return alone, twins
+    alone, later, twins = [], [], []
+    for (_, dim, _), group in groups.items():
+        first = group[0] if len(group) == 1 else None
+        if first is None and dim in FIRST_REPORTED:
+            first = _first_filing(group)
+        if first is None:
+            twins.extend(group)
+            continue
+        alone.append(first)
+        later.extend(r for r in group if r is not first)
+    return alone, later, twins
+
+
+def _first_filing(group: Sequence[dict]) -> Optional[dict]:
+    """The earliest filing of a first-reported period listed more than once, or None
+    where that is not one row: a filing date missing, or rows filed on the earliest
+    day that differ in more than ``lastupdated``."""
+    if not all(isinstance(r.get("date"), date) for r in group):
+        return None
+    day = min(r["date"] for r in group)
+    earliest = [r for r in group if r["date"] == day]
+
+    def content(r: dict) -> dict:
+        return {k: v for k, v in r.items() if k != "lastupdated"}
+
+    if any(content(r) != content(earliest[0]) for r in earliest[1:]):
+        return None
+    return earliest[0]
 
 
 def _merged_deltas(
     db: Database, bulk_dir: str | Path, files: Sequence[dict], tickers: set[str]
-) -> tuple[dict[str, list[dict]], list[tuple[dict, int]]]:
+) -> tuple[dict[str, list[dict]], list[dict], list[tuple[dict, int]]]:
     """``{ticker: rows}`` across the delta files, oldest first: where two files hold a
-    row, the one stamped later wins, and on the same stamp the later file's. Twins
-    within one file are returned apart, with their file, to quarantine."""
+    row, the one stamped later wins, and on the same stamp the later file's. Later
+    filings within one file are returned apart, to count, and twins, with their file,
+    to quarantine (:func:`_twins`)."""
     wanted = {t: sf.ALL_DATES for t in tickers}
     held: dict[tuple, dict] = {}
+    later: list[dict] = []
     twins: list[tuple[dict, int]] = []
     for f in files if wanted else ():
-        alone, dup = _twins(ledger.select(db, f["file_id"], bulk_dir, wanted))
+        alone, again, dup = _twins(ledger.select(db, f["file_id"], bulk_dir, wanted))
+        later += again
         twins += [(r, f["file_id"]) for r in dup]
         for r in alone:
             k = (r["ticker"], r["dimension"], r["reportperiod"])
@@ -892,7 +928,7 @@ def _merged_deltas(
     out: dict[str, list[dict]] = defaultdict(list)
     for (ticker, _, _), r in held.items():
         out[ticker].append(r)
-    return dict(out), twins
+    return dict(out), later, twins
 
 
 def load(
@@ -966,36 +1002,45 @@ def load(
     for t in targets.values():
         t.splits = splits.get(t.vendor_key, [])
 
-    def groups() -> Iterator[tuple[str, list[dict], list[tuple[dict, int]], int]]:
-        """``(ticker, rows, twins, file_id)``: one key's rows at a time."""
+    def groups() -> (
+        Iterator[tuple[str, list[dict], list[dict], list[tuple[dict, int]], int]]
+    ):
+        """``(ticker, rows, later, twins, file_id)``: one key's rows at a time."""
         if backfill:
             wanted = {ticker: sf.ALL_DATES for ticker in targets}
-            for ticker, rows in ledger.select_by_ticker(
-                db, result.files[0], bulk_dir, wanted
-            ):
-                alone, dup = _twins(rows)
-                yield ticker, alone, [(r, result.files[0]) for r in dup], result.files[
-                    0
-                ]
+            file_id = result.files[0]
+            for ticker, rows in ledger.select_by_ticker(db, file_id, bulk_dir, wanted):
+                alone, later, dup = _twins(rows)
+                yield ticker, alone, later, [(r, file_id) for r in dup], file_id
             return
-        merged, twins = _merged_deltas(db, bulk_dir, files, set(targets))
+        merged, later, twins = _merged_deltas(db, bulk_dir, files, set(targets))
+        later_of: dict[str, list] = defaultdict(list)
+        for r in later:
+            later_of[r["ticker"]].append(r)
         twins_of: dict[str, list] = defaultdict(list)
         for r, f in twins:
             twins_of[r["ticker"]].append((r, f))
         last = result.files[-1] if result.files else None
-        for ticker in sorted(set(merged) | set(twins_of)):
-            yield ticker, merged.get(ticker, []), twins_of.get(ticker, []), last
+        for ticker in sorted(set(merged) | set(later_of) | set(twins_of)):
+            yield (
+                ticker,
+                merged.get(ticker, []),
+                later_of.get(ticker, []),
+                twins_of.get(ticker, []),
+                last,
+            )
 
     def scan(run: Optional[RunLog]) -> None:
         written_to: set[int] = set()
         last = time.monotonic()
-        for done, (ticker, rows, twins, file_id) in enumerate(groups(), start=1):
+        for done, (ticker, rows, later, twins, file_id) in enumerate(groups(), start=1):
             t = targets[ticker]
-            result.read += len(rows) + len(twins)
+            result.read += len(rows) + len(later) + len(twins)
             sids = _load_key(
                 db,
                 t,
                 rows,
+                later,
                 twins,
                 file_id=file_id,
                 links=links,
@@ -1105,6 +1150,7 @@ def _load_key(
     db: Database,
     key: _Key,
     rows: Sequence[dict],
+    later: Sequence[dict],
     twins: Sequence[tuple[dict, int]],
     *,
     file_id: Optional[int],
@@ -1131,6 +1177,7 @@ def _load_key(
             return False
         return True
 
+    counts["later_filing"] += sum(1 for r in later if wanted(r))
     for r, f in twins:
         if wanted(r):
             sid = None

@@ -297,8 +297,8 @@ def test_a_delta_that_repeats_a_row_is_refused(db, tmp_path):
 def test_an_sf1_delta_is_read_by_filing_date_and_keeps_its_twins(db, tmp_path):
     today = date.today().isoformat()
     first = _json_sf1("ARQ", "2026-06-30", "2026-08-01", stamp=today)
-    # A twin: the same period filed again. The loader quarantines both (§6.3);
-    # the fetch passes them on, as the bulk file would.
+    # The same period filed again. The loader loads its first filing and counts the
+    # later one (§6.3); the fetch passes both on, as the bulk file would.
     twin = {**first, "date": "2026-08-15", "revenue": 1001}
     old = _json_sf1("ARQ", "2026-03-31", "2026-05-01", stamp="2026-05-01")
     client = _FakeNight({"SF1": [twin, first, old]})

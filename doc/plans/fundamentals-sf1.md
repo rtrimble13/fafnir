@@ -528,7 +528,7 @@ counted. Never by bare ticker.
 | `fundamentals_filing_before_period` | `known_from < fiscal_date` |
 | `fundamentals_missing_period_label` | `fiscalperiod` absent, or not `YYYY-FY` / `YYYY-Qn` |
 | `fundamentals_value_out_of_range` | a value its column cannot hold |
-| `fundamentals_duplicate_period` | two rows for one ticker, dimension and period in one file |
+| `fundamentals_duplicate_period` | two rows for one ticker, dimension and period in one file that cannot be told apart. As built after the first production backfill: a first-reported period SF1 lists once per filing (a 10-K and its 10-K/A) loads its earliest filing, and the later ones are counted (`later_filing`), not flagged |
 | `fundamentals_unlinked` | no security for the permaticker (§6.2) |
 
 A value that does not parse fails the file in `sharadar_files`, which names its line. Reject the

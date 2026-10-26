@@ -1465,7 +1465,7 @@ the old flag to be resolved.
 | `fundamentals_restatement` | loader | `warn` nightly, `info` backfill | judgement: operations.md › *What a restatement flag means* |
 | `fundamentals_vendor_correction` | loader | `info` | judgement |
 | `fundamentals_estimated_knowledge_date` | loader | `info` | judgement |
-| `fundamentals_unlinked`, `fundamentals_missing_period_label`, `fundamentals_filing_before_period`, `fundamentals_value_out_of_range`, `fundamentals_duplicate_period` | loader quarantine | as the loader sets | the row was not stored: fix the link or wait for the vendor |
+| `fundamentals_unlinked`, `fundamentals_missing_period_label`, `fundamentals_filing_before_period`, `fundamentals_value_out_of_range`, `fundamentals_duplicate_period` | loader quarantine | as the loader sets | the row was not stored: fix the link or wait for the vendor. A `fundamentals_duplicate_period` on a first-reported (`AR*`) row from before the later-filing fix is not a vendor fault: see doc/backfill.md › *A backfill from before the later-filing fix* |
 | `balance_sheet_identity` | `dq run` | `error`; `info` with NCI | judgement: operations.md › *Investigating a balance-sheet-identity failure* |
 | `cash_flow_tie`, `cash_balance_tie` | `dq run` | `warn` | judgement |
 | `fundamentals_gap` | `dq run` | `info` | judgement |
