@@ -6,6 +6,7 @@ extended to a rolling horizon, and refresh the screening materialized view.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Optional, Sequence
 
 from fafnir.db.connection import Database
 from fafnir.logging_config import get_logger
@@ -128,12 +129,88 @@ def ensure_horizon(
     return created, cal_rows
 
 
-def refresh_marts(db: Database, concurrently: bool = True) -> None:
-    """Refresh derived materialized views (security_latest)."""
-    mode = "CONCURRENTLY" if concurrently else ""
-    try:
-        db.execute(f"REFRESH MATERIALIZED VIEW {mode} mart.security_latest")
-    except Exception:
-        # CONCURRENTLY requires a prior non-concurrent populate; fall back.
-        db.execute("REFRESH MATERIALIZED VIEW mart.security_latest")
-    logger.info("Refreshed mart.security_latest")
+#: The materialized views ``fafnir db refresh-marts`` refreshes, in this order.
+#: A build that adds one appends it here (the fundamentals panel, #100).
+MATVIEWS: tuple[str, ...] = ("mart.security_latest",)
+
+#: The SQLSTATEs a CONCURRENTLY refresh raises for a reason a plain refresh
+#: answers: the view holds no data yet (0A000, feature_not_supported) or it has no
+#: unique index (55000, object_not_in_prerequisite_state). Anything else is a real
+#: failure.
+CONCURRENT_UNSUPPORTED = frozenset({"0A000", "55000"})
+
+
+class MartRefreshError(RuntimeError):
+    """One or more materialized views failed to refresh. The others refreshed."""
+
+    def __init__(self, failures: list[tuple[str, str]]):
+        self.failures = failures
+        super().__init__("; ".join(f"{view}: {error}" for view, error in failures))
+
+
+def _is_populated(db: Database, view: str) -> bool:
+    schema, _, name = view.partition(".")
+    populated = db.fetchval(
+        "SELECT ispopulated FROM pg_matviews WHERE schemaname = %s AND matviewname = %s",
+        (schema, name),
+    )
+    if populated is None:
+        raise LookupError(f"no materialized view {view}")
+    return bool(populated)
+
+
+def _refresh(db: Database, view: str, concurrently: bool) -> str:
+    """Refresh one view in its own transaction; the mode it took.
+
+    CONCURRENTLY (readers keep the old rows meanwhile) only where the view holds
+    data. If PostgreSQL still refuses it for one of CONCURRENT_UNSUPPORTED's
+    reasons, the attempt is rolled back to a savepoint and the view refreshed
+    plainly. Any other error propagates: before #96 a bare ``except`` turned every
+    failure into a second, plain attempt, so a broken view reported success, and
+    outside autocommit the second attempt met an aborted transaction.
+    """
+    import psycopg
+
+    with db.conn.transaction():
+        if concurrently and _is_populated(db, view):
+            try:
+                with db.conn.transaction():
+                    db.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view}")
+                return "concurrently"
+            except psycopg.Error as exc:
+                if exc.sqlstate not in CONCURRENT_UNSUPPORTED:
+                    raise
+                logger.warning(
+                    "%s: CONCURRENTLY refused (%s); refreshing plainly",
+                    view,
+                    exc.sqlstate,
+                )
+        db.execute(f"REFRESH MATERIALIZED VIEW {view}")
+        return "plain"
+
+
+def refresh_marts(
+    db: Database, concurrently: bool = True, views: Optional[Sequence[str]] = None
+) -> list[tuple[str, str]]:
+    """Refresh the derived materialized views, :data:`MATVIEWS` unless ``views``
+    names others, in order: ``(view, mode)`` for each.
+
+    Each view is refreshed and committed on its own, so one that fails neither
+    undoes nor stops the rest. If any failed, :class:`MartRefreshError` names them
+    all once the others are done.
+    """
+    done: list[tuple[str, str]] = []
+    failures: list[tuple[str, str]] = []
+    for view in MATVIEWS if views is None else views:
+        try:
+            mode = _refresh(db, view, concurrently)
+        except Exception as exc:  # noqa: BLE001 -- reported below, never swallowed
+            logger.error("Refreshing %s failed: %s", view, exc)
+            failures.append((view, f"{type(exc).__name__}: {exc}"))
+            continue
+        db.commit()
+        logger.info("Refreshed %s (%s)", view, mode)
+        done.append((view, mode))
+    if failures:
+        raise MartRefreshError(failures)
+    return done

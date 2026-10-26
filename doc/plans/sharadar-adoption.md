@@ -326,6 +326,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #96: `refresh_marts` refreshes a list and stops swallowing failures.**
+  `fafnir.db.maintenance.MATVIEWS` (`mart.security_latest`; #100 appends the panel) is
+  refreshed in order, each view committed on its own.
+  - **The mode is decided before running:** CONCURRENTLY only where `pg_matviews.ispopulated`.
+  - **A plain retry** follows only CONCURRENTLY's two "do it plainly" SQLSTATEs (0A000, 55000),
+    after a savepoint rollback.
+  - **Any other error** is collected, and the command exits non-zero naming every view that
+    failed. The others still refresh.
+  - **The behaviour change:** a broken view used to report success, and now fails
+    `refresh-marts` and the nightly. `daily_update.sh` and the CLI's flags are unchanged.
+  - **Tests:** six in `test_maintenance.py`, the existing ones unmodified. They cover an
+    unpopulated view, one with no unique index, a real failure among good views, a fallback
+    and a failure inside an open transaction, and the command.
+
 - **2026-10-26 · P4, #95: point-in-time access and TTM, migration 0036.**
   [fundamentals-sf1.md §5.7](fundamentals-sf1.md#57-as-built-point-in-time-access-and-ttm-95)
   has the detail.

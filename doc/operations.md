@@ -1234,7 +1234,23 @@ back exactly and recomputes the security's factors. See
   `max(current_year + horizon_extra_years, calendar_end_year)`), so no yearly config
   edits are needed. To force a specific target: `fafnir db ensure-horizon --through-year 2035`;
   to create an explicit fixed range instead: `fafnir db ensure-partitions --start-year 2028 --end-year 2030`.
-- **Mart refresh** — `fafnir db refresh-marts` (also part of the daily job).
+- **Mart refresh** — `fafnir db refresh-marts` (also part of the daily job). It refreshes
+  every materialized view in `fafnir.db.maintenance.MATVIEWS`, in order:
+  `mart.security_latest` today, and the views later builds append (the fundamentals panel,
+  #100). It prints each view and how it was refreshed.
+  - **CONCURRENTLY** where the view holds data, so readers keep the old rows meanwhile. A
+    view that has never been populated gets a plain refresh.
+  - **The fallback.** If PostgreSQL still refuses CONCURRENTLY because the view is
+    unpopulated or has no unique index, the attempt is rolled back to a savepoint and
+    the view refreshed plainly.
+  - **Failures (since #96).** Any other error is a failure. Each view commits on its
+    own, so one that fails neither undoes nor stops the rest. The command then exits
+    non-zero naming every view that failed, and so does the daily job, which runs it
+    unwrapped.
+    - **Before #96,** any error was retried as a plain refresh. A broken view could report
+      success, and outside autocommit the retry met an aborted transaction.
+    - **When it fails,** read the error it names, fix the view's cause, and run it again.
+      The marts it did refresh are current.
 - **Re-run adjustments** — `fafnir adjust` (whole universe) or `fafnir adjust --symbol AAPL`.
   Run it after any price reload as well as after an actions load: dividend factors
   are valued against the prior raw close, so new prices can change them.
