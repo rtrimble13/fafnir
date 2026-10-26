@@ -326,6 +326,20 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #92 prepared: the fundamentals backfill runbook.** The run itself is the
+  operator's, on the host. What it needs is in place:
+  - **The runbook:** [backfill.md › The fundamentals backfill](../backfill.md#the-fundamentals-backfill-92),
+    with the steps, what to record and when to stop.
+  - **The report:** `scripts/fundamentals_report.sql`, aggregates only, so its output can be
+    posted on #92 as it is. It covers rows, versions, corrections, restated shares,
+    `knowledge_source` by decade, open flags, the balance-sheet identity (noncontrolling
+    interest aside), both standing invariants and the tables' size.
+  - **The undo:** `scripts/reset_data.sh --scope fundamentals`, which empties the three tables
+    and their watermarks.
+  - **The projection,** from a synthetic load of 930,000 rows on the test database: about
+    1,650 rows written a second, so SF1 takes about 40 minutes there; 3.3–5.8 GB for the three
+    tables.
+
 - **2026-10-26 · P4, #91: the fundamentals integration tests.** `test_fundamentals_integration.py`
   runs the build end to end.
   - **Golden values,** read point in time: AAPL FY2020 revenue 274,515,000,000, not known the

@@ -518,6 +518,9 @@ through in about 180 s, #52).
 - **Size, to measure before the production run** (#87 and #92 record it): the quarterly and annual
   first-reported and restated rows are about two thirds of SF1. With 1.7 versions per period across
   three tables, that is on the order of 6M rows, plus `extra`. The database was 22 GB on 2026-10-22.
+  *Projected from a synthetic load (2026-10-26):* 3.3–5.8 GB with indexes, and about 40 minutes
+  at the test machine's speed
+  ([backfill.md](../backfill.md#the-fundamentals-backfill-92)).
 - **Record:** rows per table, versions, restatements, corrections, quarantines, `knowledge_source`
   by decade, and the identity pass rate.
 

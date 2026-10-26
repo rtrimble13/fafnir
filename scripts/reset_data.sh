@@ -12,6 +12,7 @@
 #
 #   scripts/reset_data.sh --scope prices              # preview (default)
 #   scripts/reset_data.sh --scope prices --yes        # actually do it
+#   scripts/reset_data.sh --scope fundamentals        # the SF1 statements (#92)
 #   scripts/reset_data.sh --scope vendor:sharadar     # report only (#70)
 #
 # DRY RUN IS THE DEFAULT. Nothing is deleted until you pass --yes.
@@ -43,6 +44,13 @@ Scopes:
                 trail. Safe at any time -- nothing reads it during ingestion.
 
   dq-flags      ops.data_quality_flag only. Clears accumulated flag history.
+
+  fundamentals  The three statement tables (core.income_statement,
+                core.balance_sheet, core.cash_flow_statement) and their SF1
+                watermarks: undoes `fafnir ingest fundamentals`. The runs and the
+                fundamentals_* flags stay as the record. Nothing else reads the
+                tables yet; reload with `--backfill`, which dates every
+                restatement it finds from the day it runs.
 
   all           Every core/ops/landing table: prices, actions, factors, security
                 master, xrefs, applied renames, profiles, vendor identity (the
@@ -121,13 +129,17 @@ LEGACY_PRICE_ENDPOINT="historical-price-eod/full"
 # list has to be in the list too. TRUNCATE is deliberately issued WITHOUT CASCADE:
 # if a future migration adds a referencing table, this fails loudly instead of
 # silently wiping something nobody listed.
-WATERMARK_SQL=""
+# The watermarks a scope clears with its tables: a WHERE on ops.load_watermark.
+PRICE_WATERMARKS="source='fmp'
+                  AND endpoint IN ('${PRICE_ENDPOINT}', '${LEGACY_PRICE_ENDPOINT}')"
+WATERMARK_WHERE=""
+WATERMARK_LABEL=""
 RESTART_IDENTITY=""
 case "${SCOPE}" in
     prices)
         TABLES="core.daily_price, core.adjustment_factor"
-        WATERMARK_SQL="DELETE FROM ops.load_watermark WHERE source='fmp'
-                        AND endpoint IN ('${PRICE_ENDPOINT}', '${LEGACY_PRICE_ENDPOINT}');"
+        WATERMARK_WHERE="${PRICE_WATERMARKS}"
+        WATERMARK_LABEL="price"
         NEXT="fafnir ingest prices --include-inactive --from <start-date>
   fafnir adjust
   fafnir db refresh-marts
@@ -141,13 +153,20 @@ case "${SCOPE}" in
         ;;
     market-data)
         TABLES="core.daily_price, core.corporate_action, core.adjustment_factor"
-        WATERMARK_SQL="DELETE FROM ops.load_watermark WHERE source='fmp'
-                        AND endpoint IN ('${PRICE_ENDPOINT}', '${LEGACY_PRICE_ENDPOINT}');"
+        WATERMARK_WHERE="${PRICE_WATERMARKS}"
+        WATERMARK_LABEL="price"
         NEXT="fafnir ingest prices --include-inactive --from <start-date>
   fafnir ingest actions
   fafnir adjust
   fafnir db refresh-marts
   fafnir dq run"
+        ;;
+    fundamentals)
+        TABLES="core.income_statement, core.balance_sheet, core.cash_flow_statement"
+        WATERMARK_WHERE="source='sharadar' AND endpoint LIKE 'SF1:%'"
+        WATERMARK_LABEL="SF1"
+        NEXT="fafnir ingest fundamentals --backfill
+  psql \"\${FAFNIR_DSN}\" -X -f scripts/fundamentals_report.sql"
         ;;
     landing)
         TABLES="landing.fmp_raw"
@@ -188,6 +207,10 @@ esac
 
 # Normalize whitespace so the list prints and re-parses cleanly.
 TABLES="$(echo "${TABLES}" | tr -s ' \n\t' ' ' | sed 's/^ //; s/ $//')"
+WATERMARK_SQL=""
+if [[ -n "${WATERMARK_WHERE}" ]]; then
+    WATERMARK_SQL="DELETE FROM ops.load_watermark WHERE ${WATERMARK_WHERE};"
+fi
 
 # Describe the target WITHOUT echoing the DSN. A URL-form DSN
 # (postgresql://user:pass@host/db -- supported, see src/fafnir/config.py) contains
@@ -311,11 +334,10 @@ for t in "${TABLE_ARR[@]}"; do
     printf '    %-28s %s\n' "${t}" \
         "$(psql "${DSN}" -tAc "SELECT count(*) FROM ${t};" 2>/dev/null || echo '(unreadable)')"
 done
-if [[ -n "${WATERMARK_SQL}" ]]; then
-    printf '    %-28s %s\n' "ops.load_watermark (price)" \
+if [[ -n "${WATERMARK_WHERE}" ]]; then
+    printf '    %-28s %s\n' "ops.load_watermark (${WATERMARK_LABEL})" \
         "$(psql "${DSN}" -tAc "SELECT count(*) FROM ops.load_watermark
-             WHERE source='fmp' AND endpoint IN
-             ('${PRICE_ENDPOINT}','${LEGACY_PRICE_ENDPOINT}');" 2>/dev/null || echo '(unreadable)')"
+             WHERE ${WATERMARK_WHERE};" 2>/dev/null || echo '(unreadable)')"
 fi
 echo
 
