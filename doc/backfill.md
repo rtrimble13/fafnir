@@ -677,6 +677,82 @@ What differed from the issue's plan:
   stopped part-way, the queue stood at 63,547 open conditions, most of them false
   once the reload finished. Work the flags only after the last load ([sweep policy](../.claude/skills/fafnir-dba/references/sweep-policy.md)).
 
+## The fundamentals backfill (#92)
+
+`fafnir ingest fundamentals --backfill` loads SF1's statements into the three statement
+tables from the ledger's SF1 file ([ingestion.md](ingestion.md#statements-from-sf1-90)). On
+the production host it runs once, after migration 0035. The night's SF1 deltas take over
+from it (#106).
+
+**Before it** (plan [§2](plans/fundamentals-sf1.md#2-the-probe)):
+- **The probe on the host's file.** Run `fafnir source probe-fundamentals` against the
+  ledger's SF1 file and compare its verdicts with the 2026-10-24 run (the table under
+  [Confirming the SF1 feed](#confirming-the-sf1-feed)).
+- **EDGAR, by hand.** Compare the five filings its `--json` evidence lists, and two filings
+  dated before 1997, with EDGAR. A first-reported `date` that is not the filing date stops the
+  backfill (§14).
+
+Run each command as `fafnir`, inside `tmux`, with the environment file sourced. Run it in
+the day, not across the night's timer (22:30 ET), and one heavy command at a time.
+
+| Step | Command | Notes |
+|---|---|---|
+| 1. Dump | `scripts/backup_dump.sh` | Record the path on #92 before anything writes |
+| 2. Deploy | `git pull && fafnir --version && fafnir db migrate` | Applies 0035; add `pip install` if `pyproject.toml` changed ([releasing.md](releasing.md#deploying-it)) |
+| 3. A current file | `fafnir source sharadar-bulk --tables SF1 --force` | The ledger's SF1 file is from 2026-10-19: refresh it, so the deltas take over from a current one. About 0.6 GB |
+| 4. The probe | `fafnir source probe-fundamentals` | Its verdicts against the 2026-10-24 table; `--json` stays on the host |
+| 5. Dry run | `time fafnir ingest fundamentals --backfill --dry-run` | Reads everything and writes nothing. Its `<table>:inserted` and `<table>:restated` counts are the rows the run will write |
+| 6. The backfill | `time fafnir ingest fundamentals --backfill` | One run, committed per vendor key, so a stopped run resumes where it stood: re-run the same command |
+| 7. The report | `psql "$FAFNIR_DSN" -X -f scripts/fundamentals_report.sql` | Aggregates only: post it on #92 as it is |
+| 8. A no-op | `fafnir ingest fundamentals --backfill --dry-run` | `0 securities would change`: the load is idempotent on production data too |
+
+- **Disk.** The run groups the file by ticker on disk first, under `[sharadar] bulk_dir`.
+  Allow about four times the zip's size free there, about 2.5 GB, until it ends. For the
+  tables' own size, see the projection below.
+- **Watching it.** Every minute the run writes its progress to `ops.ingestion_run`:
+  ```bash
+  psql "$FAFNIR_DSN" -c "SELECT ingestion_run_id, params->'progress' FROM ops.ingestion_run
+    WHERE endpoint = 'fundamentals' ORDER BY 1 DESC LIMIT 1;"
+  ```
+- **What to record on #92** (aggregates only, never a vendor value):
+  - the dump's path;
+  - steps 3, 5 and 6's times;
+  - the disk free before and after;
+  - the report's eight sections;
+  - the run's counts (`fafnir` prints them; they are also in its `params`);
+  - anything that did not work as written here.
+- **Stop and ask** (plan §14) if:
+  - the probe disagrees with the API run;
+  - the EDGAR comparison fails;
+  - the report's restated share is near 100% of periods, which would mean a field that
+    always differs;
+  - the size runs beyond what the disk can take.
+- **To undo it,** `scripts/reset_data.sh --scope fundamentals` (preview), then `--yes`. It
+  empties the three tables and their watermarks, and nothing else reads them yet. A reload
+  dates every restatement it finds from the day it runs.
+
+**The projection.** It was measured on the test database on 2026-10-26, with a synthetic SF1
+of 2,000 tickers over 31 years. That is 930,000 rows, about a quarter of SF1's, with all 112
+columns and half the periods restated.
+- **Time.** The backfill wrote 1.08M rows in 656 s, about 1,650 a second. A re-run read
+  everything and wrote nothing in 382 s. The time goes in roughly equal thirds:
+  - the database's inserts;
+  - reading and grouping the file;
+  - typing and planning the rows.
+
+  SF1's 3.2M rows scale to about 40 minutes at the test machine's speed. Allow up to two
+  hours on the 3.8 GB host.
+- **Size.** With indexes, a row takes:
+  - **income statement:** 2.3 KB, its synthetic `extra` 1.3 KB of that;
+  - **balance sheet:** 0.65 KB;
+  - **cash flow statement:** 0.52 KB.
+
+  SF1 has about 1.07M periods per table, at 1 to 1.73 versions each (73% of quarterly periods
+  differ somewhere in the probe). With `extra` at #87's measured 965 bytes, the three tables
+  come to **3.3–5.8 GB**. Dumps grow with them.
+
+Measure both on the host and record them on #92.
+
 ## Disk budget with Sharadar
 
 Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in
@@ -721,6 +797,9 @@ price files came in as projected, and SF1 came in smaller (632 MB, at 3.2M rows 
   whole of `core.daily_price` is 14.7 GB for 84.9M bars, **173 bytes a bar** with
   every index (the 151 was heap and primary key). So the new bars are about
   **3.3 GB**, and the database is 22 GB after.
+- **Fundamentals (P4).** The three statement tables come to about **3.3–5.8 GB**
+  ([projection](#the-fundamentals-backfill-92)), most of it the income statement's
+  `extra`. The backfill also needs about 2.5 GB under `bulk_dir` while it runs.
 - **Dumps.** Each nightly dump grows in proportion to `core.daily_price`, and
   `backup_dump.sh` keeps 14. Measure the bytes per bar of the current dump (its
   size over `core.daily_price`'s row count), multiply by the new bars, and check
