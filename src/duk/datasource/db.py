@@ -657,3 +657,209 @@ def company_summary(*, dsn: str, security_id: int) -> dict:
         "fundamentals": fundamentals,
         "adjusted_prices": adjusted,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fundamentals (`duk fs` / `duk fa`, #107)
+# ---------------------------------------------------------------------------
+
+#: `--statement` and the mart view of every version of that statement (0036).
+STATEMENT_VIEWS = {
+    "income": "mart.v_income_statement_versions",
+    "balance": "mart.v_balance_sheet_versions",
+    "cash": "mart.v_cash_flow_statement_versions",
+}
+STATEMENT_PERIODS = ("annual", "quarter")
+
+# A version in force at D, the rule each view's comment states and
+# mart.fn_statements_as_of applies: current on the load timeline, known at D on the
+# knowledge timeline. That function answers each security's latest period only; a
+# statement is every period, so it is read here from the view by the same rule.
+_STATEMENT_SQL = """
+    SELECT * FROM {view}
+     WHERE security_id = %(sid)s AND period_type = %(period)s
+       AND superseded_at IS NULL AND known_from <= %(as_of)s
+       AND (known_to IS NULL OR %(as_of)s < known_to)
+     ORDER BY fiscal_date DESC
+"""
+# What a point-in-time read leaves out: what the caller already named, and the later
+# dates of both timelines. A version's known_to is when it stopped being in force,
+# which seen from an --as-of date is the future (ADR 0018).
+_STATEMENT_HIDDEN = frozenset(
+    {"security_id", "period_type", "known_to", "loaded_at", "superseded_at"}
+)
+
+# Decision 5 (plan fundamentals-sf1.md): SF1 files an issuer's statements under its
+# primary share class only. A class holding none of its own is answered with the
+# one other class under its CIK that does hold them, and never with a guess among
+# several.
+_HOLDS_STATEMENTS_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM mart.v_income_statement_versions "
+    "WHERE security_id = %s) AS held"
+)
+_ISSUER_CLASS_SQL = """
+    SELECT p.security_id, p.symbol, p.cik
+      FROM mart.v_security_profile me
+      JOIN mart.v_security_profile p
+        ON ltrim(btrim(p.cik), '0') = ltrim(btrim(me.cik), '0')
+       AND p.security_id <> me.security_id
+     WHERE me.security_id = %s
+       AND NULLIF(ltrim(btrim(me.cik), '0'), '') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM mart.v_income_statement_versions v
+                    WHERE v.security_id = p.security_id)
+"""
+
+# The factor row (0037, 0038). Without a date, the latest snapshot; with one, the
+# panel's month-end on or before it. Both are materialized: unrefreshed, PostgreSQL
+# refuses the read with SQLSTATE 55000.
+_LATEST_FACTORS_SQL = (
+    "SELECT * FROM mart.security_fundamentals_latest WHERE security_id = %s"
+)
+_LATEST_AS_OF_SQL = "SELECT max(as_of_date) AS d FROM mart.security_fundamentals_latest"
+_PANEL_MONTH_END_SQL = (
+    "SELECT max(as_of_date) AS d FROM mart.fundamental_panel WHERE as_of_date <= %s"
+)
+_PANEL_ROW_SQL = (
+    "SELECT * FROM mart.fundamental_panel WHERE security_id = %s AND as_of_date = %s"
+)
+_NOT_POPULATED = "55000"
+
+
+def _sec_id(cur, symbol: Optional[str], security_id: Optional[int]) -> Optional[int]:
+    if security_id is not None:
+        return security_id
+    if not symbol:
+        raise DataSourceError("a symbol or a security_id is required")
+    return _resolve_security_id(cur, symbol.upper())
+
+
+def _statements_of(cur, security_id: int) -> Optional[dict]:
+    """The issuer's class whose statements stand for ``security_id``'s, or None
+    when it holds its own (or no single other class does)."""
+    cur.execute(_HOLDS_STATEMENTS_SQL, (security_id,))
+    if cur.fetchone()["held"]:
+        return None
+    found = _rows(cur, _ISSUER_CLASS_SQL, (security_id,))
+    return found[0] if len(found) == 1 else None
+
+
+def statements(
+    *,
+    dsn: str,
+    symbol: Optional[str] = None,
+    security_id: Optional[int] = None,
+    statement: str = "income",
+    period: str = "annual",
+    as_of: Optional[str | date] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """One statement of one security, every period as known at ``as_of``.
+
+    Each period is at its version in force on ``as_of`` (default today): a period
+    filed later is absent, and a restatement after ``as_of`` does not show. Values
+    stay the exact decimals the warehouse stores; share counts are in the share
+    terms of each version's ``known_from`` (ADR 0019).
+
+    Returns ``security_id`` (None: no such security), ``as_of``, ``statements_of``
+    (the issuer's class read instead, decision 5, else None) and ``rows``, oldest
+    first; ``limit`` keeps the latest periods.
+    """
+    if statement not in STATEMENT_VIEWS:
+        raise DataSourceError(
+            f"Unknown statement '{statement}': expected one of "
+            f"{', '.join(STATEMENT_VIEWS)}"
+        )
+    if period not in STATEMENT_PERIODS:
+        raise DataSourceError(f"Unknown period '{period}': expected annual or quarter")
+    if limit is not None and limit < 1:
+        raise DataSourceError("limit must be at least 1")
+    day = _parse_date(as_of, "as-of date")
+
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        sec_id = _sec_id(cur, symbol, security_id)
+        cur.execute("SELECT COALESCE(%s::date, current_date) AS d", (day,))
+        day = cur.fetchone()["d"]
+        out = {"security_id": sec_id, "as_of": day, "statements_of": None, "rows": []}
+        if sec_id is None:
+            return out
+        issuer = _statements_of(cur, sec_id)
+        sql = _STATEMENT_SQL.format(view=STATEMENT_VIEWS[statement])
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        cur.execute(
+            sql,
+            {
+                "sid": issuer["security_id"] if issuer else sec_id,
+                "period": period,
+                "as_of": day,
+            },
+        )
+        rows = [
+            {k: v for k, v in r.items() if k not in _STATEMENT_HIDDEN}
+            for r in cur.fetchall()
+        ]
+    rows.reverse()
+    out.update(statements_of=issuer, rows=rows)
+    return out
+
+
+def factor_row(
+    *,
+    dsn: str,
+    symbol: Optional[str] = None,
+    security_id: Optional[int] = None,
+    as_of: Optional[str | date] = None,
+) -> dict:
+    """The factor panel's row for one security.
+
+    Without ``as_of``, ``mart.security_fundamentals_latest``: the factors as of the
+    last `fafnir db refresh-marts`. With it, ``mart.fundamental_panel`` at the last
+    month-end on or before ``as_of``, every input as known then. A secondary class
+    is answered with its issuer's class, as :func:`statements` is.
+
+    Returns ``security_id``, ``source``, ``as_of_date`` (the snapshot's or the
+    month-end's; None before the panel's first), ``statements_of`` and ``row``
+    (None: the security did not trade in the week to that date).
+    """
+    day = _parse_date(as_of, "as-of date")
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        sec_id = _sec_id(cur, symbol, security_id)
+        source = (
+            "mart.security_fundamentals_latest"
+            if day is None
+            else "mart.fundamental_panel"
+        )
+        out = {
+            "security_id": sec_id,
+            "source": source,
+            "as_of_date": None,
+            "statements_of": None,
+            "row": None,
+        }
+        if sec_id is None:
+            return out
+        issuer = _statements_of(cur, sec_id)
+        read_id = issuer["security_id"] if issuer else sec_id
+        try:
+            if day is None:
+                cur.execute(_LATEST_AS_OF_SQL)
+                when = cur.fetchone()["d"]
+                cur.execute(_LATEST_FACTORS_SQL, (read_id,))
+            else:
+                cur.execute(_PANEL_MONTH_END_SQL, (day,))
+                when = cur.fetchone()["d"]
+                cur.execute(_PANEL_ROW_SQL, (read_id, when))
+            row = cur.fetchone()
+        except Exception as exc:  # noqa: BLE001 -- one case is translated
+            if getattr(exc, "sqlstate", None) == _NOT_POPULATED:
+                raise DataSourceError(
+                    f"{source} has not been refreshed yet: run "
+                    "`fafnir db refresh-marts`"
+                ) from exc
+            raise
+    out.update(
+        as_of_date=when,
+        statements_of=issuer,
+        row=dict(row) if row else None,
+    )
+    return out

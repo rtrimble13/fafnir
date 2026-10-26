@@ -703,6 +703,30 @@ fafnir status                          # appends fundamentals lines; existing li
 - A secondary class answers with its issuer's primary-class statements, through the shared CIK,
   saying so (decision 5).
 
+### 8.1 As built: `duk fs` / `fa` and the MCP tools (#107)
+
+[duk.md](../duk.md#fs-and-fa--statements-and-factors-point-in-time) and
+[agent.md](../agent.md#fundamentals) document them. These points are settled here:
+
+- **`fs` reads the version views, not `mart.fn_statements_as_of`.** The function answers each
+  security's latest period; a statement is every period. Both apply the same rule, a version in
+  force on the date: `superseded_at IS NULL AND known_from <= D AND (known_to IS NULL OR D <
+  known_to)`.
+- **What `fs` leaves out.** `known_to`, `loaded_at` and `superseded_at`: seen from an `--as-of`
+  date, when a version stopped being in force is the future.
+- **`fa` reads the materialized panel.** It reads `mart.fundamental_panel` at the last month-end on
+  or before `--as-of`, or the latest snapshot without it. It does not call
+  `fn_fundamental_snapshot`, which computes the whole cross-section to answer one security. A
+  security with no row at that month-end has no row: never an older month's.
+- **The secondary class.** It is answered only when it holds no income statement and exactly one
+  other security under its CIK does. Several, or no CIK, means no fallback.
+- **Precision.** `fs` keeps duk's 2 decimals for amounts; `fa` defaults to 4, as its values are
+  ratios. The MCP tools return exact decimals as strings, as every tool on that surface does.
+- **Tests.** `test/duk/test_cli_fundamentals.py` (the CLI contract) and `test_db_fundamentals.py`
+  (the reads against a database) are new, as is `test/fafnir_mcp/test_fundamentals_tools.py`
+  (parity with duk, validation). The one existing test changed is `test_profiles.py`'s
+  `READ_TOOLS`, deliberately, as #107 asks.
+
 ---
 
 ## 9. Non-breaking guarantees

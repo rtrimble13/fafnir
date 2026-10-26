@@ -182,6 +182,38 @@ absent, for exactly this reason.
 | **Changes, on approval** | `ingest prices\|actions\|delisted\|symbol-changes`, `adjust`, `db refresh-marts`, `dq resolve`/`reopen`, `track rm`, `security merge-rename`/`dismiss-rename`/`split-history`, `actions add`/`delete`/`redate`, `prices delete`/`shift`/`rescale`, `override revoke`, `vendor corrections revert` — each after showing its `--dry-run` |
 | **Refused outright** | `psql`, `pg_dump`, `sudo -u postgres`, `reset_data.sh`, `db migrate`/`rollback`, `security descope`, `systemctl restart`/`stop`, reading `fafnir.env` / `.pgpass` / `.fafnirrc`, editing `/opt/fafnir` |
 
+### The tools
+
+The ops profile registers every tool below; the read profile (`--profile read`,
+ADR 0008) only the first group. A tool the profile lacks does not exist on it
+(`test/fafnir_mcp/test_profiles.py`).
+
+| Tool | Profile | Reads |
+|---|---|---|
+| `resolve_symbol` | read | a ticker, identifier, `TICKER@date` or name to one security |
+| `price_history` | read | daily OHLCV, raw or adjusted (say which) |
+| `screen_securities`, `list_sectors`, `list_industries` | read | `mart.security_latest`, `ref.*` |
+| `security_profile` | read | everything held on one security |
+| `dq_summary` | read | the open DQ flags of one security, without detail |
+| `statements_as_of` | read | one statement of one security, every period as known on `as_of` (#107) |
+| `factor_row` | read | one security's factor-panel row, latest or at a month-end (#107) |
+| `dq_queue`, `dq_triage`, `dq_totals` | ops | the DQ queue with detail and history |
+| `ingestion_runs`, `watermarks`, `landing_payload`, `sharadar_files` | ops | the operational record |
+| `schema_state`, `sql_read` | ops | migrations; free-form read-only SQL |
+
+### Fundamentals
+
+`statements_as_of` and `factor_row` return what `duk fs` and `duk fa` print, from the
+same reads ([duk.md](duk.md#fs-and-fa--statements-and-factors-point-in-time)).
+- **Point in time.** With `as_of`, they answer with what was known that day: each
+  period at its version in force, and the panel's month-end row. Without it, with
+  today's knowledge, which includes later restatements. A backtest passes `as_of`.
+- **Exact amounts.** Statement amounts come as exact decimal strings.
+- **Secondary share classes.** A secondary class is answered with its issuer's
+  primary class, named in `statements_of`.
+- **Empty answers.** `factors: null` comes with a note saying why: the security did
+  not trade in the week to that date, or the date is before 1998.
+
 ### Screens and dead issuers
 
 `screen_securities` returns actively trading securities unless the agent passes

@@ -41,6 +41,11 @@ Two facts that make answers wrong if forgotten:
 Before reasoning over a series, check `dq_summary` for that security: open flags
 mean the warehouse itself is unsure about some of those bars.
 
+Fundamentals are point in time. `statements_as_of(as_of=...)` and
+`factor_row(as_of=...)` answer with what was known on that date; without as_of,
+with what is known today, which includes later restatements. A backtest passes
+as_of.
+
 Nothing here writes. Changes to the warehouse go through the `fafnir` CLI.
 """
 
@@ -206,6 +211,44 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         warehouse itself is unsure about some of those bars.
         """
         return T.dq_summary(dsn=dsn, symbol=symbol)
+
+    @server.tool()
+    @_surfaced
+    def statements_as_of(
+        symbol: str,
+        statement: str = "income",
+        period: str = "annual",
+        as_of: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """One financial statement of one security, as known on a date.
+
+        statement is income, balance or cash; period is annual or quarter. Every
+        period at its version in force on as_of (YYYY-MM-DD, default today): a
+        period filed later is absent and a later restatement does not show. limit
+        keeps the latest periods. A secondary share class answers with its
+        issuer's primary class, and says so (statements_of).
+        """
+        return T.statements_as_of(
+            dsn=dsn,
+            symbol=symbol,
+            statement=statement,
+            period=period,
+            as_of=as_of,
+            limit=limit,
+        )
+
+    @server.tool()
+    @_surfaced
+    def factor_row(symbol: str, as_of: Optional[str] = None) -> dict:
+        """One security's row of the factor panel: value, quality, growth and yield
+        factors with the basis period they come from.
+
+        Without as_of, the latest snapshot (as of the last mart refresh); with
+        as_of (YYYY-MM-DD), the panel's month-end on or before it, every input as
+        known then.
+        """
+        return T.factor_row(dsn=dsn, symbol=symbol, as_of=as_of)
 
     if profile == "ops":
         _register_ops_tools(server, dsn)

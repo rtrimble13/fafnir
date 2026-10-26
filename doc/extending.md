@@ -9,7 +9,7 @@ patterns to add new sources, tables, and consumers.
 |---|---|---|
 | **Initial release** | security master, daily OHLCV, corporate actions, dual-mode duk | ✅ shipped |
 | **Sharadar** | permaticker identity, dead-issuer history from 1998, corrections to FMP history, nightly feed; `duk -S sharadar` | in progress — [plan](plans/sharadar-adoption.md) |
-| **Fundamentals** | bitemporal statements on Sharadar SF1, point-in-time panel; derived metrics | planned (Sharadar plan, phase 4) |
+| **Fundamentals** | bitemporal statements on Sharadar SF1, point-in-time panel; derived metrics; `duk fs` / `fa` | in progress — Sharadar plan, phase 4 |
 | **Economic series** | FRED, BLS, BEA time series; treasury curve for `duk yc` (db) | planned |
 | **MCP server** | agentic read access over `mart`, plus an on-host ops tier | ✅ shipped |
 | **Intraday** | `core.intraday_bar` (TIMESTAMPTZ) | planned |
@@ -91,7 +91,7 @@ privilege decision rather than a convenience:
 
 | Profile | Role | Reads | Tools |
 |---|---|---|---|
-| `read` | member of `fafnir_app` | `mart`, `ref` | `resolve_symbol`, `price_history`, `screen_securities`, `list_sectors`/`list_industries`, `security_profile`, `dq_summary` |
+| `read` | member of `fafnir_app` | `mart`, `ref` | `resolve_symbol`, `price_history`, `screen_securities`, `list_sectors`/`list_industries`, `security_profile`, `dq_summary`, `statements_as_of`, `factor_row` |
 | `ops` | member of `fafnir_ops` (0021) | + `core`, `ops`, `landing`, `meta` | + `dq_queue`, `dq_triage`, `dq_totals`, `ingestion_runs`, `watermarks`, `landing_payload`, `sharadar_files`, `schema_state`, `sql_read` |
 
 The `read` profile is the surface [ADR 0008 §3](adr/0008-remote-duk-access-and-mcp.md)

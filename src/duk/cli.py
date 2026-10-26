@@ -5,10 +5,12 @@ This module provides the main command-line interface using Click.
 """
 
 import csv
+import datetime as dt
 import io
 import json
 import logging
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import click
@@ -1533,6 +1535,334 @@ def _ls_company_summary(
 
     if not quiet:
         click.echo(payload)
+
+
+# ---------------------------------------------------------------------------
+# Fundamentals: `duk fs` and `duk fa` (#107)
+# ---------------------------------------------------------------------------
+
+#: Decimal places `fa` shows by default: its factors are ratios, which two places
+#: would flatten (an earnings yield of 0.0345 is not 0.03).
+FACTOR_DECIMALS = 4
+
+
+def _refuse_vendor_source(ctx, command):
+    """`fs` and `fa` read the warehouse's statements: no vendor backend, as `yc`
+    has none on Sharadar."""
+    source = ctx.obj.get("source", "db")
+    if source != "db":
+        click.echo(
+            f"Error: {command} reads the warehouse's statements; it has no "
+            f"{'FMP' if source == 'fmp' else 'Sharadar'} backend (db mode only). "
+            "Re-run with -S db.",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _fundamentals_security(ctx, symbol):
+    """``(symbol, security_id)`` for `fs` / `fa`. An identifier or TICKER@date is
+    resolved to one security here (#80); a ticker is left to the datasource's
+    ladder, with the reused-ticker hint, and its security_id is None."""
+    identifier = parse_security_argument(symbol)
+    if not identifier.is_ticker:
+        return resolve_security_identifier(ctx, identifier)
+    hint_reused_ticker(ctx, identifier)
+    return identifier.value, None
+
+
+def _note_issuer_class(symbol, issuer):
+    """Decision 5: say so when a secondary class is answered with its issuer's."""
+    if issuer:
+        click.echo(
+            f"Note: {symbol} holds no statements of its own; SF1 files its "
+            f"issuer's under {issuer['symbol']} (CIK {issuer['cik']}). Shown: "
+            f"{issuer['symbol']}'s.",
+            err=True,
+        )
+
+
+def _plain(value):
+    """A warehouse value as `fs` / `fa` print it: dates as ISO text, decimals as
+    floats (so --precision applies), the rest as is."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (dt.date, dt.datetime)):
+        return value.isoformat()
+    return value
+
+
+def _emit(payload, *, output, default_name, quiet, logger):
+    """Write ``payload`` to ``output`` (a directory gets ``default_name``) and/or
+    stdout, as `ls QUERY` does."""
+    if output:
+        output_path = Path(output)
+        if output_path.is_dir():
+            output_path = output_path / default_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            payload if payload.endswith("\n") else payload + "\n", encoding="utf-8"
+        )
+        logger.info(f"Data written to {output_path}")
+        if not quiet:
+            click.echo(f"Data written to {output_path}")
+    if not quiet:
+        click.echo(payload.rstrip("\n"))
+
+
+@main.command()
+@click.argument("symbol")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress printing to stdout")
+@click.option(
+    "--statement",
+    type=click.Choice(list(ds_db.STATEMENT_VIEWS), case_sensitive=False),
+    default="income",
+    show_default=True,
+    help="Which statement",
+)
+@click.option(
+    "--period",
+    type=click.Choice(list(ds_db.STATEMENT_PERIODS), case_sensitive=False),
+    default="annual",
+    show_default=True,
+    help="Fiscal years or fiscal quarters",
+)
+@click.option(
+    "--as-of",
+    "as_of",
+    metavar="YYYY-MM-DD",
+    help="As known on this date: each period at its version in force then, and "
+    "none filed later (default: today)",
+)
+@click.option("-n", "--limit", type=int, help="The latest N periods (default: all)")
+@click.option(
+    "-p",
+    "--precision",
+    type=int,
+    default=DEFAULT_DECIMALS,
+    help=f"Decimal places for amounts (default: {DEFAULT_DECIMALS})",
+)
+@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write to a file. If path is a directory, the filename is "
+    "<symbol>_<statement>_<period>.<ext>",
+)
+@click.pass_context
+def fs(
+    ctx,
+    symbol,
+    verbose,
+    quiet,
+    statement,
+    period,
+    as_of,
+    limit,
+    precision,
+    output_csv,
+    output_json,
+    output,
+):
+    """
+    Print a financial statement from the warehouse, as known on a date.
+
+    SYMBOL: a ticker, an identifier (cik:51143, isin:..., cusip:...), or
+    TICKER@YYYY-MM-DD for the security that traded under a reused ticker that
+    day. --as-of is separate: it bounds what was known, not which security.
+
+    One row per period, oldest first. Each period is its version in force on the
+    --as-of date (default today): a period filed later is absent and a later
+    restatement does not show, and known_from / knowledge_source say when each
+    became known. Share counts are in the share terms of known_from (ADR 0019).
+    A secondary share class answers with its issuer's primary class, through
+    the shared CIK, and says so. The warehouse only (-S db).
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    _refuse_vendor_source(ctx, "fs")
+    if output_csv and output_json:
+        click.echo("Error: Only one of --csv or --json can be specified", err=True)
+        sys.exit(1)
+    if limit is not None and limit < 1:
+        click.echo("Error: --limit must be at least 1", err=True)
+        sys.exit(1)
+    require_source_credentials(ctx, "db")
+    symbol, security_id = _fundamentals_security(ctx, symbol)
+    statement, period = statement.lower(), period.lower()
+
+    try:
+        found = ds_db.statements(
+            dsn=ctx.obj["config"].dsn,
+            symbol=symbol,
+            security_id=security_id,
+            statement=statement,
+            period=period,
+            as_of=as_of,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.error(f"Failed to read statements: {exc}")
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if found["security_id"] is None:
+        click.echo(f"No security found for {symbol}.", err=True)
+        sys.exit(1)
+    _note_issuer_class(symbol, found["statements_of"])
+    if not found["rows"]:
+        logger.warning(f"No {statement} statements for {symbol}")
+        if not quiet:
+            click.echo(
+                f"No {period} {statement} statements for {symbol} as known on "
+                f"{found['as_of'].isoformat()}"
+            )
+        sys.exit(0)
+    logger.info(f"Retrieved {len(found['rows'])} {period} periods for {symbol}")
+
+    frame = pd.DataFrame(
+        [{k: _plain(v) for k, v in row.items()} for row in found["rows"]]
+    )
+    frame = apply_precision_to_dataframe(
+        frame, precision, exclude_columns=["fiscal_year", "version_no"]
+    )
+    if output_json:
+        payload = frame.to_json(orient="records")
+    else:
+        payload = frame.to_csv(index=False)
+    _emit(
+        payload,
+        output=output,
+        default_name=f"{symbol}_{statement}_{period}.{'json' if output_json else 'csv'}",
+        quiet=quiet,
+        logger=logger,
+    )
+
+
+@main.command()
+@click.argument("symbol")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress printing to stdout")
+@click.option(
+    "--as-of",
+    "as_of",
+    metavar="YYYY-MM-DD",
+    help="The panel's month-end on or before this date, every input as known "
+    "then (default: the latest snapshot)",
+)
+@click.option(
+    "-p",
+    "--precision",
+    type=int,
+    default=FACTOR_DECIMALS,
+    help=f"Decimal places (default: {FACTOR_DECIMALS})",
+)
+@click.option(
+    "--csv", "output_csv", is_flag=True, help="Output field,value CSV (default)"
+)
+@click.option("--json", "output_json", is_flag=True, help="Output a JSON object")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write to a file. If path is a directory, the filename is "
+    "<symbol>_factors.<ext>",
+)
+@click.pass_context
+def fa(ctx, symbol, verbose, quiet, as_of, precision, output_csv, output_json, output):
+    """
+    Print one security's row of the factor panel from the warehouse.
+
+    SYMBOL as for `duk fs`. Without --as-of, the latest snapshot
+    (mart.security_fundamentals_latest, as of the last `fafnir db refresh-marts`);
+    with it, the panel's month-end on or before that date (mart.fundamental_panel),
+    every input as known then. One field per line: CSV `field,value`, or a JSON
+    object. A ratio is empty where its denominator is missing, zero or negative
+    (ADR 0019). A secondary share class answers with its issuer's primary class,
+    and says so. The warehouse only (-S db).
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    _refuse_vendor_source(ctx, "fa")
+    if output_csv and output_json:
+        click.echo("Error: Only one of --csv or --json can be specified", err=True)
+        sys.exit(1)
+    require_source_credentials(ctx, "db")
+    symbol, security_id = _fundamentals_security(ctx, symbol)
+
+    try:
+        found = ds_db.factor_row(
+            dsn=ctx.obj["config"].dsn,
+            symbol=symbol,
+            security_id=security_id,
+            as_of=as_of,
+        )
+    except Exception as exc:
+        logger.error(f"Failed to read the factor panel: {exc}")
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if found["security_id"] is None:
+        click.echo(f"No security found for {symbol}.", err=True)
+        sys.exit(1)
+    _note_issuer_class(symbol, found["statements_of"])
+    if found["row"] is None:
+        when = found["as_of_date"]
+        if when is None and as_of:
+            message = (
+                f"No factor row for {symbol}: the panel's first month-end is after "
+                f"{as_of}"
+            )
+        elif when is None:
+            message = f"No factor row for {symbol}: {found['source']} is empty"
+        else:
+            message = (
+                f"No factor row for {symbol} at {when.isoformat()}: it did not "
+                "trade in the week to that date"
+            )
+        logger.warning(message)
+        if not quiet:
+            click.echo(message)
+        sys.exit(0)
+
+    frame = pd.DataFrame([{k: _plain(v) for k, v in found["row"].items()}])
+    frame = apply_precision_to_dataframe(
+        frame, precision, exclude_columns=["security_id", "fiscal_year"]
+    )
+    record = {
+        k: (None if isinstance(v, float) and v != v else v)
+        for k, v in frame.to_dict(orient="records")[0].items()
+    }
+    if output_json:
+        payload = json.dumps(record)
+    else:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["field", "value"])
+        writer.writerows([k, "" if v is None else v] for k, v in record.items())
+        payload = buffer.getvalue()
+    _emit(
+        payload,
+        output=output,
+        default_name=f"{symbol}_factors.{'json' if output_json else 'csv'}",
+        quiet=quiet,
+        logger=logger,
+    )
 
 
 @main.command()

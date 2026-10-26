@@ -167,6 +167,8 @@ a revoke that in fact left the security with none.
 | Whether a symbol has stopped advancing | `watermarks` |
 | One security, end to end | `security_profile` |
 | A price series | `price_history` (say raw or adjusted) |
+| A statement as known on a date | `statements_as_of` (pass `as_of` for anything historical) |
+| A security's factors, now or at a month-end | `factor_row` |
 | Live names the vendor stopped serving | `fafnir source vendor-gaps` (reads only) |
 | dorq against the SQL checks and the labels | `fafnir dq compare --labels-from-db` (reads only) |
 | Timers, journal, disk, backups | `scripts/monitor.sh` (changes nothing) |

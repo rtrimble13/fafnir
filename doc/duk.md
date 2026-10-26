@@ -44,6 +44,7 @@ Each vendor source needs that vendor's key, and nothing else: `-S fmp` reads
 | `ph cik:` / `isin:` / `cusip:` | ✅ warehouse identifiers | ✅ FMP search | ✖ pass a ticker, or resolve with `-S db` / `-S fmp` |
 | `ls` (list, screen) | ✅ | ✅ | ✖ |
 | `ls SYMBOL` (company summary) | ✅ | ✖ | ✖ |
+| `fs`, `fa` (statements, factors) | ✅ | ✖ db mode only | ✖ db mode only |
 | `yc` | ⤳ falls back to FMP until the FRED series land | ✅ | ✖ no treasury data |
 | `rc`, `ti` | source-agnostic | source-agnostic | source-agnostic |
 
@@ -97,6 +98,8 @@ when symbol resolution still read `core`.
 | `ph SYMBOL` | price history (OHLCV, raw or `--adj`) | ✅ warehouse | ✅ FMP (and ✅ `sharadar`) |
 | `ls` | list/screen securities, sectors, industries | ✅ `mart.security_latest` / `ref.*` | ✅ FMP |
 | `ls SYMBOL\|NAME` | everything the warehouse holds on one company | ✅ `mart.v_security_*` | ✖ db only |
+| `fs SYMBOL` | a financial statement, point in time with `--as-of` | ✅ `mart.v_*_versions` | ✖ db only |
+| `fa SYMBOL` | one security's row of the factor panel | ✅ `mart.fundamental_panel` | ✖ db only |
 | `yc` | treasury yield curve | ⤳ falls back to FMP | ✅ FMP |
 | `rc` | return calculations from an input file | source-agnostic | source-agnostic |
 | `ti` | technical indicators (sma/ema/rsi/macd) from a file | source-agnostic | source-agnostic |
@@ -364,6 +367,66 @@ records. That divergence is deliberate: flattening the report into a record arra
 would destroy the DQ breakdown. `--csv` gives a single flat row of scalars, in which
 the DQ table collapses to an `open_dq_flags` count.
 
+## `fs` and `fa` — statements and factors, point in time
+
+```bash
+duk fs AAPL                                   # annual income statements, as known today
+duk fs AAPL --statement balance --period quarter -n 8
+duk fs AAPL --as-of 2015-06-30                # what was known on that day
+duk fs CC@2008-06-30 --as-of 2008-06-30       # a reused ticker, named on a date
+duk fa AAPL                                   # the factor row as of the last refresh
+duk fa AAPL --as-of 2015-06-30 --json         # the panel's month-end row on or before
+```
+
+Both read the warehouse only: `-S fmp` and `-S sharadar` exit 1 with a *db mode
+only* message. The statements are Sharadar SF1's, versioned on two timelines
+([ADR 0018](adr/0018-bitemporal-fundamentals.md));
+[fundamentals.md](fundamentals.md) has the model.
+
+**`duk fs SYMBOL [--statement income|balance|cash] [--period annual|quarter]
+[--as-of DATE] [-n N]`** prints one row per period, oldest first, with `-n` keeping the
+latest N.
+- **Point in time.** Each period is the version in force on `--as-of` (default today),
+  the rule `mart.fn_statements_as_of` applies: a period filed later is absent, and a
+  restatement made after that date does not show. `known_from` and `knowledge_source`
+  (`filed`, `observed`, `estimated`) say when each row became known, and `version_no`
+  which version it is. A vendor correction's superseded row never shows.
+- **Two dates, two meanings.** `TICKER@DATE` names the security that traded under a
+  reused ticker that day ([above](#a-ticker-on-a-date-tickeryyyy-mm-dd)); `--as-of`
+  bounds what was known. Pass both for a backtest of a reused ticker.
+- **Values.** Amounts are in the reporting currency (`reported_currency`), at 2
+  decimals by default (`-p`). A NULL item prints empty, never 0. Share counts are in
+  the share terms of `known_from` (ADR 0019).
+
+**`duk fa SYMBOL [--as-of DATE]`** prints the factor row, one field per line
+(`field,value`; `--json` gives an object).
+- **Which row.** Without `--as-of`, the latest snapshot
+  (`mart.security_fundamentals_latest`, as of the last `fafnir db refresh-marts`).
+  With it, the panel's month-end on or before the date (`mart.fundamental_panel`),
+  every input as known then. `as_of_date` in the output says which.
+- **No row** means the security did not trade in the week to that date, or the
+  date is before the panel's first month-end (1998). Either is printed, exit 0.
+- **Values.** Ratios are empty where a denominator is missing, zero or negative, and
+  nothing is winsorized or filled ([ADR 0019](adr/0019-derived-metrics-not-vendor-metrics.md)).
+  Precision is 4 decimals by default (`-p`), since the factors are ratios.
+
+**A secondary share class** (GOOG, BRK.A) holds no statements: SF1 files an issuer's
+under its primary class. Both commands then answer with the one class under the same
+CIK that holds them, and say so on stderr: `Note: GOOG holds no statements of its own;
+SF1 files its issuer's under GOOGL (CIK 1652044). Shown: GOOGL's.` With no CIK, or
+several classes holding statements, there is no fallback.
+
+| Situation | Behaviour |
+|---|---|
+| `-S fmp` / `-S sharadar` | `… (db mode only). Re-run with -S db.`, exit 1 |
+| no security matches | `No security found for X.` on stderr, exit 1 |
+| no period known on `--as-of` | `No annual income statements for X as known on D`, exit 0 |
+| `fa` and no row | the reason, exit 0 |
+| the panel never refreshed | `… has not been refreshed yet: run fafnir db refresh-marts`, exit 1 |
+
+The MCP read profile has the same two reads as `statements_as_of` and `factor_row`
+([agent.md](agent.md#the-tools)), and they return the same rows.
+
 ## Reading dead issuers
 
 The warehouse keeps every security that stopped trading. Since #71 that includes
@@ -394,6 +457,10 @@ source-agnostic. `duk.datasource.db`, `duk.datasource.live` (FMP) and
 first two also `screen(...)`); the pure compute
 modules (`duk.indicators`, `duk.return_utils`, `duk.rates_utils`, `duk.stats`)
 operate on those frames unchanged.
+
+`duk.datasource.db.statements()` and `.factor_row()` are the reads behind `fs` and
+`fa`, returning plain dicts with the warehouse's exact decimals; the MCP tools call
+them too.
 
 The company summary follows the same split. `duk.datasource.db.resolve_company()`
 and `.company_summary()` do the I/O and return plain dicts; `duk.company_summary`

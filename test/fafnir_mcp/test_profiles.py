@@ -34,6 +34,9 @@ READ_TOOLS = {
     "list_industries",
     "security_profile",
     "dq_summary",
+    # Fundamentals, point in time (#107).
+    "statements_as_of",
+    "factor_row",
 }
 
 # The operational record, and free-form reads. These need fafnir_ops (0021).

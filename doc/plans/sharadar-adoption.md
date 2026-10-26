@@ -326,6 +326,21 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #107: `duk fs` / `duk fa` and the MCP read tools.**
+  - **`duk fs SYMBOL [--statement] [--period] [--as-of] [-n]`** prints a statement, one row per
+    period, each at its version in force on `--as-of`: a later filing or restatement does not
+    show.
+  - **`duk fa SYMBOL [--as-of]`** prints the factor row: the latest snapshot, or the panel's
+    month-end on or before the date.
+  - **Both are db mode only:** `-S fmp` and `-S sharadar` exit 1 with the message.
+  - **Both take `TICKER@date`.** A secondary share class is answered with its issuer's primary
+    class through the CIK, and they say so.
+  - **The MCP read profile** gains `statements_as_of` and `factor_row`, backed by the same
+    `duk.datasource.db` reads. `test_profiles.py` was updated deliberately.
+  - **Unchanged:** the duk regression suite, every existing command's output, and `duk ls`.
+  - **Measured:** nothing new. Both read indexed relations for one security.
+  - **Detail:** [fundamentals-sf1.md §8.1](fundamentals-sf1.md#81-as-built-duk-fs--fa-and-the-mcp-tools-107).
+
 - **2026-10-26 · P4, #106: the fundamentals in the night.**
   - **The SF1 delta** is step 2's third table (`source sharadar-delta`): by
     `lastupdated`, in filing-date order, never by offset. Its failure warns and the

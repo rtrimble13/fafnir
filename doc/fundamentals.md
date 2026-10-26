@@ -9,6 +9,10 @@
 > [data dictionary](data_dictionary.md#fundamentals-migration-0035-adr-0018), and the loader in
 > [ingestion.md](ingestion.md#statements-from-sf1-90).
 
+From the command line, `duk fs` prints a statement as known on a date and `duk fa` a
+security's factor row ([duk.md](duk.md#fs-and-fa--statements-and-factors-point-in-time)).
+An agent reads the same rows through `statements_as_of` and `factor_row` (#107).
+
 ## The factor panel (#100)
 
 `mart.fundamental_panel` holds, at the last trading day of each month from 1998, one row per

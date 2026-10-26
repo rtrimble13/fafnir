@@ -493,6 +493,122 @@ def dq_summary(*, dsn: str, symbol: str) -> dict:
     )
 
 
+def _issuer_note(symbol: str, issuer: Optional[dict]) -> Optional[str]:
+    """Decision 5 (plan fundamentals-sf1.md), said in the payload."""
+    if not issuer:
+        return None
+    return (
+        f"{symbol} holds no statements of its own: SF1 files its issuer's under "
+        f"{issuer['symbol']} (CIK {issuer['cik']}), and these are {issuer['symbol']}'s."
+    )
+
+
+def statements_as_of(
+    *,
+    dsn: str,
+    symbol: str,
+    statement: str = "income",
+    period: str = "annual",
+    as_of: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """One statement of one security, every period as known on ``as_of``.
+
+    The same rows as ``duk fs``: each period at its version in force on ``as_of``
+    (default today), so a period filed later is absent and a later restatement
+    does not show. Amounts are the exact decimals as strings (:func:`jsonable`);
+    ``limit`` keeps the latest periods.
+    """
+    from duk.datasource.db import STATEMENT_PERIODS, STATEMENT_VIEWS
+    from duk.datasource.db import statements as _duk_statements
+
+    symbol = _require_symbol(symbol)
+    statement = (statement or "").strip().lower()
+    period = (period or "").strip().lower()
+    if statement not in STATEMENT_VIEWS:
+        raise ToolError(
+            f"statement must be one of {', '.join(STATEMENT_VIEWS)}, got {statement!r}"
+        )
+    if period not in STATEMENT_PERIODS:
+        raise ToolError(f"period must be annual or quarter, got {period!r}")
+    day = _parse_date(as_of, "as_of")
+    requested = clamp_limit(limit, DEFAULT_MAX_ROWS) if limit is not None else None
+    symbol, sec_id = _resolve_named(dsn, symbol)
+    try:
+        found = _duk_statements(
+            dsn=dsn,
+            security_id=sec_id,
+            statement=statement,
+            period=period,
+            as_of=day,
+            limit=requested,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _wrap(exc, dsn) from None
+
+    issuer = found["statements_of"]
+    note = (
+        f"Each {period} period at its version in force on "
+        f"{found['as_of'].isoformat()}: a period filed later is absent, and a later "
+        "restatement does not show. known_from and knowledge_source (filed, "
+        "observed, estimated) say when each became known. Share counts are in the "
+        "share terms of known_from (ADR 0019)."
+    )
+    return envelope(
+        found["rows"],
+        max_rows=DEFAULT_MAX_ROWS,
+        symbol=symbol,
+        security_id=sec_id,
+        statement=statement,
+        period=period,
+        as_of=found["as_of"].isoformat(),
+        statements_of=issuer["symbol"] if issuer else None,
+        note=" ".join(filter(None, [note, _issuer_note(symbol, issuer)])),
+    )
+
+
+def factor_row(*, dsn: str, symbol: str, as_of: Optional[str] = None) -> dict:
+    """One security's row of the factor panel, as ``duk fa`` prints it.
+
+    Without ``as_of``, the latest snapshot (as of the last mart refresh); with it,
+    the panel's month-end on or before ``as_of``, every input as known then.
+    ``factors`` is None when the security did not trade in the week to that date.
+    """
+    from duk.datasource.db import factor_row as _duk_factor_row
+
+    symbol = _require_symbol(symbol)
+    day = _parse_date(as_of, "as_of")
+    symbol, sec_id = _resolve_named(dsn, symbol)
+    try:
+        found = _duk_factor_row(dsn=dsn, security_id=sec_id, as_of=day)
+    except Exception as exc:  # noqa: BLE001
+        raise _wrap(exc, dsn) from None
+
+    issuer = found["statements_of"]
+    when = found["as_of_date"]
+    if found["row"] is None and when:
+        note = f"No row: {symbol} did not trade in the week to {when.isoformat()}."
+    elif found["row"] is None and day:
+        note = f"No row: the panel's first month-end is after {day.isoformat()}."
+    elif found["row"] is None:
+        note = f"No row: {found['source']} is empty."
+    else:
+        note = (
+            "Every input as known at as_of_date (ADR 0018). A ratio is null where "
+            "its denominator is missing, zero or negative; nothing is winsorized "
+            "or filled (ADR 0019)."
+        )
+    return {
+        "symbol": symbol,
+        "security_id": sec_id,
+        "source": found["source"],
+        "as_of_date": when.isoformat() if when else None,
+        "statements_of": issuer["symbol"] if issuer else None,
+        "factors": jsonable(found["row"]),
+        "note": " ".join(filter(None, [note, _issuer_note(symbol, issuer)])),
+    }
+
+
 # ---------------------------------------------------------------------------
 # ops profile -- the operational record (migration 0021, ADR 0010)
 # ---------------------------------------------------------------------------
