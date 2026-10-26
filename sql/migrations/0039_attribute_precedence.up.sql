@@ -35,6 +35,13 @@
 --       It computes beta for the whole universe whenever it is read: read
 --       mart.security_latest, which holds it as of the last refresh.
 --
+--   mart.fn_security_betas(as_of date) (FUNCTION)
+--       The betas as of a date, from mart relations only, so a mart reader may call
+--       it. A function rather than CTEs in the view: the view then depends on the
+--       function and not on mart.v_daily_price_adjusted, which 0013 drops and
+--       re-creates and which nothing else may depend on (0013, 0020), as the panel's
+--       function reads it too. EXECUTE for the read roles only, as 0036.
+--
 --   mart.security_latest (MATERIALIZED, re-defined)
 --       The same seventeen columns, names, types and order (duk's screener contract),
 --       now selected from mart.v_security_attributes. Created WITH DATA, as 0010 did,
@@ -117,43 +124,56 @@ COMMENT ON VIEW core.v_security_classification IS
 -- ---------------------------------------------------------------------------
 -- mart.v_security_attributes
 -- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW mart.v_security_attributes AS
+CREATE OR REPLACE FUNCTION mart.fn_security_betas(as_of date)
+RETURNS TABLE (
+    security_id bigint,
+    beta double precision,
+    returns bigint,
+    as_of_date date
+)
+LANGUAGE sql STABLE
+AS $fn$
 WITH benchmark AS (
     -- SPY, by its current ticker: the market the betas are measured against.
     SELECT x.security_id
-      FROM core.symbol_xref x
+      FROM mart.v_symbol_lookup x
      WHERE x.symbol = 'SPY' AND x.valid_to IS NULL
      ORDER BY x.is_primary DESC, x.security_id
      LIMIT 1
 ),
 bars AS MATERIALIZED (
-    -- Every adjusted close of the last 400 days, with the bar before it: the extra
-    -- weeks give the first return of the year its starting close.
-    SELECT a.security_id, a.trade_date, a.close::float8 AS close,
-           lag(a.trade_date) OVER w AS prev_date,
-           lag(a.close::float8) OVER w AS prev_close
+    -- Every adjusted close of the 400 days to as_of, with the bar before it: the
+    -- extra weeks give the first return of the year its starting close.
+    SELECT a.security_id AS sid, a.trade_date AS d, a.close::float8 AS c,
+           lag(a.trade_date) OVER w AS prev_d,
+           lag(a.close::float8) OVER w AS prev_c
       FROM mart.v_daily_price_adjusted a
-     WHERE a.trade_date > current_date - 400 AND a.close > 0
+     WHERE a.trade_date > as_of - 400 AND a.trade_date <= as_of AND a.close > 0
     WINDOW w AS (PARTITION BY a.security_id ORDER BY a.trade_date)
 ),
 market AS MATERIALIZED (
-    SELECT b.trade_date, b.close
-      FROM bars b JOIN benchmark m ON m.security_id = b.security_id
-),
-betas AS MATERIALIZED (
-    -- Each return on SPY's over the same interval, so a security that skipped days
-    -- is not matched against a one-day market move.
-    SELECT b.security_id,
-           regr_slope(b.close / b.prev_close - 1, m1.close / m0.close - 1) AS beta,
-           count(*) AS returns,
-           max(b.trade_date) AS as_of
-      FROM bars b
-      JOIN market m1 ON m1.trade_date = b.trade_date
-      JOIN market m0 ON m0.trade_date = b.prev_date
-     WHERE b.trade_date > current_date - 365 AND b.prev_close > 0
-     GROUP BY b.security_id
-    HAVING count(*) >= 120
+    SELECT b.d, b.c FROM bars b JOIN benchmark m ON m.security_id = b.sid
 )
+-- Each return on SPY's over the same interval, so a security that skipped days is
+-- not matched against a one-day market move.
+SELECT b.sid,
+       regr_slope(b.c / b.prev_c - 1, m1.c / m0.c - 1),
+       count(*),
+       max(b.d)
+  FROM bars b
+  JOIN market m1 ON m1.d = b.d
+  JOIN market m0 ON m0.d = b.prev_d
+ WHERE b.d > as_of - 365 AND b.prev_c > 0
+ GROUP BY b.sid
+HAVING count(*) >= 120
+$fn$;
+
+COMMENT ON FUNCTION mart.fn_security_betas(date) IS
+    'Per security, the slope of its daily adjusted returns over the 365 days to '
+    'as_of on SPY''s over the same intervals, from at least 120 of them (#109): '
+    'beta, how many returns, the last one''s date.';
+
+CREATE OR REPLACE VIEW mart.v_security_attributes AS
 SELECT
     s.security_id,
     s.primary_symbol AS symbol,
@@ -220,7 +240,9 @@ LEFT JOIN LATERAL (
 LEFT JOIN (
     -- A slope too steep for the screener's numeric(12,6) is a degenerate series,
     -- not a beta.
-    SELECT security_id, beta, returns, as_of FROM betas WHERE abs(beta) < 1000000
+    SELECT f.security_id, f.beta, f.returns, f.as_of_date AS as_of
+      FROM mart.fn_security_betas(current_date) f
+     WHERE abs(f.beta) < 1000000
 ) bt ON bt.security_id = s.security_id;
 
 COMMENT ON VIEW mart.v_security_attributes IS
@@ -318,6 +340,9 @@ COMMENT ON VIEW mart.v_security_profile IS
 GRANT SELECT ON core.v_security_classification
     TO fafnir_read, fafnir_ingest, fafnir_ops;
 GRANT SELECT ON mart.v_security_attributes, mart.security_latest
+    TO fafnir_read, fafnir_app, fafnir_ops;
+REVOKE ALL ON FUNCTION mart.fn_security_betas(date) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION mart.fn_security_betas(date)
     TO fafnir_read, fafnir_app, fafnir_ops;
 
 COMMIT;

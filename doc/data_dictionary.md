@@ -763,7 +763,7 @@ Added by 0039 (#109; [ADR 0015 §4](adr/0015-multi-vendor-provenance-and-precede
 [ADR 0019 §5](adr/0019-derived-metrics-not-vendor-metrics.md)). **Grain:** one row per
 `security_id`. **Source:** `core.security`, `core.v_security_classification`,
 `core.daily_price`, `core.balance_sheet`, `mart.v_corporate_action` and
-`mart.v_daily_price_adjusted`. Read live, so it computes every security's beta when read:
+`mart.fn_security_betas(current_date)`. Read live, so it computes every security's beta when read:
 for screens, read `mart.security_latest`, which holds it as of the last refresh. No column
 of `core.security` is written.
 
@@ -789,6 +789,15 @@ of `core.security` is written.
   - **Otherwise:** with fewer than 120 returns, or no SPY in the warehouse, it is
     `core.security.beta`, and `beta_source` names its vendor.
 - **`last_trade_date`, `last_close`, `last_volume`:** the latest raw bar.
+
+**`mart.fn_security_betas(as_of DATE)`** (FUNCTION, 0039) returns `security_id, beta,
+returns, as_of_date`: the regression of each security's daily adjusted returns over the
+365 days to `as_of` on SPY's over the same intervals, where there are at least 120 of
+them.
+- **It reads mart only:** `mart.v_daily_price_adjusted`, and `mart.v_symbol_lookup` for
+  SPY. A mart reader may therefore call it, and EXECUTE is for the read roles only.
+- **It is a function, not part of the view,** so no view depends on
+  `mart.v_daily_price_adjusted`, which 0013 drops and re-creates.
 
 ### `core.v_security_classification` — the classification readers see (VIEW)
 Added by 0039 (#109). **Grain:** one row per `security_id`. Columns: `security_id,

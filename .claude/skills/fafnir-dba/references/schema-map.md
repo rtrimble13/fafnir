@@ -80,6 +80,7 @@ The last one the nightly applied is in the `prices:nightly` run's `params.throug
 | `mart.v_security_profile` | descriptive facts, one row per security; sector and industry the feeding vendor's, market cap and beta the vendor snapshot (#109) | **live** |
 | `mart.security_latest` | the screening contract; `duk ls` and `screen_securities` filter it to actively trading unless asked (#79). Since #109: the feeding vendor's classification, market cap and beta derived where they can be | **materialized, lagged** |
 | `mart.v_security_attributes` | what the screener shows, with `attributes_source`, `market_cap_source`/`_as_of`, `beta_source`/`_as_of`/`_returns` (#109) | live, but **computes every beta when read**: query `security_latest` for screens |
+| `mart.fn_security_betas(as_of)` | per security, a year of daily adjusted returns regressed on SPY's, from 120 or more (#109) | live |
 | `mart.v_security_price_coverage` | span, bar count, close range, zero-volume bars | live — **use this, not a per-security probe** |
 | `mart.v_security_action_summary` | split/dividend counts and boundaries, factor state | live |
 | `mart.v_corporate_action` | splits and dividends, one row per event (passthrough of `corporate_action`, no lineage) | live |

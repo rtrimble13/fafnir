@@ -445,6 +445,9 @@ def test_security_latest_keeps_its_columns_and_reads_the_attributes(db):
 
 def test_the_classification_check_reads_what_readers_see(db):
     _names(db)
+    # ref is kept between tests: the names this test teaches fafnir go first.
+    db.execute("DELETE FROM ref.sector WHERE sector_name = 'Shiny New Sector'")
+    db.execute("DELETE FROM ref.industry WHERE industry_name = 'Shiny'")
     # Unclassified by FMP, classified by Sharadar: nothing to flag.
     covered = _security(db, "ZZH")
     _sharadar(

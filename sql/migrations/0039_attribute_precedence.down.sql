@@ -85,6 +85,7 @@ CREATE INDEX IF NOT EXISTS ix_security_latest_symbol
 GRANT SELECT ON mart.security_latest TO fafnir_read, fafnir_app, fafnir_ops;
 
 DROP VIEW IF EXISTS mart.v_security_attributes;
+DROP FUNCTION IF EXISTS mart.fn_security_betas(date);
 DROP VIEW IF EXISTS core.v_security_classification;
 
 COMMIT;

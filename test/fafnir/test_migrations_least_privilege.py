@@ -491,6 +491,18 @@ def test_fafnir_app_can_read_the_attribute_precedence(least_privilege_dsn):
             assert app.fetchval(f"SELECT count(*) FROM {relation}") >= 0, relation
         with pytest.raises(Exception, match="permission denied"):
             app.fetchval("SELECT count(*) FROM core.v_security_classification")
+    with Database(least_privilege_dsn, autocommit=True) as owner:
+        can = owner.fetchone("""
+            SELECT has_function_privilege('public', f, 'EXECUTE') AS public_can,
+                   has_function_privilege('fafnir_app', f, 'EXECUTE') AS app_can,
+                   has_function_privilege('fafnir_ingest', f, 'EXECUTE') AS ingest_can
+              FROM CAST('mart.fn_security_betas(date)' AS regprocedure) f
+            """)
+    assert (can["public_can"], can["app_can"], can["ingest_can"]) == (
+        False,
+        True,
+        False,
+    )
 
 
 def test_fafnir_read_and_ingest_can_read_the_classification(least_privilege_dsn):
