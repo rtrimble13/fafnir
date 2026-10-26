@@ -35,6 +35,8 @@ read through the `duk` CLI.
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation
 - [Nightly Report Email](nightly_report.md) — the agent's morning summary of the
   automations and the DQ queue: schedule, mail transport, what it can and cannot see
+- [Fundamentals](fundamentals.md) — SF1's statements on two timelines (ADR 0018); a stub
+  for now, with how the build is tested (#91)
 - [Releasing and Upgrading](releasing.md) — cutting a `vX.Y.Z` release with
   `make release`, deploying it to the host, and which of `--version`,
   `git describe` and `pip show` answers which question

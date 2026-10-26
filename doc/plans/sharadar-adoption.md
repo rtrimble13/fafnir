@@ -326,6 +326,23 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #91: the fundamentals integration tests.** `test_fundamentals_integration.py`
+  runs the build end to end.
+  - **Golden values,** read point in time: AAPL FY2020 revenue 274,515,000,000, not known the
+    day before its 10-K; AAPL FY2015's counts recovered through the 2020 4-for-1; MSFT FY2015
+    in two versions, the restatement from the load day.
+  - **NULL against 0:** each kept apart on the round trip.
+  - **Idempotency:** loading twice is identical, and one moved value restates with a `warn`
+    flag.
+  - **The upgrade path,** wider than #87's: a pre-0035 warehouse shaped like production (an FMP
+    security linked to Sharadar and a minted dead issuer, bars across a split, actions,
+    factors, profiles, flags, a watermark and the ledger's files). The upgrade moves no table
+    but `meta.schema_migration`, and the first load moves none but the run's own bookkeeping
+    (`ops.ingestion_run`, `ops.data_quality_flag`, `ops.load_watermark`).
+  - **Fixtures:** built from the companies' 10-Ks, which are public record; the restated
+    values are invented.
+  - **[fundamentals.md](../fundamentals.md):** a stub for #108, with *How it is tested*.
+
 - **2026-10-25 · P4, #90: the SF1 loader.** `fafnir ingest fundamentals [--backfill] [--symbols]
   [--period annual|quarter|both] [--limit N] [--dry-run]` writes the three statement tables from
   the ledger's SF1 files, as [fundamentals-sf1.md](fundamentals-sf1.md) §4.5–4.7 and §6 specify
