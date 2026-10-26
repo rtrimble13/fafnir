@@ -131,8 +131,13 @@ def ensure_horizon(
 
 #: The materialized views ``fafnir db refresh-marts`` refreshes, in this order.
 #: A build that adds one appends it here. The factor panel (0037, #100) reads the
-#: statements and prices, not security_latest, so the order is only the log's.
-MATVIEWS: tuple[str, ...] = ("mart.security_latest", "mart.fundamental_panel")
+#: statements and prices, not security_latest, so the order is only the log's; the
+#: latest snapshot (0038, #101) follows the panel, as the issue sets out.
+MATVIEWS: tuple[str, ...] = (
+    "mart.security_latest",
+    "mart.fundamental_panel",
+    "mart.security_fundamentals_latest",
+)
 
 #: The SQLSTATEs a CONCURRENTLY refresh raises for a reason a plain refresh
 #: answers: the view holds no data yet (0A000, feature_not_supported) or it has no

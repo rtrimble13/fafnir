@@ -1236,10 +1236,11 @@ back exactly and recomputes the security's factors. See
   to create an explicit fixed range instead: `fafnir db ensure-partitions --start-year 2028 --end-year 2030`.
 - **Mart refresh** — `fafnir db refresh-marts` (also part of the daily job). It refreshes
   every materialized view in `fafnir.db.maintenance.MATVIEWS`, in order:
-  `mart.security_latest`, then the factor panel `mart.fundamental_panel` (#100), and the
-  views later builds append. It prints each view and how it was refreshed.
-  - **The panel** is created empty by migration 0037, so the first refresh after deploying
-    it is plain and every read before then is refused. It recomputes every month-end from
+  `mart.security_latest`, then the factor panel `mart.fundamental_panel` (#100), then
+  `mart.security_fundamentals_latest` (#101), and the views later builds append. It prints
+  each view and how it was refreshed.
+  - **The panel** is created empty by migration 0037, and the latest snapshot by 0038, so
+    the first refresh after deploying them is plain and every read before then is refused. It recomputes every month-end from
     1998: 45 s on a synthetic thousand securities; production's is recorded on #92. Past
     15 minutes it moves to its own timer (#106).
   - **CONCURRENTLY** where the view holds data, so readers keep the old rows meanwhile. A

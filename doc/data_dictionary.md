@@ -685,6 +685,42 @@ clipped or filled.
   and a third of quarters restated: the full refresh took **45 s** (291,430 rows), and
   one date about 3 s. Production's is recorded on #92, after the backfill (step 9).
 
+### `mart.v_industry_fundamentals` — the panel by sector and industry (VIEW)
+Added by migration 0038 (#101; build prompt §5.4). **Grain:** `(group_level, as_of_date,
+sector_name, industry_name)`. **Source:** `mart.fundamental_panel`, so it is as fresh as the
+panel's last refresh.
+- **`group_level`** is `sector` (`industry_name` NULL) or `industry` (both names). A security
+  without a sector, or an industry, is in no group at that level.
+- **`n_securities`**: the group's panel rows that month. **A group of fewer than three has no
+  row.**
+- **Per metric** (`market_cap, earnings_yield, book_to_price, sales_to_price, fcf_yield,
+  ev_to_ebitda, roe, gross_profitability, operating_margin, accruals, debt_to_equity,
+  interest_coverage, revenue_growth_yoy, asset_growth_1y, dividend_yield_ttm,
+  shareholder_yield`):
+  - `<metric>_n`: its non-NULL values;
+  - `<metric>_p25`, `_median`, `_p75`: `percentile_cont` over those values. They are NULL
+    when fewer than three are present, so a median of two companies never passes for a
+    sector norm. `_n` still shows how many there were.
+- **Classification is today's**, as in the panel: the security master's current sector and
+  industry, not as they were at `as_of_date`. `market_cap` is in the trading currency.
+- **Filters** on `as_of_date`, `sector_name` or `group_level` reach the panel's indexes. One
+  month-end reads in milliseconds; the synthetic thousand securities' whole history (7,765
+  groups) in about 0.1 s.
+
+### `mart.security_fundamentals_latest` — each security's factors now (MATERIALIZED VIEW)
+Added by migration 0038 (#101; build prompt §5.5). **Grain:** one row per `security_id`
+(unique, `ux_security_fundamentals_latest`). **Source:**
+`mart.fn_fundamental_snapshot(current_date)` joined to `core.security`. **Cadence:** `fafnir
+db refresh-marts`, after the panel (`maintenance.MATVIEWS`).
+- **Columns:** `security_id, symbol, company_name`, then the snapshot's columns after
+  `security_id` (the panel's, above).
+- **A row** is a security that traded in the week to the refresh and has a basis then.
+- **For screens, not backtests:** it is as of the last refresh. **`mart.security_latest` is
+  untouched**: duk's screener reads it, and a screen opts into fundamentals by joining this
+  on `security_id`.
+- **Created empty.** A read is refused until the first refresh, which runs plainly; later
+  ones run concurrently. About 3 s on the synthetic thousand securities.
+
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
 **Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
 
