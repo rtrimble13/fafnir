@@ -19,6 +19,7 @@ from click.testing import CliRunner
 
 from fafnir import cli
 from fafnir.db import repository as repo
+from fafnir.ingest import fundamentals as fu
 from fafnir.ingest import sharadar_prices as sp
 from fafnir.ingest import sharadar_prune as pr
 
@@ -144,6 +145,80 @@ def test_without_a_nightly_the_deltas_since_the_full_are_kept(db, tmp_path):
     # Before the first nightly, every delta after the full is pending.
     assert [r.file_id for r in plan.removals] == [before["file_id"]]
     assert plan.kept["pending"] == 1 and after["file_id"] > before["file_id"]
+
+
+def _fundamentals_run(db, endpoint, params):
+    db.execute(
+        "INSERT INTO ops.ingestion_run (source, endpoint, status, params) "
+        "VALUES ('sharadar', %s, 'success', %s::jsonb)",
+        (endpoint, json.dumps(params)),
+    )
+
+
+def test_an_applied_sf1_delta_ages_out_and_an_unapplied_one_is_kept(db, tmp_path):
+    _file(db, tmp_path, "fundamentals", "full", days_ago=100, tag="F")
+    d1 = _file(db, tmp_path, "fundamentals", "delta", days_ago=70, tag="D1")
+    d2 = _file(db, tmp_path, "fundamentals", "delta", days_ago=30, tag="D2")
+    d3 = _file(db, tmp_path, "fundamentals", "delta", days_ago=10, tag="D3")
+    # The price nightly's applied state says nothing about SF1.
+    _nightly_through(db, stocks=d3["file_id"], funds=d3["file_id"])
+
+    # Before the fundamentals nightly, every SF1 delta after the full is pending,
+    # however old.
+    plan = pr.plan(db, tmp_path, keep_days=7, now=NOW)
+    assert plan.removals == [] and plan.kept["pending"] == 3
+
+    _fundamentals_run(
+        db, fu.NIGHTLY_ENDPOINT, {"through": {"fundamentals": d2["file_id"]}}
+    )
+    done = pr.prune(db, tmp_path, keep_days=7, now=NOW)
+    assert {r.file_id: r.reason for r in done.removals} == {
+        d1["file_id"]: "delta_applied"
+    }
+    assert (done.kept["window"], done.kept["pending"]) == (1, 1)
+    assert not (tmp_path / d1["path"]).exists() and _status(db, d1) == "deleted"
+
+    # Forty days on, the applied one has aged out too; the pending one stays.
+    later = pr.prune(db, tmp_path, keep_days=7, now=NOW + timedelta(days=40))
+    assert [r.file_id for r in later.removals] == [d2["file_id"]]
+    assert (tmp_path / d3["path"]).exists() and _status(db, d3) == "downloaded"
+
+
+def test_a_whole_sf1_backfill_takes_over_from_the_deltas_before_its_file(db, tmp_path):
+    _file(db, tmp_path, "fundamentals", "full", days_ago=100, tag="F1")
+    d1 = _file(db, tmp_path, "fundamentals", "delta", days_ago=90, tag="D1")
+    d2 = _file(db, tmp_path, "fundamentals", "delta", days_ago=80, tag="D2")
+    _fundamentals_run(
+        db, fu.NIGHTLY_ENDPOINT, {"through": {"fundamentals": d1["file_id"]}}
+    )
+    # The nightly failed after d2; then a re-run from a fresh file.
+    f2 = _file(db, tmp_path, "fundamentals", "full", days_ago=60, tag="F2")
+    d3 = _file(db, tmp_path, "fundamentals", "delta", days_ago=59, tag="D3")
+
+    # A run for some securities is no takeover: d2 waits for the nightly.
+    some = {"backfill": True, "whole": False, "files": [f2["file_id"]]}
+    _fundamentals_run(db, fu.ENDPOINT, some)
+    assert fu.pending_deltas(db) == (
+        [repo.sharadar_file(db, d2["file_id"]), repo.sharadar_file(db, d3["file_id"])],
+        d1["file_id"],
+    )
+
+    # A whole one is: f2 holds d2, so d2 is applied, and only d3 is pending.
+    _fundamentals_run(db, fu.ENDPOINT, {**some, "whole": True})
+    assert fu.pending_deltas(db) == (
+        [repo.sharadar_file(db, d3["file_id"])],
+        f2["file_id"],
+    )
+    plan = pr.plan(db, tmp_path, keep_days=7, now=NOW)
+    assert {r.file_id: r.reason for r in plan.removals} == {
+        d1["file_id"]: "delta_applied",
+        d2["file_id"]: "delta_applied",
+    }
+    assert (plan.kept["current"], plan.kept["previous"], plan.kept["pending"]) == (
+        1,
+        1,
+        1,
+    )
 
 
 def test_what_a_killed_run_left(db, tmp_path):

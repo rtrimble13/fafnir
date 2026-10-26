@@ -58,6 +58,7 @@ SHARADAR_NIGHT = [
     "config get primary_price_vendor",
     "db ensure-horizon",
     "ingest sharadar",
+    "ingest fundamentals",
     "config get fmp_secondary",
     "ingest tracked --allow-secondary",
     "ingest prices --allow-secondary",
@@ -115,6 +116,7 @@ def test_sharadar_mode_without_fmp(tmp_path):
         "config get primary_price_vendor",
         "db ensure-horizon",
         "ingest sharadar",
+        "ingest fundamentals",
         "config get fmp_secondary",
         "db refresh-marts",
         "status",
@@ -142,6 +144,18 @@ def test_a_failed_sharadar_night_stops_and_a_failed_secondary_does_not(tmp_path)
     assert done.returncode == 0, done.stderr
     assert calls == SHARADAR_NIGHT
     assert "'fafnir ingest prices --allow-secondary' failed" in done.stdout
+
+
+def test_a_failed_fundamentals_load_never_costs_the_night(tmp_path):
+    # #106: the statements come after the Sharadar step, from the SF1 delta it
+    # fetched, and before the marts that read them. A failure is upkeep.
+    done, calls = _night(tmp_path, "sharadar", fail="ingest fundamentals")
+    assert done.returncode == 0, done.stderr
+    assert calls == SHARADAR_NIGHT
+    assert "'fafnir ingest fundamentals' failed" in done.stdout
+    # FMP's night has no fundamentals: no SF1 delta was fetched.
+    done, calls = _night(tmp_path, "fmp")
+    assert not [c for c in calls if "fundamentals" in c]
 
 
 @pytest.mark.parametrize("bad", ["config get primary_price_vendor", "secondary"])

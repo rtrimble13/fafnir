@@ -11,7 +11,9 @@ Two modes, both reading the ledger (no API, no landing table):
   Where two files hold a row, the one stamped later wins, and on the same stamp the
   later file's. The run's ``params.through`` names the last file applied, so a night
   that failed is read again the next, and the file prune reads it (#106, which also
-  fetches the deltas).
+  fetches the deltas). It applies them on top of a backfill: until one has succeeded
+  and the statements hold rows, it waits, reads nothing and records no run
+  (:func:`backfilled`), so the deltas stay pending for the night after it.
 
 **Rows.** First-reported rows (ARQ, ARY) and restated rows (MRQ, MRY). SF1's trailing
 rows (ART, MRT) are not read: TTM is the mart's, from quarters. A row's ticker is
@@ -793,6 +795,8 @@ class FundamentalsResult:
     unmapped: set[str] = field(default_factory=set)
     files: list[int] = field(default_factory=list)
     through: Optional[int] = None
+    #: The nightly before any backfill: nothing read, no run (:func:`backfilled`).
+    waiting: bool = False
 
 
 @dataclass
@@ -825,15 +829,32 @@ def _splits_by_key(
     return out
 
 
+def backfilled(db: Database) -> bool:
+    """Whether the nightly has statements to apply its deltas to: a backfill has
+    succeeded and the statements hold rows (a reset empties them and keeps the
+    runs). Before that a delta would load a security's latest filings alone, and
+    the backfill (doc/backfill.md) would find them there."""
+    if repo.last_successful_run(db, VENDOR, ENDPOINT) is None:
+        return False
+    return repo.statements_loaded(db)
+
+
 def pending_deltas(db: Database) -> tuple[list[dict], int]:
     """The SF1 delta files the nightly has not applied, oldest first, and the file it
-    was applied through: the last successful nightly's, or with none, the current
-    full file (the backfill read it)."""
+    was applied through: the last successful nightly's, or the full file the last
+    whole backfill read if that is newer (a re-run from a fresh file takes over from
+    the deltas before it, which the file holds); with neither, the current full
+    file."""
     last = repo.last_successful_run(db, VENDOR, NIGHTLY_ENDPOINT)
-    through = (((last or {}).get("params") or {}).get("through") or {}).get(
+    applied = (((last or {}).get("params") or {}).get("through") or {}).get(
         VENDOR_TABLE
     )
-    if through is None:
+    whole = repo.last_successful_run(db, VENDOR, ENDPOINT, params={"whole": True})
+    read = (whole["params"].get("files") or [None])[0] if whole else None
+    known = [f for f in (applied, read) if f is not None]
+    if known:
+        through = max(known)
+    else:
         full = repo.current_sharadar_full(db, VENDOR_TABLE)
         through = full["file_id"] if full else 0
     return repo.sharadar_deltas_after(db, VENDOR_TABLE, through), through
@@ -892,6 +913,9 @@ def load(
         raise ValueError(f"--period is annual, quarter or both, not {period!r}")
     as_of = as_of or date.today()
     result = FundamentalsResult(dry_run=dry_run, backfill=backfill)
+    if not backfill and not backfilled(db):
+        result.waiting = True
+        return result
     links = Links(repo.vendor_links(db, VENDOR))
     listing = repo.vendor_table_rows(db, VENDOR, VENDOR_TABLE)
     if not listing:
@@ -1010,6 +1034,9 @@ def load(
         scan(None)
         return result
     params = {"backfill": backfill, "period": period, "files": result.files}
+    if backfill:
+        # Every key and period: the nightly takes over from its file.
+        params["whole"] = not partial
     run = RunLog(
         db,
         source=VENDOR,

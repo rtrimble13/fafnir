@@ -1183,22 +1183,26 @@ fafnir ingest sharadar             # after it ([general] primary_price_vendor = 
 | Step | Command it runs | What it does |
 |---|---|---|
 | 1 | `source sharadar-bulk --tables tickers,actions --force` | Downloads TICKERS and ACTIONS whole: together under 0.1 GB. |
-| 2 | `source sharadar-delta` | Fetches SEP and SFP rows by `lastupdated` (below). |
+| 2 | `source sharadar-delta` | Fetches SEP, SFP and SF1 rows by `lastupdated` (below). |
 | 3 | `ingest sharadar-master` | Refreshes `core.vendor_security` and `core.vendor_security_event`. |
 | 4 | `ingest sharadar-universe` | Renames, delistings and new listings (#93); flags fed rows held inactive. |
 | 5 | `ingest sharadar-prices --nightly` | Writes the deltas' bars (below). |
 | 6 | `ingest sharadar-actions --backfill --gap-fill` | Splits and dividends from the fresh ACTIONS file. |
 | 7 | `source sharadar-prune` | Deletes the files nothing reads any more, keeping a week of them (below). |
 
-A step that fails stops the night with a non-zero exit. Every step is safe to run
-again, so the next run picks up where the last one stopped. A real run refuses
+A step that fails stops the night with a non-zero exit, except SF1's delta in step 2:
+it feeds the fundamentals, not the night's prices, so a failed one is a warning and a
+failed run on record, and the next night's delta starts from the same date (#106).
+Every step is safe to run again, so the next run picks up where the last one stopped. A real run refuses
 until `primary_price_vendor = "sharadar"`. From then on, `daily_update.sh` runs it
 in place of FMP's universe, price and action steps, and FMP's loaders refuse to
 write without `--allow-secondary`
 ([operations.md](operations.md#fmp-mode-and-sharadar-mode)).
 
-**The deltas.** `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` asks
-the table API for the rows stamped `lastupdated` on or after a date.
+**The deltas.** `fafnir source sharadar-delta [--tables SEP,SFP,SF1] [--since D]` asks
+the table API for the rows stamped `lastupdated` on or after a date. SF1's (#106) is
+read the same way; its `date` is the filing date. It is small: 1,105 rows over four
+days when the probe measured it.
 - **The date** defaults to the day the table's newest file, full or delta, was
   fetched, less three days. A bar is stamped no earlier than its own date, so a
   delta holds every bar dated from its start on, and the vendor's revisions of
@@ -1219,8 +1223,10 @@ the table API for the rows stamped `lastupdated` on or after a date.
   `landing.sharadar_file` with `kind = 'delta'` and `filters = {"lastupdated.gte":
   …}`.
 - **Edge cases.** A row stamped before the date means the filter was not applied,
-  and the table fails. So does a (ticker, date) that comes back twice: reads that
-  overlapped, and as many rows missing. A delta with no rows is not recorded, and
+  and the table fails. So does a row that comes back twice: reads that overlapped,
+  and as many rows missing. For a price table that is a (ticker, date); for SF1 it is
+  the whole row, since SF1 can hold twins (one period in two rows), which the
+  fundamentals loader quarantines. A delta with no rows is not recorded, and
   the same content twice is one file. Each table is one run (`endpoint =
   delta:<table>`).
 
@@ -1277,8 +1283,8 @@ step 7, decides from the ledger what each file is still for:
 | File | Kept |
 |---|---|
 | The current full file of each table | always: every loader reads it |
-| A delta the nightly has not applied (after its `through`, or after the current full before the first nightly) | always |
-| An applied delta | for 45 days, the universe step's 30-day window and a margin: a new listing reads it |
+| A delta its nightly has not applied (after its `through`, or after the current full before the first nightly): SEP's and SFP's by the price nightly, SF1's by the fundamentals nightly, which also counts the deltas before a whole backfill's file (#106) | always |
+| An applied delta | for 45 days, the universe step's 30-day window and a margin: a new listing reads it. SF1's are kept as long, for triage |
 | A superseded full file | for `[sharadar] keep_days` (7), and the newest of each table whatever its age |
 | `.*.part`, `.sharadar-sort-*` (a killed download or sort) | 24 hours |
 | A `<sha256>.<ext>` file the ledger never recorded (a header that failed the check) | 14 days, for inspection |
@@ -1345,8 +1351,19 @@ fafnir ingest fundamentals                         # the SF1 deltas since the la
   first, so allow about four times the zip's size free under `bulk_dir`. Without it,
   the run reads the SF1 delta files recorded since the last nightly run
   (`sharadar/fundamentals:nightly`). Its `params.through` names the last file
-  applied, so a failed night is read again the next. `source sharadar-delta` does not
-  fetch SF1 yet (#106), so for now the nightly finds nothing to apply.
+  applied, so a failed night is read again the next. Step 2 of `ingest sharadar`
+  fetches them, and `daily_update.sh` runs the nightly after it (#106).
+- **The nightly waits for a backfill.** Until a backfill has succeeded and the
+  statements hold rows, the nightly says so, reads nothing and records no run, so
+  its deltas stay pending. Without the wait, a night before the backfill would load
+  a security's latest filings alone. A reset (`reset_data.sh --scope fundamentals`)
+  empties the tables, so it waits again.
+- **A whole backfill takes over.** A backfill of every key and period records
+  `params.whole = true`. The nightly then counts the deltas recorded before its file
+  as applied, since the file holds them: applying them after a re-run from a newer
+  file would put older values back. A backfill with `--symbols`, `--limit` or
+  `--period` leaves the deltas pending. `scripts/backfill_fundamentals.sh` runs a
+  re-run from a fresh file ([operations.md](operations.md#fundamentals-in-the-night)).
 - **Identity.** A row's ticker resolves to its permaticker through `core.vendor_security`
   (`fundamentals`). The permaticker resolves to the security whose link covers the
   row's `reportperiod`, else to its open link; a period another key's link covers is

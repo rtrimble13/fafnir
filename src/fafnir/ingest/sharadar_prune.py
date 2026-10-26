@@ -2,15 +2,18 @@
 `fafnir source sharadar-prune`: delete the Sharadar files nothing reads any more,
 keeping a short history for triage.
 
-Every Sharadar night downloads TICKERS and ACTIONS whole and adds a SEP and an SFP
-delta, and nothing deleted a file, so ``[sharadar] bulk_dir`` grew without bound.
+Every Sharadar night downloads TICKERS and ACTIONS whole and adds a SEP, an SFP and
+an SF1 delta, and nothing deleted a file, so ``[sharadar] bulk_dir`` grew without
+bound.
 This decides from the ledger (``landing.sharadar_file``) what each file is still
 for:
 
 - **The current full file of a table** is kept: every loader reads it.
-- **A delta the nightly has not applied** is kept: one after its run's
-  ``params.through``, or after the current full file before the first nightly
-  (:func:`sharadar_prices.pending_deltas`).
+- **A delta its nightly has not applied** is kept: one after the run's
+  ``params.through``, or after the current full file before the first nightly. The
+  price nightly applies SEP's and SFP's (:func:`sharadar_prices.pending_deltas`),
+  and `fafnir ingest fundamentals` SF1's (:func:`fundamentals.pending_deltas`,
+  #106).
 - **A delta fetched within** :data:`DELTA_WINDOW_DAYS` is kept. A listing the
   universe step mints tonight reads every delta on disk for its first days
   (`sharadar-prices --nightly`), and the step mints only listings first priced
@@ -48,6 +51,7 @@ from typing import Optional
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
+from fafnir.ingest import fundamentals as fu
 from fafnir.ingest import sharadar_prices as sp
 from fafnir.ingest.runlog import RunLog
 from fafnir.ingest.sharadar_universe import LOOKBACK_DAYS
@@ -123,6 +127,7 @@ def _plan_ledger(db, root, result, *, keep_days, now) -> set[str]:
             )
         current[table] = entry["file_id"]
     _, through = sp.pending_deltas(db)
+    _, through[fu.VENDOR_TABLE] = fu.pending_deltas(db)
     previous: dict[str, int] = {}  # the newest superseded full of each table
     for r in rows:
         if r["kind"] == "full" and r["file_id"] != current.get(r["vendor_table"]):

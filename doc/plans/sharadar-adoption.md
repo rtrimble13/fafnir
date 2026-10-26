@@ -326,6 +326,23 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 
 ## [built] notes
 
+- **2026-10-26 · P4, #106: the fundamentals in the night.**
+  - **The SF1 delta** is step 2's third table (`source sharadar-delta`): by
+    `lastupdated`, in filing-date order, never by offset. Its failure warns and the
+    night goes on; the price tables' still stop it.
+  - **`daily_update.sh`** runs `fafnir ingest fundamentals` after `ingest sharadar`,
+    `upkeep`-wrapped, before `refresh-marts`. Until a backfill has loaded the
+    statements it waits and loads nothing, so deploying before #92 is safe.
+  - **The prune** reads the fundamentals nightly's applied state. An applied SF1
+    delta ages out after 45 days; a pending one is kept. A whole backfill
+    (`params.whole`) counts the deltas before its file as applied.
+  - **`scripts/backfill_fundamentals.sh`** runs a re-run: a fresh SF1 file, the
+    backfill, the marts and the report. CI runs its `--help`.
+  - **Measured:** nothing yet. The added wall-clock (the delta, the load, the panel's
+    refresh) is measured on production and recorded on #106; past 15 minutes the panel
+    gets its own timer.
+  - **Detail:** [fundamentals-sf1.md §6.8](fundamentals-sf1.md#68-as-built-the-nightly-106).
+
 - **2026-10-26 · P4, #102: fundamentals DQ checks and `status` lines.**
   - **Fourteen set-based checks** in `dq/checks.py`, written once per condition like
     every other: the balance-sheet identity (`info` where noncontrolling interest

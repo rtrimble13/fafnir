@@ -18,10 +18,14 @@ incremental and idempotent — a missed day is caught up on the next run.
    Sharadar mode, from the cutover:
 
    ```
-   ensure-horizon → ingest sharadar
+   ensure-horizon → ingest sharadar → ingest fundamentals
      → [fmp_secondary] ingest tracked, prices, actions --allow-secondary → adjust --changed
      → db refresh-marts → status
    ```
+
+   `ingest fundamentals` (#106) applies the SF1 delta `ingest sharadar` fetched, and
+   `refresh-marts` then refreshes the factor panel. It is `upkeep`-wrapped: a
+   fundamentals failure warns and never costs the night's prices.
 
 2. **DQ**, `fafnir-dq` (`scripts/run_dq_checks.sh`, `dq.log`): `dq run` (the SQL
    checks, the fundamentals checks since #102, then dorq per `[dq] engine`), then
@@ -71,13 +75,16 @@ source sharadar-bulk --tables tickers,actions --force → source sharadar-delta
   → source sharadar-prune
 ```
 
-A failed step stops the night non-zero, and every step is safe to re-run. Its runs
+A failed step stops the night non-zero, and every step is safe to re-run. The one
+exception is SF1's delta in step 2: a failure prints `!! fundamentals delta failed`
+and the night goes on, since it feeds the fundamentals, not the prices. Its runs
 are all `source = 'sharadar'`:
 
 | Endpoint | Step | Read in `params` |
 |---|---|---|
 | `bulk:tickers`, `bulk:actions` | the whole-file downloads | `file_id`, `rows`, `superseded` |
 | `delta:stocks`, `delta:funds` | SEP/SFP rows by `lastupdated` | `lastupdated.gte`, `rows`, `file_id`, `dates` (a year back is normal: the vendor restamps history it adjusts) |
+| `delta:fundamentals` | SF1 rows by `lastupdated` (#106); `dates` are filing dates | as above. A failed one does not stop the night |
 | `master:tickers`, `master:actions` | the vendor tables | |
 | `universe` | renames, delistings, listings; fed rows held inactive (`inactive:flagged`, `inactive:open`, `inactive:resolved`) | the counts |
 | `prune` | files nothing reads any more | `deleted` (by reason), `bytes_freed`, `kept`, `foreign`, `failed` |
@@ -102,6 +109,24 @@ Diagnosing it:
   is the guard working: in Sharadar mode FMP's six loaders refuse without
   `--allow-secondary`. A cron line or runbook step that hits it is FMP's night
   trying to resume. Do not add the flag to make it pass; find out why it ran.
+- **The fundamentals** (#106) come after `ingest sharadar`: `fafnir ingest
+  fundamentals`, run `sharadar/fundamentals:nightly`, applies the SF1 deltas after
+  its last `params.through`. Reading it:
+  - **`No fundamentals backfill yet`** in `daily.log`, and no run: no backfill has
+    succeeded, or a reset emptied the statements. The deltas wait; that is by design
+    until `--backfill` runs (backfill.md, #92).
+  - **A failed `delta:fundamentals` run, or a failed `fundamentals:nightly`**: the
+    night still loaded prices, and the next night re-reads from the same point. Two
+    nights running is worth a look: the SF1 delta's error names its cause (a filter
+    not applied, a repeated row, a date too full to read).
+  - **The deltas the nightly counts as applied** are those up to its `through`, or
+    up to the file the last *whole* backfill read (`params.whole = true`), if newer.
+    `sharadar-prune` reads the same state, so an applied SF1 delta ages out after
+    45 days and a pending one is kept.
+  - **Timing.** `delta:fundamentals` and `fundamentals:nightly` durations, and the
+    gap between the `Refreshed mart.*` log lines around `mart.fundamental_panel`.
+    Past 15 minutes the panel gets its own timer (operations.md, *Fundamentals in
+    the night*).
 - **Rollback** is `vendor feed --vendor fmp --all-linked`, then the setting back to
   `"fmp"` (operations.md, "Primary vendor switch and rollback"). FMP resumes from
   its watermarks and never overwrites a Sharadar row.
@@ -227,8 +252,8 @@ the evidence the switch was right, and until then it is only a reasonable bet.
 | Reconciliation | `scripts/reconcile.sh AAPL,MSFT,SPY` | weekly, rotating sample; reports, never overwrites |
 | Backups | `scripts/backup_dump.sh`, `backup_offsite.sh` | dump **every** schema, not a subset |
 | Sharadar bulk files | `fafnir source sharadar-bulk [--tables …] [--force]` | operator-run for SEP, SFP and SF1; the Sharadar night re-downloads TICKERS and ACTIONS. Downloads whole tables to `[sharadar] bulk_dir` (`<sha256>.csv.zip`) and records each in `landing.sharadar_file`; loads nothing into core. A table already on record is skipped unless `--force`. Runs are `source = sharadar`, `endpoint = bulk:<table>`. The files are **not** backed up (re-downloadable while subscribed) |
-| Sharadar deltas | `fafnir source sharadar-delta [--tables SEP,SFP] [--since D]` | step 2 of the Sharadar night. Rows stamped `lastupdated` from the newest file's fetch day less 3 days, as `<sha256>.csv` with `kind = 'delta'`. A newly minted security reads every delta still on disk, from its link's start |
-| SF1 statements | `fafnir ingest fundamentals [--backfill] [--symbols …] [--period …] [--dry-run]` | operator-run until #106 adds it to the night. `--backfill` reads the current SF1 full file; without it, the SF1 deltas since the last `sharadar/fundamentals:nightly` run (`params.through`). Writes the three statement tables (versions on two timelines, ADR 0018), committed per vendor key; a re-run writes nothing. Runs are `source = sharadar`, `endpoint = fundamentals` or `fundamentals:nightly`. Flags: `fundamentals_*` |
+| Sharadar deltas | `fafnir source sharadar-delta [--tables SEP,SFP,SF1] [--since D]` | step 2 of the Sharadar night (SF1 since #106). Rows stamped `lastupdated` from the newest file's fetch day less 3 days, as `<sha256>.csv` with `kind = 'delta'`. A newly minted security reads every delta still on disk, from its link's start |
+| SF1 statements | `fafnir ingest fundamentals [--backfill] [--symbols …] [--period …] [--dry-run]` | the nightly runs it after the Sharadar step (#106); `--backfill` is operator-run, and `scripts/backfill_fundamentals.sh` runs a re-run (a fresh SF1 file, the backfill, the marts, the report). `--backfill` reads the current SF1 full file; without it, the SF1 deltas since the last `sharadar/fundamentals:nightly` run (`params.through`), and nothing until a backfill has loaded the statements. Writes the three statement tables (versions on two timelines, ADR 0018), committed per vendor key; a re-run writes nothing. Runs are `source = sharadar`, `endpoint = fundamentals` or `fundamentals:nightly`. Flags: `fundamentals_*` |
 | Sharadar files on disk | `fafnir source sharadar-prune [--dry-run] [--keep-days N]` | step 7 of the Sharadar night. It keeps each table's current full file, the deltas the nightly has not applied, 45 days of applied ones, and superseded files for `[sharadar] keep_days` (7) plus the newest of each table. It deletes the rest, and a killed run's `.*.part` and `.sharadar-sort-*` after 24 hours. A deleted file's ledger row stays, `status = 'deleted'`. It refuses when a current file is missing from `bulk_dir`. `monitor.sh sharadar` warns past `FAFNIR_SHARADAR_WARN_GB` (8) |
 
 On backups, the trap worth knowing: skipping `mart` because it is derived and
@@ -260,7 +285,8 @@ propose the `journalctl` line for the operator when only the journal will do.
 answered with its own ~5-year window. Always pass an explicit `--from` when
 re-backfilling a truncated history, whichever version is deployed.
 
-**Propose, never run** — `scripts/reset_data.sh`, `fafnir db rollback`,
+**Propose, never run** — `scripts/reset_data.sh`, `scripts/backfill_fundamentals.sh`
+(it downloads SF1 whole and rewrites the statements), `fafnir db rollback`,
 `fafnir db migrate`, `fafnir security descope` (ADR 0012: irreversible, and its dry
 run too, since the settings deny the command by prefix), edits to `~/.fafnirrc`,
 timer and unit changes,

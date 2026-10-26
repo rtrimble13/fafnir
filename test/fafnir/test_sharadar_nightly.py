@@ -56,6 +56,23 @@ def _json_bar(ticker, day, close, *, stamp=None, unadj=None):
     }
 
 
+def _json_sf1(dim, period, filed, *, stamp, ticker="ZZA", **values):
+    """An SF1 row as the table API answers it: ``date`` is the filing date, and a
+    metric is a number or null."""
+    return {
+        "ticker": ticker,
+        "dimension": dim,
+        "calendardate": period,
+        "date": filed,
+        "reportperiod": period,
+        "fiscalperiod": "2026-Q2",
+        "lastupdated": stamp,
+        "revenue": 1000.5,
+        "netinc": None,
+        **values,
+    }
+
+
 def _csv_bar(ticker, day, close, *, stamp=None):
     return f"{ticker},{day},{close},{close},{close},{close},100,{close},{close},{stamp or day}\n"
 
@@ -275,6 +292,47 @@ def test_a_delta_that_repeats_a_row_is_refused(db, tmp_path):
     assert result.outcome == "failed"
     assert "1 of 2 rows repeat a (ticker, date)" in result.error
     assert not repo.sharadar_deltas_after(db, "stocks", 0)
+
+
+def test_an_sf1_delta_is_read_by_filing_date_and_keeps_its_twins(db, tmp_path):
+    today = date.today().isoformat()
+    first = _json_sf1("ARQ", "2026-06-30", "2026-08-01", stamp=today)
+    # A twin: the same period filed again. The loader quarantines both (§6.3);
+    # the fetch passes them on, as the bulk file would.
+    twin = {**first, "date": "2026-08-15", "revenue": 1001}
+    old = _json_sf1("ARQ", "2026-03-31", "2026-05-01", stamp="2026-05-01")
+    client = _FakeNight({"SF1": [twin, first, old]})
+    _record(db, tmp_path, "fundamentals", "ticker,dimension\n")
+
+    result = bulk.fetch_delta(db, client, "SF1", tmp_path)
+    assert (result.outcome, result.rows, result.unmapped_columns) == (
+        "recorded",
+        2,
+        [],  # SF1's metrics are numeric by default, not unknown
+    )
+    table, params = client.asked[-1]
+    assert table == "SF1" and params["sort"] == "date" and "offset" not in params
+    entry = repo.sharadar_file(db, result.file_id)
+    assert (entry["vendor_table"], entry["kind"]) == ("fundamentals", "delta")
+    assert (tmp_path / entry["path"]).read_text().splitlines() == [
+        "ticker,dimension,calendardate,date,reportperiod,fiscalperiod,lastupdated,"
+        "revenue,netinc",
+        f"ZZA,ARQ,2026-06-30,2026-08-01,2026-06-30,2026-Q2,{today},1000.5,",
+        f"ZZA,ARQ,2026-06-30,2026-08-15,2026-06-30,2026-Q2,{today},1001,",
+    ]
+    run = db.fetchone(
+        "SELECT endpoint, status, params FROM ops.ingestion_run "
+        "WHERE ingestion_run_id = %s",
+        (entry["ingestion_run_id"],),
+    )
+    assert (run["endpoint"], run["status"]) == ("delta:fundamentals", "success")
+    assert run["params"]["dates"] == ["2026-08-01", "2026-08-15"]
+
+    # A row read twice is the repeat; for SF1 that is the whole row.
+    again = _FakeNight({"SF1": [first, dict(first)]})
+    repeated = bulk.fetch_delta(db, again, "fundamentals", tmp_path)
+    assert repeated.outcome == "failed"
+    assert "1 of 2 rows repeat a row" in repeated.error
 
 
 # ---------------------------------------------------------------------------
@@ -637,3 +695,53 @@ def test_the_night_runs_in_order_and_waits_for_the_cutover(db, tmp_path, monkeyp
     assert len(repo.sharadar_deltas_after(db, "funds", 0)) == 1
     name = "SELECT name FROM core.vendor_security WHERE vendor_key = '900106'"
     assert db.fetchval(name) == "ZZA CO"
+
+
+def test_a_failed_sf1_delta_never_stops_the_night(db, tmp_path, monkeypatch):
+    _fulls(db, tmp_path)
+    _record(db, tmp_path, "fundamentals", "ticker,dimension\n")
+    today = date.today().isoformat()
+    filing = _json_sf1("ARQ", "2026-06-30", "2026-08-01", stamp=today)
+    bar = _json_bar("ZZA", "2026-10-21", 22, stamp=today)
+    tables = {
+        "SEP": [bar],
+        "SFP": [_json_bar("ZZFUND", "2026-10-21", 30, stamp=today)],
+        # Read twice: the SF1 delta fails.
+        "SF1": [filing, dict(filing)],
+    }
+    tickers = (
+        TICKERS
+        + "stocks,900107,ZZA,ZZA CO,NYSE,N,Domestic Common Stock,,3571,,,,,,,,,,"
+        "USD,,2026-10-21,2020-01-02,2020-01-02,2026-10-21,,,,\n"
+    )
+    client = _FakeNight(tables, {"tickers": tickers, "actions": ACTIONS})
+    monkeypatch.setattr(cli, "_sharadar_client", lambda cfg: client)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(f'[sharadar]\nbulk_dir = "{tmp_path}"\n')
+
+    def night():
+        return CliRunner().invoke(
+            cli.main,
+            ["--config", str(rc), "ingest", "sharadar", "--dry-run"],
+            env={"FAFNIR_DSN": db.dsn},
+        )
+
+    out = night()
+    assert out.exit_code == 0, out.output
+    assert "fundamentals  FAILED: fundamentals: 1 of 2 rows repeat a row" in out.output
+    assert "!! fundamentals delta failed: the fundamentals wait" in out.output
+    assert "[7/7] source sharadar-prune" in out.output
+    assert len(repo.sharadar_deltas_after(db, "stocks", 0)) == 1
+    assert not repo.sharadar_deltas_after(db, "fundamentals", 0)
+    failed = db.fetchval(
+        "SELECT count(*) FROM ops.ingestion_run "
+        "WHERE endpoint = 'delta:fundamentals' AND status = 'failed'"
+    )
+    assert failed == 1  # on record, for the operator
+
+    # A price table's failure still stops it at step 2.
+    tables["SEP"] = [bar, dict(bar)]
+    out = night()
+    assert out.exit_code != 0
+    assert "step 2 failed: stocks, fundamentals. The night stopped there." in out.output
+    assert "[3/7]" not in out.output
