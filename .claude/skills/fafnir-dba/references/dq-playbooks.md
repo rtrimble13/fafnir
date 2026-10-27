@@ -1608,6 +1608,12 @@ Revenue, or operating cash flow, in the quarters in force against the fiscal yea
 quarters were stored year to date, not discretely, and every TTM over them is wrong.
 SF1's quarters are discrete (#83), so this should be rare; report it.
 
+A fiscal year with two annual periods in force is not judged. A change of year end can
+label the transition period with the year it shares, and the quarters cannot then be
+assigned to either year by their label. Judged, the two annual rows were two flags on
+one key: the open-condition index refused the insert, and with it the whole `dq run`,
+price checks included (2026-10-27, 10 such keys on production).
+
 ### `fundamentals_version_chain` — a period's knowledge intervals do not chain
 
 `error`: each `known_to` must equal the next version's `known_from`, and only the last

@@ -454,6 +454,36 @@ def test_quarters_reported_year_to_date(db):
     ]
 
 
+def test_a_fiscal_year_with_two_annual_periods_is_not_judged(db):
+    # A change of year end: the June year and the transition to December share the
+    # label 2011. Both annual rows fail the ratio; judged, they were two flags on one
+    # key, which the open-condition index refused, failing the whole `dq run`.
+    sid = _security(db, "ZZFYE")
+    ends = (D(2010, 9, 30), D(2010, 12, 31), D(2011, 3, 31), D(2011, 6, 30))
+    for q, fd in enumerate(ends, start=1):
+        # 100, 200, 300, 400: a year-to-date series, 1,000 against either year's 400.
+        _put(
+            db,
+            "income",
+            sid,
+            fd,
+            label=f"2011-Q{q}",
+            known_from=fd + timedelta(days=40),
+            revenue=100 * q,
+        )
+    for fd in (D(2011, 6, 30), D(2011, 12, 31)):
+        _put(
+            db,
+            "income",
+            sid,
+            fd,
+            label="2011-FY",
+            known_from=fd + timedelta(days=60),
+            revenue=400,
+        )
+    assert _run_twice(db, "fundamentals_ytd_suspect") == []
+
+
 # ---------------------------------------------------------------------------
 # The timelines: filing lag, TTM series, version chains
 # ---------------------------------------------------------------------------
