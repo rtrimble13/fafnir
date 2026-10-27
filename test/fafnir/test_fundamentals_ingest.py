@@ -508,6 +508,61 @@ def test_the_nightly_waits_for_a_backfill(db, tmp_path):
     assert result.waiting and not _rows(db, sid=sid)
 
 
+def test_a_backfill_or_nightly_that_quarantined_rows_has_finished(db, tmp_path):
+    # A run that quarantines a row ends 'partial', and still loaded the rest: the
+    # nightly applies its deltas after it. On production the backfill quarantined
+    # SF1's duplicates and the next night waited for a backfill (2026-10-27).
+    def twins(period, filed, label, **stamp):
+        return (
+            _row("ARQ", period, filed, label, **stamp),
+            _row("ARQ", period, filed, label, revenue=1001, **stamp),
+        )
+
+    def status(run_id):
+        return db.fetchval(
+            "SELECT status FROM ops.ingestion_run WHERE ingestion_run_id = %s",
+            (run_id,),
+        )
+
+    _security(db, "ZZA", KEY)
+    full = _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(
+            _row("ARY", "2020-12-31", "2021-02-01", "2020-FY"),
+            *twins("2020-09-30", "2020-11-02", "2020-Q3"),
+        ),
+    )
+    _record(db, tmp_path, "actions", ACTIONS)
+    backfill = fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
+    assert status(backfill.run_id) == "partial"
+    assert fu.backfilled(db)
+    assert fu.pending_deltas(db) == ([], full)
+
+    delta = _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(
+            _row("ARQ", "2021-03-31", "2021-05-03", "2021-Q1", stamp="2026-10-24"),
+            *twins("2021-06-30", "2021-08-02", "2021-Q2", stamp="2026-10-24"),
+        ),
+        kind="delta",
+        since="2026-10-24",
+    )
+    night = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert not night.waiting and night.files == [delta]
+    assert status(night.run_id) == "partial"
+    assert [r["fiscal_date"] for r in _rows(db) if r["period_type"] == "quarter"] == [
+        Y(2021, 3, 31)
+    ]
+    # Its file is applied: the next night does not read it again.
+    assert fu.pending_deltas(db) == ([], delta)
+    again = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert (again.files, again.read, again.written) == ([], 0, 0)
+
+
 def test_bad_rows_are_quarantined_once_and_the_rest_loads(db, tmp_path):
     sid = _security(db, "ZZB", "900002")
     dead = _security(

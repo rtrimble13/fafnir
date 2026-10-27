@@ -7694,14 +7694,38 @@ def last_successful_run(
 ) -> Optional[dict]:
     """The newest successful ``ops.ingestion_run`` of ``source``/``endpoint``; with
     ``params``, the newest whose ``params`` hold those keys and values."""
+    return _last_run(db, source, endpoint, ("success",), params)
+
+
+def last_completed_run(
+    db: Database, source: str, endpoint: str, *, params: Optional[dict] = None
+) -> Optional[dict]:
+    """As :func:`last_successful_run`, counting a 'partial' run too: it quarantined
+    some rows and wrote every row it validated, so it finished. Only a run that
+    failed, or has not finished, is left out."""
+    return _last_run(db, source, endpoint, ("success", "partial"), params)
+
+
+def _last_run(
+    db: Database,
+    source: str,
+    endpoint: str,
+    statuses: tuple[str, ...],
+    params: Optional[dict],
+) -> Optional[dict]:
     return db.fetchone(
         """
         SELECT ingestion_run_id, started_at, params FROM ops.ingestion_run
-         WHERE source = %s AND endpoint = %s AND status = 'success'
+         WHERE source = %s AND endpoint = %s AND status = ANY(%s)
            AND (%s::jsonb IS NULL OR params @> %s::jsonb)
          ORDER BY ingestion_run_id DESC LIMIT 1
         """,
-        (source, endpoint, *[json.dumps(params) if params is not None else None] * 2),
+        (
+            source,
+            endpoint,
+            list(statuses),
+            *[json.dumps(params) if params is not None else None] * 2,
+        ),
     )
 
 
