@@ -1353,7 +1353,11 @@ fafnir ingest fundamentals                         # the SF1 deltas since the la
   (`sharadar/fundamentals:nightly`). Its `params.through` names the last file
   applied, so a failed night is read again the next. Step 2 of `ingest sharadar`
   fetches them, and `daily_update.sh` runs the nightly after it (#106).
-- **The nightly waits for a backfill.** Until a backfill has succeeded and the
+- **A run that quarantined rows has finished.** It ends `partial`, and wrote every row
+  it did not quarantine. A partial backfill counts as a backfill, and a partial
+  nightly's `through` as applied: reading its files again would only quarantine the
+  same rows, which are flagged.
+- **The nightly waits for a backfill.** Until a backfill has finished and the
   statements hold rows, the nightly says so, reads nothing and records no run, so
   its deltas stay pending. Without the wait, a night before the backfill would load
   a security's latest filings alone. A reset (`reset_data.sh --scope fundamentals`)

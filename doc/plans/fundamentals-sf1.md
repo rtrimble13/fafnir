@@ -640,8 +640,9 @@ These points are settled here:
 - **`daily_update.sh`** runs `fafnir ingest fundamentals` after `ingest sharadar`,
   `upkeep`-wrapped, and before `refresh-marts`, which refreshes the panel. FMP's night
   has no fundamentals step: it fetches no SF1 delta.
-- **The nightly waits for a backfill.** Until a backfill has succeeded and the
-  statements hold rows, it reads nothing and records no run. Without the wait, a
+- **The nightly waits for a backfill.** Until a backfill has finished (`success`, or
+  `partial` when it quarantined rows) and the statements hold rows, it reads nothing
+  and records no run. Without the wait, a
   night between this deploy and #92 would load the latest filings alone, before the
   backfill.
 - **Applied state.** A backfill of every key and period records `params.whole`. The

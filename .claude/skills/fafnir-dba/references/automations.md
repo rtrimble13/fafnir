@@ -113,8 +113,11 @@ Diagnosing it:
   fundamentals`, run `sharadar/fundamentals:nightly`, applies the SF1 deltas after
   its last `params.through`. Reading it:
   - **`No fundamentals backfill yet`** in `daily.log`, and no run: no backfill has
-    succeeded, or a reset emptied the statements. The deltas wait; that is by design
-    until `--backfill` runs (backfill.md, #92).
+    finished, or a reset emptied the statements. The deltas wait; that is by design
+    until `--backfill` runs (backfill.md, #92). A backfill that quarantined rows
+    (`status = 'partial'`) has finished. Up to v3.0.1 it did not count, so the step
+    waited after a backfill as well: check the last `fundamentals` run's status
+    before re-running one.
   - **A failed `delta:fundamentals` run, or a failed `fundamentals:nightly`**: the
     night still loaded prices, and the next night re-reads from the same point. Two
     nights running is worth a look: the SF1 delta's error names its cause (a filter

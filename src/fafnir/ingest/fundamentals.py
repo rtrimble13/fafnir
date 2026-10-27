@@ -833,25 +833,27 @@ def _splits_by_key(
 
 def backfilled(db: Database) -> bool:
     """Whether the nightly has statements to apply its deltas to: a backfill has
-    succeeded and the statements hold rows (a reset empties them and keeps the
+    finished and the statements hold rows (a reset empties them and keeps the
     runs). Before that a delta would load a security's latest filings alone, and
-    the backfill (doc/backfill.md) would find them there."""
-    if repo.last_successful_run(db, VENDOR, ENDPOINT) is None:
+    the backfill (doc/backfill.md) would find them there. A backfill that
+    quarantined rows ('partial') has finished: the rest of the file loaded."""
+    if repo.last_completed_run(db, VENDOR, ENDPOINT) is None:
         return False
     return repo.statements_loaded(db)
 
 
 def pending_deltas(db: Database) -> tuple[list[dict], int]:
     """The SF1 delta files the nightly has not applied, oldest first, and the file it
-    was applied through: the last successful nightly's, or the full file the last
+    was applied through: the last finished nightly's, or the full file the last
     whole backfill read if that is newer (a re-run from a fresh file takes over from
     the deltas before it, which the file holds); with neither, the current full
-    file."""
-    last = repo.last_successful_run(db, VENDOR, NIGHTLY_ENDPOINT)
+    file. A run that quarantined rows ('partial') counts: a quarantined row is
+    flagged, and reading its file again would only quarantine it again."""
+    last = repo.last_completed_run(db, VENDOR, NIGHTLY_ENDPOINT)
     applied = (((last or {}).get("params") or {}).get("through") or {}).get(
         VENDOR_TABLE
     )
-    whole = repo.last_successful_run(db, VENDOR, ENDPOINT, params={"whole": True})
+    whole = repo.last_completed_run(db, VENDOR, ENDPOINT, params={"whole": True})
     read = (whole["params"].get("files") or [None])[0] if whole else None
     known = [f for f in (applied, read) if f is not None]
     if known:
