@@ -735,6 +735,39 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
   dates every restatement it finds from the day it runs. Until the reload, the night's
   fundamentals step waits.
 
+### A backfill from before the later-filing fix
+
+SF1 lists a first-reported period once per filing that reported it: a 10-K and its 10-K/A,
+a quarter filed again. The loader used to quarantine every such row as a twin. The first
+production backfill (2026-10-26, run 470) set aside 70,751 rows: 33,181
+`fundamentals_duplicate_period` flags on 9,335 securities. 32,337 of those periods then took
+their restated row as version 1, `estimated` and known from the issuer's next filing. That
+gives restated figures, dated as if known when that filing was made, in place of the first
+report at its own filing date. A host loaded before the fix shows it as open
+`fundamentals_duplicate_period` flags on first-reported rows:
+
+```sql
+SELECT count(*) FROM ops.data_quality_flag
+ WHERE check_name = 'fundamentals_duplicate_period' AND resolved_at IS NULL
+   AND record_key->>'dimension' LIKE 'AR%';
+```
+
+The repair is a reload once the fix is deployed. Do it in the day, as for the backfill:
+1. **Empty the statements.** Run `scripts/reset_data.sh --scope fundamentals` to preview, then
+   again with `--yes`.
+2. **Reload.** Run `scripts/backfill_fundamentals.sh`: a fresh SF1 file, the backfill, the
+   marts, the report. Its `later_filing` count is the set-aside rows that were later filings.
+   The `fundamentals_duplicate_period` rows left are true twins.
+3. **Close the old run's flags.** The reset leaves them. Each is closed by `dq resolve`, by
+   id, after its dry run:
+   - the first-reported `fundamentals_duplicate_period` flags whose period now holds a `filed`
+     version 1, naming the reload's run;
+   - the old run's `fundamentals_restatement` flags, keyed by its `ingestion_run_id`. The
+     reload writes its own.
+
+A re-run of the backfill without the reset would record each of those periods as a vendor
+correction (`fundamentals_vendor_correction`), which they are not: the reset comes first.
+
 **The projection.** It was measured on the test database on 2026-10-26, with a synthetic SF1
 of 2,000 tickers over 31 years. That is 930,000 rows, about a quarter of SF1's, with all 112
 columns and half the periods restated.

@@ -1225,8 +1225,8 @@ days when the probe measured it.
 - **Edge cases.** A row stamped before the date means the filter was not applied,
   and the table fails. So does a row that comes back twice: reads that overlapped,
   and as many rows missing. For a price table that is a (ticker, date); for SF1 it is
-  the whole row, since SF1 can hold twins (one period in two rows), which the
-  fundamentals loader quarantines. A delta with no rows is not recorded, and
+  the whole row, since SF1 can hold one period in two rows (a filing and its
+  amendment), which the fundamentals loader resolves. A delta with no rows is not recorded, and
   the same content twice is one file. Each table is one run (`endpoint =
   delta:<table>`).
 
@@ -1387,7 +1387,13 @@ fafnir ingest fundamentals                         # the SF1 deltas since the la
   - a malformed period label;
   - a value its column cannot hold;
   - a filing before its period ended;
-  - two rows for one period in one file.
+  - two rows for one period in one file that cannot be told apart: a restated period
+    listed twice, or two different first reports filed on one day.
+- **Later filings.** SF1 lists a first-reported period once per filing that reported
+  it: a 10-K and its 10-K/A, a quarter filed again. The earliest filing is the first
+  report and loads as version 1, known from its date. The later ones are counted
+  (`later_filing`) and not loaded: what they change reaches the period through its
+  restated row, as a restatement. Rows that differ only in `lastupdated` are one row.
 - **Flags.** Restatements are flagged `fundamentals_restatement` and corrections
   `fundamentals_vendor_correction`, once per security and run, with the largest moves.
   A restatement is `warn` from the nightly and `info` from a backfill, which observes

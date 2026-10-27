@@ -266,8 +266,9 @@ def write_delta(
 
 def _row_key(vendor_table: str, row: dict) -> tuple:
     """What a row read twice repeats. A price row is one (ticker, date). SF1 can hold
-    twins, rows that share a ticker, dimension and reportperiod, which the loader
-    quarantines (fundamentals-sf1.md §6.3), so there it is the whole row."""
+    one period in two rows, sharing a ticker, dimension and reportperiod (a filing
+    and its amendment), which the loader resolves (fundamentals-sf1.md §6.3), so
+    there it is the whole row."""
     if vendor_table in PRICE_TABLES:
         return (row.get("ticker"), str(row.get("date"))[:10])
     return tuple(sorted((k, str(v)) for k, v in row.items()))

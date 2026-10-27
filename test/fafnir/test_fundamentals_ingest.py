@@ -520,8 +520,10 @@ def test_bad_rows_are_quarantined_once_and_the_rest_loads(db, tmp_path):
         _sf1(
             _row("ARQ", "2020-03-31", "2020-05-01", "2020Q1", ticker="ZZB"),
             _row("ARQ", "2020-06-30", "2020-06-29", "2020-Q2", ticker="ZZB"),
-            _row("ARQ", "2020-09-30", "2020-11-01", "2020-Q3", ticker="ZZB"),
             _row("ARQ", "2020-09-30", "2020-11-02", "2020-Q3", ticker="ZZB"),
+            _row(
+                "ARQ", "2020-09-30", "2020-11-02", "2020-Q3", ticker="ZZB", revenue=1001
+            ),
             _row("ARY", "2020-12-31", "2021-02-01", "2020-FY", ticker="ZZB"),
             # Outside its only (closed) link: no security for it.
             _row("ARY", "2010-12-31", "2011-02-01", "2010-FY", ticker="ZZD"),
@@ -535,7 +537,8 @@ def test_bad_rows_are_quarantined_once_and_the_rest_loads(db, tmp_path):
     checks = sorted(
         f["check_name"] for f in _flags(db) if f["check_name"] != fu.UNLINKED
     )
-    # The two twins are one condition, one flag; both rows are quarantined.
+    # Two different first reports filed on one day are twins: one condition, one
+    # flag, and both rows quarantined.
     assert checks == sorted([fu.MISSING_LABEL, fu.FILED_EARLY, fu.DUPLICATE])
     (unlinked,) = _flags(db, fu.UNLINKED)
     assert (unlinked["severity"], unlinked["detail"]["rows"]) == ("info", 1)
@@ -549,6 +552,78 @@ def test_bad_rows_are_quarantined_once_and_the_rest_loads(db, tmp_path):
     n = len(_flags(db))
     fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
     assert len(_flags(db)) == n
+
+
+def test_a_period_listed_once_per_filing_loads_its_first(db, tmp_path):
+    # SF1 lists a first-reported period once per filing that reported it: here the
+    # 10-K/A after the 10-K, and a quarter listed twice with only its stamp apart.
+    sid = _security(db, "ZZA", KEY)
+    _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(
+            _row("ARY", "2020-12-31", "2021-03-10", "2020-FY", revenue=1200),
+            _row("ARY", "2020-12-31", "2021-02-01", "2020-FY"),
+            _row("MRY", "2020-12-31", "", "2020-FY", revenue=1200),
+            _row("ARQ", "2020-09-30", "2020-11-02", "2020-Q3"),
+            _row("ARQ", "2020-09-30", "2020-11-02", "2020-Q3", stamp="2026-01-03"),
+        ),
+    )
+    _record(db, tmp_path, "actions", ACTIONS)
+    result = fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
+    loaded = [
+        (
+            r["period_type"],
+            r["version_no"],
+            r["knowledge_source"],
+            r["known_from"],
+            r["revenue"],
+        )
+        for r in _rows(db, sid=sid)
+    ]
+    # The 10-K is the first report, known from its filing; the amendment's figure
+    # arrives as the restated row's, a version known from the load day.
+    assert loaded == [
+        ("annual", 1, "filed", Y(2021, 2, 1), D("1000")),
+        ("annual", 2, "observed", BACKFILL_DAY, D("1200")),
+        ("quarter", 1, "filed", Y(2020, 11, 2), D("1000")),
+    ]
+    assert (result.read, result.counts["later_filing"]) == (5, 2)
+    assert not _flags(db, fu.DUPLICATE) and not _flags(db, fu.ESTIMATED_FLAG)
+    _invariants(db)
+    assert fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY).written == 0
+
+
+def test_the_nightly_loads_the_first_filing_of_a_period_listed_twice(db, tmp_path):
+    sid, _ = _backfilled(db, tmp_path)
+    _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(
+            _row(
+                "ARQ",
+                "2020-06-30",
+                "2020-08-14",
+                "2020-Q2",
+                stamp="2026-10-24",
+                revenue=1100,
+            ),
+            _row("ARQ", "2020-06-30", "2020-07-30", "2020-Q2", stamp="2026-10-24"),
+        ),
+        kind="delta",
+        since="2026-10-24",
+    )
+    result = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    (q2,) = [r for r in _rows(db, sid=sid) if r["fiscal_date"] == Y(2020, 6, 30)]
+    assert (q2["knowledge_source"], q2["known_from"], q2["revenue"]) == (
+        "filed",
+        Y(2020, 7, 30),
+        D("1000"),
+    )
+    assert result.counts["later_filing"] == 1 and not _flags(db, fu.DUPLICATE)
+    _invariants(db)
 
 
 def test_a_backfill_needs_a_file_and_rows(db, tmp_path):
