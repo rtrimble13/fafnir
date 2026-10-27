@@ -1185,7 +1185,11 @@ def check_fundamentals_implausible_filing_lag(db: Database) -> int:
 def check_fundamentals_ytd_suspect(db: Database) -> int:
     """A fiscal year whose four quarters in force sum to more than ``YTD_RATIO``
     times the year: quarters reported year to date, not discretely (``warn``).
-    Revenue, and operating cash flow, which 10-Qs report year to date."""
+    Revenue, and operating cash flow, which 10-Qs report year to date.
+
+    A fiscal year with two annual periods in force (a change of year end can label a
+    transition period with the year it shares) is not judged: its quarters cannot be
+    told apart by the label, and two annual rows would be two flags on one key."""
     parts = []
     for table, item in (
         ("core.income_statement", "revenue"),
@@ -1202,8 +1206,10 @@ def check_fundamentals_ytd_suspect(db: Database) -> int:
                        sum({item}) AS s
                   FROM {table} WHERE period_type = 'quarter' AND {IN_FORCE}
                  GROUP BY security_id, fiscal_year) q
-          JOIN (SELECT security_id, fiscal_year, {item} AS v
-                  FROM {table} WHERE period_type = 'annual' AND {IN_FORCE}) a
+          JOIN (SELECT security_id, fiscal_year, min({item}) AS v
+                  FROM {table} WHERE period_type = 'annual' AND {IN_FORCE}
+                 GROUP BY security_id, fiscal_year
+                HAVING count(*) = 1) a
             ON a.security_id = q.security_id AND a.fiscal_year = q.fiscal_year
          WHERE q.n = 4 AND a.v <> 0 AND abs(q.s) > {YTD_RATIO} * abs(a.v)""")
     return _write_flags(
