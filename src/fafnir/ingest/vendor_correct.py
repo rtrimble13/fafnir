@@ -2,10 +2,13 @@
 `fafnir vendor correct`: replace the FMP bars that disagree with Sharadar's, audited
 (plan SA-0601, #75; #66 and #69 folded in).
 
-Sharadar is the more reliable vendor (plan decision of 2026-10-20). For every FMP
-security linked to Sharadar, this reads the vendor's bars from the current bulk
-files, recovers them raw exactly as `ingest sharadar-prices` does, and compares
-them with the FMP bars on the dates both hold, from the link's ``valid_from``:
+Sharadar is the more reliable vendor (plan decision of 2026-10-20). For every
+FMP-minted security linked to Sharadar, fed or not, this reads the vendor's bars from
+the current bulk files, recovers them raw exactly as `ingest sharadar-prices` does,
+and compares them with the FMP bars on the dates both hold, from the link's
+``valid_from``. The vendor's own bars on a fed row are the nightly's, never compared.
+Up to v3.0.3 a fed row was left out, and since the cutover (#125) fed every linked
+security, that left nothing (ADS, 2026-10-28):
 
 - **A bar differs** when its close is off by more than max($0.01, 1 bp), or its
   open, high or low by more than that or the recovery's own rounding (0.0005 x the
@@ -464,21 +467,19 @@ def correct(
         raise ValueError(f"volume is keep or sharadar, not {volume!r}")
     as_of = as_of or date.today()
     result = CorrectResult(dry_run=dry_run)
+    # Fed or not: the cutover fed every linked security, and a fed FMP-minted row
+    # still holds FMP's history from before. Only the bars FMP supplied are compared.
+    fmp = [
+        t
+        for t in repo.vendor_action_targets(db, VENDOR, security_ids)
+        if t["source"] == repo.FMP_SOURCE
+    ]
     if split_bearing:
-        fmp = [
-            t
-            for t in repo.vendor_action_targets(db, VENDOR, security_ids)
-            if t["source"] == repo.FMP_SOURCE
-        ]
         splits = repo.stored_split_values(db, [t["security_id"] for t in fmp], VENDOR)
         targets = [t for t in fmp if t["security_id"] in splits]
     else:
         splits = {}
-        targets = [
-            t
-            for t in repo.vendor_action_targets(db, VENDOR, security_ids)
-            if not t["is_feed"] and t["source"] == repo.FMP_SOURCE
-        ]
+        targets = fmp
     result.securities = len(targets)
     by_file, files, keys = sp.prepare(db, bulk_dir, targets, result.counts)
     sampled = _sampled_dates(db, list(keys.values()))

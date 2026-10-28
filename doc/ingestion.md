@@ -588,8 +588,25 @@ fafnir ingest sharadar-actions --backfill --gap-fill            # then the actio
 
 Sharadar is the more reliable vendor (plan decision of 2026-10-20), so an FMP bar
 that disagrees with Sharadar's is corrected. `fafnir vendor correct` reads, for every
-FMP security linked to Sharadar, the vendor's bars, recovers them raw as above, and
-compares them with the FMP bars on the dates both hold, from the link's `valid_from`.
+FMP-minted security linked to Sharadar, fed or not, the vendor's bars, recovers them
+raw as above, and compares them with the bars FMP supplied on the dates both hold,
+from the link's `valid_from`. The vendor's own bars on a fed row are the nightly's
+to revise, and never compared.
+
+**Fed or not.** Up to v3.0.3 a fed row was left out. The cutover (2026-10-22) fed
+every linked security, so from then on the command found none: ADS, whose FMP history
+sits a constant multiple off the as-traded price, gave `0 linked securities` on
+2026-10-28. The securities still flagged `vendor_history_disagrees` are the ones the
+first correction held back because they hold a split (all 681 on 2026-10-28; 652
+hold only FMP's). On those, Sharadar is not always the right side, so correct them
+one security at a time: read the flag's samples, name the security with `--symbols`,
+and run the dry run first.
+
+**A split FMP made up to match its wrong scale stays on file.** The command corrects
+bars, not actions: delete such a split with `fafnir actions delete` as part of the
+same repair, or the adjusted series applies it to bars that no longer need it. ADS
+carries one with nothing behind it in the as-traded closes. When FMP's volume is
+scaled with its prices, take the vendor's (`--volume sharadar`).
 
 - **A bar differs** when its close is off by more than max($0.01, 1 bp), or its
   open, high or low by more than that and the recovery's own rounding
@@ -615,6 +632,7 @@ within 1% and 5%). Counts only: safe to post.
 ```bash
 fafnir vendor correct --dry-run          # the report; post it on #75
 fafnir vendor correct                    # after the volume decision
+fafnir vendor correct --symbols ADS --volume sharadar --dry-run   # one held-back security
 fafnir vendor corrections list --limit 20
 ```
 

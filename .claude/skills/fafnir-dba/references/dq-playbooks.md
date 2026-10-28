@@ -1231,6 +1231,20 @@ it, never run it. A right link with a wrong history is `fafnir vendor correct`
 bar in `ops.vendor_correction`. It is a bulk write: propose the operator's run,
 with `--dry-run` first; do not run it yourself.
 
+- **The flags still open hold a split** (all 681 on 2026-10-28). The first
+  correction held them back because Sharadar is not always the right side of a
+  split or an ADR ratio. Propose them one security at a time with `--symbols`,
+  after reading the samples: a constant ratio is a scale to correct; noise is
+  another instrument (a link question).
+- **The row is fed.** Since the cutover every linked row is. The command reaches
+  fed rows from the release after v3.0.3; up to v3.0.3 it finds `0 linked
+  securities`, and `--split-bearing` reaches only rows holding Sharadar's splits.
+- **A split FMP made up to match its wrong scale** (ADS: FMP's history sat at a
+  constant multiple, and FMP lists a split with nothing behind it in Sharadar's
+  as-traded closes) stays on file after the correction: propose its
+  `actions delete` in the same repair. When FMP's volume moves with its wrong
+  prices, propose `--volume sharadar`.
+
 **Close with:** `vendor correct`, which resolves the flag itself once every sampled
 date agrees; or the rejection. A sampled date it did not correct is an
 operator-edited bar or a bar Sharadar's own data fails validation on: report it.

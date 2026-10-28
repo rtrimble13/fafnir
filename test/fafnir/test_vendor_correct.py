@@ -242,6 +242,79 @@ def test_the_command(db, tmp_path, monkeypatch):
     assert "1 corrected, 1 vendor_history_disagrees flags resolved" in out.output
 
 
+@integration
+def test_a_fed_rows_fmp_bars_are_corrected_and_the_vendors_own_left(db, tmp_path):
+    """The cutover fed every linked security, and a fed FMP-minted row still holds
+    FMP's history from before it. Up to v3.0.3 a fed row was left out, so the command
+    found no security at all (ADS, 2026-10-28). The vendor's own bars on the row are
+    the nightly's to revise, and a row the vendor minted holds no FMP bars."""
+    repo.ensure_exchange(db, "NYSE", "NYSE", "US")
+    zzf = repo.upsert_security(
+        db, primary_symbol="ZZF", company_name="ZZF Co", exchange_code="NYSE"
+    )
+    zzg = repo.upsert_security(
+        db,
+        primary_symbol="ZZG",
+        company_name="ZZG Co",
+        exchange_code="NYSE",
+        source="sharadar",
+    )
+    for sid, key, ticker in ((zzf, "900041", "ZZF"), (zzg, "900042", "ZZG")):
+        db.execute(
+            "INSERT INTO core.vendor_security (vendor, vendor_table, vendor_key, "
+            "ticker) VALUES ('sharadar', 'stocks', %s, %s)",
+            (key, ticker),
+        )
+        repo.insert_vendor_link(
+            db,
+            security_id=sid,
+            vendor="sharadar",
+            vendor_key=key,
+            valid_from=Y(2010, 1, 4),
+            match_method="identifier",
+            confidence=None,
+            evidence={},
+            created_by="tester",
+            is_feed=True,
+        )
+    repo.upsert_daily_prices(
+        db,
+        [
+            _fmp_bar(zzf, Y(2010, 1, 5), "25.06"),  # FMP's, 1.253x: corrected
+            _fmp_bar(zzf, Y(2010, 1, 6), "20"),  # FMP's, agrees
+        ],
+    )
+    # The vendor's bars, since revised in its file.
+    repo.upsert_daily_prices(
+        db, [_fmp_bar(zzf, Y(2010, 1, 7), "21")], source="sharadar"
+    )
+    repo.upsert_daily_prices(db, [_fmp_bar(zzg, Y(2010, 1, 5), "9")], source="sharadar")
+    _file(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES
+        + _bar("ZZF", "2010-01-05", "20")
+        + _bar("ZZF", "2010-01-06", "20")
+        + _bar("ZZF", "2010-01-07", "23")
+        + _bar("ZZG", "2010-01-05", "10"),
+    )
+
+    plan = vc.correct(db, tmp_path, dry_run=True, as_of=Y(2026, 1, 2))
+    assert (plan.securities, plan.counts["differ"]) == (1, 1)
+    result = vc.correct(db, tmp_path, as_of=Y(2026, 1, 2))
+    assert result.corrected == 1
+    bars = _bars(db, zzf)
+    assert (bars[Y(2010, 1, 5)]["close"], bars[Y(2010, 1, 5)]["source"]) == (
+        D("20"),
+        "sharadar",
+    )
+    assert bars[Y(2010, 1, 7)]["close"] == D("21")
+    assert _bars(db, zzg)[Y(2010, 1, 5)]["close"] == D("9")
+    (audit,) = db.fetchall("SELECT security_id, key_date FROM ops.vendor_correction")
+    assert (audit["security_id"], audit["key_date"]) == (zzf, Y(2010, 1, 5))
+
+
 # ---------------------------------------------------------------------------
 # --split-bearing
 # ---------------------------------------------------------------------------

@@ -5617,16 +5617,20 @@ def vendor_correct(ctx, symbols, dry_run, volume, split_bearing, no_adjust):
       fafnir vendor correct --split-bearing --dry-run
       fafnir vendor corrections list        # what it replaced; `revert` undoes one
 
-    For every FMP security linked to Sharadar, compares its bars with Sharadar's,
-    recovered raw as `ingest sharadar-prices` does, on the dates both hold from the
-    link's start. A bar whose close differs by more than max($0.01, 1 bp), or whose
-    open, high or low differs by more than that and the recovery's rounding, is
-    replaced through the correction path: the FMP row is kept in
-    ops.vendor_correction. Operator-edited bars are never corrected. Volume stays
-    FMP's unless --volume sharadar. Resolves a vendor_history_disagrees flag once
-    every date it samples agrees. One ops.ingestion_run (sharadar/correct), its
-    progress written every minute. The files are grouped by ticker on disk first,
-    as for `ingest sharadar-prices`: allow about 4 GB free under bulk_dir.
+    For every FMP-minted security linked to Sharadar, fed or not, compares the bars
+    FMP supplied with Sharadar's, recovered raw as `ingest sharadar-prices` does, on
+    the dates both hold from the link's start. Since the cutover fed every linked
+    security, that is the whole linked universe: name the securities with --symbols
+    and read the dry run first. A bar whose close differs by more than
+    max($0.01, 1 bp), or whose open, high or low differs by more than that and the
+    recovery's rounding, is replaced through the correction path: the FMP row is
+    kept in ops.vendor_correction. Operator-edited bars are never corrected. Volume
+    stays FMP's unless --volume sharadar. Resolves a vendor_history_disagrees flag
+    once every date it samples agrees. A split FMP made up to match its wrong scale
+    stays on file: delete it with `fafnir actions delete`. One ops.ingestion_run
+    (sharadar/correct), its progress written every minute. The files are grouped by
+    ticker on disk first, as for `ingest sharadar-prices`: allow about 4 GB free
+    under bulk_dir.
 
     --split-bearing takes the FMP-minted securities linked to Sharadar, fed or not,
     that hold Sharadar's splits (the splits FMP never listed). It replaces a bar only
