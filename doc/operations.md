@@ -1134,6 +1134,11 @@ fafnir db refresh-marts
   `tickerchangeto` event or `--rename-date`:
   - the old ticker's period ends the day before;
   - an empty row on the new ticker is folded in;
+  - a stamped row is listed straight onto the new ticker, in the statement that
+    reverses the stamp: its old ticker may be another issuer's by now. SATS was
+    Strive's preferred four months after EchoStar became ECHO, and the listed rows
+    of a source hold a ticker once, so listing the row on SATS on its way failed
+    the merge with a `UniqueViolation` (2026-10-28);
   - the rename is recorded in `core.symbol_change` under the vendor, and its
     `symbol_change_conflict` flag closes.
 - **The record.** The `security_inactive_but_trading` flags are resolved with the
@@ -1144,6 +1149,8 @@ fafnir db refresh-marts
 - **The dry run** applies the change, shows the row after, and rolls it back.
 - **It refuses:**
   - a row with history on the new ticker;
+  - another listed row of the same source on the ticker the row would be listed on,
+    named in the plan;
   - an open `security_delisting_contradicted` flag;
   - a row holding bars, and a delisting, from before its vendor link starts
     (`next = earlier_issuer`): an earlier issuer of a reused ticker, which

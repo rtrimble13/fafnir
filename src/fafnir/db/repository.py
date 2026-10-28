@@ -972,23 +972,28 @@ def reverse_delisting(
     security_id: int,
     delisted_date: date,
     periods: Sequence[dict],
+    symbol: Optional[str] = None,
 ) -> None:
     """Undo :func:`mark_delisted` for a security that never stopped trading.
 
     The security is listed again, and the ticker periods the delisting closed
     (``periods``, from :func:`periods_closed_by_delisting`) are re-opened rather
-    than a new one inserted: the ticker never changed hands. Raises
-    :class:`VenueTransferRefused` when the row or a period is not as planned; the
-    caller's transaction then rolls back whatever was written.
+    than a new one inserted: the ticker never changed hands. ``symbol`` lists it on
+    another ticker in the same statement, for a relist under a rename: its old
+    ticker may be another listed row's by now, and the listed rows of a source hold
+    a ticker once (0009's index). Raises :class:`VenueTransferRefused` when the row
+    or a period is not as planned; the caller's transaction then rolls back
+    whatever was written.
     """
     row = db.fetchone(
         """
         UPDATE core.security
-           SET is_actively_trading = TRUE, delisted_date = NULL, updated_at = now()
+           SET is_actively_trading = TRUE, delisted_date = NULL,
+               primary_symbol = COALESCE(%s, primary_symbol), updated_at = now()
          WHERE security_id = %s AND delisted_date = %s
         RETURNING security_id
         """,
-        (security_id, delisted_date),
+        (symbol, security_id, delisted_date),
     )
     if row is None:
         raise VenueTransferRefused(
@@ -1158,6 +1163,23 @@ def holds_earlier_issuer(
         and delisted_date < link_from
         and first_bar < link_from
     )
+
+
+def listed_on_ticker(
+    db: Database, *, symbol: str, source: str, exclude: Sequence[int] = ()
+) -> Optional[int]:
+    """Another listed row of ``source`` on ``symbol``: the one 0009's index lets
+    no second listed row of that source share the ticker with."""
+    val = db.fetchval(
+        """
+        SELECT security_id FROM core.security
+         WHERE source = %s AND primary_symbol = %s AND delisted_date IS NULL
+           AND NOT (security_id = ANY(%s))
+         ORDER BY security_id LIMIT 1
+        """,
+        (source, symbol, [int(i) for i in exclude]),
+    )
+    return int(val) if val is not None else None
 
 
 def mark_trading(db: Database, security_id: int) -> bool:
