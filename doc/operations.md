@@ -1231,9 +1231,19 @@ and security checks. `run_all` keeps its five keys and adds one per check; with 
 statement tables (a database mid-migration) the new ones report 0 and run nothing.
 The loader writes its own flags as it loads (#90). Every one has a playbook in
 `.claude/skills/fafnir-dba/references/dq-playbooks.md` (*The fundamentals flags*).
-`fafnir dq recheck` closes the two that clear as the warehouse catches up:
-`fundamentals_stale` (the security has filed since) and `fundamentals_coverage` (its
-statements have loaded). Coverage by sector is in the `dq run` log.
+`fafnir dq recheck` closes a flag of `fundamentals_stale`, `fundamentals_coverage`,
+`balance_sheet_identity`, the two cash ties, `fundamentals_ttm_incomplete` and
+`fundamentals_negative_impossible` once the check's own query no longer selects it:
+the security has filed since, its statements have loaded, the vendor fixed a row, or
+the check was recalibrated. Coverage by sector is in the `dq run` log.
+
+**Recalibrated on production data (2026-10-28).** The first run over SF1 wrote about
+308,000 flags, most of them what SF1 cannot express: noncontrolling and minority
+interest, temporary equity, restricted cash, half-yearly and annual reporters, a
+financial company's revenue net of losses. The checks now allow for those (the
+playbooks say how), the identity and the cash-flow tie are one condition per period,
+and two cash gaps that cancel are one flag on the balance sheet. After deploying,
+`dq recheck` on those checks closes the flags the next `dq run` no longer writes.
 
 #### What a restatement flag means
 
@@ -1269,12 +1279,16 @@ SELECT version_no, known_from, known_to, knowledge_source, loaded_at, superseded
 #### Investigating a balance-sheet-identity failure
 
 `balance_sheet_identity` compares total assets with total liabilities plus parent
-equity, per current version, beyond the larger of 0.5% of assets and 1M of the
-reporting currency. `detail` carries the three figures, the gap and the tolerance.
+equity, per period over its current versions, beyond the larger of 0.5% of assets and
+1M of the reporting currency. `detail` carries the latest failing version's three
+figures, the gap, the tolerance and a `reason`, and `versions` lists every failing
+version.
 
-1. **NCI or not.** SF1 has no balance for noncontrolling interest. Where the period's
-   income statement shows NCI income (`detail.noncontrolling_income`), the gap is
-   that interest, and the flag is `info`: accept it.
+1. **What is already allowed for.** SF1 has no balance for noncontrolling interest:
+   where the period's income statement shows NCI income, a gap of assets over the rest
+   is not flagged. Nor is one of up to 20% of assets before SFAS 160 (periods ending
+   before 2009-12-15), when minority interest sat outside equity. A deficit with a
+   gap of 20% of assets or more, or a shell company, is `temporary_equity`, `info`.
 2. **Read the filing.** Find the balance sheet in the 10-K or 10-Q on EDGAR, and the
    line between liabilities and equity. Temporary (mezzanine) equity, such as
    redeemable preferred stock or redeemable NCI, sits outside both, and SF1 follows
@@ -1285,10 +1299,9 @@ reporting currency. `detail` carries the three figures, the gap and the toleranc
    - a gap in every period is the company's structure, as in step 2;
    - a gap in one period alone, unexplained by the filing, is a vendor error.
      Report it.
-4. **After a vendor fix.** A correction replaces the row under the same `version_no`,
-   so the flag's `record_key` still names it. Re-run `fafnir dq run`: a fixed row is
-   not flagged again, but the old flag stays open. Resolve it, naming the correction's
-   run.
+4. **After a vendor fix.** A correction replaces the row under the same `version_no`.
+   `fafnir dq recheck --check balance_sheet_identity` closes the flag once no current
+   version of the period fails: dry run first.
 
 The share that balances is in `scripts/fundamentals_report.sql`. The plan expects
 over 99% (§13); a drop after a load is a load problem, not a hundred companies.

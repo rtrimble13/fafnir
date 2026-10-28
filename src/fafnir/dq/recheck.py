@@ -46,7 +46,7 @@ from fafnir.db.connection import Database
 from fafnir.dq.checks import (
     DEFAULT_OUTLIER_THRESHOLD,
     FRESHNESS_CUTOFF_CTES,
-    FUNDAMENTALS_STALE_DAYS,
+    FUNDAMENTALS_DETECTORS,
     GAP_MIN_SESSION_DENSITY,
     GAP_MIN_SESSIONS_FOR_DENSITY,
     NAV_LAGGING_ASSET_TYPES,
@@ -229,26 +229,28 @@ SELECT f.dq_flag_id
 """
 
 
-# The two fundamentals conditions that clear as the warehouse catches up (#102):
-# the security has filed since, or SF1's statements for it have loaded. The rest of
-# the fundamentals checks judge vendor values, which a new version re-judges under
-# its own record_key.
-_FUNDAMENTALS_STALE_SQL = """
+# The fundamentals checks whose condition is a function of the statements as they
+# stand (checks.FUNDAMENTALS_DETECTORS): a flag is stale when the check's own query,
+# run today, no longer selects its security and record_key at its severity. The
+# security has filed since, the vendor fixed a row, a restated version balances, or
+# the check was recalibrated (2026-10-28: per-period keys retire the per-version
+# ones, and a condition judged at another severity is closed for the next run to
+# write again at that one). The query is the check's, not a copy, so the two cannot
+# drift.
+def _redetect_sql(check: str) -> str:
+    return f"""
+WITH detected AS ({FUNDAMENTALS_DETECTORS[check]()})
 SELECT f.dq_flag_id
   FROM ops.data_quality_flag f
- WHERE f.check_name = 'fundamentals_stale' AND f.resolved_at IS NULL
-   AND NOT EXISTS (
-        SELECT 1 FROM core.security s
-         WHERE s.security_id = f.security_id
-           AND s.is_actively_trading AND s.delisted_date IS NULL
-           AND current_date - (f.record_key->>'latest_fiscal_date')::date
-               > {stale_days}
-           AND (SELECT max(i.fiscal_date) FROM core.income_statement i
-                 WHERE i.security_id = s.security_id
-                   AND i.superseded_at IS NULL AND i.known_to IS NULL)
-               = (f.record_key->>'latest_fiscal_date')::date)
-""".format(stale_days=FUNDAMENTALS_STALE_DAYS)
+ WHERE f.check_name = '{check}' AND f.resolved_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM detected d
+                    WHERE d.security_id IS NOT DISTINCT FROM f.security_id
+                      AND d.record_key = f.record_key
+                      AND d.severity = f.severity)
+"""
 
+
+# fundamentals_coverage: the security's statements have loaded since.
 _FUNDAMENTALS_COVERAGE_SQL = """
 SELECT f.dq_flag_id
   FROM ops.data_quality_flag f
@@ -317,10 +319,44 @@ RECHECKABLE: dict[str, _Rule] = {
         "security",
     ),
     "fundamentals_stale": _Rule(
-        _FUNDAMENTALS_STALE_SQL,
+        _redetect_sql("fundamentals_stale"),
         (),
         "the security has a later period in force than the one this flag records, "
-        "or is no longer actively trading",
+        "or its reporting cycle allows the age, or it is no longer actively trading",
+    ),
+    "balance_sheet_identity": _Rule(
+        _redetect_sql("balance_sheet_identity"),
+        (),
+        "no current version of the period fails the identity as the check judges it "
+        "now (a vendor fix, or a gap it explains: NCI, minority interest before SFAS "
+        "160), or it is judged at another severity (temporary equity is info), or "
+        "the flag is keyed per version, which the check no longer writes",
+    ),
+    "cash_flow_tie": _Rule(
+        _redetect_sql("cash_flow_tie"),
+        (),
+        "no current version of the period fails the tie, or the flag is keyed per "
+        "version, which the check no longer writes",
+    ),
+    "cash_balance_tie": _Rule(
+        _redetect_sql("cash_balance_tie"),
+        (),
+        "the change in cash meets the cash flow as the check judges it now (a vendor "
+        "fix, the restricted-cash allowance from 2018), or the gap is one of an "
+        "offsetting pair now flagged once on the balance sheet",
+    ),
+    "fundamentals_ttm_incomplete": _Rule(
+        _redetect_sql("fundamentals_ttm_incomplete"),
+        (),
+        "the trailing four quarters are contiguous now, or the year is a half-yearly "
+        "reporter's (Q2 and Q4 alone), which the check does not judge",
+    ),
+    "fundamentals_negative_impossible": _Rule(
+        _redetect_sql("fundamentals_negative_impossible"),
+        (),
+        "the version no longer holds the negative, or it is a financial company's "
+        "negative revenue, which the check now judges info (the next run writes it "
+        "again at that severity)",
     ),
     "fundamentals_coverage": _Rule(
         _FUNDAMENTALS_COVERAGE_SQL,

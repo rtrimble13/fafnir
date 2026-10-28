@@ -620,6 +620,8 @@ five points this plan left open:
   - `fundamentals_unmapped_fields` is one flag per column, for no security.
 - **`dq recheck`** re-evaluates `fundamentals_stale` and `fundamentals_coverage`, the
   conditions that clear as the warehouse catches up. The rest judge vendor values.
+  (Since 2026-10-28 it also re-runs the identity, the two ties, the TTM series and the
+  negatives by their own queries: see the recalibration below.)
 - **`status`** appends a statements block and a panel line after every existing line,
   and prints nothing until statements exist.
 - **The one existing test changed** is the dedupe test's exact `run_all` dict. It now
@@ -658,6 +660,36 @@ These points are settled here:
   timer of its own.
 - **Existing tests changed:** the Sharadar night's pinned sequence in
   `test/scripts/test_daily_update_modes.py`, which now has the fundamentals step.
+
+### 6.9 Recalibrated on production data (2026-10-28)
+
+The first `dq run` over the whole of SF1 wrote about 308,000 flags. Classified by
+cause, nearly all were what SF1 cannot express. §13's "> 99% balance" assumed a
+balance item for every part of equity; SF1 has none for noncontrolling interest,
+minority interest before SFAS 160, or temporary equity. The checks now allow for
+them:
+
+- **`balance_sheet_identity`:**
+  - one condition per period, the failing versions listed;
+  - no flag for a gap explained by NCI income, or of up to 20% of assets before
+    2009-12-15;
+  - temporary equity (a deficit and a gap of 20% of assets or more, or a shell
+    company) is `info`;
+  - liabilities and equity over assets is always `error`.
+
+  144,841 per-version flags become about 34,000 periods, 17,700 of them `error`.
+- **`cash_flow_tie`** is one condition per period: 42,646 flags become 34,078.
+- **`cash_balance_tie`** allows 10% of the balance from 2018 (restricted cash), and
+  two gaps that cancel are one flag on the balance sheet between them. 94,581 become
+  about 75,600: the largest check still.
+- **`fundamentals_negative_impossible`:** a financial company's negative revenue is
+  `info` (2,982 of 7,370).
+- **`fundamentals_stale`** is judged on the security's own cycle: 200, 300 or 500
+  days for a quarterly, half-yearly or annual reporter. 376 become 165.
+- **`fundamentals_ttm_incomplete`** does not judge a year of Q2 and Q4 alone, a
+  half-yearly reporter's: about 1,750 of 11,727.
+- **`dq recheck`** re-runs these checks' own queries (`checks.FUNDAMENTALS_DETECTORS`)
+  and closes the flags they no longer select at their severity.
 
 ---
 
