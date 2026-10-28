@@ -236,6 +236,28 @@ def test_a_dry_run_shows_the_merge_and_changes_nothing(db, run_cli):
     assert _row(db, shell)["primary_symbol"] == "ZZPRE"
 
 
+def test_the_merge_relists_when_another_row_took_the_old_ticker(db, run_cli):
+    # SATS (2026-10): the fed row held SATS when EchoStar became ECHO, and Strive's
+    # preferred was listed on SATS since. The relist listed the row on SATS on its way
+    # to ECHO, which the listed rows' (source, ticker) index refused.
+    shell, victim = _pair(db)
+    reuse = repo.upsert_security(
+        db,
+        primary_symbol="ZZPRE",
+        company_name="ZZPRE Preferred",
+        asset_type="equity",
+        exchange_code="NYSE",
+        is_actively_trading=True,
+    )
+    out = run_cli(victim, shell, "--across-vendors", "-m", "one company", "--yes")
+    assert out.exit_code == 0, out.output
+    assert _row(db, victim) is None
+    row = _row(db, shell)
+    assert (row["primary_symbol"], row["delisted_date"]) == ("ZZPOS", None)
+    other = _row(db, reuse)
+    assert (other["primary_symbol"], other["delisted_date"]) == ("ZZPRE", None)
+
+
 def test_the_merge_keeps_the_fed_rows_bars_and_relists_it(db, run_cli):
     shell, victim = _pair(db)
     out = run_cli(victim, shell, "--across-vendors", "-m", "one company", "--yes")

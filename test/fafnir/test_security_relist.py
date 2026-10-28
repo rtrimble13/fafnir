@@ -387,6 +387,60 @@ def test_relist_folds_an_empty_row_on_the_new_ticker(db, run_cli):
     assert repo.resolve_security_id(db, "ZZR2") == sid
 
 
+def test_relist_takes_the_new_ticker_when_another_row_took_the_old_one(db, run_cli):
+    # SATS (2026-10): EchoStar became ECHO, and Strive's preferred was listed on SATS
+    # since. Reversing the stamp listed the row on SATS first, and the listed rows'
+    # (source, ticker) index refused it before the rename could run.
+    sid = _shell(db)
+    reuse = repo.upsert_security(
+        db, primary_symbol="ZZR1", company_name="ZZR1 Preferred", exchange_code="NYSE"
+    )
+    repo.upsert_symbol_xref(
+        db, security_id=reuse, symbol="ZZR1", valid_from=Y(2025, 6, 2)
+    )
+    out = run_cli("relist", sid, "-m", "ZZR1 became ZZR2", "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert "After: ZZR2, trading, delisted never" in out.output
+    out = run_cli("relist", sid, "-m", "ZZR1 became ZZR2", "--yes")
+    assert out.exit_code == 0, out.output
+    row = _row(db, sid)
+    assert (
+        row["primary_symbol"],
+        row["is_actively_trading"],
+        row["delisted_date"],
+    ) == (
+        "ZZR2",
+        True,
+        None,
+    )
+    assert _periods(db, sid) == [
+        ("ZZR1", Y(1900, 1, 1), Y(2025, 2, 27)),
+        ("ZZR2", Y(2025, 2, 28), None),
+    ]
+    # The other issuer keeps the old ticker, listed.
+    other = _row(db, reuse)
+    assert (other["primary_symbol"], other["delisted_date"]) == ("ZZR1", None)
+    assert repo.resolve_security_id(db, "ZZR1") == reuse
+
+
+def test_relist_refuses_a_ticker_another_listed_row_holds(db, run_cli):
+    # In place, with no open period to show the other row: the plan names it,
+    # rather than the write failing on the listed rows' (source, ticker) index.
+    _vendor(db, "900511", "ZZP")
+    stamped = _security(db, "ZZP", "900511", active=False, delisted=Y(2026, 10, 5))
+    other = repo.upsert_security(
+        db, primary_symbol="ZZP", company_name="ZZP Two", exchange_code="NYSE"
+    )
+    before = _row(db, stamped)
+    out = run_cli("relist", stamped, "-m", "x", "--yes")
+    assert out.exit_code != 0
+    assert f"Security {other} is listed on ZZP" in " ".join(
+        out.output.split()
+    ), out.output
+    assert "Nothing was changed." in out.output
+    assert _row(db, stamped) == before
+
+
 @pytest.mark.parametrize(
     "case, refusal",
     [

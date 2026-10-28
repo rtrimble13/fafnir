@@ -83,7 +83,7 @@ def _security(db: Database, security_id: int) -> Optional[dict]:
     return db.fetchone(
         """
         SELECT primary_symbol, company_name, exchange_code, is_actively_trading,
-               delisted_date
+               delisted_date, source
           FROM core.security WHERE security_id = %s
         """,
         (security_id,),
@@ -194,6 +194,9 @@ def plan_relist(
 
     rename = None
     folds = None
+    # Securities a refusal below names already, so the listed-row check that follows
+    # does not name them twice.
+    named: set[int] = set()
     if symbol != ticker:
         day = rename_date
         if day is None:
@@ -223,6 +226,7 @@ def plan_relist(
             if holder == listed and not repo.security_has_history(db, holder):
                 folds = holder
                 continue
+            named.add(holder)
             refusals.append(
                 f"{ticker} is held by security {holder}"
                 + (" with history" if repo.security_has_history(db, holder) else "")
@@ -239,6 +243,7 @@ def plan_relist(
         )
         if rename is None and symbol == ticker:
             others = set(repo.open_ticker_holders(db, symbol)) - {security_id}
+            named |= others
             if others:
                 refusals.append(
                     f"{symbol} is held open by security "
@@ -251,6 +256,25 @@ def plan_relist(
                     f"delisting date {row['delisted_date']}, so relisting would leave "
                     "the ticker unresolvable. Inspect core.symbol_xref first."
                 )
+
+    if row["delisted_date"] is not None and (rename is not None or symbol == ticker):
+        # Reversing the stamp lists the row, on the ticker it ends on; another listed
+        # row of its source there refuses the write (0009's index). Name it here,
+        # not in a traceback from the write.
+        target = rename[2] if rename is not None else symbol
+        clash = repo.listed_on_ticker(
+            db,
+            symbol=target,
+            source=row["source"],
+            exclude=[security_id] + ([folds] if folds is not None else []),
+        )
+        if clash is not None and clash not in named:
+            refusals.append(
+                f"Security {clash} is listed on {target} for {row['source']} already, "
+                f"so {security_id} cannot be listed there too. If it is this company "
+                "held twice, merge it; if it no longer trades, `security delist` it "
+                "first."
+            )
 
     open_flags = [
         int(r["dq_flag_id"])
@@ -289,14 +313,28 @@ def apply_relist(db: Database, plan: RelistPlan, *, note: str, by: str) -> Relis
     sid = plan.security_id
     if plan.refusals:
         raise RelistRefused("the plan refuses: " + " ".join(plan.refusals))
+    folded = None
     if plan.delisted_date is not None:
+        if plan.rename and plan.folds is not None:
+            # The empty row on the new ticker goes first: reversing the stamp lists
+            # this row on that ticker.
+            if not repo.fold_empty_security(db, victim_id=plan.folds, survivor_id=sid):
+                raise RelistRefused(
+                    f"security {plan.folds} on {plan.rename[2]} is no longer an "
+                    "empty row to fold"
+                )
+            folded = plan.folds
         try:
             repo.reverse_delisting(
                 db,
                 security_id=sid,
                 delisted_date=plan.delisted_date,
-                # Under a rename the old ticker's periods stay closed, ended below.
+                # Under a rename the old ticker's periods stay closed, ended below,
+                # and the row is listed straight onto the new ticker: the old one
+                # may be another listed row's by now (SATS, reused by Strive's
+                # preferred within four months of EchoStar becoming ECHO).
                 periods=() if plan.rename else plan.periods,
+                symbol=plan.rename[2] if plan.rename else None,
             )
         except repo.VenueTransferRefused as exc:
             raise RelistRefused(str(exc)) from exc
@@ -304,7 +342,6 @@ def apply_relist(db: Database, plan: RelistPlan, *, note: str, by: str) -> Relis
         raise RelistRefused(f"security {sid} is no longer inactive and undelisted")
 
     ended = 0
-    folded = None
     conflicts = 0
     if plan.rename:
         day, old, new = plan.rename
@@ -330,7 +367,7 @@ def apply_relist(db: Database, plan: RelistPlan, *, note: str, by: str) -> Relis
                 + (f": {done.reason}" if done.reason else "")
                 + ")"
             )
-        folded = done.folded_security_id
+        folded = done.folded_security_id or folded
         repo.record_symbol_change(
             db,
             old_symbol=old,
