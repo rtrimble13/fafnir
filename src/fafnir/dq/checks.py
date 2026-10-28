@@ -968,7 +968,10 @@ def detect_cash_balance_tie() -> str:
     Two consecutive gaps that cancel (within the smaller of their tolerances) are one
     balance sheet's cash out of line with both cash flows around it: one condition on
     that balance sheet (``item`` = cash_and_equivalents) rather than two on the cash
-    flows. 11,264 of the first run's 94,581 flags were such pairs."""
+    flows. 11,264 of the first run's 94,581 flags were such pairs. A run of gaps each
+    cancelling the last pairs from its start, (1, 2), (3, 4) and so on: alternating
+    gaps are every other balance sheet out of line, not every one, and a last gap left
+    over stands on its own cash flow."""
     return f"""
         WITH b AS (
             SELECT security_id, period_type, fiscal_date,
@@ -1014,13 +1017,26 @@ def detect_cash_balance_tie() -> str:
         ),
         p AS (
             SELECT f.*,
-                   coalesce(f.next_prev_fd = f.fiscal_date
-                            AND abs(f.gap + f.next_gap) <= least(f.tol, f.next_tol),
-                            false) AS opens,
                    coalesce(f.prev_fd = f.last_fd
                             AND abs(f.gap + f.last_gap) <= least(f.tol, f.last_tol),
                             false) AS closes
               FROM f
+        ),
+        r AS (
+            SELECT p.*,
+                   count(*) FILTER (WHERE NOT p.closes) OVER w AS run,
+                   coalesce(lead(p.closes) OVER w, false) AS next_closes
+              FROM p
+            WINDOW w AS (PARTITION BY p.security_id, p.period_type
+                         ORDER BY p.fiscal_date)
+        ),
+        -- An odd place in its run opens a pair when the next gap cancels it, and
+        -- stands alone when none does; an even one is the pair's other half.
+        s AS (
+            SELECT r.*,
+                   row_number() OVER (PARTITION BY r.security_id, r.period_type, r.run
+                                      ORDER BY r.fiscal_date) AS place
+              FROM r
         )
         SELECT t.security_id, 'core.cash_flow_statement' AS table_name,
                {_PERIOD_KEY} AS record_key, 'warn' AS severity,
@@ -1029,8 +1045,8 @@ def detect_cash_balance_tie() -> str:
                    'previous_fiscal_date', t.prev_fd::text,
                    'net_change_in_cash', t.ncf::float8, 'gap', t.gap::float8,
                    'tolerance', t.tol::float8) AS detail
-          FROM p t
-         WHERE NOT t.opens AND NOT t.closes
+          FROM s t
+         WHERE mod(t.place, 2) = 1 AND NOT t.next_closes
         UNION ALL
         SELECT t.security_id, 'core.balance_sheet' AS table_name,
                jsonb_build_object('period_type', t.period_type,
@@ -1042,8 +1058,8 @@ def detect_cash_balance_tie() -> str:
                    'from_cash_flow', (t.prev_cash + t.ncf)::float8,
                    'gap', t.gap::float8, 'next_fiscal_date', t.next_fd::text,
                    'next_gap', t.next_gap::float8) AS detail
-          FROM p t
-         WHERE t.opens
+          FROM s t
+         WHERE mod(t.place, 2) = 1 AND t.next_closes
         """
 
 

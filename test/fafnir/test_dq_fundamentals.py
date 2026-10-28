@@ -379,6 +379,30 @@ def test_two_gaps_that_cancel_are_one_balance_sheet(db):
     assert detail["next_fiscal_date"] == "2012-09-30"
 
 
+def test_a_run_of_alternating_gaps_pairs_from_its_start(db):
+    # Q2 and Q4 are each 390M over the cash flows, Q3 is right: gaps +390, -390,
+    # +390. Q2's pairs with Q3's; Q3's balance sheet is not flagged, and Q4's gap,
+    # with nothing after it to cancel, stands on its cash flow.
+    three = _security(db, "ZZRUN3")
+    _cash_quarters(db, three, 2012, (500, 900, 520, 930), (None, 10, 10, 20))
+    # The same, and Q4's cancelled in the next year's Q1: two pairs, Q2 and Q4.
+    four = _security(db, "ZZRUN4")
+    _cash_quarters(db, four, 2012, (500, 900, 520, 930), (None, 10, 10, 20))
+    _cash_quarters(db, four, 2013, (550, 560, 570, 580), (10, 10, 10, 10))
+    flags = _run_twice(db, "cash_balance_tie")
+    assert sorted(
+        (f["security_id"], f["table_name"], f["record_key"]["fiscal_date"])
+        for f in flags
+    ) == [
+        (three, "core.balance_sheet", "2012-06-30"),
+        (three, "core.cash_flow_statement", "2012-12-31"),
+        (four, "core.balance_sheet", "2012-06-30"),
+        (four, "core.balance_sheet", "2012-12-31"),
+    ]
+    (alone,) = [f for f in flags if f["table_name"] == "core.cash_flow_statement"]
+    assert alone["detail"]["gap"] == pytest.approx(390_000_000)
+
+
 def _flag(db, sid, check, record_key, severity):
     return db.fetchval(
         "INSERT INTO ops.data_quality_flag (security_id, table_name, record_key,"

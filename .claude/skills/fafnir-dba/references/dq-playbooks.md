@@ -1559,11 +1559,12 @@ Discontinued operations make both fire. `cash_flow_tie` is one condition per per
 **Two gaps that cancel** are one balance sheet's cash out of line with the cash flows
 either side: one `cash_balance_tie` on that balance sheet (`table_name`
 `core.balance_sheet`, `record_key.item` = `cash_and_equivalents`), with `detail.cash`
-against `detail.from_cash_flow`. A vendor value to check against the filing. Accept
-a tie with the filing's reason. Both ties stay the largest fundamentals checks after
-the 2026-10-28 recalibration (about 75,000 and 34,000): a gap between two filings'
-figures for the same cash is common, and SF1 carries no comparative column to tell
-a reclassification from an error.
+against `detail.from_cash_flow`. A run of such gaps pairs from its start, so alternating
+gaps flag every other balance sheet. A vendor value to check against the filing. Accept
+a tie with the filing's reason. Both ties stay the largest fundamentals checks after the
+2026-10-28 recalibration (about 75,000 and 34,000): a gap between two filings' figures
+for the same cash is common, and SF1 carries no comparative column to tell a
+reclassification from an error.
 
 ### `fundamentals_gap` — traded, with no statement for over 400 days
 
