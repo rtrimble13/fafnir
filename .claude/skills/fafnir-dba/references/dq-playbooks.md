@@ -931,8 +931,11 @@ SELECT c.attributes_source,
 **Repair** depends on the source:
 - **`sharadar` with no industry:** a Sharadar name fafnir's vocabulary lacks. Find it
   in `core.vendor_security` (`sector`, `industry` of the linked key). The fix is an
-  alias in `sharadar_map.INDUSTRY_ALIASES` and in migration 0039's list, which a test
-  holds equal. That is a code change: propose it.
+  alias in `sharadar_map.INDUSTRY_ALIASES` and in the view's list (a new migration
+  re-defining `core.v_security_classification`, as 0040 did), which a test holds equal.
+  That is a code change: propose it. Before 0040 (2026-10-28) Sharadar's Morningstar
+  names (`Medical Devices`, `Oil & Gas E&P`, 67 more) had no alias, and 1,660 listed
+  securities showed Sharadar's sector with no industry.
 - **`fmp`, or Sharadar's sector did not map:** the pair is `core.security`'s. In FMP's
   night, run `fafnir ingest securities` on a build that carries the screener
   classification through `upsert_security`. In Sharadar's night that loader does not

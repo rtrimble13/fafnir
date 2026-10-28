@@ -18,6 +18,7 @@ import hashlib
 import math
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -116,12 +117,14 @@ def _classification(db, sid):
 
 
 def _names(db):
-    for name in ("Technology", "Healthcare", "Consumer Cyclical"):
+    for name in ("Technology", "Healthcare", "Consumer Cyclical", "Utilities"):
         repo.get_or_create_sector(db, name)
     for name in (
         "Software - Application",
         "Drug Manufacturers - General",
         "Furnishings, Fixtures & Appliances",
+        "Medical - Devices",
+        "Regulated Electric",
     ):
         repo.get_or_create_industry(db, name)
 
@@ -198,6 +201,8 @@ def test_the_feeding_vendor_classifies(db):
         ("Healthcare", "Drug Manufacturers - Major"),
         ("Consumer Cyclical", "Furnishings,Fixtures & Appliances"),
         ("Consumer Cyclical", "Furnishings"),
+        ("Healthcare", "Medical Devices"),
+        ("Utilities", "Utilities - Regulated Electric"),
         ("Technology", "Not An Industry"),
         ("Not A Sector", "Software - Application"),
         ("", ""),
@@ -221,12 +226,15 @@ def test_the_sql_map_is_map_classification(db, sector, industry):
 
 
 def test_the_aliases_are_sharadar_maps():
-    """The migration's alias list is sharadar_map.INDUSTRY_ALIASES, normalized."""
-    sql = (
-        maintenance.__file__.rsplit("src/", 1)[0]
-        + "sql/migrations/0039_attribute_precedence.up.sql"
+    """The alias list of the newest migration that defines the view (0040) is
+    sharadar_map.INDUSTRY_ALIASES, normalized."""
+    migrations = Path(maintenance.__file__.rsplit("src/", 1)[0]) / "sql/migrations"
+    defining = sorted(
+        p
+        for p in migrations.glob("*.up.sql")
+        if "CREATE OR REPLACE VIEW core.v_security_classification" in p.read_text()
     )
-    text = open(sql).read()
+    text = defining[-1].read_text()
     block = text[text.index("LEFT JOIN (VALUES") : text.index(") al (alias_norm")]
     pairs = set()
     for line in block.splitlines()[1:]:

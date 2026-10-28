@@ -300,7 +300,7 @@ full TICKERS file used (#52, 2026-10-19).
 | `category` `CEF`, `CEF Preferred` | `equity`, `is_fund` | as FMP stores its funds today; `fund` is the declared NAV-priced mutual fund (ADR 0006). The price validator reads `equity` + `is_fund` as NAV-priced, so a CEF bar with only a close is accepted, as FMP's are (#75) |
 | `category` `MF` | `fund`, `is_fund` | NAV-priced |
 | `category` `UNIT`, `IDX` | none, silently | units are out of scope (ADR 0012); an index is not a security |
-| `sector`, `industry` | a name already in `ref.sector` / `ref.industry` | `map_classification`: case, commas and spacing ignored; two reviewed industry aliases (`Drug Manufacturers - Major`, `Furnishings`); anything else is none, and `missing_classification` flags the security |
+| `sector`, `industry` | a name already in `ref.sector` / `ref.industry` | `map_classification`: case, commas and spacing ignored; reviewed industry aliases for the 69 industries Sharadar spells otherwise than FMP's vocabulary (`Medical Devices` is `Medical - Devices`, `Oil & Gas E&P` is `Oil & Gas Exploration & Production`); anything else is none, and `missing_classification` flags the security |
 | split `value` | `split_numerator / split_denominator` | `split_ratio`: the value's fraction, snapped to a denominator up to 1,000 only within its own rounding (4 → 4/1, 0.25 → 1/4, 0.3333 → 1/3, 0.0002 → 1/5000); non-positive refused |
 | dividend `value` | `dividend_amount`, as declared | `as_declared_dividend(value, split_product_after(splits, ex_date))`, quantized to 6 dp half-up; non-positive refused |
 | SEP/SFP `closeunadj` | raw `close` | `recover_raw` |

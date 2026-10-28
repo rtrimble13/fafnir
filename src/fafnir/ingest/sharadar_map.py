@@ -119,12 +119,84 @@ def map_category(category: Optional[str]) -> Optional[AssetClass]:
 # Sector and industry
 # ---------------------------------------------------------------------------
 
-#: Sharadar's names that differ from the current spelling of the same industry in
-#: FMP's vocabulary (ref.industry). Reviewed by hand; extend it only the same way.
+#: Sharadar's industry names (Morningstar's) and the same industry in FMP's
+#: vocabulary (ref.industry), both normalized. Every name in Sharadar's TICKERS
+#: (2026-10-28) that FMP's vocabulary does not spell the same way is here; each target
+#: is the industry FMP gives most of the securities both vendors classify, by name
+#: where those are too few to say (Computer Systems, Infrastructure Operations,
+#: Industrial Metals & Minerals). Reviewed by hand; extend it only the same way, and
+#: in the classification view's list (migration 0040), which a test holds equal.
 #: Sharadar's sectors are FMP's eleven, verbatim, so sectors need none.
 INDUSTRY_ALIASES = {
+    "airlines": "airlines airports & air services",
+    "airports & air services": "airlines airports & air services",
+    "apparel manufacturing": "apparel - manufacturers",
+    "apparel retail": "apparel - retail",
+    "auto & truck dealerships": "auto - dealerships",
+    "auto manufacturers": "auto - manufacturers",
+    "auto parts": "auto - parts",
+    "beverages - brewers": "beverages - alcoholic",
+    "building materials": "construction materials",
+    "building products & equipment": "construction materials",
+    "capital markets": "financial - capital markets",
+    "coking coal": "coal",
+    "computer systems": "computer hardware",
+    "confectioners": "food confectioners",
+    "credit services": "financial - credit services",
+    "diagnostics & research": "medical - diagnostics & research",
+    "diversified industrials": "industrial - machinery",
     "drug manufacturers - major": "drug manufacturers - general",
+    "electronic components": "hardware equipment & parts",
+    "electronics & computer distribution": "technology distributors",
+    "farm & heavy construction machinery": "agricultural - machinery",
+    "farm products": "agricultural farm products",
+    "financial conglomerates": "financial - conglomerates",
+    "financial data & stock exchanges": "financial - data & stock exchanges",
+    "footwear & accessories": "apparel - footwear & accessories",
     "furnishings": "furnishings fixtures & appliances",
+    "gambling": "gambling resorts & casinos",
+    "health information services": "medical - healthcare information services",
+    "healthcare plans": "medical - healthcare plans",
+    "home improvement retail": "home improvement",
+    "industrial distribution": "industrial - distribution",
+    "industrial metals & minerals": "industrial materials",
+    "infrastructure operations": "industrial - infrastructure operations",
+    "insurance brokers": "insurance - brokers",
+    "internet retail": "specialty retail",
+    "lodging": "travel lodging",
+    "lumber & wood production": "paper lumber & forest products",
+    "medical care facilities": "medical - care facilities",
+    "medical devices": "medical - devices",
+    "medical distribution": "medical - distribution",
+    "medical instruments & supplies": "medical - instruments & supplies",
+    "metal fabrication": "manufacturing - metal fabrication",
+    "mortgage finance": "financial - mortgages",
+    "oil & gas e&p": "oil & gas exploration & production",
+    "other industrial metals & mining": "industrial materials",
+    "other precious metals & mining": "other precious metals",
+    "paper & paper products": "paper lumber & forest products",
+    "personal services": "personal products & services",
+    "pharmaceutical retailers": "medical - pharmaceuticals",
+    "pollution & treatment controls": "industrial - pollution & treatment controls",
+    "real estate services": "real estate - services",
+    "recreational vehicles": "auto - recreational vehicles",
+    "resorts & casinos": "gambling resorts & casinos",
+    "savings & cooperative banks": "banks - regional",
+    "scientific & technical instruments": "hardware equipment & parts",
+    "semiconductor equipment & materials": "semiconductors",
+    "shipping & ports": "marine shipping",
+    "specialty chemicals": "chemicals - specialty",
+    "specialty industrial machinery": "industrial - machinery",
+    "telecom services": "telecommunications services",
+    "textile manufacturing": "manufacturing - textiles",
+    "thermal coal": "coal",
+    "tools & accessories": "manufacturing - tools & accessories",
+    "utilities - diversified": "diversified utilities",
+    "utilities - independent power producers": "independent power producers",
+    "utilities - regulated electric": "regulated electric",
+    "utilities - regulated gas": "regulated gas",
+    "utilities - regulated water": "regulated water",
+    "utilities - renewable": "renewable utilities",
 }
 
 

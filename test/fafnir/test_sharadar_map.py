@@ -108,6 +108,10 @@ INDUSTRIES = [
     "Drug Manufacturers - General",
     "Furnishings, Fixtures & Appliances",
     "Banks - Regional",
+    "Medical - Devices",
+    "Oil & Gas Exploration & Production",
+    "Airlines, Airports & Air Services",
+    "Regulated Electric",
 ]
 
 
@@ -135,6 +139,26 @@ def test_legacy_industry_names_map_through_the_reviewed_aliases():
     assert _cls(None, "Furnishings Fixtures & Appliances")[1] == (
         "Furnishings, Fixtures & Appliances"
     )
+
+
+def test_sharadars_morningstar_names_map_onto_fmps():
+    # Sharadar's TICKERS spells 69 industries otherwise than FMP's vocabulary
+    # (2026-10-28); two of its names can share one of FMP's.
+    assert _cls(None, "Medical Devices")[1] == "Medical - Devices"
+    assert _cls(None, "Oil & Gas E&P")[1] == "Oil & Gas Exploration & Production"
+    assert _cls(None, "Airlines")[1] == "Airlines, Airports & Air Services"
+    assert _cls(None, "Airports & Air Services")[1] == (
+        "Airlines, Airports & Air Services"
+    )
+    assert _cls(None, "Utilities - Regulated Electric")[1] == "Regulated Electric"
+
+
+def test_the_aliases_are_normalized_names():
+    """Keys and targets as _norm leaves them, so the view's list can be compared
+    with this one as text; no alias points at another alias."""
+    for alias, target in sm.INDUSTRY_ALIASES.items():
+        assert alias == sm._norm(alias) and target == sm._norm(target), alias
+        assert alias != target and target not in sm.INDUSTRY_ALIASES, alias
 
 
 def test_anything_else_is_none_never_a_new_row():

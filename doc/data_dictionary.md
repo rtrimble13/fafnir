@@ -800,14 +800,15 @@ them.
   `mart.v_daily_price_adjusted`, which 0013 drops and re-creates.
 
 ### `core.v_security_classification` — the classification readers see (VIEW)
-Added by 0039 (#109). **Grain:** one row per `security_id`. Columns: `security_id,
-sector_id, industry_id, attributes_source`.
+Added by 0039 (#109); 0040 completes its industry aliases. **Grain:** one row per
+`security_id`. Columns: `security_id, sector_id, industry_id, attributes_source`.
 
 - **The feeding vendor's.** A security Sharadar feeds (an open `is_feed` link in
   `core.security_vendor_xref`) takes Sharadar's TICKERS sector and industry
   (`core.vendor_security`, the `stocks` row, else `funds`). They are mapped onto fafnir's
   names as `sharadar_map.map_classification` maps them when it mints: case, commas and
-  spacing ignored, and its industry aliases. A test holds the two equal.
+  spacing ignored, and its industry aliases: every industry Sharadar spells otherwise
+  than FMP's vocabulary (69 in the 2026-10-28 TICKERS). A test holds the two equal.
 - **A pair.** Sector and industry come together from Sharadar when its sector maps, else
   from `core.security`, so a sector and an industry from different vendors are never
   mixed. Sharadar's industry may then be NULL, which the classification check flags.
