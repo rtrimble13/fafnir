@@ -55,6 +55,14 @@ def test_every_rule_binds_the_settings_its_sql_asks_for():
         }
 
 
+def test_the_fundamentals_negations_run_the_checks_own_queries():
+    """A recalibrated fundamentals check is re-evaluated by its own detection query,
+    not a copy that could keep closing flags by the old rule."""
+    for name, detect in checks.FUNDAMENTALS_DETECTORS.items():
+        assert detect() in rc.RECHECKABLE[name].sql, name
+        assert name in checks.FUNDAMENTALS_CHECKS, name
+
+
 def test_an_unknown_check_is_refused_by_name():
     with pytest.raises(ValueError, match="not re-evaluable"):
         rc.recheck(None, checks=["security_duplicate_identity"])

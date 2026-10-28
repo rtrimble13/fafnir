@@ -654,9 +654,28 @@ IN_FORCE = "superseded_at IS NULL AND known_to IS NULL"
 #: A balance sheet balances within the larger of 0.5% of total assets and 1M of the
 #: reporting currency (the build prompt's §6.4).
 IDENTITY_SHARE, TIE_FLOOR = 0.005, 1_000_000
+#: What SF1 leaves out of both liabilities and parent equity, so that assets exceed
+#: their sum with nothing wrong. Nine in ten of the 144,841 flags of the first run on
+#: production (2026-10-28) were these:
+#: - noncontrolling interest, where the period's income shows NCI income: not flagged;
+#: - minority interest before SFAS 160 moved it into equity (periods ending before
+#:   MINORITY_IN_EQUITY_FROM), up to MINORITY_SHARE of total assets: not flagged.
+#:   SF1 has no NCI income line for those years to say so;
+#: - temporary (mezzanine) equity: a SPAC's redeemable shares, a pre-IPO company's
+#:   redeemable preferred. The parent's equity is then a deficit and the gap at least
+#:   TEMPORARY_EQUITY_SHARE of assets, or the company is a shell: info.
+#: Liabilities and equity above total assets are none of these: an error, NCI or not.
+MINORITY_IN_EQUITY_FROM = "2009-12-15"
+MINORITY_SHARE = 0.20
+TEMPORARY_EQUITY_SHARE = 0.20
+SHELL_INDUSTRY = "Shell Companies"
 #: Cash: the period's change against the cash flow's, within 2% of the balance
 #: (restricted cash, which SF1's balance leaves out, makes small gaps).
 CASH_TIE_SHARE = 0.02
+#: From 2018 (ASU 2016-18) the cash flow reconciles cash and restricted cash together,
+#: and SF1's balance still holds cash alone, so the change in restricted cash is the
+#: gap: up to this share of the balance passes (Apple's is about 4%).
+RESTRICTED_CASH_FROM, RESTRICTED_CASH_SHARE = "2018-01-01", 0.10
 #: Consecutive periods: a quarter 8 to 18 weeks after the last (TTM contiguity,
 #: 0036), a year 300 to 430 days.
 QUARTER_GAP = (56, 126)
@@ -665,8 +684,17 @@ YEAR_GAP = (300, 430)
 GAP_DAYS = 400
 #: The panel's survivorship floor (decision 4): a leading gap counts from here.
 COVERAGE_FLOOR = "1998-01-01"
-#: An actively trading security whose latest period ended this long ago is stale.
+#: An actively trading security whose latest period ended this long ago is stale,
+#: on its own reporting cycle: the median spacing of its period ends in force over the
+#: three years to its latest. A quarterly reporter (spacing up to 100 days) at 200
+#: days, a half-yearly one (up to 200) at 300, an annual one at 500: a foreign private
+#: issuer's 20-F or 40-F, a year and the four months the form allows. 349 of the 376
+#: stale flags of 2026-10-28 were ADRs and Canadian filers.
 FUNDAMENTALS_STALE_DAYS = 200
+STALE_DAYS_BY_SPACING = ((100, FUNDAMENTALS_STALE_DAYS), (200, 300))
+STALE_DAYS_ANNUAL = 500
+#: How far back the spacing is measured from a security's latest period end.
+CADENCE_DAYS = 1096
 #: A filing this soon after its period end is implausible.
 FILING_LAG_MIN_DAYS = 5
 #: Four discrete quarters sum to the year; this many years' worth is a quarter
@@ -685,6 +713,11 @@ NEVER_ZERO = {
     ),
     "core.cash_flow_statement": ("net_cash_operating",),
 }
+#: Revenue can be negative at a financial company: SF1's is net of trading and
+#: investment losses for banks, brokers and mortgage REITs. There a negative revenue
+#: is info; a negative total assets or share count is an error for anyone.
+FINANCIAL_SECTORS = ("Financial Services",)
+FINANCIAL_INDUSTRIES = ("REIT - Mortgage",)
 #: Items that cannot be negative, by table.
 NEVER_NEGATIVE = {
     "core.income_statement": (
@@ -719,6 +752,38 @@ def _keyed(key: str, table: str) -> str:
         "jsonb_build_object(",
         f"jsonb_build_object('statement', '{_STATEMENT[table]}', ",
         1,
+    )
+
+
+def _in(names: tuple[str, ...]) -> str:
+    """A SQL list of vocabulary names, which are constants here."""
+    assert all("'" not in n for n in names), names
+    return ", ".join(f"'{n}'" for n in names) or "NULL"
+
+
+def _classified_as(
+    *, sectors: tuple[str, ...] = (), industries: tuple[str, ...] = ()
+) -> str:
+    """The securities readers see in these sectors or industries (the classification
+    view, #109)."""
+    return f"""
+        SELECT c.security_id
+          FROM core.v_security_classification c
+          LEFT JOIN ref.sector r ON r.sector_id = c.sector_id
+          LEFT JOIN ref.industry i ON i.industry_id = c.industry_id
+         WHERE r.sector_name IN ({_in(sectors)})
+            OR i.industry_name IN ({_in(industries)})"""
+
+
+def _per_period(fields: str) -> str:
+    """One condition per period from the failing current versions grouped by it:
+    the latest failing version's ``fields`` (jsonb_build_object arguments over the
+    alias ``t``), and every failing version's number."""
+    return (
+        f"(array_agg(jsonb_build_object({fields}, 'version_no', t.version_no)"
+        " ORDER BY t.version_no DESC))[1]"
+        " || jsonb_build_object('versions', jsonb_agg(t.version_no"
+        " ORDER BY t.version_no))"
     )
 
 
@@ -779,87 +844,132 @@ def _write_flags(
     return int(row["flagged"])
 
 
-def check_balance_sheet_identity(db: Database) -> int:
-    """Assets against liabilities and parent equity, per current version.
+def detect_balance_sheet_identity() -> str:
+    """Assets against liabilities and parent equity, per period: the current versions
+    that do not balance once what SF1 leaves out is allowed for (see
+    ``MINORITY_IN_EQUITY_FROM``). ``error`` if any version's gap is unexplained,
+    ``info`` if every one is temporary equity. ``detail`` is the latest failing
+    version's figures and ``reason``, and ``versions`` lists every failing one."""
+    detail = _per_period(
+        "'total_assets', t.total_assets::float8, "
+        "'total_liabilities', t.total_liabilities::float8, "
+        "'total_equity_parent', t.total_equity_parent::float8, "
+        "'gap', t.gap::float8, 'tolerance', t.tol::float8, 'reason', t.reason"
+    )
+    return f"""
+        WITH shell AS ({_classified_as(industries=(SHELL_INDUSTRY,))}),
+        v AS (
+            SELECT t.security_id, t.period_type, t.fiscal_date, t.version_no,
+                   t.total_assets, t.total_liabilities, t.total_equity_parent,
+                   t.total_assets - t.total_liabilities - t.total_equity_parent
+                       AS gap,
+                   greatest(abs(t.total_assets) * {IDENTITY_SHARE}, {TIE_FLOOR})
+                       AS tol,
+                   EXISTS (
+                       SELECT 1 FROM core.income_statement i
+                        WHERE i.security_id = t.security_id
+                          AND i.period_type = t.period_type
+                          AND i.fiscal_date = t.fiscal_date
+                          AND i.{CURRENT}
+                          AND coalesce(i.net_income_noncontrolling, 0) <> 0) AS nci,
+                   sh.security_id IS NOT NULL AS shell
+              FROM core.balance_sheet t
+              LEFT JOIN shell sh ON sh.security_id = t.security_id
+             WHERE t.{CURRENT}
+               AND t.total_assets IS NOT NULL AND t.total_liabilities IS NOT NULL
+               AND t.total_equity_parent IS NOT NULL
+        ),
+        judged AS (
+            SELECT v.*,
+                   CASE
+                       WHEN v.gap < 0 THEN 'liabilities_and_equity_exceed_assets'
+                       WHEN v.nci THEN NULL
+                       WHEN v.fiscal_date < DATE '{MINORITY_IN_EQUITY_FROM}'
+                        AND v.gap <= abs(v.total_assets) * {MINORITY_SHARE} THEN NULL
+                       WHEN v.shell OR (v.total_equity_parent < 0 AND v.gap
+                            >= abs(v.total_assets) * {TEMPORARY_EQUITY_SHARE})
+                           THEN 'temporary_equity'
+                       ELSE 'unexplained'
+                   END AS reason
+              FROM v
+             WHERE abs(v.gap) > v.tol
+        )
+        SELECT t.security_id, 'core.balance_sheet' AS table_name,
+               {_PERIOD_KEY} AS record_key,
+               CASE WHEN bool_and(t.reason = 'temporary_equity') THEN 'info'
+                    ELSE 'error' END AS severity,
+               {detail} AS detail
+          FROM judged t
+         WHERE t.reason IS NOT NULL
+         GROUP BY t.security_id, t.period_type, t.fiscal_date
+        """
 
-    SF1 carries no balance for noncontrolling interest, so where the period's income
-    statement shows NCI income the gap is that interest: ``info`` there, ``error``
-    elsewhere (plan §6.5).
-    """
+
+def check_balance_sheet_identity(db: Database) -> int:
+    """:func:`detect_balance_sheet_identity`, written once per open condition."""
     return _write_flags(
         db,
         "balance_sheet_identity",
-        f"""
-        SELECT t.security_id, 'core.balance_sheet' AS table_name,
-               {_VERSION_KEY} AS record_key,
-               CASE WHEN nci.has THEN 'info' ELSE 'error' END AS severity,
-               jsonb_build_object(
-                   'total_assets', t.total_assets::float8,
-                   'total_liabilities', t.total_liabilities::float8,
-                   'total_equity_parent', t.total_equity_parent::float8,
-                   'gap', x.gap::float8, 'tolerance', x.tol::float8,
-                   'noncontrolling_income', nci.has) AS detail
-          FROM core.balance_sheet t
-          CROSS JOIN LATERAL (
-                SELECT t.total_assets - t.total_liabilities - t.total_equity_parent
-                           AS gap,
-                       greatest(abs(t.total_assets) * {IDENTITY_SHARE},
-                                {TIE_FLOOR}) AS tol) x
-          CROSS JOIN LATERAL (
-                SELECT EXISTS (
-                    SELECT 1 FROM core.income_statement i
-                     WHERE i.security_id = t.security_id
-                       AND i.period_type = t.period_type
-                       AND i.fiscal_date = t.fiscal_date
-                       AND i.{CURRENT}
-                       AND coalesce(i.net_income_noncontrolling, 0) <> 0) AS has) nci
-         WHERE t.{CURRENT}
-           AND t.total_assets IS NOT NULL AND t.total_liabilities IS NOT NULL
-           AND t.total_equity_parent IS NOT NULL
-           AND abs(x.gap) > x.tol
-        """,
+        detect_balance_sheet_identity(),
         what="balance sheets that do not balance",
     )
 
 
-def check_cash_flow_tie(db: Database) -> int:
+def detect_cash_flow_tie() -> str:
     """Operating, investing and financing cash flows and FX against the net change
-    in cash, per current version (``warn``)."""
+    in cash, per period: the current versions that do not sum (``warn``)."""
+    detail = _per_period(
+        "'components', t.s::float8, "
+        "'net_change_in_cash', t.net_change_in_cash::float8, "
+        "'gap', (t.s - t.net_change_in_cash)::float8, 'tolerance', t.tol::float8"
+    )
+    return f"""
+        WITH v AS (
+            SELECT t.security_id, t.period_type, t.fiscal_date, t.version_no,
+                   t.net_change_in_cash, x.s, x.tol
+              FROM core.cash_flow_statement t
+              CROSS JOIN LATERAL (
+                    SELECT t.net_cash_operating + t.net_cash_investing
+                           + t.net_cash_financing + coalesce(t.fx_effect_on_cash, 0)
+                               AS s,
+                           greatest(greatest(abs(t.net_cash_operating),
+                                             abs(t.net_cash_investing),
+                                             abs(t.net_cash_financing))
+                                    * {IDENTITY_SHARE}, {TIE_FLOOR}) AS tol) x
+             WHERE t.{CURRENT}
+               AND t.net_cash_operating IS NOT NULL
+               AND t.net_cash_investing IS NOT NULL
+               AND t.net_cash_financing IS NOT NULL
+               AND t.net_change_in_cash IS NOT NULL
+               AND abs(x.s - t.net_change_in_cash) > x.tol
+        )
+        SELECT t.security_id, 'core.cash_flow_statement' AS table_name,
+               {_PERIOD_KEY} AS record_key, 'warn' AS severity, {detail} AS detail
+          FROM v t
+         GROUP BY t.security_id, t.period_type, t.fiscal_date
+        """
+
+
+def check_cash_flow_tie(db: Database) -> int:
+    """:func:`detect_cash_flow_tie`, written once per open condition."""
     return _write_flags(
         db,
         "cash_flow_tie",
-        f"""
-        SELECT t.security_id, 'core.cash_flow_statement' AS table_name,
-               {_VERSION_KEY} AS record_key, 'warn' AS severity,
-               jsonb_build_object(
-                   'components', x.s::float8,
-                   'net_change_in_cash', t.net_change_in_cash::float8,
-                   'gap', (x.s - t.net_change_in_cash)::float8,
-                   'tolerance', x.tol::float8) AS detail
-          FROM core.cash_flow_statement t
-          CROSS JOIN LATERAL (
-                SELECT t.net_cash_operating + t.net_cash_investing
-                       + t.net_cash_financing + coalesce(t.fx_effect_on_cash, 0) AS s,
-                       greatest(greatest(abs(t.net_cash_operating),
-                                         abs(t.net_cash_investing),
-                                         abs(t.net_cash_financing)) * {IDENTITY_SHARE},
-                                {TIE_FLOOR}) AS tol) x
-         WHERE t.{CURRENT}
-           AND t.net_cash_operating IS NOT NULL AND t.net_cash_investing IS NOT NULL
-           AND t.net_cash_financing IS NOT NULL AND t.net_change_in_cash IS NOT NULL
-           AND abs(x.s - t.net_change_in_cash) > x.tol
-        """,
+        detect_cash_flow_tie(),
         what="cash flows that do not sum to the change in cash",
     )
 
 
-def check_cash_balance_tie(db: Database) -> int:
+def detect_cash_balance_tie() -> str:
     """The change in cash between consecutive balance sheets against the cash flow's
-    net change, as in force today (``warn``)."""
-    return _write_flags(
-        db,
-        "cash_balance_tie",
-        f"""
+    net change, as in force today (``warn``), within ``CASH_TIE_SHARE`` of the
+    balance, or ``RESTRICTED_CASH_SHARE`` from ``RESTRICTED_CASH_FROM``.
+
+    Two consecutive gaps that cancel (within the smaller of their tolerances) are one
+    balance sheet's cash out of line with both cash flows around it: one condition on
+    that balance sheet (``item`` = cash_and_equivalents) rather than two on the cash
+    flows. 11,264 of the first run's 94,581 flags were such pairs."""
+    return f"""
         WITH b AS (
             SELECT security_id, period_type, fiscal_date,
                    cash_and_equivalents AS cash,
@@ -868,30 +978,81 @@ def check_cash_balance_tie(db: Database) -> int:
               FROM core.balance_sheet
              WHERE {IN_FORCE}
             WINDOW w AS (PARTITION BY security_id, period_type ORDER BY fiscal_date)
+        ),
+        t AS (
+            SELECT b.security_id, b.period_type, b.fiscal_date, b.prev_fd, b.cash,
+                   b.prev_cash, c.net_change_in_cash AS ncf,
+                   (b.cash - b.prev_cash) - c.net_change_in_cash AS gap,
+                   greatest(greatest(abs(b.cash), abs(b.prev_cash))
+                            * CASE WHEN b.fiscal_date >= DATE '{RESTRICTED_CASH_FROM}'
+                                   THEN {RESTRICTED_CASH_SHARE}
+                                   ELSE {CASH_TIE_SHARE} END,
+                            {TIE_FLOOR}) AS tol
+              FROM b
+              JOIN core.cash_flow_statement c
+                ON c.security_id = b.security_id AND c.period_type = b.period_type
+               AND c.fiscal_date = b.fiscal_date AND c.{IN_FORCE}
+             WHERE b.cash IS NOT NULL AND b.prev_cash IS NOT NULL
+               AND c.net_change_in_cash IS NOT NULL
+               AND b.fiscal_date - b.prev_fd BETWEEN
+                   CASE b.period_type WHEN 'quarter' THEN {QUARTER_GAP[0]}
+                                      ELSE {YEAR_GAP[0]} END
+                   AND CASE b.period_type WHEN 'quarter' THEN {QUARTER_GAP[1]}
+                                          ELSE {YEAR_GAP[1]} END
+        ),
+        f AS (
+            SELECT t.*,
+                   lead(t.prev_fd) OVER w AS next_prev_fd,
+                   lead(t.fiscal_date) OVER w AS next_fd,
+                   lead(t.gap) OVER w AS next_gap, lead(t.tol) OVER w AS next_tol,
+                   lag(t.fiscal_date) OVER w AS last_fd,
+                   lag(t.gap) OVER w AS last_gap, lag(t.tol) OVER w AS last_tol
+              FROM t
+             WHERE abs(t.gap) > t.tol
+            WINDOW w AS (PARTITION BY t.security_id, t.period_type
+                         ORDER BY t.fiscal_date)
+        ),
+        p AS (
+            SELECT f.*,
+                   coalesce(f.next_prev_fd = f.fiscal_date
+                            AND abs(f.gap + f.next_gap) <= least(f.tol, f.next_tol),
+                            false) AS opens,
+                   coalesce(f.prev_fd = f.last_fd
+                            AND abs(f.gap + f.last_gap) <= least(f.tol, f.last_tol),
+                            false) AS closes
+              FROM f
         )
         SELECT t.security_id, 'core.cash_flow_statement' AS table_name,
                {_PERIOD_KEY} AS record_key, 'warn' AS severity,
                jsonb_build_object(
-                   'cash', b.cash::float8, 'previous_cash', b.prev_cash::float8,
-                   'previous_fiscal_date', b.prev_fd::text,
-                   'net_change_in_cash', t.net_change_in_cash::float8,
-                   'gap', ((b.cash - b.prev_cash) - t.net_change_in_cash)::float8)
-                   AS detail
-          FROM b
-          JOIN core.cash_flow_statement t
-            ON t.security_id = b.security_id AND t.period_type = b.period_type
-           AND t.fiscal_date = b.fiscal_date AND t.{IN_FORCE}
-         WHERE b.cash IS NOT NULL AND b.prev_cash IS NOT NULL
-           AND t.net_change_in_cash IS NOT NULL
-           AND b.fiscal_date - b.prev_fd BETWEEN
-               CASE b.period_type WHEN 'quarter' THEN {QUARTER_GAP[0]}
-                                  ELSE {YEAR_GAP[0]} END
-               AND CASE b.period_type WHEN 'quarter' THEN {QUARTER_GAP[1]}
-                                      ELSE {YEAR_GAP[1]} END
-           AND abs((b.cash - b.prev_cash) - t.net_change_in_cash)
-               > greatest(greatest(abs(b.cash), abs(b.prev_cash)) * {CASH_TIE_SHARE},
-                          {TIE_FLOOR})
-        """,
+                   'cash', t.cash::float8, 'previous_cash', t.prev_cash::float8,
+                   'previous_fiscal_date', t.prev_fd::text,
+                   'net_change_in_cash', t.ncf::float8, 'gap', t.gap::float8,
+                   'tolerance', t.tol::float8) AS detail
+          FROM p t
+         WHERE NOT t.opens AND NOT t.closes
+        UNION ALL
+        SELECT t.security_id, 'core.balance_sheet' AS table_name,
+               jsonb_build_object('period_type', t.period_type,
+                                  'fiscal_date', t.fiscal_date::text,
+                                  'item', 'cash_and_equivalents') AS record_key,
+               'warn' AS severity,
+               jsonb_build_object(
+                   'cash', t.cash::float8,
+                   'from_cash_flow', (t.prev_cash + t.ncf)::float8,
+                   'gap', t.gap::float8, 'next_fiscal_date', t.next_fd::text,
+                   'next_gap', t.next_gap::float8) AS detail
+          FROM p t
+         WHERE t.opens
+        """
+
+
+def check_cash_balance_tie(db: Database) -> int:
+    """:func:`detect_cash_balance_tie`, written once per open condition."""
+    return _write_flags(
+        db,
+        "cash_balance_tie",
+        detect_cash_balance_tie(),
         what="periods whose change in cash does not meet the cash flow",
     )
 
@@ -939,25 +1100,64 @@ def check_fundamentals_gap(db: Database) -> int:
     )
 
 
+def _stale_allowed(spacing: str) -> str:
+    """The days a period end may age, by the reporting cycle ``spacing`` (days)."""
+    steps = " ".join(
+        f"WHEN {spacing} <= {upto} THEN {days}" for upto, days in STALE_DAYS_BY_SPACING
+    )
+    return f"CASE {steps} ELSE {STALE_DAYS_ANNUAL} END"
+
+
+def detect_fundamentals_stale() -> str:
+    """An actively trading security whose latest period in force has aged past what
+    its own reporting cycle allows (``STALE_DAYS_BY_SPACING``; ``warn``). A single
+    period is an annual cycle. A later filing is a new occurrence, and ``dq
+    recheck`` closes the old one."""
+    allowed = _stale_allowed("c.spacing")
+    return f"""
+        WITH l AS (
+            SELECT security_id, max(fiscal_date) AS fd
+              FROM core.income_statement WHERE {IN_FORCE}
+             GROUP BY security_id
+        ),
+        e AS (
+            SELECT DISTINCT i.security_id, i.fiscal_date
+              FROM core.income_statement i
+              JOIN l ON l.security_id = i.security_id
+             WHERE i.{IN_FORCE} AND i.fiscal_date > l.fd - {CADENCE_DAYS}
+        ),
+        c AS (
+            SELECT g.security_id,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY g.d) AS spacing
+              FROM (SELECT security_id,
+                           fiscal_date - lag(fiscal_date) OVER (
+                               PARTITION BY security_id ORDER BY fiscal_date) AS d
+                      FROM e) g
+             WHERE g.d IS NOT NULL
+             GROUP BY g.security_id
+        ),
+        a AS (
+            SELECT l.security_id, l.fd, {allowed} AS allowed
+              FROM l LEFT JOIN c ON c.security_id = l.security_id
+        )
+        SELECT a.security_id, 'core.income_statement' AS table_name,
+               jsonb_build_object('latest_fiscal_date', a.fd::text) AS record_key,
+               'warn' AS severity,
+               jsonb_build_object('days', current_date - a.fd, 'allowed', a.allowed)
+                   AS detail
+          FROM a
+          JOIN core.security s ON s.security_id = a.security_id
+         WHERE s.is_actively_trading AND s.delisted_date IS NULL
+           AND current_date - a.fd > a.allowed
+        """
+
+
 def check_fundamentals_stale(db: Database) -> int:
-    """An actively trading security whose latest period in force ended more than
-    ``FUNDAMENTALS_STALE_DAYS`` ago (``warn``). A later filing is a new occurrence;
-    ``dq recheck`` closes the old one."""
+    """:func:`detect_fundamentals_stale`, written once per open condition."""
     return _write_flags(
         db,
         "fundamentals_stale",
-        f"""
-        SELECT l.security_id, 'core.income_statement' AS table_name,
-               jsonb_build_object('latest_fiscal_date', l.fd::text) AS record_key,
-               'warn' AS severity,
-               jsonb_build_object('days', current_date - l.fd) AS detail
-          FROM (SELECT security_id, max(fiscal_date) AS fd
-                  FROM core.income_statement WHERE {IN_FORCE}
-                 GROUP BY security_id) l
-          JOIN core.security s ON s.security_id = l.security_id
-         WHERE s.is_actively_trading AND s.delisted_date IS NULL
-           AND current_date - l.fd > {FUNDAMENTALS_STALE_DAYS}
-        """,
+        detect_fundamentals_stale(),
         what="trading securities with stale statements",
     )
 
@@ -1012,10 +1212,14 @@ def _contiguous(a: str, b: str, da: str, db_: str) -> str:
     return f"({a} - {b} = 1 AND {da} - {db_} BETWEEN {lo} AND {hi})"
 
 
-def check_fundamentals_ttm_incomplete(db: Database) -> int:
+def detect_fundamentals_ttm_incomplete() -> str:
     """Quarters in force whose trailing four are not contiguous, past a security's
-    first three: a missing or mislabelled quarter. One flag per security and fiscal
-    year, listing the quarters (``info``)."""
+    first three: a missing or mislabelled quarter. One condition per security and
+    fiscal year, listing the quarters (``info``).
+
+    A fiscal year whose quarters in force are Q2 and Q4 alone is a half-yearly
+    reporter's (a foreign issuer's interim and annual figures): it has no trailing
+    four to break, and is not judged. 1,757 of the first run's 11,727 flags were."""
     c3 = " AND ".join(
         (
             _contiguous("qn", "qn1", "fiscal_date", "d1"),
@@ -1023,15 +1227,19 @@ def check_fundamentals_ttm_incomplete(db: Database) -> int:
             _contiguous("qn2", "qn3", "d2", "d3"),
         )
     )
-    return _write_flags(
-        db,
-        "fundamentals_ttm_incomplete",
-        f"""
+    return f"""
         WITH q AS (
             SELECT security_id, fiscal_date, fiscal_year, fiscal_period,
                    fiscal_year * 4 + substr(fiscal_period, 2)::int AS qn
               FROM core.income_statement
              WHERE period_type = 'quarter' AND {IN_FORCE}
+        ),
+        half AS (
+            SELECT security_id, fiscal_year
+              FROM q
+             GROUP BY security_id, fiscal_year
+            HAVING array_agg(DISTINCT fiscal_period::text
+                             ORDER BY fiscal_period::text) = ARRAY['Q2', 'Q4']
         ),
         w AS (
             SELECT q.*, row_number() OVER w AS rn,
@@ -1049,32 +1257,63 @@ def check_fundamentals_ttm_incomplete(db: Database) -> int:
                    AS detail
           FROM w
          WHERE rn >= 4 AND NOT coalesce({c3}, false)
+           AND NOT EXISTS (SELECT 1 FROM half h
+                            WHERE h.security_id = w.security_id
+                              AND h.fiscal_year = w.fiscal_year)
          GROUP BY security_id, fiscal_year
-        """,
+        """
+
+
+def check_fundamentals_ttm_incomplete(db: Database) -> int:
+    """:func:`detect_fundamentals_ttm_incomplete`, written once per open condition."""
+    return _write_flags(
+        db,
+        "fundamentals_ttm_incomplete",
+        detect_fundamentals_ttm_incomplete(),
         what="security-years with an incomplete TTM",
     )
 
 
-def check_fundamentals_negative_impossible(db: Database) -> int:
+def detect_fundamentals_negative_impossible() -> str:
     """A negative total assets, revenue or share count in a current version
-    (``error``)."""
+    (``error``). A financial company's negative revenue alone is ``info``
+    (``FINANCIAL_SECTORS``): SF1's revenue there is net of losses."""
+    financial = _classified_as(
+        sectors=FINANCIAL_SECTORS, industries=FINANCIAL_INDUSTRIES
+    )
     parts = []
     for table, items in NEVER_NEGATIVE.items():
         cond = " OR ".join(f"t.{c} < 0" for c in items)
         found = ", ".join(
             f"'{c}', CASE WHEN t.{c} < 0 THEN t.{c}::float8 END" for c in items
         )
+        others = " OR ".join(f"t.{c} < 0" for c in items if c != "revenue")
+        if "revenue" in items:
+            severity = (
+                "CASE WHEN fin.security_id IS NOT NULL"
+                f" AND NOT coalesce({others}, false) THEN 'info' ELSE 'error' END"
+            )
+            join = f"LEFT JOIN ({financial}) fin ON fin.security_id = t.security_id"
+        else:
+            severity, join = "'error'", ""
         parts.append(f"""
         SELECT t.security_id, '{table}' AS table_name,
                {_keyed(_VERSION_KEY, table)} AS record_key,
-               'error' AS severity, jsonb_strip_nulls(jsonb_build_object({found}))
+               {severity} AS severity, jsonb_strip_nulls(jsonb_build_object({found}))
                    AS detail
           FROM {table} t
+          {join}
          WHERE t.{CURRENT} AND ({cond})""")
+    return "\n        UNION ALL".join(parts)
+
+
+def check_fundamentals_negative_impossible(db: Database) -> int:
+    """:func:`detect_fundamentals_negative_impossible`, written once per open
+    condition."""
     return _write_flags(
         db,
         "fundamentals_negative_impossible",
-        "\n        UNION ALL".join(parts),
+        detect_fundamentals_negative_impossible(),
         what="versions with an impossible negative",
     )
 
@@ -1253,6 +1492,19 @@ def check_fundamentals_version_chain(db: Database) -> int:
         what="periods whose versions do not chain",
     )
 
+
+#: The fundamentals checks whose condition is a function of the statements as they
+#: stand, each with the query that detects it. ``dq recheck`` closes a flag of theirs
+#: that the query no longer selects: a vendor's fix, a restated version that
+#: balances, a period that filed, or a recalibration of the check itself.
+FUNDAMENTALS_DETECTORS = {
+    "balance_sheet_identity": detect_balance_sheet_identity,
+    "cash_flow_tie": detect_cash_flow_tie,
+    "cash_balance_tie": detect_cash_balance_tie,
+    "fundamentals_stale": detect_fundamentals_stale,
+    "fundamentals_ttm_incomplete": detect_fundamentals_ttm_incomplete,
+    "fundamentals_negative_impossible": detect_fundamentals_negative_impossible,
+}
 
 #: The fundamentals checks, in the order ``run_all`` runs them: its keys.
 FUNDAMENTALS_CHECKS = {

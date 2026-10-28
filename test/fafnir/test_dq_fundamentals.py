@@ -156,37 +156,96 @@ def test_without_fundamentals_or_their_tables_nothing_runs_against_them(
 # ---------------------------------------------------------------------------
 
 
-def test_balance_sheet_identity_is_an_error_unless_noncontrolling_interest(db):
+def _classify(db, sid, *, sector=None, industry=None):
+    """The classification readers see, as core.security's pair (no feeding vendor)."""
+    db.execute(
+        "UPDATE core.security SET sector_id = %s, industry_id = %s"
+        " WHERE security_id = %s",
+        (
+            repo.get_or_create_sector(db, sector),
+            repo.get_or_create_industry(db, industry),
+            sid,
+        ),
+    )
+
+
+def test_balance_sheet_identity_allows_for_what_sf1_leaves_out(db):
     sid = _security(db, "ZZBAL")
-    filed = D(2011, 2, 18)
-    # 2010: 100M short, no NCI -> error. 2009: short, but NCI income -> info.
-    # 2008: 0.4M short of 2,000M, inside the tolerance -> nothing.
-    for year, eq, nci in ((2010, 900, 0), (2009, 900, 5), (2008, 999.6, 0)):
-        end = D(year, 12, 31)
+    m = 1_000_000
+
+    def year(y, *, liabilities=1000, equity=900, nci=0, version=1, **kw):
+        end = D(y, 12, 31)
         _put(
             db,
             "balance_sheet",
             sid,
             end,
-            label=f"{year}-FY",
-            known_from=D(year + 1, 2, 18) if year != 2010 else filed,
-            total_assets=2_000_000_000,
-            total_liabilities=1_000_000_000,
-            total_equity_parent=eq * 1_000_000,
+            label=f"{y}-FY",
+            known_from=kw.get("known_from", D(y + 1, 2, 18)),
+            version=version,
+            known_to=kw.get("known_to"),
+            total_assets=2000 * m,
+            total_liabilities=liabilities * m,
+            total_equity_parent=equity * m,
         )
-        _put(
-            db,
-            "income",
-            sid,
-            end,
-            label=f"{year}-FY",
-            known_from=D(year + 1, 2, 18) if year != 2010 else filed,
-            net_income_noncontrolling=nci,
-        )
+        if version == 1:
+            _put(
+                db,
+                "income",
+                sid,
+                end,
+                label=f"{y}-FY",
+                known_from=D(y + 1, 2, 18),
+                net_income_noncontrolling=nci,
+            )
+
+    year(2007, equity=400)  # before SFAS 160, but 30% of assets: unexplained
+    year(2008)  # before SFAS 160, 5%: minority interest outside equity
+    year(2010)  # 5% short, no NCI: unexplained
+    year(2011, nci=5)  # short by the NCI: not flagged
+    year(2012, equity=1100, nci=5)  # liabilities and equity over assets, NCI or not
+    year(2013, equity=999.6)  # 0.4M of 2,000M: inside the tolerance
+    year(2014, equity=-100)  # a deficit, 55% short: temporary equity
+    # Two versions, both short: one condition, listing both.
+    year(2015, known_to=D(2016, 6, 1))
+    year(2015, equity=800, version=2, known_from=D(2016, 6, 1))
+    spac = _security(db, "ZZSPAC")
+    _classify(db, spac, sector="Financial Services", industry="Shell Companies")
+    _put(
+        db,
+        "balance_sheet",
+        spac,
+        D(2020, 12, 31),
+        label="2020-FY",
+        known_from=D(2021, 3, 1),
+        total_assets=200 * m,
+        total_liabilities=7 * m,
+        total_equity_parent=5 * m,  # the redeemable shares are neither
+    )
     flags = _run_twice(db, "balance_sheet_identity")
-    got = {f["record_key"]["fiscal_date"]: f["severity"] for f in flags}
-    assert got == {"2010-12-31": "error", "2009-12-31": "info"}
-    assert flags[0]["detail"]["gap"] == pytest.approx(100_000_000)
+    got = {
+        (f["security_id"], f["record_key"]["fiscal_date"]): (
+            f["severity"],
+            f["detail"]["reason"],
+        )
+        for f in flags
+    }
+    assert got == {
+        (sid, "2007-12-31"): ("error", "unexplained"),
+        (sid, "2010-12-31"): ("error", "unexplained"),
+        (sid, "2012-12-31"): ("error", "liabilities_and_equity_exceed_assets"),
+        (sid, "2014-12-31"): ("info", "temporary_equity"),
+        (sid, "2015-12-31"): ("error", "unexplained"),
+        (spac, "2020-12-31"): ("info", "temporary_equity"),
+    }
+    # One flag per period, not per version.
+    assert all(set(f["record_key"]) == {"period_type", "fiscal_date"} for f in flags)
+    (twice,) = [f for f in flags if f["record_key"]["fiscal_date"] == "2015-12-31"]
+    assert twice["detail"]["versions"] == [1, 2]
+    assert (twice["detail"]["version_no"], twice["detail"]["gap"]) == (
+        2,
+        pytest.approx(200 * m),
+    )
 
 
 def test_the_cash_ties(db):
@@ -229,7 +288,12 @@ def test_the_cash_ties(db):
     assert [(f["record_key"]["fiscal_date"], f["severity"]) for f in tie] == [
         ("2010-06-30", "warn")
     ]
+    assert tie[0]["record_key"] == {
+        "period_type": "quarter",
+        "fiscal_date": "2010-06-30",
+    }
     assert tie[0]["detail"]["gap"] == pytest.approx(-10_000_000)
+    assert tie[0]["detail"]["versions"] == [1]
     assert _run_twice(db, "cash_balance_tie") == []
     # Q1's cash flow says cash fell 200M; the balances say it rose to 500M from
     # nothing on file before: no previous balance, so no tie to judge. Make Q2's
@@ -244,6 +308,156 @@ def test_the_cash_ties(db):
         {"period_type": "quarter", "fiscal_date": "2010-06-30"}
     ]
     assert flags[0]["detail"]["gap"] == pytest.approx(150_000_000)
+
+
+def _cash_quarters(db, sid, year, cash, ncf):
+    """Quarters of ``year``: the balance's cash and the cash flow's change, in
+    millions; a None change files no cash flow."""
+    ends = ((3, 31), (6, 30), (9, 30), (12, 31))
+    for q, ((m, d), c, n) in enumerate(zip(ends, cash, ncf), start=1):
+        fd = D(year, m, d)
+        known = fd + timedelta(days=40)
+        _put(
+            db,
+            "balance_sheet",
+            sid,
+            fd,
+            label=f"{year}-Q{q}",
+            known_from=known,
+            cash_and_equivalents=c * 1_000_000,
+        )
+        if n is not None:
+            _put(
+                db,
+                "cash_flow",
+                sid,
+                fd,
+                label=f"{year}-Q{q}",
+                known_from=known,
+                net_change_in_cash=n * 1_000_000,
+            )
+
+
+def test_the_cash_balance_tie_allows_restricted_cash_from_2018(db):
+    # Q2: the balance rose 40M against no change in the cash flow, 3.8% of the
+    # balance: restricted cash moving, within 2019's allowance. Q3: 200M against a
+    # 200M fall, 19%: flagged. The same 40M in 2016 is beyond 2% of the balance.
+    new = _security(db, "ZZRESTR")
+    _cash_quarters(db, new, 2019, (1000, 1040, 1040, 1040), (None, 0, -200, 0))
+    old = _security(db, "ZZRESTR16")
+    _cash_quarters(db, old, 2016, (1000, 1040, 1040, 1040), (None, 0, 0, 0))
+    flags = _run_twice(db, "cash_balance_tie")
+    assert sorted(
+        (f["security_id"], f["record_key"]["fiscal_date"]) for f in flags
+    ) == [
+        (new, "2019-09-30"),
+        (old, "2016-06-30"),
+    ]
+
+
+def test_two_gaps_that_cancel_are_one_balance_sheet(db):
+    # Q2's cash is 900M where the cash flows say 510M: Q2's change is 390M over its
+    # cash flow and Q3's 390M under. One balance sheet out of line, flagged once.
+    sid = _security(db, "ZZPAIR")
+    _cash_quarters(db, sid, 2012, (500, 900, 520, 540), (None, 10, 10, 20))
+    flags = _run_twice(db, "cash_balance_tie")
+    assert [(f["table_name"], f["record_key"]) for f in flags] == [
+        (
+            "core.balance_sheet",
+            {
+                "period_type": "quarter",
+                "fiscal_date": "2012-06-30",
+                "item": "cash_and_equivalents",
+            },
+        )
+    ]
+    detail = flags[0]["detail"]
+    assert (detail["cash"], detail["from_cash_flow"]) == (
+        pytest.approx(900_000_000),
+        pytest.approx(510_000_000),
+    )
+    assert detail["next_fiscal_date"] == "2012-09-30"
+
+
+def _flag(db, sid, check, record_key, severity):
+    return db.fetchval(
+        "INSERT INTO ops.data_quality_flag (security_id, table_name, record_key,"
+        " check_name, severity, detail, detected_at)"
+        " VALUES (%s, 'core.balance_sheet', %s, %s, %s, '{}', now())"
+        " RETURNING dq_flag_id",
+        (sid, json.dumps(record_key), check, severity),
+    )
+
+
+def test_recheck_closes_what_the_recalibrated_checks_no_longer_select(db):
+    sid = _security(db, "ZZRECAL")
+    m = 1_000_000
+    for y, equity in ((2010, 900), (2011, 1000)):  # 2010 short; 2011 balances
+        _put(
+            db,
+            "balance_sheet",
+            sid,
+            D(y, 12, 31),
+            label=f"{y}-FY",
+            known_from=D(y + 1, 2, 18),
+            total_assets=2000 * m,
+            total_liabilities=1000 * m,
+            total_equity_parent=equity * m,
+        )
+    period = {"period_type": "annual", "fiscal_date": "2010-12-31"}
+    held = _flag(db, sid, "balance_sheet_identity", period, "error")
+    # Before the recalibration: one flag per version, and one on a period that
+    # balances now (a vendor's fix).
+    per_version = _flag(
+        db, sid, "balance_sheet_identity", {**period, "version_no": 1}, "error"
+    )
+    fixed = _flag(
+        db,
+        sid,
+        "balance_sheet_identity",
+        {"period_type": "annual", "fiscal_date": "2011-12-31"},
+        "error",
+    )
+    # A bank's negative revenue, written as an error before.
+    bank = _security(db, "ZZRBANK")
+    _classify(db, bank, sector="Financial Services", industry="Banks - Regional")
+    _put(
+        db,
+        "income",
+        bank,
+        D(2010, 12, 31),
+        label="2010-FY",
+        known_from=D(2011, 2, 1),
+        revenue=-7,
+    )
+    rejudged = _flag(
+        db,
+        bank,
+        "fundamentals_negative_impossible",
+        {"statement": "income", **period, "version_no": 1},
+        "error",
+    )
+    results = {
+        r.check_name: r
+        for r in rc.recheck(
+            db, checks=["balance_sheet_identity", "fundamentals_negative_impossible"]
+        )
+    }
+    assert sorted(results["balance_sheet_identity"].stale_flag_ids) == sorted(
+        [per_version, fixed]
+    )
+    assert held not in results["balance_sheet_identity"].stale_flag_ids
+    assert results["fundamentals_negative_impossible"].stale_flag_ids == [rejudged]
+    # Closed, the next run writes the bank's flag again, as info.
+    repo.resolve_dq_flags(
+        db,
+        repo.DqFilter(flag_ids=(rejudged,)),
+        note="test",
+        resolved_by="tester",
+    )
+    checks.check_fundamentals_negative_impossible(db)
+    (now,) = _flags(db, "fundamentals_negative_impossible")
+    assert (now["security_id"], now["severity"]) == (bank, "info")
 
 
 # ---------------------------------------------------------------------------
@@ -274,25 +488,46 @@ def test_a_gap_while_trading_and_a_leading_one(db):
     assert checks.check_fundamentals_gap(db) == 0
 
 
-def test_stale_statements_and_their_recheck(db):
-    sid = _security(db, "ZZSTALE")
-    end = TODAY - timedelta(days=300)
-    _put(db, "income", sid, end, label=f"{end.year}-FY", known_from=end + timedelta(1))
+def _ends(db, sid, ends, period):
+    for end in ends:
+        label = f"{end.year}-{'FY' if period == 'annual' else 'Q1'}"
+        _put(db, "income", sid, end, label=label, known_from=end + timedelta(40))
+
+
+def test_stale_statements_on_their_own_cycle_and_their_recheck(db):
+    ago = [TODAY - timedelta(days=d) for d in (300, 391, 482, 573)]
+    quarterly = _security(db, "ZZSTALE")
+    _ends(db, quarterly, ago, "quarter")  # every 91 days: stale at 200
+    annual = _security(db, "ZZ20F")
+    _ends(db, annual, ago[:1] + [ago[0] - timedelta(365)], "annual")  # 500
+    old_annual = _security(db, "ZZ20FOLD")
+    late = TODAY - timedelta(days=520)
+    _ends(db, old_annual, [late, late - timedelta(365)], "annual")
     fresh = _security(db, "ZZFRESH")
-    recent = TODAY - timedelta(days=90)
-    _put(db, "income", fresh, recent, label=f"{recent.year}-FY", known_from=TODAY)
+    _ends(db, fresh, [TODAY - timedelta(days=90)], "quarter")
     gone = _security(db, "ZZGONE", active=False)
-    _put(db, "income", gone, end, label=f"{end.year}-FY", known_from=end + timedelta(1))
+    _ends(db, gone, ago, "quarter")
     flags = _run_twice(db, "fundamentals_stale")
-    assert [(f["security_id"], f["record_key"]) for f in flags] == [
-        (sid, {"latest_fiscal_date": end.isoformat()})
+    assert sorted(
+        ((f["security_id"], f["record_key"], f["detail"]) for f in flags),
+        key=lambda f: f[0],
+    ) == [
+        (
+            quarterly,
+            {"latest_fiscal_date": ago[0].isoformat()},
+            {"days": 300, "allowed": 200},
+        ),
+        (
+            old_annual,
+            {"latest_fiscal_date": late.isoformat()},
+            {"days": 520, "allowed": 500},
+        ),
     ]
     assert rc.recheck(db, checks=["fundamentals_stale"])[0].stale == 0
     # It files: the recorded condition is gone, and recheck says so.
-    later = TODAY - timedelta(days=20)
-    _put(db, "income", sid, later, label=f"{later.year}-Q1", known_from=TODAY)
+    _ends(db, quarterly, [TODAY - timedelta(days=20)], "quarter")
     result = rc.recheck(db, checks=["fundamentals_stale"])[0]
-    assert result.stale == 1 and result.open_flags == 1
+    assert result.stale == 1 and result.open_flags == 2
 
 
 def _sf1_coverage(db, sid, key):
@@ -379,12 +614,37 @@ def test_impossible_negatives(db):
         total_assets=100,
         shares_outstanding=-1,
     )
+    # A bank's revenue is net of its losses: info. Its share count is not.
+    bank = _security(db, "ZZBANK")
+    _classify(db, bank, sector="Financial Services", industry="Banks - Regional")
+    mreit = _security(db, "ZZMREIT")
+    _classify(db, mreit, sector="Real Estate", industry="REIT - Mortgage")
+    for who, shares in ((bank, None), (mreit, -3)):
+        _put(
+            db,
+            "income",
+            who,
+            D(2010, 12, 31),
+            label="2010-FY",
+            known_from=D(2011, 2, 1),
+            revenue=-7,
+            weighted_average_shares=shares,
+        )
     flags = _run_twice(db, "fundamentals_negative_impossible")
-    got = sorted((f["table_name"], f["severity"], f["detail"]) for f in flags)
+    got = sorted(
+        (f["security_id"], f["table_name"], f["severity"], f["detail"]) for f in flags
+    )
     # Net income may be negative; revenue and a share count may not.
     assert got == [
-        ("core.balance_sheet", "error", {"shares_outstanding": -1}),
-        ("core.income_statement", "error", {"revenue": -5}),
+        (sid, "core.balance_sheet", "error", {"shares_outstanding": -1}),
+        (sid, "core.income_statement", "error", {"revenue": -5}),
+        (bank, "core.income_statement", "info", {"revenue": -7}),
+        (
+            mreit,
+            "core.income_statement",
+            "error",
+            {"revenue": -7, "weighted_average_shares": -3},
+        ),
     ]
 
 
@@ -513,6 +773,18 @@ def test_a_missing_quarter_breaks_the_ttm_series(db):
                 D(year, m, d),
                 label=f"{year}-Q{q}",
                 known_from=D(year, m, d) + timedelta(days=40),
+            )
+    # A half-yearly reporter: Q2 and Q4 each year, no trailing four to break.
+    half = _security(db, "ZZHALF")
+    for year in (2008, 2009, 2010):
+        for q, (m, d) in ((2, (6, 30)), (4, (12, 31))):
+            _put(
+                db,
+                "income",
+                half,
+                D(year, m, d),
+                label=f"{year}-Q{q}",
+                known_from=D(year, m, d) + timedelta(days=60),
             )
     flags = _run_twice(db, "fundamentals_ttm_incomplete")
     # 2010-Q3, Q4 and 2011-Q1 would reach back over Q2; 2009's first three are the

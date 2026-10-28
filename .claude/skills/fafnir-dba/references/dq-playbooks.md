@@ -42,9 +42,9 @@ and they are not interchangeable:
 
 - **`dq recheck`** re-evaluates a check against its own open flags and closes the
   ones whose condition is no longer true. It is the negation of the check, run by
-  the same constants, so what it closes cannot come back. Only six SQL checks
-  support it, plus the `dorq_*` checks by re-running dorq (below); a check that is
-  not listed cannot be rechecked at all.
+  the same constants, so what it closes cannot come back. Only the SQL checks the
+  table marks support it, plus the `dorq_*` checks by re-running dorq (below); a
+  check that is not listed cannot be rechecked at all.
 - **`dq accept`** is a terminal disposition for a condition that is real,
   understood, and has no repair. It sets `accepted_at`, and `add_dq_flag_once`
   skips a condition already accepted — so the writer stops re-detecting it. It
@@ -58,6 +58,7 @@ and they are not interchangeable:
 | Check | Written by | Written through | A resolve is re-written by | `dq accept` suppresses? | `dq recheck`? |
 |---|---|---|---|---|---|
 | `gap`, `sparse_coverage`, `outlier`, `stale`, `security_duplicate_identity`, `security_missing_classification` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes — except `security_duplicate_identity` |
+| `balance_sheet_identity`, `cash_flow_tie`, `cash_balance_tie`, `fundamentals_stale`, `fundamentals_coverage`, `fundamentals_ttm_incomplete`, `fundamentals_negative_impossible` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes: the check's own query, run again (a flag at another severity, or keyed per version, closes) |
 | `dividend_no_prior_close`, `dividend_exceeds_price`, `adjustment_factor_extreme`, `adjustment_failed` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security | yes | `dividend_no_prior_close` only |
 | `price_scale_collapse` | price loader | `add_dq_flag_once` | a re-read of that bar | yes | no |
 | `price_restatement_conflict` | nightly price load (not `--from`) | `add_dq_flag_once` | a nightly re-read of that date while the vendor still restates it beyond the guard. An explicit `ingest prices --from` re-fetch of the date **resolves it itself** | yes | no |
@@ -1458,7 +1459,13 @@ condition. A statement condition's `record_key` names the period
 (`period_type`, `fiscal_date`), plus the `version_no` where the check reads every
 current version, and the `statement` where the check reads more than one table. So
 a restated version that still fails is a new condition, and one that passes leaves
-the old flag to be resolved.
+the old flag to be resolved. The identity and the cash-flow tie are one condition
+per period since 2026-10-28: `detail.versions` lists the failing versions, and the
+figures are the latest one's.
+
+**`dq recheck` re-runs the check's own query** for the checks the table marks, and
+closes a flag it no longer selects at its severity: a vendor's fix, a restated
+version that balances, a period that filed, or a recalibration of the check.
 
 | Check | From | Severity | Closes by |
 |---|---|---|---|
@@ -1466,15 +1473,15 @@ the old flag to be resolved.
 | `fundamentals_vendor_correction` | loader | `info` | judgement |
 | `fundamentals_estimated_knowledge_date` | loader | `info` | judgement |
 | `fundamentals_unlinked`, `fundamentals_missing_period_label`, `fundamentals_filing_before_period`, `fundamentals_value_out_of_range`, `fundamentals_duplicate_period` | loader quarantine | as the loader sets | the row was not stored: fix the link or wait for the vendor. A `fundamentals_duplicate_period` on a first-reported (`AR*`) row from before the later-filing fix is not a vendor fault: see doc/backfill.md › *A backfill from before the later-filing fix* |
-| `balance_sheet_identity` | `dq run` | `error`; `info` with NCI | judgement: operations.md › *Investigating a balance-sheet-identity failure* |
-| `cash_flow_tie`, `cash_balance_tie` | `dq run` | `warn` | judgement |
+| `balance_sheet_identity` | `dq run` | `error`; `info` for temporary equity | **`dq recheck`**, else judgement: operations.md › *Investigating a balance-sheet-identity failure* |
+| `cash_flow_tie`, `cash_balance_tie` | `dq run` | `warn` | **`dq recheck`**, else judgement |
 | `fundamentals_gap` | `dq run` | `info` | judgement |
 | `fundamentals_stale` | `dq run` | `warn` | **`dq recheck`** |
 | `fundamentals_coverage` | `dq run` | `info` | **`dq recheck`** |
 | `fundamentals_currency_mismatch` | `dq run` | `info` | judgement |
 | `fundamentals_unmapped_fields` | `dq run` | `info` | a map change and a migration |
-| `fundamentals_ttm_incomplete` | `dq run` | `info` | judgement |
-| `fundamentals_negative_impossible` | `dq run` | `error` | judgement |
+| `fundamentals_ttm_incomplete` | `dq run` | `info` | **`dq recheck`**, else judgement |
+| `fundamentals_negative_impossible` | `dq run` | `error`; `info` for a financial company's revenue | **`dq recheck`**, else judgement |
 | `fundamentals_suspicious_zero` | `dq run` | `info` | judgement |
 | `fundamentals_implausible_filing_lag` | `dq run` | `warn` | judgement |
 | `fundamentals_ytd_suspect` | `dq run` | `warn` | judgement |
@@ -1522,21 +1529,41 @@ in `scripts/fundamentals_report.sql`.
 
 ### `balance_sheet_identity` — assets ≠ liabilities + parent equity
 
-Per current version, beyond the larger of 0.5% of assets and 1M of the reporting
-currency. SF1 has no balance for noncontrolling interest, so where the period's income
-statement shows NCI income the gap is that interest: `info`. Elsewhere `error`.
-operations.md › *Investigating a balance-sheet-identity failure* has the steps; the
-usual causes are temporary (mezzanine) equity and redeemable NCI, which SF1 leaves
-out of both liabilities and equity. Accept when the filing shows it.
+Per period, over its current versions, beyond the larger of 0.5% of assets and 1M of
+the reporting currency, once what SF1 leaves out of both liabilities and parent
+equity is allowed for (`detail.reason`):
+
+- **Not flagged:** assets over liabilities and equity where the period shows NCI
+  income (SF1 has no balance for noncontrolling interest), or before SFAS 160 (periods
+  ending before 2009-12-15) by up to 20% of assets: minority interest outside equity.
+- **`info`, `temporary_equity`:** a parent deficit with a gap of 20% of assets or
+  more, or a shell company. A SPAC's redeemable shares, a pre-IPO company's redeemable
+  preferred: mezzanine equity, which SF1 also leaves out.
+- **`error`:** `liabilities_and_equity_exceed_assets` (nothing SF1 omits explains
+  it), or `unexplained`.
+
+operations.md › *Investigating a balance-sheet-identity failure* has the steps.
+Accept when the filing shows the line. The first run on production (2026-10-28)
+wrote 144,841 per-version flags; recalibrated, about 34,000 periods remain (17,700
+`error`).
 
 ### `cash_flow_tie`, `cash_balance_tie` — the cash flow does not add up
 
 `cash_flow_tie`: operating + investing + financing + FX ≠ the net change in cash, per
 current version, beyond 0.5% of the largest component or 1M. `cash_balance_tie`: the
 change in `cash_and_equivalents` between consecutive balance sheets in force ≠ the
-period's net change, beyond 2% of the balance or 1M. Restricted cash, which SF1's
-balance leaves out and US GAAP's cash flow has included since 2018, makes the second
-fire; discontinued operations make both. Accept with the filing's reason.
+period's net change, beyond 2% of the balance or 1M, and 10% from 2018: restricted
+cash, which SF1's balance leaves out and US GAAP's cash flow has included since then.
+Discontinued operations make both fire. `cash_flow_tie` is one condition per period.
+
+**Two gaps that cancel** are one balance sheet's cash out of line with the cash flows
+either side: one `cash_balance_tie` on that balance sheet (`table_name`
+`core.balance_sheet`, `record_key.item` = `cash_and_equivalents`), with `detail.cash`
+against `detail.from_cash_flow`. A vendor value to check against the filing. Accept
+a tie with the filing's reason. Both ties stay the largest fundamentals checks after
+the 2026-10-28 recalibration (about 75,000 and 34,000): a gap between two filings'
+figures for the same cash is common, and SF1 carries no comparative column to tell
+a reclassification from an error.
 
 ### `fundamentals_gap` — traded, with no statement for over 400 days
 
@@ -1545,9 +1572,12 @@ coverage of the security has a hole. Compare the vendor master's `first_quarter`
 `last_quarter` (`core.vendor_security`, `vendor_table = 'fundamentals'`). A hole SF1
 also has is accepted; one it does not is a load to re-run for that security.
 
-### `fundamentals_stale` — an active security's latest period ended over 200 days ago
+### `fundamentals_stale` — an active security's latest period is older than its cycle allows
 
-Keyed by the latest `fiscal_date`, so a later stale period is a new condition.
+On its own reporting cycle, the median spacing of its period ends in the three years
+to its latest (`detail.allowed`): 200 days for a quarterly reporter, 300 for a
+half-yearly one, 500 for an annual one such as a 20-F or 40-F filer. Keyed by the
+latest `fiscal_date`, so a later stale period is a new condition.
 **`fafnir dq recheck --check fundamentals_stale`** closes it once the security has filed
 since, or stopped trading. Still open after a recheck: a delinquent filer (accept, if
 so), a load that missed the security (`ingest fundamentals --symbols`), or a link
@@ -1579,13 +1609,16 @@ Per security and fiscal year, the quarters in force whose trailing four are not
 contiguous (labels consecutive, 8 to 18 weeks apart), past the series' first three. A
 missing quarter, a mislabelled one, or a fiscal-year change. The panel falls back to
 the fiscal year there. Accept a fiscal-year change; a missing quarter is a coverage
-question for SF1.
+question for SF1. A year whose quarters are Q2 and Q4 alone is a half-yearly
+reporter's, and not judged.
 
 ### `fundamentals_negative_impossible` — a negative revenue, total assets or share count
 
 `error`, per current version and statement. Almost always a vendor sign or unit
-error: check the filing, and report it to Sharadar; the fix arrives as a correction.
-Resolve after it does.
+error: check the filing, and report it to Sharadar; the fix arrives as a correction,
+and `dq recheck` closes the flag. A financial company's negative revenue alone is
+`info` (sector Financial Services, or a mortgage REIT): SF1's revenue there is net of
+trading and investment losses.
 
 ### `fundamentals_suspicious_zero` — a zero between two reported values
 
