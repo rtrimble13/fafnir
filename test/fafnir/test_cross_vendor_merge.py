@@ -92,19 +92,21 @@ def _pair(
     *,
     vendor_ticker="ZZPOS",
     victim_cik="0000123456",
+    vendor_cik=None,
     early_scale=Decimal(1),
     recent_scale=Decimal(1),
 ):
     """The fed shell ZZPRE and FMP's re-mint ZZPOS. The re-mint holds a prefix the
     shell lacks, the shared sessions half a cent apart (at ``recent_scale``), its
     history before :data:`EARLY_CUT` at ``early_scale``, and a dividend of its own
-    on each side of the shell's first bar."""
+    on each side of the shell's first bar. ``vendor_cik`` is the CIK the vendor's
+    master gives the fed key."""
     db.execute(
         "INSERT INTO core.vendor_security (vendor, vendor_table, vendor_key, ticker, "
-        "name, category, exchange, is_delisted, first_price_date, last_price_date) "
-        "VALUES ('sharadar', 'stocks', %s, %s, 'ZZ CORP', 'Domestic Common Stock', "
-        "'NYSE', false, %s, %s)",
-        (KEY, vendor_ticker, FIRST, LAST),
+        "name, category, exchange, is_delisted, first_price_date, last_price_date, "
+        "cik) VALUES ('sharadar', 'stocks', %s, %s, 'ZZ CORP', "
+        "'Domestic Common Stock', 'NYSE', false, %s, %s, %s)",
+        (KEY, vendor_ticker, FIRST, LAST, vendor_cik),
     )
     for action, contra in (("tickerchangefrom", "ZZPRE"), ("tickerchangeto", "ZZPOS")):
         db.execute(
@@ -343,6 +345,43 @@ def test_the_guard_refuses(db, run_cli, case, blocker):
     assert blocker in _flat(out), out.output
     assert "Nothing was changed." in out.output
     assert _row(db, victim) is not None and _row(db, shell) is not None
+
+
+@pytest.mark.parametrize("vendor_cik", ["0000999999", "999999"])
+def test_a_new_registrant_the_vendor_carries_merges(db, run_cli, vendor_cik):
+    """MTMT to MPU (2026-10): a redomicile gives the company a new registrant. The
+    vendor carries it as one security under the new CIK, which FMP's re-mint holds;
+    the fed row still holds the old one. The difference is reported, not refused,
+    and the survivor takes the new CIK."""
+    shell, victim = _pair(db, victim_cik="0000999999", vendor_cik=vendor_cik)
+    out = run_cli(victim, shell, "--across-vendors", "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert (
+        "Identifier differs (reported, not a blocker): cik 0000123456 vs 0000999999, "
+        f"the CIK sharadar gives {KEY}: a new registrant it carries as one security"
+    ) in _flat(out)
+    out = run_cli(victim, shell, "--across-vendors", "-m", "redomiciled", "--yes")
+    assert out.exit_code == 0, out.output
+    assert _row(db, victim) is None
+    assert _row(db, shell)["cik"] == "0000999999"
+    run = db.fetchone(
+        "SELECT params FROM ops.ingestion_run WHERE endpoint = "
+        "'security-merge-across-vendors'"
+    )
+    assert run["params"]["identity_before"]["cik"] == "0000123456"
+
+
+def test_a_cik_the_vendor_gives_the_survivor_still_refuses(db, run_cli):
+    """The vendor naming the fed row's own CIK says the re-mint is another
+    registrant."""
+    shell, victim = _pair(db, victim_cik="0000999999", vendor_cik="0000123456")
+    out = run_cli(victim, shell, "--across-vendors", "--yes")
+    assert out.exit_code != 0
+    assert (
+        f"cik differs: survivor '0000123456' vs victim '0000999999' (sharadar gives "
+        f"{KEY} '0000123456') -- another registrant is not a rename"
+    ) in _flat(out), out.output
+    assert _row(db, victim) is not None and _row(db, shell)["cik"] == "0000123456"
 
 
 @pytest.mark.parametrize("policy, moved", [("drop", False), ("carry", True)])

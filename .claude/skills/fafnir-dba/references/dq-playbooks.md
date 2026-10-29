@@ -1128,8 +1128,12 @@ never the answer (rule 4). `security merge <held_by> <id> --across-vendors` is: 
 proves identity from the vendor (the fed key listed under the re-mint's ticker, a
 matching CIK, today's closes within 1%), keeps the fed row's bars, and relists it.
 Read its dry run for:
-- **`BLOCKER: cik differs`**: another registrant (HHC/HHH, HTA/HR). Report it; it is
-  not a rename.
+- **`BLOCKER: cik differs`**: another registrant. Report it; it is not a rename. A
+  company that changed registrant (a redomicile, a holding-company reorganisation,
+  a de-SPAC, a legal acquirer renamed: MTMT/MPU, HHC/HHH, NCAC/PBM, HTA/HR) does not
+  block: the vendor's master gives the fed key the victim's CIK, and the dry run
+  reports the difference instead. The blocker names the vendor's CIK when it has
+  one.
 - **Bars that do not join**: the re-mint's prefix on another scale. Do not pick
   `--unjoined drop` or `carry` yourself: the choice is the operator's, with the
   ratio and the span in front of them.
