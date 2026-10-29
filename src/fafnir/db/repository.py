@@ -1089,7 +1089,7 @@ def vendor_master_row(
     return db.fetchone(
         """
         SELECT vendor_key, vendor_table, ticker, name, exchange, is_delisted,
-               first_price_date, last_price_date
+               first_price_date, last_price_date, cik
           FROM core.vendor_security
          WHERE vendor = %s AND vendor_key = %s AND vendor_table = ANY(%s)
          ORDER BY vendor_table
@@ -1209,8 +1209,9 @@ def adopt_identity(
     """Take another row's current name and instrument identifiers: the
     cross-vendor merge's survivor adopting its victim's, which describe the
     instrument as it trades today (a reverse split or redomicile issues a new
-    CUSIP). A CIK fills only an empty one; the merge refuses a differing CIK.
-    Returns the row as it was."""
+    CUSIP). The CIK too: the merge's guard lets one differ only where the vendor's
+    master gives the fed key the victim's, a new registrant the vendor carries as
+    one security. Returns the row as it was."""
     before = db.fetchone(
         "SELECT company_name, cusip, isin, cik FROM core.security "
         "WHERE security_id = %s",
@@ -1222,7 +1223,7 @@ def adopt_identity(
            SET company_name = COALESCE(%s, company_name),
                cusip = COALESCE(%s, cusip),
                isin = COALESCE(%s, isin),
-               cik = COALESCE(cik, %s),
+               cik = COALESCE(%s, cik),
                updated_at = now()
          WHERE security_id = %s
         """,

@@ -26,9 +26,14 @@ So identity is established from the vendor instead, and the fed row's bars win:
 1. **The survivor is the fed row.** It holds the open feeding link, and the vendor's
    master lists that key live under the victim's ticker: the vendor says the fed
    key trades as the other row now. The victim has no link to the vendor.
-2. **The CIK agrees** where both rows carry one (a new registrant is not a
-   rename: HHC and HHH, HTA and HR). A CUSIP or ISIN that differs is reported, not
-   a blocker.
+2. **The CIK agrees** where both rows carry one, **or the vendor's master gives the
+   fed key the victim's**. A company that changes registrant -- a redomicile (MTMT
+   to MPU), a holding-company reorganisation (HHC to HHH), a de-SPAC under a new
+   issuer (NCAC to PBM), a legal acquirer renamed (HTA to HR) -- is one security
+   to the vendor, which then lists the new registrant's CIK. The fed row still
+   carries the old one; FMP's re-mint, the new one. Any other CIK that differs is
+   another registrant and refuses. A CUSIP or ISIN that differs is reported, not a
+   blocker.
 3. **They agree today**: at least 90% of the last 20 shared sessions close within
    1% of each other.
 4. **On a session both hold, the survivor's bar is kept** (the merge's own rule), so
@@ -44,10 +49,10 @@ So identity is established from the vendor instead, and the fed row's bars win:
    row's first bar) is not seen: the plan names the victim's splits there, and
    `vendor correct --split-bearing` is how such bars are checked.
 
-The survivor takes the victim's name, CUSIP and ISIN (they describe the instrument
-as it trades now), and is relisted on the vendor's ticker (`security relist`'s own
-plan and write), in the same transaction: one row, active, fed, on the ticker the
-company trades under.
+The survivor takes the victim's name, CUSIP, ISIN and CIK (they describe the
+instrument as it trades now), and is relisted on the vendor's ticker
+(`security relist`'s own plan and write), in the same transaction: one row, active,
+fed, on the ticker the company trades under.
 """
 
 from __future__ import annotations
@@ -60,7 +65,7 @@ from typing import NamedTuple, Optional, Sequence
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest import sharadar_universe as su
-from fafnir.ingest.vendor_link import PRICED_TABLES
+from fafnir.ingest.vendor_link import PRICED_TABLES, normalise_cik
 
 #: The last shared sessions compared, and the share that must agree within
 #: :data:`RECENT_TOLERANCE`: today's prices are the identity test that history
@@ -134,6 +139,11 @@ def _ratio(a, b) -> Optional[float]:
     return float(a) / float(b) if a and b and float(b) > 0 else None
 
 
+def _same_cik(a, b) -> bool:
+    """Two CIKs name one registrant: the same number, however zero-padded."""
+    return normalise_cik(a) is not None and normalise_cik(a) == normalise_cik(b)
+
+
 def plan_cross_vendor_merge(
     db: Database,
     *,
@@ -154,7 +164,7 @@ def plan_cross_vendor_merge(
 
     # 1. The vendor's word: the survivor is fed, its key live, under the victim's
     # ticker.
-    vendor = key = ticker = None
+    vendor = key = ticker = master = None
     link = repo.feeding_link(db, survivor_id)
     victim_link = repo.feeding_link(db, victim_id)
     if victim_link is not None:
@@ -185,13 +195,25 @@ def plan_cross_vendor_merge(
                 )
     blockers += repo.vendor_link_conflicts(db, victim_id, survivor_id)
 
-    # 2. Identifiers: a CIK must agree; a CUSIP or ISIN may not, and is reported.
+    # 2. Identifiers: a CIK must agree, unless the vendor gives the fed key the
+    # victim's (a new registrant it carries as one security); a CUSIP or ISIN may
+    # not, and is reported.
     notes = []
+    vendor_cik = master["cik"] if master else None
     for field, survivor_value, victim_value in base.identity_mismatches:
-        if field == "cik":
+        if field == "cik" and _same_cik(survivor_value, victim_value):
+            continue  # one CIK, zero-padded differently
+        if field == "cik" and _same_cik(victim_value, vendor_cik):
+            notes.append(
+                f"cik {survivor_value} vs {victim_value}, the CIK {vendor} gives "
+                f"{key}: a new registrant it carries as one security"
+            )
+        elif field == "cik":
             blockers.append(
                 f"cik differs: survivor {survivor_value!r} vs victim "
-                f"{victim_value!r} -- another registrant is not a rename"
+                f"{victim_value!r}"
+                + (f" ({vendor} gives {key} {vendor_cik!r})" if vendor_cik else "")
+                + " -- another registrant is not a rename"
             )
         else:
             notes.append(f"{field} {survivor_value} vs {victim_value}")

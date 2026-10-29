@@ -1193,8 +1193,13 @@ fafnir db refresh-marts
 - **The guard reads the vendor, not the whole overlap.**
   - The survivor must be the fed row, and the vendor's master must list its key,
     live, under the victim's ticker.
-  - The CIK must agree where both rows carry one: a new registrant is not a rename
-    (HHC and HHH, HTA and HR, MTMT and MPU, NCAC and PBM refuse).
+  - The CIK must agree where both rows carry one, **or the vendor's master must
+    give the fed key the victim's CIK**. A company that changes registrant is one
+    security to the vendor, which then lists the new registrant's CIK, while the
+    fed row keeps the old one: a redomicile (MTMT to MPU), a holding-company
+    reorganisation (HHC to HHH), a de-SPAC under a new issuer (NCAC to PBM), a
+    legal acquirer renamed (HTA to HR). The dry run reports that difference, with
+    the vendor's CIK. Any other differing CIK is another registrant, and refuses.
   - At least 90% of the last 20 shared sessions must close within 1% of each
     other.
   - A differing CUSIP or ISIN is reported, not a blocker.
@@ -1211,7 +1216,7 @@ fafnir db refresh-marts
   - **A split inside them** is not visible where the histories meet, so the dry run
     names any victim split before the survivor's first bar. Check those bars after
     the merge with `vendor correct --split-bearing --dry-run`.
-- **The survivor takes the victim's name, CUSIP and ISIN**, which describe the
+- **The survivor takes the victim's name, CUSIP, ISIN and CIK**, which describe the
   instrument as it trades now; the run log keeps the old ones.
 - **Then the survivor is relisted** on the vendor's ticker in the same transaction,
   by `security relist`'s own plan, so it refuses as relist does. The victim's
