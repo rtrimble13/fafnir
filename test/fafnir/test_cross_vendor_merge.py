@@ -371,6 +371,18 @@ def test_a_new_registrant_the_vendor_carries_merges(db, run_cli, vendor_cik):
     assert run["params"]["identity_before"]["cik"] == "0000123456"
 
 
+def test_one_cik_padded_differently_is_no_difference(db, run_cli):
+    """0000123456 and 123456 are one registrant: nothing to refuse and nothing to
+    report, though the vendor gives no CIK to settle it."""
+    shell, victim = _pair(db, victim_cik="123456")
+    plan = cvm.plan_cross_vendor_merge(db, victim_id=victim, survivor_id=shell)
+    assert plan.blockers == []
+    assert not [n for n in plan.identifier_notes if n.startswith("cik")]
+    out = run_cli(victim, shell, "--across-vendors", "--yes")
+    assert out.exit_code == 0, out.output
+    assert _row(db, victim) is None
+
+
 def test_a_cik_the_vendor_gives_the_survivor_still_refuses(db, run_cli):
     """The vendor naming the fed row's own CIK says the re-mint is another
     registrant."""

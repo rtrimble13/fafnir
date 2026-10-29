@@ -50,9 +50,9 @@ So identity is established from the vendor instead, and the fed row's bars win:
    `vendor correct --split-bearing` is how such bars are checked.
 
 The survivor takes the victim's name, CUSIP, ISIN and CIK (they describe the
-instrument as it trades now), and is relisted on the vendor's ticker (`security relist`'s own
-plan and write), in the same transaction: one row, active, fed, on the ticker the
-company trades under.
+instrument as it trades now), and is relisted on the vendor's ticker
+(`security relist`'s own plan and write), in the same transaction: one row, active,
+fed, on the ticker the company trades under.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ from typing import NamedTuple, Optional, Sequence
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest import sharadar_universe as su
-from fafnir.ingest.vendor_link import PRICED_TABLES
+from fafnir.ingest.vendor_link import PRICED_TABLES, normalise_cik
 
 #: The last shared sessions compared, and the share that must agree within
 #: :data:`RECENT_TOLERANCE`: today's prices are the identity test that history
@@ -141,7 +141,7 @@ def _ratio(a, b) -> Optional[float]:
 
 def _same_cik(a, b) -> bool:
     """Two CIKs name one registrant: the same number, however zero-padded."""
-    return bool(a and b) and str(a).strip().lstrip("0") == str(b).strip().lstrip("0")
+    return normalise_cik(a) is not None and normalise_cik(a) == normalise_cik(b)
 
 
 def plan_cross_vendor_merge(
@@ -201,6 +201,8 @@ def plan_cross_vendor_merge(
     notes = []
     vendor_cik = master["cik"] if master else None
     for field, survivor_value, victim_value in base.identity_mismatches:
+        if field == "cik" and _same_cik(survivor_value, victim_value):
+            continue  # one CIK, zero-padded differently
         if field == "cik" and _same_cik(victim_value, vendor_cik):
             notes.append(
                 f"cik {survivor_value} vs {victim_value}, the CIK {vendor} gives "
