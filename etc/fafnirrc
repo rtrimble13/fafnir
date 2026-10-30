@@ -4,8 +4,7 @@
 # SECRETS: the database password and API keys should come from the environment
 # or a secrets manager in preference to this file. Environment variables always
 # win over file values:
-#   FAFNIR_DSN, FAFNIR_DB_PASSWORD / PGPASSWORD, FMP_API_KEY,
-#   FRED_API_KEY, BLS_API_KEY, BEA_API_KEY
+#   FAFNIR_DSN, FAFNIR_DB_PASSWORD / PGPASSWORD, FMP_API_KEY
 
 [database]
 # Either set a full libpq DSN ...
@@ -31,10 +30,6 @@ fmp_key = ""
 # elsewhere. The Sharadar KEY is not set here: fafnir reads SHARADAR_API_KEY from
 # the environment only (see [sharadar] below).
 # sharadar_base_url = "https://api.sharadar.com/v1.0/data"
-# Fast-follow economic sources:
-fred_key = ""
-bls_key = ""
-bea_key = ""
 
 [general]
 # Target universe for the security master.

@@ -68,9 +68,9 @@ Of the last 80 commits, 7 touched `fafnir/sources/`; 6 of those also touched the
 loaders, the repository or the CLI. `duk` changed in 4, every one alongside
 `fafnir` or the MCP server. The next phases of the plan make the coupling tighter:
 fundamentals on SF1 (P4) changes client constants, file typing and loaders in one
-step; Tiingo and FRED (P5) add two vendors. One distribution per vendor would be
-four or five, each with its own release, config file and test doubles, for code
-that moves in lockstep with the loaders.
+step. (Tiingo and FRED, P5's two further vendors, were dropped on 2026-10-30.) One
+distribution per vendor would be two or three, each with its own release, config
+file and test doubles, for code that moves in lockstep with the loaders.
 
 ### A separate distribution undoes ADR 0011
 
@@ -90,7 +90,7 @@ ladder matches `repository.resolve_security_id`.
 The plan reduces FMP to a lower tier, keeps it as the secondary feed, and leaves
 cancellation to the licence letter (#43, #128). The tier's contents are not yet
 verified. The treasury-curve and identifier-search endpoints exist only in `duk`'s
-FMP client, and the plan moves the yield curve to FRED.
+FMP client, and with FRED dropped (2026-10-30) the yield curve stays on FMP.
 
 ### Keys and configuration would fragment
 

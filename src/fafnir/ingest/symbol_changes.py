@@ -1,6 +1,13 @@
 """
 Ticker-rename reconciliation.
 
+NOT RUN IN SHARADAR MODE. Since the cutover (v2.0.0, 2026-10-22) renames come from
+``fafnir ingest sharadar-universe``, resolved by the permaticker's link with this
+module's rename rules (``repository.apply_rename``; ADR 0016), and the CLI refuses
+``ingest symbol-changes`` while ``primary_price_vendor`` is ``"sharadar"`` unless
+given ``--allow-secondary``, which ``daily_update.sh`` does not pass it. The sweep
+stays for FMP's history and the rollback (ADR 0005's notes).
+
 This is the loader that keeps a renamed company *one* company. Without it a
 rename reaches the warehouse disguised as a new listing: the screener reports
 META, no active row matches ``(fmp, 'META', 'NASDAQ')``, and the security-master

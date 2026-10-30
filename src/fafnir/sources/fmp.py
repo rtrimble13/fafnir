@@ -70,8 +70,8 @@ class FMPClient(BaseSource):
     EP_DELISTED = "delisted-companies"
     EP_SYMBOL_CHANGE = "symbol-change"
     # duk's reads (ADR 0017). Never ingested: the warehouse adjusts its own bars
-    # (ADR 0001), the curve comes from FRED once it lands, and a listing status is
-    # the security master's to decide.
+    # (ADR 0001), the curve is FMP's alone (FRED was not adopted), and a listing
+    # status is the security master's to decide.
     EP_EOD_DIVIDEND_ADJUSTED = "historical-price-eod/dividend-adjusted"
     EP_ACTIVELY_TRADING = "actively-trading-list"
     EP_TREASURY_RATES = "treasury-rates"

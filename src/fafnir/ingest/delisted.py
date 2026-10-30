@@ -1,6 +1,12 @@
 """
 Delisting reconciliation.
 
+NOT RUN IN SHARADAR MODE. Since the cutover (v2.0.0, 2026-10-22) delistings come
+from ``fafnir ingest sharadar-universe`` through the permaticker's link (ADR 0016),
+and the CLI refuses ``ingest delisted`` while ``primary_price_vendor`` is
+``"sharadar"`` unless given ``--allow-secondary``, which ``daily_update.sh`` does not
+pass it. The sweep stays for FMP's history and the rollback (ADR 0005's notes).
+
 This is the loader that keeps the warehouse free of survivorship bias. A security
 that stops trading is never deleted (see
 ``sql/migrations/0003_security_master.up.sql``); this step flips

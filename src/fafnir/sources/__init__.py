@@ -1,1 +1,1 @@
-"""External data-source clients for fafnir (FMP today; FRED/BLS/BEA fast-follow)."""
+"""External data-source clients for fafnir: Sharadar (primary) and FMP (secondary)."""

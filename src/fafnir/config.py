@@ -12,7 +12,7 @@ Config sections
     dsn        -- full libpq connection string/URL (takes precedence if set)
     host, port, dbname, user, password  -- assembled into a DSN if dsn is unset
 ``[api]``
-    fmp_key, fred_key, bls_key, bea_key
+    fmp_key
     sharadar_base_url -- shared with duk; the Sharadar *key* is never read here
 ``[general]``
     log_level, log_dir, universe, request_rate_per_min, overlap_days,
@@ -30,8 +30,7 @@ Config sections
 
 Environment overrides
 ---------------------
-``FAFNIR_DSN``, ``FAFNIR_DB_PASSWORD``/``PGPASSWORD``, ``FMP_API_KEY``,
-``FRED_API_KEY``, ``BLS_API_KEY``, ``BEA_API_KEY``, ``FAFNIR_LOG_DIR``,
+``FAFNIR_DSN``, ``FAFNIR_DB_PASSWORD``/``PGPASSWORD``, ``FMP_API_KEY``, ``FAFNIR_LOG_DIR``,
 ``FAFNIR_DORQ_PATH``, ``SHARADAR_API_KEY`` (the only source of that key),
 ``SHARADAR_BASE_URL``.
 """
@@ -141,27 +140,6 @@ class FafnirConfig:
         return (
             os.environ.get("FMP_API_KEY", "").strip()
             or (self._get("api", "fmp_key", "") or "").strip()
-        )
-
-    @property
-    def fred_key(self) -> str:
-        return (
-            os.environ.get("FRED_API_KEY", "").strip()
-            or (self._get("api", "fred_key", "") or "").strip()
-        )
-
-    @property
-    def bls_key(self) -> str:
-        return (
-            os.environ.get("BLS_API_KEY", "").strip()
-            or (self._get("api", "bls_key", "") or "").strip()
-        )
-
-    @property
-    def bea_key(self) -> str:
-        return (
-            os.environ.get("BEA_API_KEY", "").strip()
-            or (self._get("api", "bea_key", "") or "").strip()
         )
 
     # -- sharadar -----------------------------------------------------------

@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-08-27
 - Extends: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md)
+- Superseded for new data: by [ADR 0015](0015-multi-vendor-provenance-and-precedence.md)
+  and [ADR 0016](0016-sharadar-identity-and-survivorship-floor.md) at the cutover
+  (2026-10-22, v2.0.0); retained for the FMP-sourced history and rollback. The
+  sweeps below do not run in Sharadar mode (the 2026-10-22 note).
 - Note (2026-10-20): the vendor-independent key this ADR names as the right
   long-term answer is adopted by [ADR 0016](0016-sharadar-identity-and-survivorship-floor.md):
   Sharadar's permaticker, through `core.security_vendor_xref`. The sweeps below stay
@@ -12,6 +16,9 @@
   permaticker's link, with the rename rules of this ADR (`repository.apply_rename`).
   It runs from the cutover (#125); until then its dry run is compared with the
   sweeps ([ingestion.md](../ingestion.md#sharadar-as-primary-universe-maintenance-93)).
+  Since the cutover the sweeps (`symbol-changes`, `securities`, `delisted`) do not run:
+  the CLI refuses them in Sharadar mode without `--allow-secondary`, and the nightly
+  never passes it to them.
 
 ## Context
 

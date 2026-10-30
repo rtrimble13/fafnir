@@ -6464,6 +6464,9 @@ def source_probe_prices(ctx, symbol, on_date):
     should differ by exactly the cumulative split ratio since that date. Costs 3
     requests and writes nothing. Run it before a backfill, and after any change to
     the price loader.
+
+    FMP only: since the cutover FMP is the secondary vendor, and Sharadar's feed is
+    checked by `probe-sharadar`.
     """
     from fafnir.ingest import fmp_probe as probe
 
@@ -6548,6 +6551,9 @@ def source_probe_actions(ctx, symbols, days):
 
     Costs 2 + 2N requests and writes nothing. Probe a fund separately if you hold
     any; a fund has no listing venue and the calendar is not assumed to reach it.
+
+    FMP only: it gates FMP's `ingest actions`, which since the cutover loads only what
+    FMP alone still feeds. Sharadar's actions come from its own files.
     """
     from fafnir.ingest import fmp_probe as probe
 

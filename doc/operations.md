@@ -258,6 +258,10 @@ way: `delisted_date` stamped, ticker period closed, every bar kept.
 
 ### Switching corporate actions to the incremental path
 
+This is FMP's loader, and with it FMP's `probe-actions`. Since the cutover (2026-10-22)
+`ingest actions` runs as the secondary vendor, for what FMP alone still feeds;
+Sharadar's actions come from its ACTIONS table (`ingest sharadar-actions`).
+
 `ingest actions` ships in `symbol` mode: a full split and dividend history for every
 active security, every night. That is ~16,000 requests and about an hour of the nightly
 window to capture a few hundred changed rows, and the only reason it is still the

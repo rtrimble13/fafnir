@@ -3,6 +3,12 @@
 - Status: Accepted (implemented; **adoption gated** — see *Implementation status*)
 - Date: 2026-08-29
 - Implemented: 2026-08-30
+- Superseded for new data: by [ADR 0015](0015-multi-vendor-provenance-and-precedence.md)
+  and [ADR 0016](0016-sharadar-identity-and-survivorship-floor.md) at the cutover
+  (2026-10-22, v2.0.0); retained for the FMP-sourced history, FMP as the secondary
+  vendor (`ingest actions --allow-secondary` loads what FMP alone still feeds), and
+  rollback.
+  Sharadar's actions come from its ACTIONS table (`fafnir ingest sharadar-actions`).
 - Depends on: [ADR 0001](0001-raw-prices-plus-adjustment-factors.md),
   [ADR 0004](0004-unadjusted-price-feed.md),
   [ADR 0006](0006-curated-fund-universe.md)

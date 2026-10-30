@@ -6,6 +6,9 @@
   events), #62 and #63 (`fafnir vendor link`, `show`, `accept`, `reject`), #71
   (`fafnir vendor mint-delisted`), #98 (`fafnir vendor feed`, the Sharadar-driven
   sweeps)
+- Note (2026-10-30): §1's mutual funds keep FMP. Tiingo is not adopted
+  ([ADR 0015](0015-multi-vendor-provenance-and-precedence.md)'s note), so a fund keeps
+  its FMP identity and FMP's feed.
 - Extends: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md) (the
   surrogate `security_id`) and [ADR 0005](0005-automatic-universe-maintenance.md),
   whose "right long-term answer", a vendor-independent key, this adopts

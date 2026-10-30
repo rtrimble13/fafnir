@@ -1,6 +1,13 @@
 """
 Daily OHLCV loader.
 
+SECONDARY VENDOR SINCE v2.0.0 (the cutover, 2026-10-22). In Sharadar mode this
+loader writes only for what FMP alone still feeds (``repo.fmp_fed``: the funds and
+the securities with no Sharadar link). ``daily_update.sh`` runs it with
+``--allow-secondary`` while ``[general] fmp_secondary`` is true, and the CLI refuses
+it without the flag. Sharadar's bars come from :mod:`fafnir.ingest.sharadar_prices`,
+which validates them with this module's gates.
+
 For each symbol: resolve security_id, compute the incremental window from the
 watermark (minus an overlap to catch late corrections), fetch raw bars, land the
 raw payload, set aside bars dated on days the venue did not trade, validate each
