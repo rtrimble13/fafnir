@@ -54,6 +54,12 @@ time, and none of it improves data anyone uses.
    Funds and ETFs never match. The name alone never decides: most SPAC warrants
    carry the sponsor's plain name, and "Units" also appears in MLP and equity-unit
    names that are in scope.
+
+   Sharadar numbers a dead issuer's ticker when the ticker is reused (`HCMAU1`, a
+   unit). A Sharadar row is read with and without that number (`unnumbered`), by
+   `vendor overlap`, `vendor mint-delisted` (ADR 0016 §3) and `security descope`
+   (added 2026-10-30; the 2026-10-20 mint had created 104 dead units, 17 of them
+   numbered).
 2. **Stop minting them.** `fafnir ingest securities` skips an excluded entry before
    anything is written, like an exchange test issue, and reports the count.
 3. **Remove what is held** with `fafnir security descope`. `--dry-run` lists every

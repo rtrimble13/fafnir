@@ -1006,9 +1006,19 @@ Two other cases:
 - **The FMP row is the dead issuer** (it is delisted, unlinked, and the samples agree):
   link it with `vendor link accept` instead of minting a second row.
 - **The samples disagree:** the bars are another issuer's. Mint the dead issuer with
-  `--allow-overlap` and move nothing.
+  `--allow-overlap` and move nothing. Check the ratio first: closes that disagree by
+  one constant factor (×0.1, ×125) are the same issuer at FMP's wrong scale, not
+  another issuer, and minting it would put its history on two rows.
 
 The next `vendor overlap` resolves a flag once its overlap is gone.
+
+**Warrants, rights and units are never minted** (ADR 0012). Sharadar files a SPAC's
+unit as a common stock's secondary class, so `vendor overlap` and `mint-delisted`
+read the ticker as the security-master loads do, with and without the number
+Sharadar appends to a reused dead ticker (`HCMAU1` is a unit). Neither evaluates
+one; `vendor overlap` resolves an open flag on one with a note naming the kind, and
+both report how many they left out. `[general] exclude_instruments` decides which
+kinds, and a declared symbol (`track add`) is kept.
 
 ### Venue transfers
 

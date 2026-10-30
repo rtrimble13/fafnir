@@ -113,6 +113,20 @@ def out_of_scope_kind(
     return kind if kind is not None and kind in set(excluded) else None
 
 
+#: Sharadar files a dead issuer whose ticker was later reused under that ticker and a
+#: number: BID1 for Sotheby's, CADE3, HCMAU1 for a SPAC's unit.
+_REUSED = re.compile(r"^(.*[A-Z])\d+$")
+
+
+def unnumbered(symbol: Optional[str]) -> Optional[str]:
+    """The ticker without the number Sharadar appends to a dead issuer whose ticker
+    was reused (``BID1`` -> ``BID``, ``HCMAU1`` -> ``HCMAU``); any other unchanged.
+    Read a Sharadar row's instrument from both: ``HCMAU1`` is a unit, which its last
+    letter alone no longer says. FMP never numbers a ticker."""
+    match = _REUSED.match(symbol or "")
+    return match.group(1) if match else symbol
+
+
 def _described(kind: Optional[str]) -> str:
     return f"a {kind}" if kind else "not a warrant, right or unit"
 
@@ -202,6 +216,9 @@ def select_descope_candidates(
       of the history. Granite REIT's ``GRP-UN``, which left the NYSE on 2025-12-31,
       is the case that needed it.
 
+    A row Sharadar minted (``source = 'sharadar'``) is also read without the number
+    Sharadar appends to a reused dead ticker (:func:`unnumbered`).
+
     A keep that matches no candidate is returned in ``unmatched_keeps`` instead of
     being ignored, and the caller refuses the run: a misspelt keep would otherwise
     delete the very security it was meant to save. Tickers compare case-insensitively.
@@ -214,12 +231,25 @@ def select_descope_candidates(
     kept_by_request: list[dict] = []
     matched: set[str] = set()
     for row in securities:
-        kind = out_of_scope_kind(
-            row.get("primary_symbol"),
-            row.get("company_name"),
-            is_etf=bool(row.get("is_etf")),
-            is_fund=bool(row.get("is_fund")),
-            excluded=wanted,
+        spellings = [row.get("primary_symbol")]
+        if row.get("source") == "sharadar":
+            spellings.append(unnumbered(row.get("primary_symbol")))
+        kind = next(
+            (
+                k
+                for k in (
+                    out_of_scope_kind(
+                        s,
+                        row.get("company_name"),
+                        is_etf=bool(row.get("is_etf")),
+                        is_fund=bool(row.get("is_fund")),
+                        excluded=wanted,
+                    )
+                    for s in dict.fromkeys(spellings)
+                )
+                if k
+            ),
+            None,
         )
         if kind is None:
             continue

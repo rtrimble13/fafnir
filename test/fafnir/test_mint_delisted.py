@@ -290,6 +290,33 @@ def test_a_permaticker_outside_the_rules_or_unknown_is_refused(db):
 
 
 @integration
+def test_warrants_rights_and_units_are_never_minted(db):
+    # Sharadar files a SPAC's unit as a common stock's secondary class.
+    secondary = "Domestic Common Stock Secondary Class"
+    _vendor(db, "900150", "ZZACU", category=secondary)
+    _vendor(db, "900151", "ZZADU1", category=secondary)  # numbered: reused
+    _vendor(db, "900152", "ZZAE.WS", category=secondary)
+    _vendor(db, "900153", "ZZFINE")
+    _scan(db)
+    plan = vm.mint(db, dry_run=True)
+    assert {m.vendor_key for m in plan.mints} == {"900153"}
+    assert plan.out_of_scope == 3
+    with pytest.raises(vm.MintError, match="is a unit, which ADR 0012 keeps out"):
+        vm.mint(db, permaticker="900151")
+    # The configuration decides: with nothing excluded they mint as before.
+    assert len(vm.mint(db, dry_run=True, excluded_kinds=()).mints) == 4
+    # A declared symbol is kept, as the security-master loads keep it.
+    repo.upsert_tracked_symbol(db, symbol="ZZACU", asset_type="equity")
+    assert {m.vendor_key for m in vm.mint(db, dry_run=True).mints} == {
+        "900150",
+        "900153",
+    }
+    result = vm.mint(db)
+    assert result.minted == 2 and result.out_of_scope == 2
+    assert set(_minted(db)) == {"900150", "900153"}
+
+
+@integration
 def test_the_overlap_scan_must_be_newer_than_the_master(db):
     _vendor(db, "900140", "ZZX")
     with pytest.raises(vm.MintError, match="vendor overlap"):

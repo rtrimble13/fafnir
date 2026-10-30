@@ -34,13 +34,14 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.ingest import sharadar_map
 from fafnir.ingest import vendor_link as vl
 from fafnir.ingest.runlog import RunLog
+from fafnir.instruments import INSTRUMENT_KINDS, out_of_scope_kind, unnumbered
 from fafnir.logging_config import get_logger
 
 logger = get_logger("ingest.vendor_overlap")
@@ -60,9 +61,15 @@ EARLIER_MARGIN = timedelta(days=30)
 VENDOR_START = FLOOR + timedelta(days=31)
 
 
-def mintable(c: dict) -> bool:
+def mintable(
+    c: dict,
+    *,
+    excluded: Iterable[str] = INSTRUMENT_KINDS,
+    declared: frozenset = frozenset(),
+) -> bool:
     """ADR 0016 §3, less the two rules about fafnir's own rows (no open link, not
-    flagged here): what #71 would mint."""
+    flagged here), and not an instrument ADR 0012 keeps out (:func:`out_of_scope`):
+    what #71 would mint."""
     if c["vendor_table"] not in vl.PRICED_TABLES or not c.get("is_delisted"):
         return False
     if c.get("last_price_date") is None or c["last_price_date"] < FLOOR:
@@ -70,7 +77,47 @@ def mintable(c: dict) -> bool:
     kind = sharadar_map.map_category(c.get("category"))
     if kind is None or kind.asset_type == "fund":
         return False
-    return sharadar_map.map_exchange(c.get("exchange")) in MINT_VENUES
+    if sharadar_map.map_exchange(c.get("exchange")) not in MINT_VENUES:
+        return False
+    return out_of_scope(c, excluded=excluded, declared=declared) is None
+
+
+def out_of_scope(
+    c: dict,
+    *,
+    excluded: Iterable[str] = INSTRUMENT_KINDS,
+    declared: frozenset = frozenset(),
+) -> Optional[str]:
+    """The kind ADR 0012 keeps out (``[general] exclude_instruments``) a Sharadar
+    issuer is, by its ticker and name as the security-master loads read them, or
+    None. Sharadar's category files a SPAC's unit as a common stock's secondary class,
+    so only the ticker tells, and a dead one's carries the number Sharadar appends
+    when the ticker was reused (``HCMAU1``): both spellings are read. A declared
+    symbol (``fafnir track add``) is kept, as those loads keep it."""
+    kind = sharadar_map.map_category(c.get("category"))
+    ticker = c.get("ticker")
+    spellings = [s for s in dict.fromkeys((ticker, unnumbered(ticker))) if s]
+    if any(s in declared for s in spellings):
+        return None
+    for symbol in spellings:
+        found = out_of_scope_kind(
+            symbol,
+            c.get("name"),
+            is_etf=bool(kind and kind.is_etf),
+            is_fund=bool(kind and kind.is_fund),
+            excluded=excluded,
+        )
+        if found:
+            return found
+    return None
+
+
+def declared_symbols(db: Database, excluded: Iterable[str]) -> frozenset:
+    """The symbols ``fafnir track add`` declared, which ADR 0012 never excludes; none
+    are needed when nothing is excluded."""
+    if not tuple(excluded):
+        return frozenset()
+    return frozenset(r["symbol"] for r in repo.list_tracked_symbols(db))
 
 
 @dataclass
@@ -119,6 +166,8 @@ class OverlapResult:
     dead_issuers: int = 0  # mintable permatickers evaluated
     overlaps: list[Overlap] = field(default_factory=list)
     resolved: int = 0
+    #: dead issuers ADR 0012 keeps out, never minted: permaticker -> kind
+    out_of_scope: dict[str, str] = field(default_factory=dict)
 
     def counts(self) -> Counter:
         """``(kind, agreement)``: ``agree`` (four samples or more), ``disagree``,
@@ -141,12 +190,24 @@ class OverlapResult:
         return len({o.vendor_key for o in self.overlaps if o.kind == "dead_issuer"})
 
 
-def find(db: Database, source_for) -> tuple[list[Overlap], int, Optional[str]]:
-    """Every overlap, the number of dead issuers evaluated, and the price source
-    used. Writes nothing."""
+def find(
+    db: Database, source_for, *, excluded: Iterable[str] = INSTRUMENT_KINDS
+) -> tuple[list[Overlap], int, Optional[str], dict[str, str]]:
+    """Every overlap, the number of dead issuers evaluated, the price source used,
+    and the dead issuers ADR 0012 keeps out (permaticker -> kind), which are not
+    evaluated: nothing will be minted onto their history. Writes nothing."""
     candidates = repo.vendor_link_candidates(db, vl.VENDOR, vl.PRICED_TABLES)
     by_key = {c["vendor_key"]: c for c in candidates}
-    dead = [c for c in candidates if mintable(c) and not c["taken"]]
+    declared = declared_symbols(db, excluded)
+    dead, kept_out = [], {}
+    for c in candidates:
+        if c["taken"] or not mintable(c, excluded=()):
+            continue
+        kind = out_of_scope(c, excluded=excluded, declared=declared)
+        if kind:
+            kept_out[c["vendor_key"]] = kind
+        else:
+            dead.append(c)
     securities = repo.overlap_scope(db, vl.VENDOR)
     by_ticker: dict[str, list[dict]] = defaultdict(list)
     for s in securities:
@@ -202,7 +263,7 @@ def find(db: Database, source_for) -> tuple[list[Overlap], int, Optional[str]]:
     source_name = _sample(
         db, [o for o in out if o.kind == "dead_issuer"], by_key, source_for
     )
-    return out, len(dead), source_name
+    return out, len(dead), source_name, kept_out
 
 
 def _sample(db: Database, overlaps: Sequence[Overlap], by_key: dict, source_for):
@@ -247,9 +308,17 @@ def _sample(db: Database, overlaps: Sequence[Overlap], by_key: dict, source_for)
     return source.name
 
 
-def _write(db: Database, overlaps: Sequence[Overlap], run: RunLog) -> int:
+def _write(
+    db: Database,
+    overlaps: Sequence[Overlap],
+    run: RunLog,
+    out_of_scope: Optional[dict[str, str]] = None,
+) -> int:
     """Flag every overlap once, refresh an open flag's evidence, and resolve the
-    open flags whose overlap is gone. Returns how many were resolved."""
+    open flags whose overlap is gone, or whose dead issuer ADR 0012 keeps out (it
+    will never be minted, so the flag holds nothing back). Returns how many were
+    resolved."""
+    out_of_scope = out_of_scope or {}
     open_flags = repo.list_dq_flags(db, repo.DqFilter(checks=(CHECK,)), limit=1_000_000)
     by_key = {
         (f["security_id"], tuple(sorted((f.get("record_key") or {}).items()))): f
@@ -273,7 +342,16 @@ def _write(db: Database, overlaps: Sequence[Overlap], run: RunLog) -> int:
                 detail=o.detail(),
                 ingestion_run_id=run.run_id,
             )
-    gone = [f["dq_flag_id"] for k, f in by_key.items() if k not in current]
+    gone, kept_out = [], defaultdict(list)
+    for k, f in by_key.items():
+        if k in current:
+            continue
+        rk = f.get("record_key") or {}
+        kind = out_of_scope.get(rk.get("vendor_key"))
+        if kind and rk.get("kind") == "dead_issuer":
+            kept_out[kind].append(f["dq_flag_id"])
+        else:
+            gone.append(f["dq_flag_id"])
     if gone:
         repo.resolve_dq_flags(
             db,
@@ -281,25 +359,49 @@ def _write(db: Database, overlaps: Sequence[Overlap], run: RunLog) -> int:
             note=f"vendor overlap run {run.run_id}: the overlap is gone",
             resolved_by=CREATED_BY,
         )
-    return len(gone)
+    for kind, ids in sorted(kept_out.items()):
+        repo.resolve_dq_flags(
+            db,
+            repo.DqFilter(flag_ids=tuple(ids)),
+            note=(
+                f"vendor overlap run {run.run_id}: the dead issuer is a {kind}, which "
+                "ADR 0012 keeps out ([general] exclude_instruments): it is never "
+                "minted, so no history can go onto two rows"
+            ),
+            resolved_by=CREATED_BY,
+        )
+    return len(gone) + sum(len(ids) for ids in kept_out.values())
 
 
-def scan(db: Database, source_for, *, dry_run: bool = False) -> OverlapResult:
-    """Find every overlap and, unless ``dry_run``, flag it (one run)."""
+def scan(
+    db: Database,
+    source_for,
+    *,
+    dry_run: bool = False,
+    excluded_kinds: Iterable[str] = INSTRUMENT_KINDS,
+) -> OverlapResult:
+    """Find every overlap and, unless ``dry_run``, flag it (one run).
+    ``excluded_kinds`` is ``[general] exclude_instruments`` (ADR 0012)."""
     result = OverlapResult(dry_run=dry_run)
-    result.overlaps, result.dead_issuers, result.price_source = find(db, source_for)
+    (
+        result.overlaps,
+        result.dead_issuers,
+        result.price_source,
+        result.out_of_scope,
+    ) = find(db, source_for, excluded=tuple(excluded_kinds))
     if dry_run:
         return result
     run = RunLog(db, source=vl.VENDOR, endpoint=ENDPOINT, params={})
     with run:
         result.run_id = run.run_id
-        result.resolved = _write(db, result.overlaps, run)
+        result.resolved = _write(db, result.overlaps, run, result.out_of_scope)
         run.rows_inserted = len(result.overlaps)
         run.params.update(
             dead_issuers=result.dead_issuers,
             price_source=result.price_source,
             overlaps={f"{k}:{a}": n for (k, a), n in result.counts().items()},
             resolved=result.resolved,
+            out_of_scope=dict(Counter(result.out_of_scope.values())),
         )
         db.commit()
     return result
