@@ -745,7 +745,7 @@ def yc(
         # Sharadar sells equity and fund data; it has no treasury curve.
         click.echo(
             "Error: yc has no Sharadar backend (Sharadar carries no treasury "
-            "rates). Use -S fmp, or -S db once the FRED series land.",
+            "rates). Use -S fmp, or -S db, which reads FMP for it.",
             err=True,
         )
         sys.exit(1)

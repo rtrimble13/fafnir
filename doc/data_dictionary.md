@@ -18,8 +18,10 @@ Conventions:
 
 ### `core.security` — security master
 **Grain:** one row per minted `security_id`. **Source:** FMP `stock-list` / `etf-list`
-(+ `profile` enrichment). **Cadence:** refreshed on security loads; profile fields
-on enrichment.
+(+ `profile` enrichment), and Sharadar's TICKERS for the securities it mints (the dead
+issuers, #71; new listings since the cutover, #93). **Cadence:** nightly, by `ingest
+sharadar-universe` in Sharadar mode and `ingest securities` in FMP mode; profile
+fields on enrichment.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -78,7 +80,8 @@ and a second security's claim was closed the day before the surviving period ope
 
 ### `core.symbol_change` — applied ticker renames
 **Grain:** one row per `(source, old_symbol, new_symbol, change_date)`. **Source:**
-FMP `symbol-change`. **Cadence:** nightly (`fafnir ingest symbol-changes`).
+FMP `symbol-change` (`source = 'fmp'`) and, since the cutover, Sharadar's rename events
+(`source = 'sharadar'`, `fafnir ingest sharadar-universe`). **Cadence:** nightly.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -134,10 +137,11 @@ enrichment. History is retained in `landing.fmp_raw`.
 | `source` | TEXT | |
 
 ### `core.daily_price` — raw daily OHLCV  ⟵ primary fact
-**Grain:** `(security_id, trade_date)`. **Source:** FMP
-`historical-price-eod/non-split-adjusted` — the *unadjusted* endpoint. `.../full` is
-already split-adjusted and must not be used here; see
-[adr/0004](adr/0004-unadjusted-price-feed.md).
+**Grain:** `(security_id, trade_date)`. **Source:** since the cutover (2026-10-22),
+Sharadar's SEP and SFP for the securities it feeds (`source = 'sharadar'`, as traded);
+FMP `historical-price-eod/non-split-adjusted`, the *unadjusted* endpoint, for what FMP
+still feeds and for the history it loaded. `.../full` is already split-adjusted and
+must not be used here; see [adr/0004](adr/0004-unadjusted-price-feed.md).
 **Units:** price NUMERIC(20,6) in the security's currency; volume shares (BIGINT).
 **Adjustment status:** **RAW (unadjusted).** **Cadence:** daily; immutable once the
 day closes. Range-partitioned by `trade_date` (yearly).
@@ -168,9 +172,10 @@ Constraints reject impossible bars: `high>=low,open,close`; `low<=open,close`;
 `volume>=0`; all prices `>0`.
 
 ### `core.corporate_action` — splits & cash dividends
-**Grain:** `(security_id, action_type, ex_date)`. **Source:** FMP `splits` /
-`dividends` (per security) or `splits-calendar` / `dividends-calendar` (market-wide),
-per `actions_mode`. **Cadence:** daily. Never holds an `ex_date` in the future — a
+**Grain:** `(security_id, action_type, ex_date)`. **Source:** Sharadar's ACTIONS for
+the securities it feeds (`ingest sharadar-actions`); for what FMP still feeds, FMP
+`splits` / `dividends` (per security) or `splits-calendar` / `dividends-calendar`
+(market-wide), per `actions_mode`. **Cadence:** daily. Never holds an `ex_date` in the future — a
 declared-but-not-yet-ex event would back-adjust prices for something that has not
 happened (ADR 0007).
 

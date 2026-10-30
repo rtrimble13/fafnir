@@ -1,26 +1,26 @@
 # Extending Fafnir
 
-Fafnir is built to grow. This guide covers the planned fast-follows and the
-patterns to add new sources, tables, and consumers.
+Fafnir is built to grow. This guide covers the roadmap and the patterns to add new
+sources, tables, and consumers.
 
 ## Roadmap
 
 | Milestone | Adds | Status |
 |---|---|---|
 | **Initial release** | security master, daily OHLCV, corporate actions, dual-mode duk | ✅ shipped |
-| **Sharadar** | permaticker identity, dead-issuer history from 1998, corrections to FMP history, nightly feed; `duk -S sharadar` | in progress — [plan](plans/sharadar-adoption.md) |
+| **Sharadar** | permaticker identity, dead-issuer history from 1998, corrections to FMP history, nightly feed; `duk -S sharadar` | ✅ the primary vendor since 2026-10-22 — [plan](plans/sharadar-adoption.md); its close-out is #131 |
 | **Fundamentals** | bitemporal statements on Sharadar SF1, point-in-time panel; derived metrics; `duk fs` / `fa` | ✅ shipped — [guide](fundamentals.md); the production load is #92 |
-| **Economic series** | FRED, BLS, BEA time series; treasury curve for `duk yc` (db) | planned |
+| **Economic series** | FRED, BLS, BEA time series; treasury curve for `duk yc` (db) | ✖ not planned (2026-10-30): `duk yc` stays on FMP's treasury rates |
 | **MCP server** | agentic read access over `mart`, plus an on-host ops tier | ✅ shipped |
 | **Intraday** | `core.intraday_bar` (TIMESTAMPTZ) | planned |
 
-## Adding a new data source (FRED / BLS / BEA)
+## Adding a new data source
 
 1. **Client.** Add `src/fafnir/sources/<name>.py` subclassing `BaseSource`
    (`sources/base.py`) — you inherit throttling, retry/backoff, bandwidth
    metering and secret redaction. Implement domain methods returning parsed
-   payloads. Add the API key to `FafnirConfig` (already stubbed: `fred_key`,
-   `bls_key`, `bea_key`).
+   payloads. Add its API key to `FafnirConfig`, from the environment, and have the
+   loader pass it to the client, as `SharadarClient(api_key, …)` takes its key.
 
    `sources/sharadar.py` is the worked example:
    - **Endpoints as class constants** (`T_SEP`, `T_TICKERS`, ...), so a correction
@@ -51,7 +51,8 @@ patterns to add new sources, tables, and consumers.
      `ingest/vendor_gaps.py` are the three that moved). `duk -S <name>` is an
      adapter over the same client, never a second one.
 2. **Schema.** Add a migration `sql/migrations/NNNN_<name>.up.sql` (+ `.down.sql`)
-   for the new tables. Economic series fit a tidy shape:
+   for the new tables. A vendor time series fits a tidy shape, as the economic
+   series would have:
    `core.economic_series(series_id, source, title, units, frequency, seasonal_adj)`
    and `core.economic_observation(series_id, obs_date, value, vintage_date, loaded_at)`
    — note `vintage_date` for point-in-time (ALFRED-style) revisions.

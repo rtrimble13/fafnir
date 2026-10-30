@@ -39,7 +39,13 @@ incremental and idempotent — a missed day is caught up on the next run. Instal
 crontab etc/crontab.example   # edit paths/times first
 ```
 
-The daily job performs, in order:
+**Production runs Sharadar mode** since the cutover of 2026-10-22: `ingest sharadar`,
+the fundamentals, FMP as the secondary for what it alone feeds, then the marts
+([FMP mode and Sharadar mode](#fmp-mode-and-sharadar-mode)). FMP mode, described
+first below, is the default on a fresh install, which starts from FMP
+([backfill.md](backfill.md)), and the night a rollback returns to.
+
+In FMP mode the daily job performs, in order:
 `ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked →
 ingest delisted → ingest prices → vendor link --new → ingest actions → adjust →
 refresh-marts`. `vendor link --new` links tonight's new listings to Sharadar
@@ -124,8 +130,9 @@ validate stops it before anything loads.
     - **Errors.** Each step warns and carries on, like the universe steps: an FMP
       outage must not cost the marts the Sharadar night's data.
     - **When to turn it off.** Set it false once the reduced FMP tier (#128) no
-      longer serves them. They then stop updating, and the funds wait for Tiingo
-      (#97).
+      longer serves them. They then stop updating for good: Sharadar carries no
+      mutual funds, and no other fund vendor was adopted (Tiingo was dropped on
+      2026-10-30).
   - **Not run:** FMP's universe sweeps (`symbol-changes`, `securities`, `delisted`)
     and `vendor link --new`. Sharadar's universe step replaces them (ADR 0016).
   - **FMP's loaders refuse to write in Sharadar mode.** `ingest symbol-changes`,
@@ -437,8 +444,9 @@ set +a; fafnir …'`, and the queries in `psql` as the ops role.
 4. **Move the feeds:** `fafnir vendor feed --vendor sharadar --all-linked
    --dry-run`, then the same without `--dry-run`, with `--by <your name>`. Put
    the counts it prints on #125.
-   - **Not `--vendor tiingo --funds` yet.** Tiingo has no loader until #97, and
-     the funds would then be fed by no one. FMP keeps them as the secondary.
+   - **Not `--vendor tiingo --funds`.** Tiingo has no loader and was not adopted
+     (2026-10-30), so the funds would be fed by no one. FMP keeps them as the
+     secondary.
 5. **Set the mode.** In `/var/lib/fafnir/.fafnirrc`, under `[general]`, set
    `primary_price_vendor = "sharadar"`. Leave `fmp_secondary` at its default,
    true. Check that `fafnir config get primary_price_vendor` prints `sharadar`,
