@@ -1,24 +1,20 @@
 #!/usr/bin/env bash
-# reconcile.sh -- re-pull a sample of symbols from FMP and diff against stored
-# values to catch silent drift (re-adjustments, late corrections). Reports
-# differences; it does not auto-overwrite. Intended for periodic (e.g. weekly)
-# runs over a rotating sample.
+# reconcile.sh -- compare a sample of symbols' raw closes in the warehouse with
+# FMP's, date by date, to catch silent drift (re-adjustments, late corrections) and,
+# since the cutover, disagreement between the vendors. Reports; it does not
+# overwrite. Intended for periodic (e.g. weekly) runs over a rotating sample.
+#
+# Each date is judged by whose bar the warehouse holds (fafnir source reconcile,
+# #117): DRIFT when it is FMP's own and FMP now serves another, DIFFERS when it is
+# another vendor's (Sharadar's, since the cutover) and FMP disagrees. Dates
+# `vendor correct` replaced (ops.vendor_correction) and bars an operator changed are
+# expected. A symbol FMP serves nothing for is compared with Sharadar over its last
+# 5 stored sessions instead, when SHARADAR_API_KEY is set.
 #
 # Usage: scripts/reconcile.sh SYM1,SYM2,...  [FROM_DATE]
 set -euo pipefail
 
-SYMBOLS="${1:?provide comma-separated symbols}"
+SYMBOLS="${1:?usage: reconcile.sh SYM1,SYM2,... [FROM_DATE]}"
 FROM_DATE="${2:-$(date -u -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)}"
 
-echo "==> Reconciling ${SYMBOLS} from ${FROM_DATE}"
-echo "    Re-pulling live and diffing against the warehouse (db)."
-
-IFS=',' read -ra SYMS <<< "${SYMBOLS}"
-for sym in "${SYMS[@]}"; do
-    echo "---- ${sym} ----"
-    # Compare close series from each source; differences indicate drift.
-    diff <(duk -S db   ph "${sym}" -s "${FROM_DATE}" --close --csv 2>/dev/null) \
-         <(duk -S live ph "${sym}" -s "${FROM_DATE}" --close --csv 2>/dev/null) \
-         && echo "    OK: db matches live" \
-         || echo "    DRIFT: db and live differ for ${sym} (review above)"
-done
+exec fafnir source reconcile "${SYMBOLS}" --from "${FROM_DATE}"

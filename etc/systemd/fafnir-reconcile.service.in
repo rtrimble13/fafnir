@@ -1,5 +1,5 @@
 [Unit]
-Description=fafnir weekly reconciliation against the live feed
+Description=fafnir weekly reconciliation against FMP (fafnir source reconcile)
 Documentation=file://@FAFNIR_HOME@/doc/operations.md
 After=postgresql.service network-online.target
 Wants=postgresql.service network-online.target
