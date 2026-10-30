@@ -3,8 +3,8 @@ Source-client contract.
 
 A data source returns (parsed_payload, raw_bytes) tuples so callers can both use
 the typed data and land the raw response for lineage, while metering bandwidth.
-Subclasses (FMP now; FRED/BLS/BEA as fast-follows) implement domain methods on
-top of a throttled, retrying ``_get``.
+Subclasses (``FMPClient``, ``SharadarClient``) implement domain methods on top of a
+throttled, retrying ``_get``.
 """
 
 from __future__ import annotations

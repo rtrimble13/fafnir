@@ -1,6 +1,12 @@
 """
 Security-master loader.
 
+NOT RUN IN SHARADAR MODE. Since the cutover (v2.0.0, 2026-10-22) new listings are
+minted by ``fafnir ingest sharadar-universe`` through the permaticker's link
+(ADR 0016), and the CLI refuses ``ingest securities`` while ``primary_price_vendor``
+is ``"sharadar"`` unless given ``--allow-secondary``, which ``daily_update.sh`` does
+not pass it. The loader stays for FMP's history and the rollback (ADR 0005's notes).
+
 Builds ``core.security`` + ``core.symbol_xref`` from FMP. The default
 ``us-equity-etf`` universe comes from ``company-screener``, the only bulk endpoint
 carrying the exchange; ``stock-list`` / ``etf-list`` back the unfiltered universes.

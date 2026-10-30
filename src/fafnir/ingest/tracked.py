@@ -1,6 +1,12 @@
 """
 Declared-universe loader (ADR 0006).
 
+SECONDARY VENDOR SINCE v2.0.0 (the cutover, 2026-10-22). In Sharadar mode this is
+part of FMP's secondary night: ``daily_update.sh`` runs it with
+``--allow-secondary`` while ``[general] fmp_secondary`` is true, and the CLI refuses
+it without the flag. The declared funds have no other vendor: Sharadar carries no
+mutual funds, and no fund vendor was adopted (Tiingo was dropped on 2026-10-30).
+
 ``ingest securities`` builds a *discovered* universe: it re-reads FMP's company
 screener nightly and keeps whatever carries a US venue. An open-end mutual fund has
 no venue -- it is struck at NAV once a day, not traded on an exchange -- so it never

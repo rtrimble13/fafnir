@@ -16,7 +16,7 @@ Provenance flows one direction; every downstream layer is rebuildable from the
 one upstream.
 
 ```
- sources (Sharadar, FMP; later FRED/BLS/BEA)
+ sources (Sharadar primary, FMP secondary)
      │   throttled, retrying, bandwidth-metered loaders
      ▼
  landing   raw immutable payloads (landing.fmp_raw) and the ledger of Sharadar's
@@ -112,10 +112,10 @@ series is **point-in-time stable and reproducible**. See
   company's identity into two `security_id`s. See
   [adr/0005-automatic-universe-maintenance.md](adr/0005-automatic-universe-maintenance.md).
 - **More than one vendor writes to the same security.** Every fact row carries the
-  party that supplied it in `source` (`fmp`, `sharadar`, `tiingo`, `fred`,
-  `operator`); on `core.security` that is the vendor that *minted* it, while which
-  vendor *feeds* its new rows is an explicit assignment. When two parties hold the
-  same key the higher one wins, `operator > sharadar > tiingo > fmp`: a vendor never
+  party that supplied it in `source` (`fmp`, `sharadar` or `operator`; `tiingo` is
+  allowed and unused, since Tiingo was not adopted); on `core.security` that is the
+  vendor that *minted* it, while which vendor *feeds* its new rows is an explicit
+  assignment. When two parties hold the same key the higher one wins, `operator > sharadar > tiingo > fmp`: a vendor never
   writes over a higher-ranked row, and replaces a lower-ranked one only through an
   explicit correction recorded in `ops.vendor_correction`, so it can be reviewed and
   reverted. See

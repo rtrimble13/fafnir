@@ -45,7 +45,7 @@ Each vendor source needs that vendor's key, and nothing else: `-S fmp` reads
 | `ls` (list, screen) | ✅ | ✅ | ✖ |
 | `ls SYMBOL` (company summary) | ✅ | ✖ | ✖ |
 | `fs`, `fa` (statements, factors) | ✅ | ✖ db mode only | ✖ db mode only |
-| `yc` | ⤳ falls back to FMP until the FRED series land | ✅ | ✖ no treasury data |
+| `yc` | ⤳ falls back to FMP: the warehouse holds no treasury data | ✅ | ✖ no treasury data |
 | `rc`, `ti` | source-agnostic | source-agnostic | source-agnostic |
 
 ### The Sharadar source
@@ -114,8 +114,9 @@ is already split-adjusted), and `sharadar` recovers the as-traded series from
 vendors return their own adjusted series — close, but a moving vendor snapshot
 rather than a reproducible one, so small differences on old dates are expected.
 
-> `yc` reads FMP until the economic-series fast-follow adds treasury data to the
-> warehouse; in db mode it logs a warning and reads FMP (requires an FMP key).
+> `yc` reads FMP in every mode: the warehouse holds no treasury data, and none is
+> planned (FRED was not adopted, 2026-10-30). In db mode it logs a warning and reads
+> FMP (requires an FMP key).
 
 ## Examples
 

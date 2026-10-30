@@ -14,12 +14,13 @@ read through the `duk` CLI.
 
 - [Install on a Hetzner Cloud Server](install_hetzner.md) — end-to-end fresh install:
   provision, harden, PostgreSQL 16, fafnir, schedule, backups
-- [Initial Setup & Backfill](backfill.md) — stand up the DB and backfill history
-  (single run, a few hours); also
+- [Initial Setup & Backfill](backfill.md) — stand up the DB and backfill history:
+  FMP first, then Sharadar's population, dead issuers and fundamentals; also
   [confirming the price feed](backfill.md#confirming-the-price-feed) and
   [clearing data for a reload](backfill.md#clearing-data-for-a-reload)
-- [Ingestion](ingestion.md) — FMP endpoint→table map, idempotency, watermarks, the
-  restatement guard, the adjustment step
+- [Ingestion](ingestion.md) — Sharadar's files and nightly, the rules every vendor
+  follows (feed assignment, precedence), the adjustment step, watermarks; FMP as the
+  secondary vendor (endpoint→table map, the restatement guard)
 - [Operations Runbook](operations.md) — setup, daily upkeep, monitoring,
   [working the DQ queue](operations.md#working-the-dq-queue),
   [venue transfers](operations.md#venue-transfers) ([ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)),
@@ -35,15 +36,15 @@ read through the `duk` CLI.
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation
 - [Nightly Report Email](nightly_report.md) — the agent's morning summary of the
   automations and the DQ queue: schedule, mail transport, what it can and cannot see
-- [Fundamentals](fundamentals.md) — SF1's statements on two timelines (ADR 0018); a stub
-  for now, with how the build is tested (#91)
+- [Fundamentals](fundamentals.md) — the researcher's guide: SF1's statements on two
+  timelines (ADR 0018), point-in-time reads, the look-ahead rules, the factor panel
 - [Releasing and Upgrading](releasing.md) — cutting a `vX.Y.Z` release with
   `make release`, deploying it to the host, and which of `--version`,
   `git describe` and `pip show` answers which question
 
 ## Growing it
 
-- [Extending](extending.md) — add a source (FRED/BLS/BEA), fundamentals, MCP server
+- [Extending](extending.md) — the roadmap; add a source, fundamentals, MCP server
 - Plans (proposed, not yet implemented):
   - [`duk ls <company>` company summary](plans/duk-company-summary.md) — per-company
     meta, price/action statistics, fundamentals seam, and open DQ flags

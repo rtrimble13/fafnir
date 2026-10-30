@@ -366,6 +366,50 @@ free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they wer
 
 ## [built] notes
 
+- **2026-10-30 · P3, #124 and #130: the docs and the FMP code describe Sharadar as
+  primary.** No behaviour change.
+  - **#124, the user docs:**
+    - **[ingestion.md](../ingestion.md) is reordered.** The order is now:
+      - Sharadar first: its files, a command → table map, the night, SF1, the fields,
+        the bars and actions, linking, the dead issuers, the corrections;
+      - then the rules every vendor follows: feed assignment, precedence, instrument
+        scope;
+      - then the adjustment step, the daily order and the watermarks;
+      - then FMP under *Legacy / secondary vendor: FMP*.
+
+      Every heading keeps its text, so no link moved.
+    - **README** has `SHARADAR_API_KEY` in the quick start, and "then Sharadar" after the
+      FMP build. Its nightly paragraph describes Sharadar mode, and its docs table is
+      current.
+    - **Also current:**
+      - `index.md`;
+      - `architecture.md`'s `source` values;
+      - `backfill.md`'s opening and scope: an install starts from FMP, then Sharadar.
+        There is no Sharadar-only install, so the issue's "backfills from Sharadar"
+        was not written;
+      - `operations.md`: which night production runs, and no Tiingo;
+      - `duk.md` and `duk yc`'s message: `yc` stays on FMP;
+      - `extending.md`: the roadmap's Sharadar row is done and its economic series
+        are not planned, and the add-a-source recipe no longer names FRED/BLS/BEA;
+      - the data dictionary's sources for `core.security`, `core.symbol_change`,
+        `core.daily_price` and `core.corporate_action`.
+  - **#130, the FMP machinery:**
+    - **ADRs 0004, 0005 and 0007** gain a *Superseded for new data* line: by ADRs 0015
+      and 0016 at the cutover. 0004's #74 amendment and 0005's 2026-10-22 note are
+      extended.
+    - **ADRs 0015 and 0016** gain a note: Tiingo and FRED are not adopted. ADR 0017,
+      still proposed, is edited in place.
+    - **The FMP loaders' docstrings:**
+      - `security_master`, `symbol_changes` and `delisted` are *not run in Sharadar
+        mode*;
+      - `corporate_actions`, `daily_price` and `tracked` are the *secondary vendor
+        since v2.0.0*.
+    - **Scoped to FMP:** `probe-prices` and `probe-actions`.
+    - **Removed:** the unused `fred_key`, `bls_key` and `bea_key` stubs, from
+      `FafnirConfig` and `etc/fafnirrc`.
+    - **The `tiingo` hooks stay.**
+  - **Measured:** nothing; docs and docstrings. The unit suite passes unchanged.
+
 - **2026-10-26 · P3, #109: security attributes after the cutover, migration 0039.** Both
   parts at once, since the panel (#100) had shipped.
   - **Classification:** `core.v_security_classification` gives the feeding vendor's.

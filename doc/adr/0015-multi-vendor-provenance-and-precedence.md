@@ -5,6 +5,11 @@
 - Implemented by: #45 (FMP loaders scoped to FMP-fed securities), #46 (the precedence
   write path and `ops.vendor_correction`), #55 (`core.security_vendor_xref`), #98
   (`fafnir vendor feed`), #70 (the per-vendor report, optional)
+- Note (2026-10-30): **Tiingo and FRED are not adopted** (the plan's
+  [decision log](../plans/sharadar-adoption.md#decision-log)). Nothing was built for
+  either. `tiingo` keeps its rank in §3 and its place in the `vendor` CHECK
+  constraints, unused: no command writes a Tiingo link, so the funds stay FMP's.
+  `fred` in §1 and FRED in §3 describe a vendor that never arrived.
 - Extends: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md) (one
   `security_id` per security, whoever supplies its rows)
 - Related: [ADR 0001](0001-raw-prices-plus-adjustment-factors.md) and

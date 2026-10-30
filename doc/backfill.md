@@ -1,18 +1,28 @@
 # Initial Setup & Historical Backfill
 
-How to stand up fafnir and backfill **active US equities + ETFs** from a chosen
-start date (e.g. 1990) to present. Target host: Linux + PostgreSQL 16 + Python 3.11+,
-with an FMP **Professional** key.
+How to stand up fafnir and backfill its history. Target host: Linux + PostgreSQL 16 +
+Python 3.11+, with an FMP key (§6's figures assume FMP's Professional plan) and a
+Sharadar subscription.
+
+A fresh install starts from FMP, which mints the live securities from its screener:
+**active US equities + ETFs** from a chosen start date (e.g. 1990) to present, §§0–8.
+Sharadar comes after, on top of it: its files and the links to its permatickers
+([Sharadar initial population](#sharadar-initial-population)), the dead issuers from
+1998 that FMP never had
+([the dead-issuer backfill](#the-dead-issuer-backfill-on-the-production-host-77)), and
+the fundamentals ([the fundamentals backfill](#the-fundamentals-backfill-92)). There is
+no install from Sharadar alone. The nightly then moves to Sharadar
+([operations.md › Cutover to Sharadar as primary](operations.md#cutover-to-sharadar-as-primary)).
 
 > **Standing up a cloud server from scratch?** Follow
 > [install_hetzner.md](install_hetzner.md) instead — it covers provisioning, OS
 > hardening, cluster tuning, service users, and scheduling, then hands off to §6 here
 > for the load itself.
 
-> **Scope:** `ingest securities` loads the *active* universe (FMP `stock-list` +
-> `etf-list`). Retaining *delisted* names (survivorship-bias-free) needs the
-> delisted endpoint — a documented fast-follow. So this backfill covers active
-> securities.
+> **Scope of §§0–8:** `ingest securities` loads the *active* universe (FMP's
+> screener), so the FMP backfill covers active securities. The dead issuers come from
+> Sharadar, from 1998, and fafnir retains every security that stops trading after it
+> first holds it.
 
 ---
 
@@ -23,8 +33,9 @@ sudo apt-get update && sudo apt-get install -y postgresql-16 python3.11 python3-
 pg_isready    # expect: accepting connections
 ```
 
-Have your FMP key ready. **Never commit it** — it lives in the environment or a
-root-only env file.
+Have your FMP and Sharadar keys ready. **Never commit them** — they live in the
+environment or a root-only env file, and fafnir reads `SHARADAR_API_KEY` from the
+environment only.
 
 ## 1. Install
 

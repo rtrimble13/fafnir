@@ -3,6 +3,12 @@
 - Status: Accepted
 - Date: 2026-08-17
 - Amends: [ADR 0001](0001-raw-prices-plus-adjustment-factors.md)
+- Superseded for new data: by [ADR 0015](0015-multi-vendor-provenance-and-precedence.md)
+  and [ADR 0016](0016-sharadar-identity-and-survivorship-floor.md) at the cutover
+  (2026-10-22, v2.0.0); retained for the FMP-sourced history, FMP as the secondary
+  vendor, and rollback. The
+  [amendment](#amendment-2026-10-vendor-derived-raw-prices-for-sharadar-history-74)
+  says how Sharadar's bars are raw.
 
 ## Context
 
@@ -106,6 +112,10 @@ SFP, which serve split-adjusted prices and the raw close (`closeunadj`). So:
   from ACTIONS, which is exact, rather than from the rounded ratio.
 - **Nightly Sharadar captures after cutover (#98) are observed raw.** On the capture
   day there is no later split, the ratio is exactly 1, and nothing is derived.
+- **From the cutover (2026-10-22)** a Sharadar-fed security's new bars are Sharadar's.
+  FMP's unadjusted endpoint loads only what FMP alone still feeds (`repo.fmp_fed`): the
+  funds and the securities with no Sharadar link. A rollback
+  ([operations.md](../operations.md#rollback-how)) gives the rest back to it.
 
 ## Alternatives considered
 

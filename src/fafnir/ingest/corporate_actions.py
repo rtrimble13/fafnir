@@ -1,6 +1,13 @@
 """
 Corporate-actions loader: splits and cash dividends from FMP.
 
+SECONDARY VENDOR SINCE v2.0.0 (the cutover, 2026-10-22). In Sharadar mode this
+loader writes only for what FMP alone still feeds (``repo.fmp_fed``: the funds and
+the securities with no Sharadar link). ``daily_update.sh`` runs it with
+``--allow-secondary`` while ``[general] fmp_secondary`` is true, and the CLI refuses
+it without the flag. Sharadar's splits and dividends come from
+:mod:`fafnir.ingest.sharadar_actions`, which shares :func:`_within_horizon`.
+
 Handles the field-name variation across FMP responses (numerator/denominator vs
 splitFrom/splitTo; dividend vs adjDividend). Validates and upserts idempotently.
 
