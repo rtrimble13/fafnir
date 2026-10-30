@@ -3,9 +3,10 @@
 - Status: **in progress — plan v2, revised 2026-10-18.** Plan v1 (2026-09-23, seventeen weekly
   sprints S01–S17) is superseded; its calendar and status tables are in git history
   (`git show 1d26d82:doc/plans/sharadar-adoption.md`).
-- **Sharadar has been the primary nightly vendor since 2026-10-22** (#125). P0–P2 are closed, P3 is open,
-  P4 and P5 have not started. The open issues were reconciled with the build on 2026-10-24 (*Issue
-  dispositions (applied 2026-10-24)*).
+- **Sharadar has been the primary nightly vendor since 2026-10-22** (#125). P0–P2 are closed and P3 is
+  open. P4's code shipped on 2026-10-26 (v3.0.0); its production load is #92. P5 is the close-out alone:
+  Tiingo, FRED, BLS and BEA were dropped on 2026-10-30. The open issues were reconciled with the build on
+  2026-10-24 and 2026-10-30 (*Issue dispositions*).
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -57,9 +58,9 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
 | Minting, renames, delistings | FMP screener and sweeps | FMP, plus a permaticker link for every security | **Sharadar TICKERS/ACTIONS** via the xref |
 | Identity | ticker-keyed (`security_id` surrogate) | `core.security_vendor_xref` → permaticker | permaticker authoritative ([ADR 0016](../adr/0016-sharadar-identity-and-survivorship-floor.md), #67) |
 | Fundamentals | none | — | **SF1**, bitemporal, 1998+ (phase 4) |
-| Mutual funds (8 tracked) | FMP, 3 of 8 | FMP 3 of 8 | **Tiingo** for all eight once FMP's tier drops them (phase 5) |
+| Mutual funds (8 tracked) | FMP, 3 of 8 | FMP 3 of 8 | FMP, 3 of 8, as the secondary, while its tier serves them (Tiingo not adopted, 2026-10-30) |
 | `duk -S …` | `db` / `live` | `db` default · `fmp` · `sharadar` | same |
-| `duk yc` | FMP | FMP | FMP, then FRED (phase 5) |
+| `duk yc` | FMP | FMP | FMP (FRED not adopted, 2026-10-30) |
 | Subscriptions | FMP Premium | FMP Premium + Sharadar Bundle (max history, annual) | **Sharadar annual + FMP reduced tier** |
 
 **Survivorship floor: 1998-01-01.** Neither vendor has delistings before 1998, so cross-sectional work before
@@ -96,12 +97,13 @@ Phases are ordered by dependency, not by calendar week. Each closes with a short
 | **P1** | Land, link, mint | #55, #56, #58, #59, #62, #63, #64, #67, #68, #71 | ≥ 99% of active non-fund securities linked or explained; dead issuers minted (empty) |
 | **P2** | Backfill, compare, correct | #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** (shipped as v1.8.x; closed on v1.8.4) |
 | **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** (tagged 2026-10-22) |
-| **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; a **minor** release (v2.1.0 went to `security relist` on 2026-10-24) |
-| **P5** | Funds, FRED, close-out | #88, #97, #104, #114, #116, #117, #131 | Eight funds on one vendor; `duk yc -S db`; plan marked implemented |
+| **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; a release (shipped as **v3.0.0** on 2026-10-26, a major where a minor was planned) |
+| **P5** | Close-out | #117, #131 | `scripts/reconcile.sh` a cross-vendor check; plan marked implemented |
 
 P3 and P4 are independent once P2 is done; run them in whichever order the comparison report and the SF1
-probe allow. P5's fund work (#88, #97, #104) is only urgent if the reduced FMP tier drops the three funds FMP
-serves today — check that in #128 before scheduling it.
+probe allow. P5's fund and FRED work (#88, #97, #104, #114, #116) was dropped on 2026-10-30: the funds and
+`duk yc` stay on FMP, so the reduced tier has to serve them (#128; *Issue dispositions (applied
+2026-10-30)*).
 
 ### The verification that replaces the parallel run
 
@@ -142,7 +144,7 @@ had run. #122 is closed with where each criterion stood:
 | 0034 | #79 | `mart.v_security_lifecycle` — **built** |
 | 0035–0038 | #87, #95, #100, #101 | fundamentals tables, PIT functions, panel, aggregates — **built** |
 | 0039 | #109 | attribute precedence; `mart.security_latest` re-defined (same columns) — **built** |
-| (optional) | #114, #116 | fund distribution types; FRED economic series |
+| ~~(optional)~~ | ~~#114, #116~~ | ~~fund distribution types; FRED economic series~~: dropped on 2026-10-30 (Tiingo and FRED not adopted) |
 
 ## Issue dispositions (applied 2026-10-18)
 
@@ -271,15 +273,51 @@ open.
 #87, #90, #91, #95, #96, #100, #101, #102, #108, #114 and #125 were left as written. #125 stays open for its
 step-6 verification comment.
 
+## Issue dispositions (applied 2026-10-30)
+
+Seventeen issues were open. The operator dropped Tiingo, FRED, BLS and BEA, so the five issues that would
+have built them were closed as not planned. Seven bodies were revised, each with a *Revised 2026-10-30* note
+on top: those that leaned on the five, and those the build had overtaken since 2026-10-24. Twelve remain open.
+
+### Close
+
+| Issue | Reason |
+|---|---|
+| #88 Tiingo client and fund probe | **Not planned**: Tiingo is not adopted. Nothing was built |
+| #97 Tiingo fund loader | **Not planned**: Tiingo is not adopted. FMP keeps loading the funds it covers as the secondary vendor, and its NAV rows stay the only ones |
+| #104 Tiingo production | **Not planned**: Tiingo is not adopted. No terms were read and no key installed; the cutover's deferred step 3b (`vendor feed --vendor tiingo --funds`) does not run |
+| #114 fund distribution types | **Not planned**, on its own terms: with #88 closed, no source will split distributions |
+| #116 FRED treasury curve | **Not planned**: FRED is not adopted. `duk yc` stays on FMP's treasury rates in every mode |
+
+### Edit
+
+| Issue | Change |
+|---|---|
+| #41 tracking | P4 shipped (v3.0.0); the decisions of 2026-10-26, 2026-10-28 and 2026-10-30; P5 narrowed to #117 and #131 |
+| #128 FMP tier | Nothing stands behind FMP for the funds or the treasury curve: the tier must serve them, or they stop |
+| #124 v2 docs | What #108 already did; the wording left, Tiingo's, FRED's, BLS's and BEA's included; a fresh install starts from FMP, not from Sharadar alone |
+| #130 legacy notes | The ADRs, docstrings and config stubs that promise Tiingo, FRED, BLS or BEA; the dormant `tiingo` hooks stay; no longer waits on #126 |
+| #131 close-out | P5's done-when; the retrospective counts the nights after 2026-10-24 and the v3.0.0 release |
+| #117 reconcile.sh | Only its `duk -S sharadar` fallback waits on #128 |
+| #92 fundamentals backfill | Run 470 has run and needs the later-filing reload (#216); the identity criterion as §6.9 measured it |
+
+#125 and #126 stay open for their records from the host. #219, #220 and #221 belong to dorq's statements
+plan, not this one; #221 was revised for #223's recalibration.
+
+**What stays in the code:** the `tiingo` precedence rank (`repo.PRECEDENCE`), `LINKED_VENDORS`, `vendor feed
+--vendor tiingo` and the CHECK constraints that allow `tiingo`. No command writes a Tiingo link, so none of
+them acts, and removing them would take a migration.
+
 ## Costs
 
 | Phase | Sharadar | FMP | Funds | ≈ annual rate |
 |---|---|---|---|---|
 | P0–P2 | Bundle, max history, annual: $499 | Premium $708 | FMP | ~$1,207 |
-| P3 onward | $499 | reduced tier (~$264 if Starter; verify in #128) | Tiingo (free tier) | **~$763** |
-| If FMP confirms retention after cancellation (#43) | $499 | $0 | Tiingo | ~$499 |
+| P3 onward | $499 | reduced tier (~$264 if Starter; verify in #128) | FMP, on the reduced tier | **~$763** |
+| If FMP confirms retention after cancellation (#43) | $499 | $0 | none: the funds stop updating | ~$499 |
 
-Prices are from the assessment (2026-09-23) and the vendor pages as last read; confirm at checkout.
+Prices are from the assessment (2026-09-23) and the vendor pages as last read; confirm at checkout. Tiingo's
+free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they were.
 
 ## Risks
 
@@ -289,7 +327,7 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | A bulk correction applies a vendor convention difference as if it were an error | Working agreement 2 (audited, revertible); categories decided from outside-reference spot checks before any bulk apply (#69) |
 | SEP precision too coarse to recover exact raw prices for split-heavy dead issuers | #49, #75 (`sharadar_split_ratio_mismatch`) |
 | Reused-ticker histories duplicated across vendors | #68 (`vendor_history_overlap`) before minting |
-| The reduced FMP tier drops something the nightly still needs before cutover | #128 verifies the tier's contents **before** the change; P5's Tiingo work covers funds |
+| The reduced FMP tier drops something the nightly still needs | #128 verifies the tier's contents **before** the change. Since 2026-10-30 nothing stands behind FMP for the funds or the treasury curve: the tier serves them, or they stop |
 | FMP's licence does not permit retaining data after a downgrade | #43's letter; the agreement stays in force on a lower tier (the assessment's reading); cancellation only on written confirmation |
 | Personal-licence eligibility fails (professional use) | #43 self-check before paying — the one remaining hard stop |
 | Backfill floods the DQ queue | #76 measures first; dorq's backfill path and the SQL checks as they are |
@@ -324,6 +362,7 @@ Prices are from the assessment (2026-09-23) and the vendor pages as last read; c
 | 2026-10-24 | **Issues reconciled with the build.** Four closed and 18 bodies revised (*Issue dispositions (applied 2026-10-24)*). Plan v1's ADR numbers are retired: the fundamentals ADRs (#86) take the next free numbers, and P4's release is the next minor, since v2.1.0 went to `security relist` | #41 |
 | 2026-10-25 | **Fundamentals on SF1: five decisions** ([fundamentals-sf1.md](fundamentals-sf1.md), from #83's probe). (1) A restatement is known from the day fafnir first loads it, since SF1 gives no restatement date; each version carries a knowledge interval, closed by the next version's start, so history before the backfill reads as first reported. (2) A version is stored in the share terms of its knowledge date: first-reported values are SF1's ÷ Sharadar's splits after the filing; per-share values are derived in the mart. (3) A split's re-expression is not a version. (4) Rows before 1998 load; the factor panel starts on 1998-01-01. (5) Statements attach to the primary share class only. The document, with the choices it lists, was signed off the same day (GO on #85) | #85 |
 | 2026-10-28 | **`vendor correct` reaches fed rows.** It compared only unfed FMP rows, and the cutover (run 426) fed all of them, so from 2026-10-22 it found none: ADS gave `0 linked securities`. It now compares the bars FMP supplied on any FMP-minted linked row, fed or not; the vendor's own bars stay the nightly's. This does not lift the 2026-10-21 hold: the 681 open `vendor_history_disagrees` flags all hold a split, and are corrected one security at a time with `--symbols`, a split FMP made up to match its scale deleted in the same repair | #75 |
+| 2026-10-30 | **Tiingo, FRED, BLS and BEA are not adopted.** #88, #97, #104, #114 and #116 are closed as not planned, and the economic-series milestone leaves the roadmap. The funds stay on FMP as the secondary vendor: three of the eight tracked funds, the other five uncovered, as today. `duk yc` stays on FMP's treasury rates in every mode. So the reduced FMP tier must serve both, or they stop (#128). The `tiingo` hooks in the code stay, dormant | #41, *Issue dispositions (applied 2026-10-30)* |
 
 ## [built] notes
 
