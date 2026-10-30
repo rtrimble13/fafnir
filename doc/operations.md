@@ -1395,9 +1395,43 @@ Both decisions survive the engine:
 
 ## Reconciliation
 
-`scripts/reconcile.sh AAPL,MSFT,SPY` re-pulls a sample live and diffs against the
-warehouse to catch silent drift (re-adjustments, late corrections). Run weekly over
-a rotating sample. It reports differences; it does not auto-overwrite.
+`scripts/reconcile.sh AAPL,MSFT,SPY,BRK-B [FROM_DATE]` compares a sample's raw closes
+in the warehouse with FMP's, date by date, from `FROM_DATE` (default 30 days ago). The
+weekly timer (`fafnir-reconcile`, Sunday 06:00 ET) runs it on
+`FAFNIR_RECONCILE_SYMBOLS`. It reports; it does not overwrite. The script runs
+`fafnir source reconcile` (#117), which can also be run by hand:
+
+```bash
+fafnir source reconcile AAPL,MSFT --from 2026-10-01
+fafnir source reconcile AAPL --vendor sharadar        # the last 5 stored sessions
+```
+
+Each symbol's block names whose bars the warehouse holds, `warehouse (sharadar) vs
+FMP` in Sharadar mode or `warehouse (fmp) vs FMP` for a security FMP feeds, and judges
+each date by whose bar it holds there:
+
+| Kind | Means | Verdict |
+|---|---|---|
+| `match` | the closes agree: exactly against the vendor that supplied the stored bar, within a cent or a basis point against another (`vendor correct`'s tolerance) | — |
+| `corrected` | `vendor correct` replaced FMP's bar on that date (`ops.vendor_correction`) | expected |
+| `operator` | an operator deleted, transformed or wrote the bar (`ops.operator_override`) | expected |
+| `drift` | the stored bar is FMP's own and FMP now serves another or none, or FMP feeds the security and serves a bar the warehouse lacks | **DRIFT** |
+| `differs` | the stored bar is another vendor's and FMP disagrees, or serves a bar the warehouse lacks | **DIFFERS** |
+| `extra` | the warehouse holds another vendor's bar FMP does not serve: a gap the other vendor filled | — |
+
+- **DRIFT** is the check it always was: FMP changed a bar it had served (a
+  restatement, a late correction). For a security FMP still feeds, it is worth a look
+  with `fafnir dq list --symbol X`.
+- **DIFFERS** is the cross-vendor check, since the cutover: Sharadar's bar against
+  FMP's. One date in a sample is usually one vendor's late correction. Many, or a
+  level apart, is a split or a scale one vendor applied: look before deciding which is
+  right.
+- **When FMP serves nothing** for a symbol (an outage, or a tier without the
+  unadjusted endpoint, #128), the symbol is compared with Sharadar over its last 5
+  stored sessions instead, when `SHARADAR_API_KEY` is set: a check that the nightly
+  loaded what the vendor serves. The block says so.
+- **The exit status** is non-zero only when no symbol could be compared, so the
+  timer's unit fails and the morning report shows it.
 
 Corporate actions have their own automatic version of this, and it is not optional
 housekeeping: in `calendar`/`auto` mode it is the only thing that can detect a gap in
@@ -1408,8 +1442,9 @@ leaves the sweep unverified — do that only while running in `symbol` mode, whe
 is nothing to verify.
 
 It compares **raw** closes, and both sides are unadjusted — `core.daily_price` on one
-side, FMP's `historical-price-eod/non-split-adjusted` on the other — so a split in
-the compared window is not by itself a reason for the two to disagree.
+side, FMP's `historical-price-eod/non-split-adjusted` (or Sharadar's `closeunadj`) on
+the other — so a split in the compared window is not by itself a reason for the two
+to disagree.
 
 Once a second vendor loads, a vendor that outranks another replaces its rows only in
 an explicit correction (ADR 0015), and each one is kept. `fafnir vendor corrections

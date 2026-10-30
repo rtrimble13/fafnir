@@ -108,8 +108,9 @@ when symbol resolution still read `core`.
 up as a real jump. Every source honours that: `db` reads `mart.v_daily_price_raw`,
 `fmp` reads FMP's `historical-price-eod/non-split-adjusted` (not `.../full`, which
 is already split-adjusted), and `sharadar` recovers the as-traded series from
-`closeunadj`. That is what makes the sources comparable, and what
-`scripts/reconcile.sh` relies on. With `--adj`, `db` reads
+`closeunadj`. That is what makes the sources comparable: `diff` two of them to check
+a series by hand. `scripts/reconcile.sh` makes the same comparison date by date, from
+the warehouse's side (`fafnir source reconcile`, [operations.md](operations.md#reconciliation)). With `--adj`, `db` reads
 `mart.v_daily_price_adjusted` (split + dividend, point-in-time stable) while the
 vendors return their own adjusted series — close, but a moving vendor snapshot
 rather than a reproducible one, so small differences on old dates are expected.

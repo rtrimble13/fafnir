@@ -6663,6 +6663,75 @@ def source_vendor_gaps(ctx, min_sessions, exchange, as_json):
     )
 
 
+@source.command("reconcile")
+@click.argument("symbols")
+@click.option(
+    "--from",
+    "from_date",
+    default=None,
+    help="First date compared, YYYY-MM-DD [default: 30 days ago]",
+)
+@click.option(
+    "--vendor",
+    type=click.Choice(["fmp", "sharadar"]),
+    default="fmp",
+    show_default=True,
+    help="The vendor compared with. FMP falls back to Sharadar when it serves "
+    "nothing for a symbol.",
+)
+@click.option(
+    "--sessions",
+    default=5,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Against Sharadar: the security's last N stored sessions.",
+)
+@click.pass_context
+def source_reconcile(ctx, symbols, from_date, vendor, sessions):
+    """Compare a sample's raw closes with a vendor's, date by date (#117).
+
+    \b
+      fafnir source reconcile AAPL,MSFT,SPY,BRK-B
+      fafnir source reconcile AAPL --from 2026-10-01
+      fafnir source reconcile AAPL --vendor sharadar
+
+    `scripts/reconcile.sh` runs it weekly. A date the warehouse and the vendor
+    disagree on is DRIFT when the stored bar is the vendor's own (it changed a bar it
+    served), or DIFFERS when it is another vendor's (the two disagree). Dates `vendor
+    correct` replaced, and bars an operator changed, are expected. Reads only; exits 1
+    when no symbol could be compared.
+    """
+    from fafnir.ingest import reconcile as rc
+
+    syms = _split_symbols(symbols)
+    if not syms:
+        raise click.ClickException("SYMBOLS must name at least one symbol.")
+    cfg = ctx.obj["config"]
+    today = dt.date.today()
+    start = _parse_date(from_date) or today - dt.timedelta(days=rc.DEFAULT_DAYS)
+    fmp = _fmp_client(cfg) if cfg.fmp_key else None
+    sharadar = _sharadar_client(cfg) if cfg.sharadar_api_key else None
+    click.echo(
+        f"==> Reconciling {','.join(syms)}: the warehouse's raw closes against "
+        f"{rc.VENDOR_NAME[vendor]}, from {start}"
+    )
+    with Database(cfg.dsn) as database:
+        results = rc.reconcile(
+            database,
+            syms,
+            vendor=vendor,
+            from_date=start,
+            to_date=today,
+            fmp=fmp,
+            sharadar=sharadar,
+            sessions=sessions,
+        )
+    for line in rc.format_report(results):
+        click.echo(line)
+    if all(r.verdict == rc.NOT_COMPARED for r in results):
+        raise click.ClickException("No symbol could be compared.")
+
+
 @main.group()
 def dq():
     """Data-quality checks."""

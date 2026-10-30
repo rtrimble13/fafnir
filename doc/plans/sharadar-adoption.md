@@ -366,6 +366,31 @@ free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they wer
 
 ## [built] notes
 
+- **2026-10-30 · P5, #117: `scripts/reconcile.sh` is a cross-vendor check.**
+  - **`fafnir source reconcile SYMBOLS [--from D] [--vendor fmp|sharadar]`** does the
+    comparison. The script keeps its interface (`SYM1,SYM2,... [FROM_DATE]`) and runs
+    it. The comparison needs each stored bar's `source` and `ops.vendor_correction`,
+    which duk's mart seam does not expose. So the command reads `core` and calls FMP
+    through `FMPClient`, the client `duk -S fmp` uses (ADR 0017), rather than diffing
+    two `duk` outputs.
+  - **Each date is judged by whose bar the warehouse holds:**
+    - **`drift`:** the bar is FMP's own and FMP now serves another or none. This is the
+      original check.
+    - **`differs`:** the bar is Sharadar's and FMP disagrees beyond `vendor correct`'s
+      tolerance. This is the new cross-vendor check.
+    - **`corrected` and `operator`:** expected, from `ops.vendor_correction` and
+      `ops.operator_override`.
+    - **`extra`:** a gap the other vendor filled.
+
+    Each block is labelled `warehouse (<feeding vendor>) vs FMP`.
+  - **The fallback:** a symbol FMP serves nothing for is compared with Sharadar's API
+    over its last 5 stored sessions, through the open link's ticker and table. It runs
+    when `SHARADAR_API_KEY` is set. It is built now, not after #128: it triggers on
+    FMP's failure, whatever the tier.
+  - **The exit status** is non-zero only when no symbol could be compared. The old
+    script exited 0 even when `duk` failed, and showed the failure as DRIFT.
+  - **Measured:** nothing on the host yet. The first Sunday run's output is the check.
+
 - **2026-10-30 · P3, #124 and #130: the docs and the FMP code describe Sharadar as
   primary.** No behaviour change.
   - **#124, the user docs:**
