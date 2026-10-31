@@ -87,6 +87,7 @@ then, and no query should present a pre-1998 cross-section as complete.
 | It is in `stocks` or `funds` (SEP/SFP), so it has prices | A security with no bars adds nothing a researcher can use |
 | `is_delisted`, and `last_price_date >= 1998-01-01` | Live securities come from the screener; before 1998 is below the floor |
 | Its category maps to an asset type (`sharadar_map.map_category`): common and preferred stock (domestic, ADR, Canadian), ETF, ETN, ETD, ETMF, CEF | `UNIT` is out of scope (ADR 0012), and `IDX` is not a security |
+| It is not a warrant, right or unit by its ticker and name (`instruments.out_of_scope_kind`, `[general] exclude_instruments`), read with and without the number Sharadar appends to a reused dead ticker (`HCMAU1`); a declared symbol is kept | ADR 0012. Sharadar files a SPAC's unit as a common stock's secondary class, so the category alone lets it through: until 2026-10-30 the mint did, and held back 1,149 dead units only because their overlap flags stayed open |
 | Its last exchange maps to a screener venue: NYSE, NASDAQ, AMEX (Sharadar's NYSEMKT and NYSEARCA), BATS | The same venues `SCREENER_EXCHANGES` admits for live names; OTC-only lives are excluded |
 | No open link holds its permaticker | It is already a fafnir security |
 | Overlap detection (#68) does not flag it | It may be a delisted FMP security that did not link; minting it would fork one issuer into two rows |

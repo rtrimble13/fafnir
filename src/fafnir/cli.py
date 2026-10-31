@@ -3281,7 +3281,7 @@ def security_descope(ctx, kinds, note, keep_symbols, removed_by, dry_run, yes):
         declared = {r["symbol"] for r in repo.list_tracked_symbols(database)}
         securities = database.fetchall(
             "SELECT security_id, primary_symbol, company_name, is_etf, is_fund,"
-            " is_actively_trading, delisted_date FROM core.security"
+            " is_actively_trading, delisted_date, source FROM core.security"
             " ORDER BY primary_symbol, security_id"
         )
         selection = select_descope_candidates(
@@ -5749,14 +5749,20 @@ def vendor_overlap(ctx, dry_run, prices):
     data: keep them on the host. See the vendor_history_overlap playbook and
     doc/operations.md, "Separating two issuers held on one security".
     """
+    from collections import Counter
+
     from fafnir.ingest import vendor_link as vl
     from fafnir.ingest import vendor_overlap as vo
 
     cfg = ctx.obj["config"]
+    excluded = _excluded_instruments(cfg)
     with Database(cfg.dsn) as database:
         try:
             result = vo.scan(
-                database, _link_closes(cfg, database, prices), dry_run=dry_run
+                database,
+                _link_closes(cfg, database, prices),
+                dry_run=dry_run,
+                excluded_kinds=excluded,
             )
         except vl.LinkError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -5772,6 +5778,12 @@ def vendor_overlap(ctx, dry_run, prices):
     )
     for (kind, agreement), n in sorted(result.counts().items()):
         click.echo(f"  {kind:<16} {agreement:<9} {n}")
+    if result.out_of_scope:
+        kinds = Counter(result.out_of_scope.values())
+        click.echo(
+            f"  {len(result.out_of_scope)} dead issuers not evaluated, out of scope "
+            "(ADR 0012): " + ", ".join(f"{n} {k}s" for k, n in sorted(kinds.items()))
+        )
     click.echo(
         f"  {result.flagged_keys()} permatickers held back from minting"
         + ("" if dry_run else f"; {result.resolved} flags resolved")
@@ -5821,7 +5833,9 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit, sample
         raise click.ClickException("--allow-overlap needs --permaticker.")
     if sample and permaticker:
         raise click.ClickException("Give --sample or --permaticker, not both.")
-    with Database(ctx.obj["config"].dsn) as database:
+    cfg = ctx.obj["config"]
+    excluded = _excluded_instruments(cfg)
+    with Database(cfg.dsn) as database:
         try:
             result = vm.mint(
                 database,
@@ -5831,6 +5845,7 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit, sample
                 sample=sample,
                 seed=seed,
                 dry_run=dry_run,
+                excluded_kinds=excluded,
             )
         except vm.MintError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -5846,6 +5861,11 @@ def vendor_mint_delisted(ctx, dry_run, permaticker, allow_overlap, limit, sample
             f"back by vendor_history_overlap; {result.unclassified} without a sector "
             f"or industry fafnir knows; {result.periods_skipped} ticker periods "
             "skipped (another row starts that ticker on that date)."
+        )
+    if result.out_of_scope:
+        click.echo(
+            f"{result.out_of_scope} dead issuers left out: warrants, rights or units "
+            "ADR 0012 keeps out ([general] exclude_instruments)."
         )
     for what in ("category", "exchange", "death year"):
         counts = result.by(what)

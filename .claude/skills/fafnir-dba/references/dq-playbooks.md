@@ -1302,6 +1302,22 @@ and `detail` has the range (`from`, `to`), its `bars`, and the security's own
     split-history … --into-security-id <minted row>`, each with `--dry-run` first.
 - **`dead_issuer` with disagreeing samples:** the bars are another issuer's. Minting
   `K` with `--allow-overlap` moves nothing.
+  - First compute FMP/Sharadar per sample. A ratio scattered over 10% or more is
+    another instrument: a preferred series or a note beside the common, another share
+    class, or a later issuer of a reused ticker. One constant factor (×0.1, ×0.56) is
+    the **same** issuer at FMP's wrong scale: repair the scale, and do not mint.
+  - A ratio near 1 that misses the 1 bp tolerance is either a sibling trading at the
+    same level (a $25 preferred series, a SPAC unit beside its $10 share) or the
+    same bars slightly off. Look before choosing.
+  - **Accepting a `dead_issuer` flag lets the next bulk `vendor mint-delisted` mint
+    `K`.** The mint holds back only permatickers with an *open* flag. Accept only
+    where minting is the repair.
+- **A dead warrant, right or unit** (ADR 0012) is never minted. Sharadar files a
+  SPAC's unit as a common stock's secondary class, and a dead one under a numbered
+  ticker (`HCMAU1`). Where the deployed `vendor overlap` prints "dead issuers not
+  evaluated, out of scope (ADR 0012)", it skips these and resolves their open flags
+  with a note naming the kind. On an older build, leave them open: an accept would
+  let the mint create them.
 - **`earlier_history`:** compare the bars just before `to` with those after it
   (`duk -S db ph <SYM>`). A level jump where `K` begins is an earlier issuer: the
   same split, into a row minted for that issuer (if Sharadar knows it, it shows up

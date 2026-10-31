@@ -8,9 +8,10 @@ priced. Each that ADR 0016 §3 admits becomes a ``core.security`` row minted by
 Sharadar:
 
 - **Which.** :func:`vendor_overlap.mintable` (priced in SEP/SFP, delisted on or
-  after 1998-01-01, a category and a venue fafnir keeps), with no open link to its
-  permaticker, and no open ``vendor_history_overlap`` flag for it (#68): a flagged
-  issuer's history is already on an FMP row. ``--permaticker K --allow-overlap``
+  after 1998-01-01, a category and a venue fafnir keeps, and not a warrant, right or
+  unit ADR 0012 keeps out by ``[general] exclude_instruments``), with no open link
+  to its permaticker, and no open ``vendor_history_overlap`` flag for it (#68): a
+  flagged issuer's history is already on an FMP row. ``--permaticker K --allow-overlap``
   mints one flagged issuer on purpose, for the split-history playbook.
 - **The row.** ``source = 'sharadar'``, the vendor's ticker as ``primary_symbol``,
   its name, ``asset_type``/``is_etf``/``is_fund`` and venue through
@@ -45,6 +46,7 @@ from fafnir.ingest import sharadar_map
 from fafnir.ingest import vendor_link as vl
 from fafnir.ingest import vendor_overlap as vo
 from fafnir.ingest.runlog import RunLog
+from fafnir.instruments import INSTRUMENT_KINDS
 from fafnir.logging_config import get_logger
 
 logger = get_logger("ingest.vendor_mint")
@@ -88,6 +90,7 @@ class MintResult:
     run_id: Optional[int] = None
     mints: list[Mint] = field(default_factory=list)
     held_back: int = 0  # mintable, but flagged vendor_history_overlap
+    out_of_scope: int = 0  # dead issuers ADR 0012 keeps out (warrants, rights, units)
     minted: int = 0
     unclassified: int = 0  # minted with no sector or industry fafnir knows
     periods_skipped: int = 0  # a ticker period another row starts on that date
@@ -148,11 +151,15 @@ def plan(
     limit: int = 0,
     sample: int = 0,
     seed: int = 0,
+    excluded_kinds: Sequence[str] = INSTRUMENT_KINDS,
 ) -> MintResult:
     """What would be minted; writes nothing. ``sample`` picks that many at random
     (``seed`` makes the pick repeatable): #76 measures DQ on a sample, minted,
-    loaded and checked on one day."""
+    loaded and checked on one day. ``excluded_kinds`` is ``[general]
+    exclude_instruments`` (ADR 0012)."""
     _guard(db)
+    excluded = tuple(excluded_kinds)
+    declared = vo.declared_symbols(db, excluded)
     candidates = repo.vendor_link_candidates(db, vl.VENDOR, vl.PRICED_TABLES)
     flags = repo.list_dq_flags(db, repo.DqFilter(checks=(vo.CHECK,)), limit=1_000_000)
     flagged = {
@@ -166,7 +173,13 @@ def plan(
             raise MintError(f"no Sharadar stock or fund has permaticker {permaticker}")
         if c["taken"]:
             raise MintError(f"permaticker {permaticker} is already linked")
-        if not vo.mintable(c):
+        kind = vo.out_of_scope(c, excluded=excluded, declared=declared)
+        if kind and vo.mintable(c, excluded=()):
+            raise MintError(
+                f"permaticker {permaticker} ({c['ticker']}) is a {kind}, which ADR "
+                "0012 keeps out ([general] exclude_instruments)"
+            )
+        if not vo.mintable(c, excluded=excluded, declared=declared):
             raise MintError(
                 f"permaticker {permaticker} is outside ADR 0016's rules (alive, before "
                 "1998, or a category or venue fafnir does not keep)"
@@ -176,9 +189,17 @@ def plan(
                 f"permaticker {permaticker} has an open vendor_history_overlap flag: "
                 "pass --allow-overlap to mint it on purpose (the split-history playbook)"
             )
-        chosen, held_back = [c], 0
+        chosen, held_back, kept_out = [c], 0, 0
     else:
-        eligible = [c for c in candidates if vo.mintable(c) and not c["taken"]]
+        open_ = [
+            c for c in candidates if not c["taken"] and vo.mintable(c, excluded=())
+        ]
+        eligible = [
+            c
+            for c in open_
+            if vo.out_of_scope(c, excluded=excluded, declared=declared) is None
+        ]
+        kept_out = len(open_) - len(eligible)
         chosen = [c for c in eligible if c["vendor_key"] not in flagged]
         held_back = len(eligible) - len(chosen)
     chosen.sort(key=lambda c: c["vendor_key"])
@@ -195,7 +216,7 @@ def plan(
     ):
         events.setdefault(e["vendor_key"], []).append(e)
     sectors, industries = repo.classification_names(db)
-    result = MintResult(dry_run=True, held_back=held_back)
+    result = MintResult(dry_run=True, held_back=held_back, out_of_scope=kept_out)
     for c in chosen:
         mine = events.get(c["vendor_key"], [])
         delisted = [e["event_date"] for e in mine if e["action"] == "delisted"]
@@ -285,6 +306,7 @@ def mint(
     sample: int = 0,
     seed: int = 0,
     dry_run: bool = False,
+    excluded_kinds: Sequence[str] = INSTRUMENT_KINDS,
 ) -> MintResult:
     """Plan and, unless ``dry_run``, mint (one run, a commit per 500)."""
     result = plan(
@@ -294,6 +316,7 @@ def mint(
         limit=limit,
         sample=sample,
         seed=seed,
+        excluded_kinds=excluded_kinds,
     )
     result.dry_run = dry_run
     if dry_run:
@@ -323,6 +346,7 @@ def mint(
         run.params.update(
             minted=result.minted,
             held_back=result.held_back,
+            out_of_scope=result.out_of_scope,
             unclassified=result.unclassified,
             periods_skipped=result.periods_skipped,
         )

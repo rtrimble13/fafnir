@@ -19,6 +19,7 @@ from fafnir.instruments import (
     out_of_scope_kind,
     rename_changes_instrument,
     select_descope_candidates,
+    unnumbered,
 )
 
 
@@ -246,6 +247,37 @@ def test_a_symbol_both_declared_and_kept_counts_as_matched():
     )
     assert sel.unmatched_keeps == []
     assert "ABCDU" not in _symbols(sel.candidates)
+
+
+@pytest.mark.parametrize(
+    "ticker, expected",
+    [
+        ("BID1", "BID"),  # a reused ticker's dead issuer
+        ("CADE3", "CADE"),
+        ("HCMAU1", "HCMAU"),  # a SPAC's unit, so numbered
+        ("ZZAB.U", "ZZAB.U"),
+        ("BRK-B", "BRK-B"),
+        ("AAPL", "AAPL"),
+        ("1234", "1234"),  # nothing before the number to keep
+        (None, None),
+    ],
+)
+def test_unnumbered_drops_sharadars_reuse_number(ticker, expected):
+    assert unnumbered(ticker) == expected
+
+
+def test_a_sharadar_row_is_read_without_its_reuse_number():
+    rows = [
+        _sec(1, "ABCDU1", source="sharadar"),  # a dead SPAC's unit, numbered
+        _sec(2, "ABCD.WS2", source="sharadar"),
+        _sec(3, "ABCD1", source="sharadar"),  # the share: still in scope
+        _sec(4, "ABCDU1", source="fmp"),  # FMP never numbers: left alone
+    ]
+    sel = select_descope_candidates(rows, excluded=INSTRUMENT_KINDS)
+    assert [(r["security_id"], r["kind"]) for r in sel.candidates] == [
+        (1, "unit"),
+        (2, "warrant"),
+    ]
 
 
 @pytest.mark.parametrize(

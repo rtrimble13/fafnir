@@ -196,6 +196,45 @@ def test_mintable_is_adr_0016():
         assert not vo.mintable(dict(base, **change)), change
 
 
+def test_mintable_keeps_adr_0012_out():
+    """Sharadar files a SPAC's unit as a common stock's secondary class, so the
+    ticker decides, as for the FMP master; a dead one's ticker may carry Sharadar's
+    reuse number."""
+    base = {
+        "vendor_table": "stocks",
+        "is_delisted": True,
+        "last_price_date": Y(2022, 6, 30),
+        "category": "Domestic Common Stock Secondary Class",
+        "exchange": "NASDAQ",
+        "name": "ZZAB Acquisition Corp",
+    }
+    for ticker, kind in (
+        ("ZZABU", "unit"),
+        ("ZZAB.U", "unit"),
+        ("ZZABU1", "unit"),
+        ("ZZABW", "warrant"),
+        ("ZZAB.WS", "warrant"),
+        ("ZZABR", "right"),
+    ):
+        c = dict(base, ticker=ticker)
+        assert vo.out_of_scope(c) == kind, ticker
+        assert not vo.mintable(c), ticker
+        # Not excluded by the configuration, or declared: minted as before.
+        assert vo.mintable(c, excluded=()), ticker
+        assert vo.mintable(c, excluded=("warrant",)) == (kind != "warrant"), ticker
+        assert vo.mintable(c, declared=frozenset({ticker})), ticker
+    # A declaration names the issue listed under the ticker today, not the dead one
+    # Sharadar numbered when the ticker was reused: descope would remove that one.
+    numbered = dict(base, ticker="ZZABU1")
+    assert vo.out_of_scope(numbered, declared=frozenset({"ZZABU"})) == "unit"
+    for ticker in ("ZZAB", "ZZAB1", "ZZAB-PA", "SNOW1"):
+        assert vo.out_of_scope(dict(base, ticker=ticker)) is None, ticker
+        assert vo.mintable(dict(base, ticker=ticker)), ticker
+    # An exchange-traded product is never one of them, whatever its ticker.
+    etf = dict(base, ticker="ZZABU", category="ETF", exchange="NYSEARCA")
+    assert vo.out_of_scope(etf) is None and vo.mintable(etf)
+
+
 # ---------------------------------------------------------------------------
 # Scans
 # ---------------------------------------------------------------------------
@@ -302,6 +341,41 @@ def test_a_rerun_refreshes_and_a_gone_overlap_resolves(db):
     assert {f["resolved_by"] for f in _flags(db, "resolved")} == {
         "fafnir vendor overlap"
     }
+
+
+@integration
+def test_a_dead_unit_is_not_evaluated_and_its_flag_resolves(db):
+    # The share's FMP row, and its dead unit under Sharadar's numbered ticker:
+    # the unit trades near the share, but its bars are not on the row.
+    _sec(db, "ZZAB", *DEAD, price=lambda d: close_of(d, 9.8))
+    _vendor(
+        db,
+        "900040",
+        "ZZABU1",
+        *DEAD,
+        related=["ZZAB"],
+        category="Domestic Common Stock Secondary Class",
+    )
+    src = _source({"ZZABU1": lambda d: close_of(d, 10.2)})
+    # Before ADR 0012 applied to the mint, the unit was evaluated and flagged.
+    before = vo.scan(db, src, excluded_kinds=())
+    assert before.counts() == {("dead_issuer", "disagree"): 1}
+    assert before.out_of_scope == {}
+    (flag,) = _flags(db)
+    after = vo.scan(db, src)
+    assert after.overlaps == [] and after.dead_issuers == 0
+    assert after.out_of_scope == {"900040": "unit"}
+    assert after.resolved == 1 and _flags(db) == []
+    note = db.fetchone(
+        "SELECT resolution_note FROM ops.data_quality_flag WHERE dq_flag_id = %s",
+        (flag["dq_flag_id"],),
+    )["resolution_note"]
+    assert "is a unit, which ADR 0012 keeps out" in note
+    run = db.fetchone(
+        "SELECT params FROM ops.ingestion_run WHERE ingestion_run_id = %s",
+        (after.run_id,),
+    )
+    assert run["params"]["out_of_scope"] == {"unit": 1}
 
 
 @integration
