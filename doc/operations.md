@@ -896,9 +896,8 @@ traded price. The vendor's payload has the same defect, so a re-fetch changes no
   one-day shift turns `Sun Mon Tue Wed Thu` into five weekdays. A history that is only
   partly misdated shows Fridays in the *before* row; narrow the range. Refused, naming
   the dates: a bar landing on a stored bar outside the range, on a day the venue
-  calendar has no session (`--allow-non-session` overrides it; the calendar marks MLK
-  Day 1990-1997 closed although NYSE traded), in the future, or outside the venue
-  calendar's span altogether — which `--allow-non-session` does *not* override, since
+  calendar has no session (`--allow-non-session` overrides it), in the future, or
+  outside the venue calendar's span altogether — which `--allow-non-session` does *not* override, since
   a date the calendar has never heard of is a mistyped `--days`, not a holiday. Corporate actions stay
   where they are unless `--with-actions`; the dry run lists the ones in the range with
   their weekdays, so you can see whether the vendor misdated them too.

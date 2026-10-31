@@ -366,3 +366,90 @@ def test_folding_a_stub_keeps_both_securities_price_quarantines(db):
     assert repo.fold_empty_security(db, victim_id=stub, survivor_id=survivor)
 
     assert repo.count_price_quarantines(db, survivor, "2024-06-05") == 4
+
+
+# ---------------------------------------------------------------------------
+# 0041: MLK Day 1990-1997, a session the seed left out
+# ---------------------------------------------------------------------------
+
+MLK_1996 = dt.date(1996, 1, 15)
+MLK_1997 = dt.date(1997, 1, 20)
+
+
+@pytest.fixture()
+def old_calendars(db):
+    """Two venues seeded the old way, with MLK Day closed: one spanning 1996, one
+    whose calendar starts after 1997's MLK Day. Removed afterwards: ref is shared
+    by the whole session."""
+    from fafnir.db.seed import trading_days
+
+    venues = ("ZQ41A", "ZQ41B")
+    for code in venues:
+        repo.ensure_exchange(db, code, f"Test {code}", "US")
+    old = [d for d in trading_days(1996, 1997) if d not in (MLK_1996, MLK_1997)]
+    for code, days in (
+        ("ZQ41A", [d for d in old if d.year == 1996]),
+        ("ZQ41B", [d for d in old if d >= dt.date(1997, 2, 3)]),
+    ):
+        for d in days:
+            db.execute(
+                "INSERT INTO ref.trading_calendar (exchange_code, trade_date, is_open)"
+                " VALUES (%s, %s, TRUE)",
+                (code, d),
+            )
+    try:
+        yield db
+    finally:
+        db.execute(
+            "DELETE FROM ref.trading_calendar WHERE exchange_code = ANY(%s)",
+            (list(venues),),
+        )
+        db.execute(
+            "DELETE FROM ref.exchange WHERE exchange_code = ANY(%s)", (list(venues),)
+        )
+
+
+def _sessions(db, code, start, end):
+    return {
+        r["trade_date"]
+        for r in db.fetchall(
+            "SELECT trade_date FROM ref.trading_calendar WHERE exchange_code = %s"
+            " AND is_open AND trade_date BETWEEN %s AND %s",
+            (code, start, end),
+        )
+    }
+
+
+def _span(db, code):
+    row = db.fetchone(
+        "SELECT min(trade_date) AS first, max(trade_date) AS last"
+        " FROM ref.trading_calendar WHERE exchange_code = %s",
+        (code,),
+    )
+    return row["first"], row["last"]
+
+
+def test_0041_opens_mlk_day_only_inside_a_calendars_own_span(old_calendars):
+    db = old_calendars
+    spans = {code: _span(db, code) for code in ("ZQ41A", "ZQ41B", "NASDAQ")}
+
+    _run_migration(db, "0041")
+
+    # Inside the span: the missing Monday is now a session.
+    assert MLK_1996 in _sessions(db, "ZQ41A", MLK_1996, MLK_1996)
+    # Outside it: nothing written, so no calendar's edges move -- neither the
+    # venue that starts after 1997's MLK Day nor the session's 2023-2024 seed.
+    assert _sessions(db, "ZQ41B", dt.date(1990, 1, 1), dt.date(1997, 1, 31)) == set()
+    assert _sessions(db, "NASDAQ", dt.date(1990, 1, 1), dt.date(1997, 12, 31)) == set()
+    assert {code: _span(db, code) for code in spans} == spans
+
+    # Safe to run again, and the down takes back exactly what the up added.
+    _run_migration(db, "0041")
+    assert len(_sessions(db, "ZQ41A", MLK_1996, MLK_1996)) == 1
+    down = next(find_sql_dir().glob("migrations/0041*.down.sql"))
+    db.execute_script(down.read_text())
+    assert _sessions(db, "ZQ41A", MLK_1996, MLK_1996) == set()
+    assert _sessions(db, "ZQ41A", dt.date(1996, 1, 12), dt.date(1996, 1, 16)) == {
+        dt.date(1996, 1, 12),
+        dt.date(1996, 1, 16),
+    }

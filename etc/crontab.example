@@ -24,7 +24,8 @@ FAFNIR_HOME=/opt/fafnir
 # was still running (it takes over an hour) and judged a half-loaded night, every
 # security not yet loaded looking stale. `;`, not `&&`: as under systemd (the
 # fafnir-dq unit is After=, not Requires=, fafnir-daily), DQ still runs after a
-# failed load, and then a stale security really is stale.
+# failed load, and then a stale security really is stale. dorq judges a night once,
+# so with no new session it writes nothing.
 # In Sharadar mode the load includes the fundamentals, from SF1's nightly delta, and
 # the factor panel's refresh (#106): no entry of their own. Re-running the
 # fundamentals backfill (scripts/backfill_fundamentals.sh) is done by hand, in the

@@ -285,9 +285,9 @@ explanation. The queries and thresholds for each are in
   money-market fund's weekend NAV stored before the loader set these aside) is
   removed with `fafnir prices delete --symbol <SYM> --non-session`. Check the
   weekday distribution first: a history dated one day early (FVI, WLL — no Fridays,
-  Sunday bars that are Monday sessions) would lose every Monday. And
-  `ref.trading_calendar` marks MLK Day 1990–1997 closed although NYSE traded, so
-  real bars on those dates look non-session.
+  Sunday bars that are Monday sessions) would lose every Monday. On a warehouse
+  without migration 0041, real bars on MLK Day 1990–1997 also look non-session
+  (data-semantics.md §16).
 - **The first bar of a new listing after years of silence** is usually a fund or SPAC
   that took a ticker whose earlier history FMP still serves under it. Earlier
   segments that are junk (sub-penny on zero volume, stray bars after delisting) can

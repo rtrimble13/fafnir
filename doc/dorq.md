@@ -125,9 +125,15 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    reads and reports everything. The first run has no previous date and reports
    the whole lookback.
 
-   A second run for an as-of date already judged reports over the same span as
-   that night's run, not from five sessions before the night itself. Step 5,
-   **Write**, says why.
+   **A night is judged once.** When the market's latest session is a date a run
+   already judged (its watermark), a nightly run judges nothing and says which run
+   did: no session has loaded since. That is a failed load (2026-10-31: Sharadar's
+   SFP answered 503, the night stopped before its prices, and `fafnir-dq` re-judged
+   10-29), a market holiday, or `dq run` run a second time. A `--full` run's night
+   counts as judged too. The SQL checks still run. `--rerun` judges the night again,
+   over the span that night's run used (step 5, **Write**): the deliberate re-run
+   after a repair. Skipping costs the next night nothing, since its backfill pass
+   starts from the last run that judged a night.
 
    **Backfill.** A bar is judged on the nights whose window it falls in. History
    that arrives, or changes, behind the window falls in none. CELG-RI was minted
@@ -195,8 +201,8 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    check carries: a condition already open, or accepted, is not written again. The
    as-of date goes to `ops.load_watermark`.
 
-   A shadow file is named by its as-of date, and a second run for the same date
-   replaces it. `dq compare` reads one file a night, so the second run judges the
+   A shadow file is named by its as-of date, and a `--rerun` for the same date
+   replaces it. `dq compare` reads one file a night, so the re-run judges the
    same night: it takes `--since` from that night's run (the newest successful
    nightly run of the same endpoint for that date) and the same backfill
    securities. On unchanged data its file is byte for byte the first's; after a
@@ -204,7 +210,9 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    run reported only from five sessions before the night's own as-of date, and the
    nightly ran DQ twice (the daily, then `fafnir-dq`), so every night's file was
    the narrower one. DQ now runs once a night, from `fafnir-dq`
-   ([operations.md](operations.md)).
+   ([operations.md](operations.md)). A second run without `--rerun` writes nothing
+   (step 2), so the scheduled run on a night with no new session leaves the judged
+   night's file as it stands.
 
 **The run's record.** Each run has a row in `ops.ingestion_run` (`source =
 'dorq'`, endpoint `dq-run` or `dq-shadow`), which the MCP `ingestion_runs` tool

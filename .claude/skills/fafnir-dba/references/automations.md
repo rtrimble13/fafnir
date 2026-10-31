@@ -38,6 +38,14 @@ incremental and idempotent — a missed day is caught up on the next run.
    the first's shadow file. One `dq-shadow` row in `ops.ingestion_run` a night,
    started after `fafnir-daily` ended, is the healthy shape.
 
+   It runs after a failed load too. dorq then finds no session newer than the night
+   it last judged, says so in `dq.log` and writes no run row, no file and no
+   watermark. **No `dq-shadow` row after a failed daily is expected, not a second
+   failure.** Before that guard, the 2026-10-31 night (Sharadar SFP 503) re-judged
+   10-29 and replaced its shadow file. After the operator re-runs the load,
+   `fafnir-dq` judges the new session as usual; `dq run --rerun` re-judges a night
+   on purpose.
+
 The first four are **universe maintenance** and their order is not arbitrary:
 
 1. **`symbol-changes` first.** To the screener a renamed ticker is

@@ -4,10 +4,10 @@ Every schema, table, view, materialized view and function fafnir stores or serve
 with its **grain**, **source**, **units**, **adjustment status** and **update
 cadence**. This is the contract between the warehouse and everything that reads it.
 
-It describes the schema at migration **0040** (`industry_aliases`, release v3.0.4).
-It was checked against the live catalog (`pg_class`, `pg_attribute`,
+It describes the schema at migration **0041** (`mlk_day_before_1998`). It was
+checked against the live catalog at 0040 (`pg_class`, `pg_attribute`,
 `pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
-on 2026-10-31. A migration that adds, drops or re-types a column updates this file in
+on 2026-10-31; 0041 adds calendar rows and changes no object. A migration that adds, drops or re-types a column updates this file in
 the same pull request: the PR template's first box.
 
 Conventions:
@@ -1208,7 +1208,9 @@ extends the tail year by year. **Used by** the gap, stale and sparse checks, dor
 
 **How a closed day is represented.**
 - **Recurring holidays:** by *absence*. The seed inserts open weekdays only, so no
-  weekend and no recurring NYSE holiday has a row. A date with no row is closed
+  weekend and no recurring NYSE holiday has a row. Martin Luther King Jr. Day is a
+  holiday from 1998 (`seed.MLK_DAY_FIRST_CLOSED`), the first year NYSE closed for
+  it. A date with no row is closed
   inside the calendar's span and *unknown* outside it
   (`repository.open_sessions`).
 - **Ad hoc closures:** the eleven 1990–2028 days with no annual rule are rows with
@@ -1219,12 +1221,15 @@ extends the tail year by year. **Used by** the gap, stale and sparse checks, dor
 - **Every reader** filters on `is_open`, so the two forms read alike.
 
 On 2026-10-31 the calendar covers AMEX, BATS, NASDAQ, NYSE and OTC, 1990-01-02 to
-2028-12-29: 9,812 open sessions and 11 closed rows each. TXSE, CBOE and MUTF have
-none and fall back to NASDAQ's.
+2028-12-29: 9,812 open sessions and 11 closed rows each, before 0041 adds eight. TXSE,
+CBOE and MUTF have none and fall back to NASDAQ's.
 
-**Known defect:** the seed closes Martin Luther King Jr. Day in 1990–1997, when NYSE
-was open (it first closed for it in 1998). Those eight sessions are missing, so a bar
-on one of them reads as a non-session date.
+**MLK Day 1990–1997 (migration 0041).** Before 0041 the seed closed MLK Day in every
+year, so those eight Mondays, sessions NYSE traded, were missing. The price loaders'
+non-session set-aside dropped real bars on them, `prices delete --non-session` counted
+the 14,183 stored ones as deletable, and dorq reported them as `dorq_non_session_bar`
+(DQ105). 0041 inserts the eight dates as open sessions into each calendar whose span
+covers them. The gap check then flags them for a security that holds no bar on one.
 
 ---
 
@@ -1598,7 +1603,8 @@ current full file of each of `stocks`, `funds`, `fundamentals`, `tickers` and
 ### `meta.schema_migration` — migration bookkeeping. **Grain:** `version`.
 `version` (TEXT PK, `0001`…), `name`, `checksum` (SHA-256 of the up-migration),
 `applied_at`. Written by `fafnir db migrate`, removed by `fafnir db rollback`. On
-2026-10-31 it holds 0001–0040, the repository's full set (MCP `schema_state`).
+2026-10-31 the host held 0001–0040 (MCP `schema_state`); the repository's set ends at
+0041.
 
 ---
 

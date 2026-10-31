@@ -4737,9 +4737,9 @@ def prices_shift(
 
     Refused, naming the dates: a bar landing on a date that already has a bar outside
     the range, or on a day the venue calendar has no session (--allow-non-session
-    overrides that one -- the calendar marks MLK Day 1990-1997 closed although NYSE
-    traded), or in the future. Corporate actions stay put unless --with-actions; the
-    dry run lists the ones in the range so you can see whether they are misdated too.
+    overrides that one), or in the future. Corporate actions stay put unless
+    --with-actions; the dry run lists the ones in the range so you can see whether
+    they are misdated too.
 
     Adjustment factors are recomputed. Undo with `fafnir override revoke`, which
     restores the vendor's bars at their original dates.
@@ -6786,21 +6786,34 @@ def _dq_engine(cfg, engine: Optional[str]) -> str:
     is_flag=True,
     help="dorq over every bar of every security, not the nightly lookback.",
 )
+@click.option(
+    "--rerun",
+    is_flag=True,
+    help="dorq judges the latest night again although a run already judged it, "
+    "over the span that run used, replacing its shadow file (after a repair).",
+)
 @click.pass_context
-def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full):
+def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full, rerun):
     """Run the data-quality checks; write flags to ops.data_quality_flag.
 
     \b
       fafnir dq run                          # [dq] engine: sql by default
       fafnir dq run --engine both            # SQL checks, and dorq in shadow
       fafnir dq run --engine dorq --full     # dorq over the whole history
+      fafnir dq run --engine dorq --rerun    # dorq on a night it already judged
 
     The SQL engine is the gap / outlier / freshness / identity / classification
     checks. dorq (doc/dorq.md) judges every bar of the lookback for a data error
     and writes `dorq_*` flags -- or, in shadow mode, the shadow file
     `fafnir dq compare` reads, leaving the queue alone. Shadow is the default
     until the cutover criteria are met (dorq plan §7.4, §8).
+
+    dorq judges a night once. When no session has loaded since its last run (a
+    failed load, a holiday, a second run by hand) it says which run judged the
+    night and does nothing; the SQL checks run regardless. --rerun overrides that.
     """
+    if rerun and full:
+        raise click.UsageError("--rerun is for the nightly window; --full always runs.")
     from fafnir.dq import checks
     from fafnir.dq import dorq as dorq_engine
 
@@ -6820,11 +6833,20 @@ def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full):
             settings = dorq_engine.settings_from(cfg)
             try:
                 out = dorq_engine.run(
-                    database, settings, exchange, shadow=shadow, full=full
+                    database, settings, exchange, shadow=shadow, full=full, rerun=rerun
                 )
             except dorq_engine.DorqError as exc:
                 raise click.ClickException(str(exc)) from exc
             database.commit()
+            if out.judged_by:
+                j = out.judged_by
+                at = j["started_at"].astimezone(dt.timezone.utc)
+                click.echo(
+                    f"dorq: {out.window.as_of} was judged by run {j['ingestion_run_id']}"
+                    f" ({at:%Y-%m-%d %H:%M} UTC) and no newer session has loaded;"
+                    " nothing to judge. --rerun to judge it again."
+                )
+                return
             w = out.window
             span = (
                 f"{w.bars_from or 'start'}..{w.as_of}"
