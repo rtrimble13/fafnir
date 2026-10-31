@@ -110,7 +110,7 @@ from urllib.parse import urlsplit
 import requests
 
 from fafnir.logging_config import get_logger
-from fafnir.sources.base import BaseSource, SourceError
+from fafnir.sources.base import BaseSource, SourceError, TransientSourceError
 
 logger = get_logger("source.sharadar")
 
@@ -280,7 +280,7 @@ class SharadarClient(BaseSource):
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            raise SourceError(
+            raise TransientSourceError(
                 f"GET {self._redact(url)} failed: "
                 f"{type(exc).__name__}: {self._redact(str(exc))}"
             ) from None
@@ -460,7 +460,13 @@ class SharadarClient(BaseSource):
             detail = f": {exc}"
         except ValueError:
             pass
-        raise SourceError(
+        # An outage answers 5xx or 429 here too; a 4xx is the key or the tier.
+        error = (
+            TransientSourceError
+            if resp.status_code >= 500 or resp.status_code == 429
+            else SourceError
+        )
+        raise error(
             f"Sharadar {table} bulk (years={years}) answered HTTP "
             f"{resp.status_code} without a redirect{detail}. Bulk is "
             "subscription-gated; a 403 'Exceeds free tier' is the free key."
@@ -472,9 +478,22 @@ class SharadarClient(BaseSource):
         self.limiter.acquire()
         try:
             resp = requests.get(url, stream=True, timeout=self.timeout)
-            resp.raise_for_status()
         except requests.RequestException as exc:
-            raise SourceError(
+            raise TransientSourceError(
+                f"GET {_no_query(url)} failed: "
+                f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
+            ) from None
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            # A 4xx from the pre-signed link (expired, refused) will not change by
+            # waiting; a 5xx or a 429 may.
+            error = (
+                TransientSourceError
+                if resp.status_code >= 500 or resp.status_code == 429
+                else SourceError
+            )
+            raise error(
                 f"GET {_no_query(url)} failed: "
                 f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
             ) from None
@@ -486,7 +505,7 @@ class SharadarClient(BaseSource):
                         self.bytes_downloaded += len(chunk)
                         yield chunk
             except requests.RequestException as exc:
-                raise SourceError(
+                raise TransientSourceError(
                     f"GET {_no_query(url)} broke off: "
                     f"{type(exc).__name__}: {_no_query(self._redact(str(exc)))}"
                 ) from None

@@ -85,7 +85,21 @@ source sharadar-bulk --tables tickers,actions --force → source sharadar-delta
 
 A failed step stops the night non-zero, and every step is safe to re-run. The one
 exception is SF1's delta in step 2: a failure prints `!! fundamentals delta failed`
-and the night goes on, since it feeds the fundamentals, not the prices. Its runs
+and the night goes on, since it feeds the fundamentals, not the prices.
+
+**A Sharadar outage is retried.** When steps 1 or 2 stop on Sharadar's availability
+(retries run out on 429/5xx, timeouts, dropped connections) the command exits 75 and
+`daily_update.sh` runs it again: after 15 minutes, 30 minutes, then hourly, inside a
+4 h window (`FAFNIR_RETRY_DELAYS`, `FAFNIR_RETRY_WINDOW`). So on a bad night:
+- **Several failed `bulk:*`/`delta:*` runs** in `ops.ingestion_run` is one night
+  retrying, not several failures.
+- **A long `fafnir-daily`** (up to about 5 h) is that night waiting.
+- **DQ and the dump** start after the final attempt.
+- **A failed unit with exit status 75** means the vendor was still down at the end
+  of the window. Probe it (an unauthenticated `curl -s -o /dev/null -w '%{http_code}'
+  .../SFP?ticker=SPY` answers 200 when it is up) and have the operator re-run.
+- **Exit status 1** is a fault, not an outage: read the run's `error_message` before
+  anyone re-runs. Its runs
 are all `source = 'sharadar'`:
 
 | Endpoint | Step | Read in `params` |

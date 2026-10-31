@@ -20,7 +20,7 @@ from click.testing import CliRunner
 from fafnir import cli
 from fafnir.sources import base as base_mod
 from fafnir.sources import sharadar as mod
-from fafnir.sources.base import SourceError, redact_secrets
+from fafnir.sources.base import SourceError, TransientSourceError, redact_secrets
 from fafnir.sources.sharadar import DEFAULT_BASE_URL, SharadarClient
 
 KEY = "test-sharadar-key-not-a-secret"
@@ -409,6 +409,62 @@ def test_bulk_without_a_redirect_says_why(tmp_path):
     c = _client(_Resp(status=403, body={"error": "Exceeds free tier"}))
     with pytest.raises(SourceError, match="HTTP 403 without a redirect: .*free tier"):
         c.bulk_export("SEP", tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# An outage or a fault: what `ingest sharadar` exits 75 on (daily_update.sh retries)
+# ---------------------------------------------------------------------------
+
+
+def test_retries_outlasted_by_a_5xx_or_a_dropped_connection_are_transient():
+    """2026-10-31: SFP answered 503 to every retry. Waiting may fix that."""
+    with pytest.raises(TransientSourceError, match="exhausted retries.*503"):
+        _client(*[_Resp(status=503, body={})] * 4).query("SFP", {"ticker": "A"})
+    with pytest.raises(TransientSourceError, match="exhausted retries.*429"):
+        _client(*[_Resp(status=429, body={})] * 4).query("SFP", {"ticker": "A"})
+    boom = requests.ConnectionError("connection reset")
+    with pytest.raises(TransientSourceError, match="ConnectionError"):
+        _client(*[boom] * 4).ping()
+
+
+def test_a_refusal_or_a_bad_answer_is_not_transient():
+    for resp in (
+        _Resp(status=403, body={}),  # the key, the tier
+        _Resp(status=200, body=None, raw=b"<html>"),  # not JSON
+    ):
+        with pytest.raises(SourceError) as exc:
+            _client(resp).query("SFP", {"ticker": "A"})
+        assert not isinstance(exc.value, TransientSourceError)
+
+
+def test_a_bulk_request_the_vendor_cannot_answer_is_transient(tmp_path):
+    with pytest.raises(TransientSourceError, match="HTTP 503 without a redirect"):
+        _client(_Resp(status=503, body={})).bulk_export("SEP", tmp_path)
+    with pytest.raises(SourceError) as exc:
+        _client(_Resp(status=403, body={})).bulk_export("SEP", tmp_path)
+    assert not isinstance(exc.value, TransientSourceError)
+    boom = requests.ConnectTimeout("timed out")
+    with pytest.raises(TransientSourceError, match="ConnectTimeout"):
+        _client(boom).bulk_export("SEP", tmp_path)
+
+
+def test_the_signed_link_failing_is_transient_unless_it_is_refused(
+    tmp_path, link_fetches
+):
+    class _Broken(_Resp):
+        def iter_content(self, chunk_size=1):
+            yield b"partial"
+            raise requests.exceptions.ChunkedEncodingError("broke off")
+
+    _, queue = link_fetches
+    queue.extend([_Resp(status=503, raw=b""), _Broken(raw=b"x"), _Resp(status=403)])
+    for _ in range(2):  # the link's 503, then a download that broke off
+        with pytest.raises(TransientSourceError):
+            _client(_redirect()).bulk_export("SEP", tmp_path)
+    with pytest.raises(SourceError) as exc:  # an expired or refused link
+        _client(_redirect()).bulk_export("SEP", tmp_path)
+    assert not isinstance(exc.value, TransientSourceError)
     assert list(tmp_path.iterdir()) == []
 
 

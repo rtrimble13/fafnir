@@ -24,6 +24,7 @@ from fafnir.db import repository as repo
 from fafnir.ingest import sharadar_actions as sa
 from fafnir.ingest import sharadar_bulk as bulk
 from fafnir.ingest import sharadar_prices as sp
+from fafnir.sources.base import TransientSourceError
 from fafnir.sources.sharadar import SharadarClient
 
 pytestmark = pytest.mark.integration
@@ -739,9 +740,81 @@ def test_a_failed_sf1_delta_never_stops_the_night(db, tmp_path, monkeypatch):
     )
     assert failed == 1  # on record, for the operator
 
-    # A price table's failure still stops it at step 2.
+    # A price table's failure still stops it at step 2: a fault in what the vendor
+    # sent, not an outage, so exit 1 and daily_update.sh does not try again.
     tables["SEP"] = [bar, dict(bar)]
     out = night()
-    assert out.exit_code != 0
+    assert out.exit_code == 1
     assert "step 2 failed: stocks, fundamentals. The night stopped there." in out.output
     assert "[3/7]" not in out.output
+
+
+class _Outage(_FakeNight):
+    """Sharadar unreachable for ``down`` (tables queried, or bulk tables): what the
+    client raises once its own retries run out."""
+
+    def __init__(self, *args, down=(), **kw):
+        super().__init__(*args, **kw)
+        self.down = set(down)
+
+    def _call(self, table, params=None):
+        if table in self.down:
+            raise TransientSourceError(
+                f"GET https://api/{table} exhausted retries (last status 503)"
+            )
+        return super()._call(table, params)
+
+    def _bulk_link(self, table, years):
+        if table in self.down:
+            raise TransientSourceError(f"Sharadar {table} bulk answered HTTP 503")
+        return super()._bulk_link(table, years)
+
+
+@pytest.mark.parametrize(
+    "down, at",
+    [({"SFP"}, 2), ({"tickers"}, 1), ({"SEP", "SFP"}, 2)],
+)
+def test_a_vendor_outage_exits_75_so_the_night_is_tried_again(
+    db, tmp_path, monkeypatch, down, at
+):
+    """2026-10-31: the SFP delta answered 503 past every retry. The night stops
+    as before, but with EX_TEMPFAIL, which daily_update.sh retries."""
+    _fulls(db, tmp_path)
+    today = date.today().isoformat()
+    tables = {
+        "SEP": [_json_bar("ZZA", "2026-10-21", 22, stamp=today)],
+        "SFP": [_json_bar("ZZFUND", "2026-10-21", 30, stamp=today)],
+        "SF1": [],
+    }
+    client = _Outage(tables, {"tickers": TICKERS, "actions": ACTIONS}, down=down)
+    monkeypatch.setattr(cli, "_sharadar_client", lambda cfg: client)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(f'[sharadar]\nbulk_dir = "{tmp_path}"\n')
+    out = CliRunner().invoke(
+        cli.main,
+        ["--config", str(rc), "ingest", "sharadar", "--dry-run"],
+        env={"FAFNIR_DSN": db.dsn},
+    )
+    assert out.exit_code == cli.EX_TEMPFAIL == 75, out.output
+    assert f"step {at} failed" in out.output
+    assert "Sharadar could not be reached, so a later run may succeed" in out.output
+    assert f"[{at + 1}/7]" not in out.output
+
+
+def test_an_outage_beside_a_fault_is_a_fault(db, tmp_path, monkeypatch):
+    """Retrying cannot fix the half that is a fault, so the night exits 1."""
+    _fulls(db, tmp_path)
+    today = date.today().isoformat()
+    bar = _json_bar("ZZA", "2026-10-21", 22, stamp=today)
+    tables = {"SEP": [bar, dict(bar)], "SFP": [], "SF1": []}  # SEP repeats a row
+    client = _Outage(tables, {"tickers": TICKERS, "actions": ACTIONS}, down={"SFP"})
+    monkeypatch.setattr(cli, "_sharadar_client", lambda cfg: client)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(f'[sharadar]\nbulk_dir = "{tmp_path}"\n')
+    out = CliRunner().invoke(
+        cli.main,
+        ["--config", str(rc), "ingest", "sharadar", "--dry-run"],
+        env={"FAFNIR_DSN": db.dsn},
+    )
+    assert out.exit_code == 1, out.output
+    assert "step 2 failed: stocks, funds. The night stopped there." in out.output
