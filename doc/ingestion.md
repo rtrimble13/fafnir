@@ -180,6 +180,11 @@ fafnir ingest sharadar             # after it ([general] primary_price_vendor = 
 A step that fails stops the night with a non-zero exit, except SF1's delta in step 2:
 it feeds the fundamentals, not the night's prices, so a failed one is a warning and a
 failed run on record, and the next night's delta starts from the same date (#106).
+When every failure that stopped step 1 or 2 is Sharadar's availability
+(`TransientSourceError`), the exit status is 75 (`EX_TEMPFAIL`) and `daily_update.sh`
+tries the night again later. That covers retries run out on 429s or 5xx answers,
+timeouts, dropped connections and a download that broke off
+([operations.md](operations.md#fmp-mode-and-sharadar-mode)). Anything else exits 1.
 Every step is safe to run again, so the next run picks up where the last one stopped. A real run refuses
 until `primary_price_vendor = "sharadar"`. From then on, `daily_update.sh` runs it
 in place of FMP's universe, price and action steps, and FMP's loaders refuse to

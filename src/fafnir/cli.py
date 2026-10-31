@@ -73,6 +73,20 @@ def _split_symbols(value: Optional[str]) -> list[str]:
     return [s.strip().upper() for s in value.split(",") if s.strip()]
 
 
+#: The exit status of a command stopped by a vendor outage: sysexits'
+#: EX_TEMPFAIL. ``daily_update.sh`` retries the night's payload step on it, and on
+#: nothing else, so a failure that waiting cannot fix fails the night at once.
+EX_TEMPFAIL = 75
+
+
+class VendorUnavailable(click.ClickException):
+    """A command stopped because a vendor could not be reached or answered
+    (:class:`fafnir.sources.base.TransientSourceError`): exits
+    :data:`EX_TEMPFAIL`, so a caller can tell an outage from a fault."""
+
+    exit_code = EX_TEMPFAIL
+
+
 class _FafnirGroup(click.Group):
     """Turns a connection failure into one actionable line, once, for every
     subcommand.
@@ -1179,11 +1193,14 @@ def ingest_sharadar(ctx, dry_run):
     price tables and SF1 come as deltas. A step that fails stops the night with a
     non-zero exit, except SF1's delta: it is for `ingest fundamentals`, which
     daily_update.sh runs after this, and a failed one warns and is fetched again
-    the next night. Every step is safe to run again, so the next run picks up where
-    it stopped. Factors are recomputed for the securities whose bars or actions
-    changed. Step 7 deletes the files nothing reads any more, keeping [sharadar]
-    keep_days of them; it runs only after the rest succeeded, and if it cannot
-    run it warns without failing the night.
+    the next night. When what stopped steps 1 or 2 was Sharadar's availability (its
+    429s, 5xx answers, timeouts or dropped connections outlasting the client's
+    retries) the exit status is 75 (EX_TEMPFAIL), and daily_update.sh tries the
+    night again later; any other failure exits 1. Every step is safe to run again,
+    so the next run picks up where it stopped. Factors are recomputed for the
+    securities whose bars or actions changed. Step 7 deletes the files nothing
+    reads any more, keeping [sharadar] keep_days of them; it runs only after the
+    rest succeeded, and if it cannot run it warns without failing the night.
 
     The dry run still downloads and records the files and refreshes the vendor
     tables (core.vendor_security, core.vendor_security_event): that is Sharadar's
@@ -1211,29 +1228,42 @@ def ingest_sharadar(ctx, dry_run):
     def step(n: int, name: str) -> None:
         click.echo(f"\n[{n}/7] {name}")
 
-    def stop(n: int, why: str):
+    def stop(n: int, why: str, results=()):
+        # Every failure that stopped the step was the vendor's availability: say
+        # so in the exit status, so daily_update.sh tries the night again later.
+        transient = bool(results) and all(r.transient for r in results)
+        if transient:
+            raise VendorUnavailable(
+                f"step {n} failed: {why}. The night stopped there: Sharadar could "
+                "not be reached, so a later run may succeed."
+            )
         raise click.ClickException(f"step {n} failed: {why}. The night stopped there.")
+
+    def failures(results, tables=None):
+        return [
+            r
+            for r in results
+            if r.outcome == "failed" and (tables is None or r.table in tables)
+        ]
 
     with Database(cfg.dsn) as database:
         step(1, "source sharadar-bulk --tables tickers,actions --force")
-        failed = _echo_sharadar_files(
-            sharadar_bulk.download_tables(
-                database, client, ["tickers", "actions"], bulk_dir, force=True
-            )
+        results = sharadar_bulk.download_tables(
+            database, client, ["tickers", "actions"], bulk_dir, force=True
         )
+        failed = _echo_sharadar_files(results)
         if failed:
-            stop(1, ", ".join(failed))
+            stop(1, ", ".join(failed), failures(results))
         step(2, "source sharadar-delta")
-        failed = _echo_sharadar_files(
-            sharadar_bulk.fetch_deltas(
-                database, client, sharadar_bulk.DELTA_TABLES, bulk_dir
-            )
+        results = sharadar_bulk.fetch_deltas(
+            database, client, sharadar_bulk.DELTA_TABLES, bulk_dir
         )
+        failed = _echo_sharadar_files(results)
         # SF1's delta feeds the fundamentals, not tonight's prices: it never stops
         # the night. Its failed run is on record, and the next night's delta starts
         # from the same date.
         if any(t in sharadar_bulk.PRICE_TABLES for t in failed):
-            stop(2, ", ".join(failed))
+            stop(2, ", ".join(failed), failures(results, sharadar_bulk.PRICE_TABLES))
         if failed:
             click.echo(
                 f"!! {', '.join(failed)} delta failed: the fundamentals wait for the "

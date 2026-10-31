@@ -65,6 +65,18 @@ class SourceError(Exception):
     """Raised when a source request fails after retries."""
 
 
+class TransientSourceError(SourceError):
+    """A source request that failed because the vendor could not be reached or
+    answered, not because of what it said: the client's retries ran out on 429s,
+    5xx answers, timeouts or connection errors, or a download broke off. Waiting
+    and trying again may succeed (2026-10-31: Sharadar's SFP answered 503 for over
+    a minute, then served the night hours later). A 4xx, a refused key, or rows
+    of the wrong shape stay plain :class:`SourceError`: trying again cannot help.
+
+    `daily_update.sh` retries the night's payload step on this, and only this
+    (the CLI exits :data:`fafnir.cli.EX_TEMPFAIL`)."""
+
+
 class RateLimiter:
     """Simple sliding-window limiter: at most ``max_calls`` per ``period`` seconds."""
 
@@ -135,7 +147,7 @@ class BaseSource:
                     # `from None`, not `from exc`: the chained RequestException
                     # renders the full URL -- API key and all -- into the
                     # traceback. The redacted detail is carried over instead.
-                    raise SourceError(
+                    raise TransientSourceError(
                         f"GET {self._redact(url)} failed: "
                         f"{type(exc).__name__}: {self._redact(str(exc))}"
                     ) from None
@@ -190,7 +202,7 @@ class BaseSource:
                 )
             return data, resp.status_code, nbytes
 
-        raise SourceError(
+        raise TransientSourceError(
             f"GET {self._redact(url)} exhausted retries"
             + (f" (last status {last_status})" if last_status else "")
         )

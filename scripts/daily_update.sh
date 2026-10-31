@@ -52,6 +52,68 @@ upkeep() {
     fi
 }
 
+# A vendor outage is waited out, not reported in the morning. The payload step exits
+# 75 (EX_TEMPFAIL) when what stopped it was the vendor's availability -- 429s, 5xx
+# answers, timeouts or dropped connections outlasting the HTTP client's own retries
+# (2026-10-31: Sharadar's SFP answered 503, and the night stopped at 02:31 UTC with
+# no prices). Then it is run again after each delay, as long as the next attempt
+# would start within FAFNIR_RETRY_WINDOW seconds of this script's start. Every step
+# is idempotent and watermark-driven, so an attempt picks up where the last stopped.
+# Any other failure is a fault that waiting cannot fix, and stops the night at once.
+#
+# Retrying here, inside the one unit, rather than with systemd's Restart=: the unit
+# stays active across the attempts, so fafnir-dq and fafnir-dump, ordered
+# After=fafnir-daily, wait for the night's final state instead of starting between
+# two attempts. The crontab's chain behaves the same. Each attempt leaves its own
+# failed ops.ingestion_run row. The defaults (15 min, 30 min, then hourly: about
+# 3h45 of waiting; a 4 h window) end the night well inside fafnir-daily's
+# TimeoutStartSec=6h.
+RETRY_DELAYS=(${FAFNIR_RETRY_DELAYS:-900 1800 3600 3600 3600})
+RETRY_WINDOW=${FAFNIR_RETRY_WINDOW:-14400}
+START_EPOCH=$(date -u +%s)
+EX_TEMPFAIL=75
+
+retry_transient() {
+    local attempt=1 rc wait
+    while :; do
+        rc=0
+        "$@" || rc=$?
+        [ "${rc}" -eq 0 ] && return 0
+        [ "${rc}" -ne "${EX_TEMPFAIL}" ] && return "${rc}"
+        if [ "${attempt}" -gt "${#RETRY_DELAYS[@]}" ]; then
+            echo "!! '$*': the vendor was still unavailable after ${attempt}" \
+                "attempts -- the night stops here."
+            return "${rc}"
+        fi
+        wait=${RETRY_DELAYS[$((attempt - 1))]}
+        case "${wait}" in
+            '' | *[!0-9]*)
+                echo "!! FAFNIR_RETRY_DELAYS holds '${wait}', not seconds -- no retry."
+                return "${rc}"
+                ;;
+        esac
+        # Checked here, not left to `[`: a window that is not a number would make the
+        # test below an error, which `if` reads as false, and the retries would go on
+        # with no window at all.
+        case "${RETRY_WINDOW}" in
+            '' | *[!0-9]*)
+                echo "!! FAFNIR_RETRY_WINDOW holds '${RETRY_WINDOW}', not seconds --" \
+                    "no retry."
+                return "${rc}"
+                ;;
+        esac
+        if [ $(($(date -u +%s) + wait - START_EPOCH)) -gt "${RETRY_WINDOW}" ]; then
+            echo "!! '$*': the vendor was unavailable; another attempt would start" \
+                "past FAFNIR_RETRY_WINDOW (${RETRY_WINDOW}s) -- the night stops here."
+            return "${rc}"
+        fi
+        echo "!! '$*' stopped on a vendor outage (attempt ${attempt}, exit" \
+            "${EX_TEMPFAIL}); trying again in $((wait / 60)) min."
+        sleep "${wait}"
+        attempt=$((attempt + 1))
+    done
+}
+
 # Keep partitions + trading calendar rolled forward to the horizon (auto-extends
 # to current year + horizon_extra_years; no yearly config edits needed).
 fafnir db ensure-horizon
@@ -118,10 +180,11 @@ fmp_night() {
 sharadar_night() {
     # TICKERS and ACTIONS downloaded whole, the SEP/SFP/SF1 deltas, the vendor master,
     # renames/delistings/listings, then bars and actions for what Sharadar feeds. The
-    # payload, so fatal, as `ingest prices` is in FMP's night. It recomputes the
-    # factors it changes itself. See doc/ingestion.md, "Sharadar as primary".
+    # payload, so fatal, as `ingest prices` is in FMP's night -- after a vendor outage
+    # has been waited out (retry_transient). It recomputes the factors it changes
+    # itself. See doc/ingestion.md, "Sharadar as primary".
     echo "==> Sharadar night"
-    fafnir ingest sharadar
+    retry_transient fafnir ingest sharadar
 
     # The statements from the SF1 delta the step above fetched (#106). Upkeep: a
     # fundamentals failure never costs the night's prices, and the deltas it did

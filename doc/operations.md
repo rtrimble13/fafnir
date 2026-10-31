@@ -57,8 +57,9 @@ marts ([FMP mode and Sharadar mode](#fmp-mode-and-sharadar-mode)).
 Data quality is a second job, `fafnir-dq` (`scripts/run_dq_checks.sh`), which runs
 once the daily has finished; the cron example chains it in the same entry. It is
 the night's only `dq run`: a DQ failure does not mark the load failed, and its
-queue summary goes to its own log. Run DQ once per load: dorq's shadow file is one
-per night.
+queue summary goes to its own log. dorq judges a night once: a second run with no new
+session (after a failed load, on a holiday, or by hand) says so and writes nothing,
+and `dq run --rerun` re-judges on purpose ([dorq.md](dorq.md)).
 
 The first four steps are **universe maintenance**, and their order is load-bearing:
 
@@ -120,6 +121,32 @@ validate stops it before anything loads.
     [ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98) has each
     step. It is the payload, so a failure stops the night before the marts, as a
     failed `ingest prices` does in FMP mode.
+  - **A Sharadar outage is waited out.** When what stopped steps 1 or 2 was
+    Sharadar's availability, the command exits 75 (`EX_TEMPFAIL`). That covers 429s,
+    5xx answers, timeouts and dropped connections that outlast the client's own four
+    tries. `daily_update.sh` then runs it again after 15 minutes, 30 minutes, then
+    hourly, about 3¾ h of waiting in all. Each attempt picks up where the last
+    stopped. Any other failure exits 1 and stops the night at once: a 4xx, a header
+    drift, a delta that repeats rows. On 2026-10-31 SFP answered 503 and the night
+    stopped at 02:31 UTC with no prices. It would now have tried five more times,
+    the last at about 06:20 UTC.
+    - **Where to see it.** `daily.log` has a `stopped on a vendor outage (attempt N,
+      exit 75)` line per retry, and `ops.ingestion_run` has each attempt's failed
+      run. A night that waited is a long `fafnir-daily`. `fafnir-dq` and
+      `fafnir-dump` start after it, since they are ordered `After=` it and the
+      retries happen inside the one unit. That is why this is not systemd's
+      `Restart=`: between restarts the unit is inactive, and DQ could start on a
+      half-loaded night.
+    - **Settings,** in `/etc/fafnir/fafnir.env`: `FAFNIR_RETRY_DELAYS` (seconds,
+      space-separated; default `900 1800 3600 3600 3600`) and `FAFNIR_RETRY_WINDOW`
+      (default `14400`). No attempt starts more than the window after the script
+      did, so the night stays inside the unit's `TimeoutStartSec=6h`.
+      `FAFNIR_RETRY_WINDOW=0` turns retrying off. A value of either that is not
+      whole seconds (`4h`) stops the retrying where it is read, with a line in the
+      journal saying so.
+    - **Giving up** exits 75 and fails the unit as before. DQ still runs, and the
+      operator re-runs the night once the vendor answers. FMP mode's night is not
+      retried.
   - **`fafnir ingest fundamentals`** applies the SF1 delta step 2 fetched to the
     statement tables, and the marts refreshed after it carry the change into the
     factor panel. It warns and carries on if it fails, so the fundamentals never

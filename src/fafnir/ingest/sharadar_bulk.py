@@ -54,7 +54,7 @@ from fafnir.db.connection import Database
 from fafnir.ingest.runlog import RunLog
 from fafnir.logging_config import get_logger
 from fafnir.sources import sharadar_files as sf
-from fafnir.sources.base import SourceError
+from fafnir.sources.base import SourceError, TransientSourceError
 from fafnir.sources.sharadar import BULK_YEARS, SharadarClient
 
 logger = get_logger("ingest.sharadar_bulk")
@@ -88,6 +88,9 @@ class TableResult:
     superseded: int = 0
     unmapped_columns: list = field(default_factory=list)
     error: Optional[str] = None
+    #: The failure was the vendor's availability (:class:`TransientSourceError`),
+    #: not its data: trying again later may succeed.
+    transient: bool = False
 
 
 class HeaderDrift(SourceError):
@@ -198,6 +201,7 @@ def download_table(
             )
     except (SourceError, sf.SharadarFileError, OSError) as exc:
         result.error = str(exc)
+        result.transient = isinstance(exc, TransientSourceError)
         logger.error("Sharadar bulk %s failed: %s", vendor_table, exc)
     return result
 
@@ -349,6 +353,7 @@ def fetch_delta(
                 result = _record_delta(db, run, vendor_table, rows, filters, bulk_dir)
     except (SourceError, OSError) as exc:
         result.error = str(exc)
+        result.transient = isinstance(exc, TransientSourceError)
         logger.error("Sharadar delta %s failed: %s", vendor_table, exc)
     return result
 
