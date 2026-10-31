@@ -2664,24 +2664,209 @@ def tc(
     )
 
 
+# ---------------------------------------------------------------------------
+# `duk rc` and `duk ti ...`: compute on a price file
+#
+# The five commands differ only in what they compute. Reading the file, checking
+# the column, warning on a short series, and writing and printing the result are
+# one implementation each, below; test/duk/test_cli_compute_commands.py pins the
+# bytes all five print.
+# ---------------------------------------------------------------------------
+
+
+def _apply(func, options):
+    """Apply click ``options`` so they list in --help in the order given."""
+    for option in reversed(options):
+        func = option(func)
+    return func
+
+
+def compute_input_options(quiet_help):
+    """-v, -q and -i: the head of every compute command's option list."""
+
+    def decorate(func):
+        return _apply(
+            func,
+            [
+                click.option(
+                    "-v",
+                    "--verbose",
+                    is_flag=True,
+                    help="Print log output to the console (default: log file only)",
+                ),
+                click.option("-q", "--quiet", is_flag=True, help=quiet_help),
+                click.option(
+                    "-i",
+                    "--input",
+                    "input_file",
+                    type=click.Path(exists=True),
+                    required=True,
+                    help="Input file containing price data (CSV or JSON)",
+                ),
+            ],
+        )
+
+    return decorate
+
+
+def compute_output_options(func):
+    """--table/--csv/--json, --summary, -p and -o: the tail of the option list."""
+    return _apply(
+        func,
+        [
+            table_option,
+            click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP),
+            click.option(
+                "--json", "output_json", is_flag=True, help="Output data as JSON"
+            ),
+            click.option(
+                "--summary",
+                is_flag=True,
+                help="Print summary statistics instead of data observations",
+            ),
+            click.option(
+                "-p",
+                "--precision",
+                type=int,
+                default=3,
+                help="Decimal precision for output values (default: 3)",
+            ),
+            click.option(
+                "-o",
+                "--output",
+                type=click.Path(),
+                help="Write data to file",
+            ),
+        ],
+    )
+
+
+def _fail(logger, message, *, logged=None):
+    """Log ``logged`` (default: ``message``), print ``Error: message``, exit 1."""
+    logger.error(logged or message)
+    click.echo(f"Error: {message}", err=True)
+    sys.exit(1)
+
+
+def _warn(logger, message):
+    """Log a warning and print it to stderr; the command carries on."""
+    logger.warning(message)
+    click.echo(f"Warning: {message}", err=True)
+
+
+def read_compute_input(input_file, logger):
+    """The price file as a DataFrame: JSON by its extension, else CSV.
+
+    Exits 1 when it cannot be read or holds no rows.
+    """
+    try:
+        if Path(input_file).suffix.lower() == ".json":
+            df = pd.read_json(input_file)
+        else:
+            df = pd.read_csv(input_file)
+        logger.info(f"Read {len(df)} records from {input_file}")
+    except Exception as e:
+        _fail(logger, f"Failed to read input file: {e}")
+    if df.empty:
+        logger.warning("Input file contains no data")
+        click.echo("Error: Input file contains no data", err=True)
+        sys.exit(1)
+    return df
+
+
+def resolve_numeric_column(df, column, logger):
+    """``column`` as ``df`` spells it (case-insensitively), and numeric; or exit 1."""
+    column = match_column(df, column)
+    if column not in df.columns:
+        _fail(
+            logger,
+            f"Column '{column}' not found in input data. "
+            f"Available columns: {list(df.columns)}",
+            logged=f"Column '{column}' not found in input data",
+        )
+    if not pd.api.types.is_numeric_dtype(df[column]):
+        _fail(
+            logger,
+            f"Column '{column}' must be numeric",
+            logged=f"Column '{column}' is not numeric",
+        )
+    return column
+
+
+def emit_compute_frame(
+    frame, *, console, output, quiet, summary, precision, logger, label, input_file
+):
+    """A computed frame at ``precision``: written to ``-o`` (CSV, or JSON with
+    --json), then printed as ``console`` says, or as its summary statistics."""
+    frame = apply_precision_to_dataframe(frame, precision)
+    file_format = "json" if console == "json" else "csv"
+
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if file_format == "json":
+                frame.to_json(output_path, orient="records", date_format="iso")
+            else:
+                frame.to_csv(output_path, index=False)
+            logger.info(f"Data written to {output_path}")
+            if not quiet:
+                click.echo(f"Data written to {output_path}")
+        except Exception as e:
+            _fail(logger, f"Failed to write output file: {e}")
+
+    if quiet:
+        return
+    if summary:
+        stats = compute_summary_stats(frame)
+        if console == "table":
+            echo_summary_table(stats, title=f"{label} summary statistics")
+        else:
+            click.echo(format_summary_stats(stats))
+    elif console == "json":
+        click.echo(frame.to_json(orient="records", date_format="iso"))
+    elif console == "table":
+        echo_table(
+            frame,
+            decimals=precision,
+            footer=f"{tables.plural(len(frame), 'row')} · {label} · "
+            f"{Path(input_file).name}",
+        )
+    else:
+        click.echo(frame.to_csv(index=False))
+
+
+def _compute_logger(ctx, verbose):
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    return logger
+
+
+#: Average days between observations -> periods per year, for annualising.
+_PERIODS_PER_YEAR = ((1.5, 252), (5, 52), (20, 12), (70, 4), (150, 2))
+
+
+def _periods_per_year(index, logger):
+    """Observations per year, inferred from the mean spacing of ``index``."""
+    try:
+        if len(index) < 2:
+            _fail(logger, "Need at least 2 observations to infer periods_per_year")
+        days_diff = (index[1:] - index[:-1]).mean().days
+        periods = next((n for limit, n in _PERIODS_PER_YEAR if days_diff <= limit), 1)
+        logger.info(
+            f"Inferred periods_per_year={periods} from date index "
+            f"(avg days between observations: {days_diff})"
+        )
+        return periods
+    except SystemExit:
+        raise
+    except Exception as e:
+        _fail(logger, f"Failed to infer periods_per_year: {e}")
+
+
 @main.command()
-@click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    help="Print log output to the console (default: log file only)",
-)
-@click.option(
-    "-q", "--quiet", is_flag=True, help="Suppress printing return data to stdout"
-)
-@click.option(
-    "-i",
-    "--input",
-    "input_file",
-    type=click.Path(exists=True),
-    required=True,
-    help="Input file containing price data (CSV or JSON)",
-)
+@compute_input_options("Suppress printing return data to stdout")
 @click.option(
     "-a",
     "--append",
@@ -2734,27 +2919,7 @@ def tc(
         "(default: 1)"
     ),
 )
-@table_option
-@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
-@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
-@click.option(
-    "--summary",
-    is_flag=True,
-    help="Print summary statistics instead of data observations",
-)
-@click.option(
-    "-p",
-    "--precision",
-    type=int,
-    default=3,
-    help="Decimal precision for output values (default: 3)",
-)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(),
-    help="Write data to file",
-)
+@compute_output_options
 @click.pass_context
 def rc(
     ctx,
@@ -2784,278 +2949,134 @@ def rc(
     including simple returns, log returns, differenced prices, cumulative returns,
     and annualized returns.
     """
-    # Get logger from context
-    logger = ctx.obj.get("logger", logging.getLogger("duk"))
-
-    # Adjust logging based on verbose flag
-    if verbose:
-        enable_console_logging(logger)
-
+    logger = _compute_logger(ctx, verbose)
     logger.info(f"Computing returns from {input_file}")
-
-    # Determine output format: the console's, and the -o file's (never a table).
     console = output_format(ctx, output_table, output_csv, output_json)
-    file_format = "json" if console == "json" else "csv"
 
-    # Check that at least one return calculation option is specified
-    return_options = [
-        simple,
-        log_returns,
-        diff,
-        cum_simple,
-        cum_log,
-        annual_simple,
-        annual_log,
-    ]
-    if not any(return_options):
-        logger.error("At least one return calculation option must be specified")
-        click.echo(
-            "Error: At least one return calculation option must be specified "
+    if not any(
+        [simple, log_returns, diff, cum_simple, cum_log, annual_simple, annual_log]
+    ):
+        _fail(
+            logger,
+            "At least one return calculation option must be specified "
             "(--simple, --log, --diff, --cum-simple, --cum-log, "
             "--annual-simple, --annual-log)",
-            err=True,
+            logged="At least one return calculation option must be specified",
         )
-        sys.exit(1)
 
-    # Read input file
-    try:
-        input_path = Path(input_file)
-        if input_path.suffix.lower() == ".json":
-            df = pd.read_json(input_file)
-        else:
-            # Default to CSV
-            df = pd.read_csv(input_file)
+    df = read_compute_input(input_file, logger)
 
-        logger.info(f"Read {len(df)} records from {input_file}")
-    except Exception as e:
-        logger.error(f"Failed to read input file: {e}")
-        click.echo(f"Error: Failed to read input file: {e}", err=True)
-        sys.exit(1)
-
-    if df.empty:
-        logger.warning("Input file contains no data")
-        click.echo("Error: Input file contains no data", err=True)
-        sys.exit(1)
-
-    # Identify date column, whatever its case
+    # The date column, whatever its case, becomes the sorted index.
     date_col = next((col for col in df.columns if str(col).lower() == "date"), None)
-
     if date_col is None:
-        logger.error("No date column found in input data")
-        click.echo(
-            "Error: Input data must contain a 'date' column",
-            err=True,
+        _fail(
+            logger,
+            "Input data must contain a 'date' column",
+            logged="No date column found in input data",
         )
-        sys.exit(1)
-
-    # Convert date column to datetime and set as index
     try:
         df[date_col] = pd.to_datetime(df[date_col])
-        df = df.set_index(date_col)
-        df = df.sort_index()
+        df = df.set_index(date_col).sort_index()
         logger.debug(f"Set '{date_col}' as index and sorted by date")
     except Exception as e:
-        logger.error(f"Failed to process date column: {e}")
-        click.echo(f"Error: Failed to process date column: {e}", err=True)
-        sys.exit(1)
+        _fail(logger, f"Failed to process date column: {e}")
 
-    # Extract price columns (numeric columns only)
+    # Every numeric column is a price series.
     price_columns = df.select_dtypes(include=["number"]).columns.tolist()
     if not price_columns:
-        logger.error("No numeric price columns found in input data")
-        click.echo(
-            "Error: Input data must contain at least one numeric price column",
-            err=True,
+        _fail(
+            logger,
+            "Input data must contain at least one numeric price column",
+            logged="No numeric price columns found in input data",
         )
-        sys.exit(1)
-
     logger.info(f"Found price columns: {price_columns}")
     prices = df[price_columns]
 
-    # Infer periods_per_year for annualized returns if needed
     periods_per_year = None
     if annual_simple or annual_log:
-        # Infer from date index
-        try:
-            date_index = prices.index
-            if len(date_index) >= 2:
-                # Calculate average time difference
-                time_diffs = date_index[1:] - date_index[:-1]
-                avg_diff = time_diffs.mean()
-                days_diff = avg_diff.days
+        periods_per_year = _periods_per_year(prices.index, logger)
 
-                # Map to periods_per_year
-                if days_diff <= 1.5:  # Daily
-                    periods_per_year = 252
-                elif days_diff <= 5:  # Weekly
-                    periods_per_year = 52
-                elif days_diff <= 20:  # Monthly
-                    periods_per_year = 12
-                elif days_diff <= 70:  # Quarterly
-                    periods_per_year = 4
-                elif days_diff <= 150:  # Semi-annual
-                    periods_per_year = 2
-                else:  # Annual
-                    periods_per_year = 1
+    def simple_():
+        return simple_return(prices, periods=lookback)
 
-                logger.info(
-                    f"Inferred periods_per_year={periods_per_year} from date index "
-                    f"(avg days between observations: {days_diff})"
-                )
-            else:
-                logger.error("Need at least 2 observations to infer periods_per_year")
-                click.echo(
-                    "Error: Need at least 2 observations to infer periods_per_year",
-                    err=True,
-                )
-                sys.exit(1)
-        except Exception as e:
-            logger.error(f"Failed to infer periods_per_year: {e}")
-            click.echo(f"Error: Failed to infer periods_per_year: {e}", err=True)
-            sys.exit(1)
+    def log_():
+        return log_return(prices, periods=lookback)
 
-    # Compute returns
+    # (asked, column suffix, what it is for the log, how it is computed), in
+    # the order the columns are written.
+    kinds = [
+        (simple, "simple_ret", "simple returns", simple_),
+        (log_returns, "log_ret", "log returns", log_),
+        (
+            diff,
+            "diff",
+            "price differences",
+            lambda: price_difference(prices, periods=lookback),
+        ),
+        (
+            cum_simple,
+            "cum_simple",
+            "cumulative simple returns",
+            lambda: cumulative_simple_return(simple_()),
+        ),
+        (
+            cum_log,
+            "cum_log",
+            "cumulative log returns",
+            lambda: cumulative_log_return(log_()),
+        ),
+        (
+            annual_simple,
+            "annual_simple",
+            "annualized simple returns",
+            lambda: annualized_return(
+                simple_(), periods_per_year=periods_per_year, return_type="simple"
+            ),
+        ),
+        (
+            annual_log,
+            "annual_log",
+            "annualized log returns",
+            lambda: annualized_return(
+                log_(), periods_per_year=periods_per_year, return_type="log"
+            ),
+        ),
+    ]
+
     result_df = pd.DataFrame(index=prices.index)
-
-    # Add original prices if append flag is set
     if append:
         for col in price_columns:
             result_df[col] = prices[col]
-
     try:
-        # Simple returns
-        if simple:
-            simple_ret = simple_return(prices, periods=lookback)
+        for asked, suffix, what, compute in kinds:
+            if not asked:
+                continue
+            values = compute()
+            if lookback != 1:
+                suffix = f"{suffix}_l{lookback}"
             for col in price_columns:
-                suffix = f"_simple_ret_l{lookback}" if lookback != 1 else "_simple_ret"
-                result_df[f"{col}{suffix}"] = simple_ret[col]
-            logger.info(f"Computed simple returns with lookback={lookback}")
-
-        # Log returns
-        if log_returns:
-            log_ret = log_return(prices, periods=lookback)
-            for col in price_columns:
-                suffix = f"_log_ret_l{lookback}" if lookback != 1 else "_log_ret"
-                result_df[f"{col}{suffix}"] = log_ret[col]
-            logger.info(f"Computed log returns with lookback={lookback}")
-
-        # Price differences
-        if diff:
-            price_diff = price_difference(prices, periods=lookback)
-            for col in price_columns:
-                suffix = f"_diff_l{lookback}" if lookback != 1 else "_diff"
-                result_df[f"{col}{suffix}"] = price_diff[col]
-            logger.info(f"Computed price differences with lookback={lookback}")
-
-        # Cumulative simple returns
-        if cum_simple:
-            # First compute simple returns, then cumulative
-            simple_ret = simple_return(prices, periods=lookback)
-            cum_simple_ret = cumulative_simple_return(simple_ret)
-            for col in price_columns:
-                suffix = f"_cum_simple_l{lookback}" if lookback != 1 else "_cum_simple"
-                result_df[f"{col}{suffix}"] = cum_simple_ret[col]
-            logger.info(f"Computed cumulative simple returns with lookback={lookback}")
-
-        # Cumulative log returns
-        if cum_log:
-            # First compute log returns, then cumulative
-            log_ret = log_return(prices, periods=lookback)
-            cum_log_ret = cumulative_log_return(log_ret)
-            for col in price_columns:
-                suffix = f"_cum_log_l{lookback}" if lookback != 1 else "_cum_log"
-                result_df[f"{col}{suffix}"] = cum_log_ret[col]
-            logger.info(f"Computed cumulative log returns with lookback={lookback}")
-
-        # Annualized simple returns
-        if annual_simple:
-            # First compute simple returns, then annualize
-            simple_ret = simple_return(prices, periods=lookback)
-            annual_ret = annualized_return(
-                simple_ret, periods_per_year=periods_per_year, return_type="simple"
+                result_df[f"{col}_{suffix}"] = values[col]
+            annualised = (
+                f", periods_per_year={periods_per_year}"
+                if suffix.startswith("annual")
+                else ""
             )
-            for col in price_columns:
-                suffix = (
-                    f"_annual_simple_l{lookback}" if lookback != 1 else "_annual_simple"
-                )
-                result_df[f"{col}{suffix}"] = annual_ret[col]
-            logger.info(
-                f"Computed annualized simple returns with lookback={lookback}, "
-                f"periods_per_year={periods_per_year}"
-            )
-
-        # Annualized log returns
-        if annual_log:
-            # First compute log returns, then annualize
-            log_ret = log_return(prices, periods=lookback)
-            annual_ret = annualized_return(
-                log_ret, periods_per_year=periods_per_year, return_type="log"
-            )
-            for col in price_columns:
-                suffix = f"_annual_log_l{lookback}" if lookback != 1 else "_annual_log"
-                result_df[f"{col}{suffix}"] = annual_ret[col]
-            logger.info(
-                f"Computed annualized log returns with lookback={lookback}, "
-                f"periods_per_year={periods_per_year}"
-            )
-
+            logger.info(f"Computed {what} with lookback={lookback}{annualised}")
     except Exception as e:
-        logger.error(f"Failed to compute returns: {e}")
-        click.echo(f"Error: Failed to compute returns: {e}", err=True)
-        sys.exit(1)
-
+        _fail(logger, f"Failed to compute returns: {e}")
     logger.info(f"Computed returns for {len(result_df)} records")
 
-    # Prepare output - reset index to include date as a column
-    output_df = result_df.reset_index()
-
-    # Apply precision to numeric columns
-    output_df = apply_precision_to_dataframe(output_df, precision)
-
-    # Handle output to file
-    if output:
-        output_path = Path(output)
-
-        # Ensure parent directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to file based on format
-        try:
-            if file_format == "json":
-                output_df.to_json(output_path, orient="records", date_format="iso")
-            else:
-                output_df.to_csv(output_path, index=False)
-
-            logger.info(f"Data written to {output_path}")
-
-            if not quiet:
-                click.echo(f"Data written to {output_path}")
-        except Exception as e:
-            logger.error(f"Failed to write output file: {e}")
-            click.echo(f"Error: Failed to write output file: {e}", err=True)
-            sys.exit(1)
-
-    # Print to stdout unless quiet flag is set
-    if not quiet:
-        # Print summary statistics if requested
-        if summary:
-            stats = compute_summary_stats(output_df)
-            if console == "table":
-                echo_summary_table(stats, title="returns summary statistics")
-            else:
-                click.echo(format_summary_stats(stats))
-        # Otherwise print data
-        elif console == "json":
-            click.echo(output_df.to_json(orient="records", date_format="iso"))
-        elif console == "table":
-            echo_table(
-                output_df,
-                decimals=precision,
-                footer=f"{tables.plural(len(output_df), 'row')} · returns · "
-                f"{Path(input_file).name}",
-            )
-        else:
-            click.echo(output_df.to_csv(index=False))
+    emit_compute_frame(
+        result_df.reset_index(),
+        console=console,
+        output=output,
+        quiet=quiet,
+        summary=summary,
+        precision=precision,
+        logger=logger,
+        label="returns",
+        input_file=input_file,
+    )
 
 
 @main.group()
@@ -3070,66 +3091,18 @@ def ti(ctx):
     pass
 
 
-@ti.command()
-@click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    help="Print log output to the console (default: log file only)",
-)
-@click.option(
-    "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
-)
-@click.option(
-    "-i",
-    "--input",
-    "input_file",
-    type=click.Path(exists=True),
-    required=True,
-    help="Input file containing price data (CSV or JSON)",
-)
-@click.option(
-    "-c",
-    "--column",
-    required=True,
-    help="Column name to calculate SMA on (e.g., 'close', 'high', 'low')",
-)
-@click.option(
-    "-w",
-    "--window",
-    type=int,
-    required=True,
-    help="Window size for SMA calculation (number of periods)",
-)
-@table_option
-@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
-@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
-@click.option(
-    "--summary",
-    is_flag=True,
-    help="Print summary statistics instead of data observations",
-)
-@click.option(
-    "-p",
-    "--precision",
-    type=int,
-    default=3,
-    help="Decimal precision for output values (default: 3)",
-)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(),
-    help="Write data to file",
-)
-@click.pass_context
-def sma(
+def _run_indicator(
     ctx,
+    *,
+    label,
+    checks,
+    short_warning,
+    calculate,
+    calculated,
     verbose,
     quiet,
     input_file,
     column,
-    window,
     output_table,
     output_csv,
     output_json,
@@ -3137,6 +3110,135 @@ def sma(
     precision,
     output,
 ):
+    """One indicator over one column of a price file, start to finish.
+
+    ``checks`` are ``(failed, message)`` pairs refused in order before anything
+    is read; ``short_warning(rows)`` is the warning a series too short to fill
+    the window gets, or None; ``calculate(df, column)`` computes the frame and
+    ``calculated(column)`` is the line logged when it has.
+    """
+    logger = _compute_logger(ctx, verbose)
+    logger.info(f"Computing {label} from {input_file}")
+    for failed, message in checks:
+        if failed:
+            _fail(logger, message)
+    console = output_format(ctx, output_table, output_csv, output_json)
+
+    df = read_compute_input(input_file, logger)
+    column = resolve_numeric_column(df, column, logger)
+    warning = short_warning(len(df))
+    if warning:
+        _warn(logger, warning)
+
+    try:
+        result_df = calculate(df, column)
+        logger.info(calculated(column))
+    except Exception as e:
+        _fail(logger, f"Failed to calculate {label}: {e}")
+
+    emit_compute_frame(
+        result_df,
+        console=console,
+        output=output,
+        quiet=quiet,
+        summary=summary,
+        precision=precision,
+        logger=logger,
+        label=label,
+        input_file=input_file,
+    )
+
+
+def _window_indicator(label, calculate, *, extra_rows=0, short_note=""):
+    """`ti sma`, `ti ema`, `ti rsi`: one column, one window.
+
+    ``extra_rows`` is how many rows past the window the indicator needs before
+    its first value (RSI: one, for the first price change), and ``short_note`` the
+    sentence that says so in the warning, with ``{needed}`` for that many rows.
+    """
+
+    def command(
+        ctx,
+        verbose,
+        quiet,
+        input_file,
+        column,
+        window,
+        output_table,
+        output_csv,
+        output_json,
+        summary,
+        precision,
+        output,
+    ):
+        def short_warning(rows):
+            if rows >= window + extra_rows:
+                return None
+            return (
+                f"Input data has {rows} records, but window size is {window}. "
+                f"{short_note.format(needed=window + extra_rows)}"
+                f"{label} will be NaN for all records."
+            )
+
+        _run_indicator(
+            ctx,
+            label=label,
+            checks=[(window <= 0, "Window must be greater than 0")],
+            short_warning=short_warning,
+            calculate=lambda df, col: calculate(df, column=col, window=window),
+            calculated=lambda col: (
+                f"Calculated {label} with window={window} on column '{col}'"
+            ),
+            verbose=verbose,
+            quiet=quiet,
+            input_file=input_file,
+            column=column,
+            output_table=output_table,
+            output_csv=output_csv,
+            output_json=output_json,
+            summary=summary,
+            precision=precision,
+            output=output,
+        )
+
+    return command
+
+
+def _window_command(name, label, calculate, doc, *, default_window=None, **kwargs):
+    """Register ``duk ti <name>`` for a one-window indicator."""
+    window_help = (
+        f"Window size for {label} calculation (number of periods, default: "
+        f"{default_window})"
+        if default_window is not None
+        else f"Window size for {label} calculation (number of periods)"
+    )
+    command = _window_indicator(label, calculate, **kwargs)
+    command.__name__ = name
+    command.__doc__ = doc
+    window = (
+        click.option(
+            "-w", "--window", type=int, default=default_window, help=window_help
+        )
+        if default_window is not None
+        else click.option("-w", "--window", type=int, required=True, help=window_help)
+    )
+    return ti.command(name=name)(
+        compute_input_options("Suppress printing indicator data to stdout")(
+            click.option(
+                "-c",
+                "--column",
+                required=True,
+                help=f"Column name to calculate {label} on (e.g., 'close', 'high', "
+                "'low')",
+            )(window(compute_output_options(click.pass_context(command))))
+        )
+    )
+
+
+sma = _window_command(
+    "sma",
+    "SMA",
+    calculate_sma,
     """
     Calculate Simple Moving Average (SMA) on input data.
 
@@ -3145,197 +3247,13 @@ def sma(
 
     Example:
         duk ti sma --input prices.csv --column close --window 20 --output sma_result.csv
-    """
-    # Get logger from context
-    logger = ctx.obj.get("logger", logging.getLogger("duk"))
-
-    # Adjust logging based on verbose flag
-    if verbose:
-        enable_console_logging(logger)
-
-    logger.info(f"Computing SMA from {input_file}")
-
-    # Validate window
-    if window <= 0:
-        logger.error("Window must be greater than 0")
-        click.echo("Error: Window must be greater than 0", err=True)
-        sys.exit(1)
-
-    # Determine output format: the console's, and the -o file's (never a table).
-    console = output_format(ctx, output_table, output_csv, output_json)
-    file_format = "json" if console == "json" else "csv"
-
-    # Read input file
-    try:
-        input_path = Path(input_file)
-        if input_path.suffix.lower() == ".json":
-            df = pd.read_json(input_file)
-        else:
-            # Default to CSV
-            df = pd.read_csv(input_file)
-
-        logger.info(f"Read {len(df)} records from {input_file}")
-    except Exception as e:
-        logger.error(f"Failed to read input file: {e}")
-        click.echo(f"Error: Failed to read input file: {e}", err=True)
-        sys.exit(1)
-
-    if df.empty:
-        logger.warning("Input file contains no data")
-        click.echo("Error: Input file contains no data", err=True)
-        sys.exit(1)
-
-    # Validate column exists: `-c Close` finds a `close` column
-    column = match_column(df, column)
-    if column not in df.columns:
-        logger.error(f"Column '{column}' not found in input data")
-        click.echo(
-            f"Error: Column '{column}' not found in input data. "
-            f"Available columns: {list(df.columns)}",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Validate column is numeric
-    if not pd.api.types.is_numeric_dtype(df[column]):
-        logger.error(f"Column '{column}' is not numeric")
-        click.echo(f"Error: Column '{column}' must be numeric", err=True)
-        sys.exit(1)
-
-    # Check if we have enough data points
-    if len(df) < window:
-        msg = (
-            f"Input data has {len(df)} records, but window size is {window}. "
-            f"SMA will be NaN for all records."
-        )
-        logger.warning(msg)
-        click.echo(f"Warning: {msg}", err=True)
-
-    # Calculate SMA
-    try:
-        result_df = calculate_sma(df, column=column, window=window)
-        logger.info(f"Calculated SMA with window={window} on column '{column}'")
-    except Exception as e:
-        logger.error(f"Failed to calculate SMA: {e}")
-        click.echo(f"Error: Failed to calculate SMA: {e}", err=True)
-        sys.exit(1)
-
-    # Apply precision to numeric columns
-    result_df = apply_precision_to_dataframe(result_df, precision)
-
-    # Handle output to file
-    if output:
-        output_path = Path(output)
-
-        # Ensure parent directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to file based on format
-        try:
-            if file_format == "json":
-                result_df.to_json(output_path, orient="records", date_format="iso")
-            else:
-                result_df.to_csv(output_path, index=False)
-
-            logger.info(f"Data written to {output_path}")
-
-            if not quiet:
-                click.echo(f"Data written to {output_path}")
-        except Exception as e:
-            logger.error(f"Failed to write output file: {e}")
-            click.echo(f"Error: Failed to write output file: {e}", err=True)
-            sys.exit(1)
-
-    # Print to stdout unless quiet flag is set
-    if not quiet:
-        # Print summary statistics if requested
-        if summary:
-            stats = compute_summary_stats(result_df)
-            if console == "table":
-                echo_summary_table(stats, title="SMA summary statistics")
-            else:
-                click.echo(format_summary_stats(stats))
-        # Otherwise print data
-        elif console == "json":
-            click.echo(result_df.to_json(orient="records", date_format="iso"))
-        elif console == "table":
-            echo_table(
-                result_df,
-                decimals=precision,
-                footer=f"{tables.plural(len(result_df), 'row')} · SMA · "
-                f"{Path(input_file).name}",
-            )
-        else:
-            click.echo(result_df.to_csv(index=False))
-
-
-@ti.command()
-@click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    help="Print log output to the console (default: log file only)",
+    """,
 )
-@click.option(
-    "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
-)
-@click.option(
-    "-i",
-    "--input",
-    "input_file",
-    type=click.Path(exists=True),
-    required=True,
-    help="Input file containing price data (CSV or JSON)",
-)
-@click.option(
-    "-c",
-    "--column",
-    required=True,
-    help="Column name to calculate EMA on (e.g., 'close', 'high', 'low')",
-)
-@click.option(
-    "-w",
-    "--window",
-    type=int,
-    required=True,
-    help="Window size for EMA calculation (number of periods)",
-)
-@table_option
-@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
-@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
-@click.option(
-    "--summary",
-    is_flag=True,
-    help="Print summary statistics instead of data observations",
-)
-@click.option(
-    "-p",
-    "--precision",
-    type=int,
-    default=3,
-    help="Decimal precision for output values (default: 3)",
-)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(),
-    help="Write data to file",
-)
-@click.pass_context
-def ema(
-    ctx,
-    verbose,
-    quiet,
-    input_file,
-    column,
-    window,
-    output_table,
-    output_csv,
-    output_json,
-    summary,
-    precision,
-    output,
-):
+
+ema = _window_command(
+    "ema",
+    "EMA",
+    calculate_ema,
     """
     Calculate Exponential Moving Average (EMA) on input data.
 
@@ -3344,197 +3262,13 @@ def ema(
 
     Example:
         duk ti ema --input prices.csv --column close --window 20 --output ema_result.csv
-    """
-    # Get logger from context
-    logger = ctx.obj.get("logger", logging.getLogger("duk"))
-
-    # Adjust logging based on verbose flag
-    if verbose:
-        enable_console_logging(logger)
-
-    logger.info(f"Computing EMA from {input_file}")
-
-    # Validate window
-    if window <= 0:
-        logger.error("Window must be greater than 0")
-        click.echo("Error: Window must be greater than 0", err=True)
-        sys.exit(1)
-
-    # Determine output format: the console's, and the -o file's (never a table).
-    console = output_format(ctx, output_table, output_csv, output_json)
-    file_format = "json" if console == "json" else "csv"
-
-    # Read input file
-    try:
-        input_path = Path(input_file)
-        if input_path.suffix.lower() == ".json":
-            df = pd.read_json(input_file)
-        else:
-            # Default to CSV
-            df = pd.read_csv(input_file)
-
-        logger.info(f"Read {len(df)} records from {input_file}")
-    except Exception as e:
-        logger.error(f"Failed to read input file: {e}")
-        click.echo(f"Error: Failed to read input file: {e}", err=True)
-        sys.exit(1)
-
-    if df.empty:
-        logger.warning("Input file contains no data")
-        click.echo("Error: Input file contains no data", err=True)
-        sys.exit(1)
-
-    # Validate column exists: `-c Close` finds a `close` column
-    column = match_column(df, column)
-    if column not in df.columns:
-        logger.error(f"Column '{column}' not found in input data")
-        click.echo(
-            f"Error: Column '{column}' not found in input data. "
-            f"Available columns: {list(df.columns)}",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Validate column is numeric
-    if not pd.api.types.is_numeric_dtype(df[column]):
-        logger.error(f"Column '{column}' is not numeric")
-        click.echo(f"Error: Column '{column}' must be numeric", err=True)
-        sys.exit(1)
-
-    # Check if we have enough data points
-    if len(df) < window:
-        msg = (
-            f"Input data has {len(df)} records, but window size is {window}. "
-            f"EMA will be NaN for all records."
-        )
-        logger.warning(msg)
-        click.echo(f"Warning: {msg}", err=True)
-
-    # Calculate EMA
-    try:
-        result_df = calculate_ema(df, column=column, window=window)
-        logger.info(f"Calculated EMA with window={window} on column '{column}'")
-    except Exception as e:
-        logger.error(f"Failed to calculate EMA: {e}")
-        click.echo(f"Error: Failed to calculate EMA: {e}", err=True)
-        sys.exit(1)
-
-    # Apply precision to numeric columns
-    result_df = apply_precision_to_dataframe(result_df, precision)
-
-    # Handle output to file
-    if output:
-        output_path = Path(output)
-
-        # Ensure parent directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to file based on format
-        try:
-            if file_format == "json":
-                result_df.to_json(output_path, orient="records", date_format="iso")
-            else:
-                result_df.to_csv(output_path, index=False)
-
-            logger.info(f"Data written to {output_path}")
-
-            if not quiet:
-                click.echo(f"Data written to {output_path}")
-        except Exception as e:
-            logger.error(f"Failed to write output file: {e}")
-            click.echo(f"Error: Failed to write output file: {e}", err=True)
-            sys.exit(1)
-
-    # Print to stdout unless quiet flag is set
-    if not quiet:
-        # Print summary statistics if requested
-        if summary:
-            stats = compute_summary_stats(result_df)
-            if console == "table":
-                echo_summary_table(stats, title="EMA summary statistics")
-            else:
-                click.echo(format_summary_stats(stats))
-        # Otherwise print data
-        elif console == "json":
-            click.echo(result_df.to_json(orient="records", date_format="iso"))
-        elif console == "table":
-            echo_table(
-                result_df,
-                decimals=precision,
-                footer=f"{tables.plural(len(result_df), 'row')} · EMA · "
-                f"{Path(input_file).name}",
-            )
-        else:
-            click.echo(result_df.to_csv(index=False))
-
-
-@ti.command()
-@click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    help="Print log output to the console (default: log file only)",
+    """,
 )
-@click.option(
-    "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
-)
-@click.option(
-    "-i",
-    "--input",
-    "input_file",
-    type=click.Path(exists=True),
-    required=True,
-    help="Input file containing price data (CSV or JSON)",
-)
-@click.option(
-    "-c",
-    "--column",
-    required=True,
-    help="Column name to calculate RSI on (e.g., 'close', 'high', 'low')",
-)
-@click.option(
-    "-w",
-    "--window",
-    type=int,
-    default=14,
-    help="Window size for RSI calculation (number of periods, default: 14)",
-)
-@table_option
-@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
-@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
-@click.option(
-    "--summary",
-    is_flag=True,
-    help="Print summary statistics instead of data observations",
-)
-@click.option(
-    "-p",
-    "--precision",
-    type=int,
-    default=3,
-    help="Decimal precision for output values (default: 3)",
-)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(),
-    help="Write data to file",
-)
-@click.pass_context
-def rsi(
-    ctx,
-    verbose,
-    quiet,
-    input_file,
-    column,
-    window,
-    output_table,
-    output_csv,
-    output_json,
-    summary,
-    precision,
-    output,
-):
+
+rsi = _window_command(
+    "rsi",
+    "RSI",
+    calculate_rsi,
     """
     Calculate Relative Strength Index (RSI) on input data.
 
@@ -3548,150 +3282,16 @@ def rsi(
 
     Example:
         duk ti rsi --input prices.csv --column close --window 14 --output rsi_result.csv
-    """
-    # Get logger from context
-    logger = ctx.obj.get("logger", logging.getLogger("duk"))
-
-    # Adjust logging based on verbose flag
-    if verbose:
-        enable_console_logging(logger)
-
-    logger.info(f"Computing RSI from {input_file}")
-
-    # Validate window
-    if window <= 0:
-        logger.error("Window must be greater than 0")
-        click.echo("Error: Window must be greater than 0", err=True)
-        sys.exit(1)
-
-    # Determine output format: the console's, and the -o file's (never a table).
-    console = output_format(ctx, output_table, output_csv, output_json)
-    file_format = "json" if console == "json" else "csv"
-
-    # Read input file
-    try:
-        input_path = Path(input_file)
-        if input_path.suffix.lower() == ".json":
-            df = pd.read_json(input_file)
-        else:
-            # Default to CSV
-            df = pd.read_csv(input_file)
-
-        logger.info(f"Read {len(df)} records from {input_file}")
-    except Exception as e:
-        logger.error(f"Failed to read input file: {e}")
-        click.echo(f"Error: Failed to read input file: {e}", err=True)
-        sys.exit(1)
-
-    if df.empty:
-        logger.warning("Input file contains no data")
-        click.echo("Error: Input file contains no data", err=True)
-        sys.exit(1)
-
-    # Validate column exists: `-c Close` finds a `close` column
-    column = match_column(df, column)
-    if column not in df.columns:
-        logger.error(f"Column '{column}' not found in input data")
-        click.echo(
-            f"Error: Column '{column}' not found in input data. "
-            f"Available columns: {list(df.columns)}",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Validate column is numeric
-    if not pd.api.types.is_numeric_dtype(df[column]):
-        logger.error(f"Column '{column}' is not numeric")
-        click.echo(f"Error: Column '{column}' must be numeric", err=True)
-        sys.exit(1)
-
-    # Check if we have enough data points
-    # RSI needs window+1 records (window periods + 1 for price difference)
-    if len(df) < window + 1:
-        msg = (
-            f"Input data has {len(df)} records, but window size is {window}. "
-            f"RSI requires at least {window + 1} records. "
-            f"RSI will be NaN for all records."
-        )
-        logger.warning(msg)
-        click.echo(f"Warning: {msg}", err=True)
-
-    # Calculate RSI
-    try:
-        result_df = calculate_rsi(df, column=column, window=window)
-        logger.info(f"Calculated RSI with window={window} on column '{column}'")
-    except Exception as e:
-        logger.error(f"Failed to calculate RSI: {e}")
-        click.echo(f"Error: Failed to calculate RSI: {e}", err=True)
-        sys.exit(1)
-
-    # Apply precision to numeric columns
-    result_df = apply_precision_to_dataframe(result_df, precision)
-
-    # Handle output to file
-    if output:
-        output_path = Path(output)
-
-        # Ensure parent directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to file based on format
-        try:
-            if file_format == "json":
-                result_df.to_json(output_path, orient="records", date_format="iso")
-            else:
-                result_df.to_csv(output_path, index=False)
-
-            logger.info(f"Data written to {output_path}")
-
-            if not quiet:
-                click.echo(f"Data written to {output_path}")
-        except Exception as e:
-            logger.error(f"Failed to write output file: {e}")
-            click.echo(f"Error: Failed to write output file: {e}", err=True)
-            sys.exit(1)
-
-    # Print to stdout unless quiet flag is set
-    if not quiet:
-        # Print summary statistics if requested
-        if summary:
-            stats = compute_summary_stats(result_df)
-            if console == "table":
-                echo_summary_table(stats, title="RSI summary statistics")
-            else:
-                click.echo(format_summary_stats(stats))
-        # Otherwise print data
-        elif console == "json":
-            click.echo(result_df.to_json(orient="records", date_format="iso"))
-        elif console == "table":
-            echo_table(
-                result_df,
-                decimals=precision,
-                footer=f"{tables.plural(len(result_df), 'row')} · RSI · "
-                f"{Path(input_file).name}",
-            )
-        else:
-            click.echo(result_df.to_csv(index=False))
+    """,
+    default_window=14,
+    # RSI needs window+1 records (window periods + 1 for price difference).
+    extra_rows=1,
+    short_note="RSI requires at least {needed} records. ",
+)
 
 
 @ti.command()
-@click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    help="Print log output to the console (default: log file only)",
-)
-@click.option(
-    "-q", "--quiet", is_flag=True, help="Suppress printing indicator data to stdout"
-)
-@click.option(
-    "-i",
-    "--input",
-    "input_file",
-    type=click.Path(exists=True),
-    required=True,
-    help="Input file containing price data (CSV or JSON)",
-)
+@compute_input_options("Suppress printing indicator data to stdout")
 @click.option(
     "-c",
     "--column",
@@ -3716,27 +3316,7 @@ def rsi(
     default=9,
     help="Signal line EMA window size (number of periods, default: 9)",
 )
-@table_option
-@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
-@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
-@click.option(
-    "--summary",
-    is_flag=True,
-    help="Print summary statistics instead of data observations",
-)
-@click.option(
-    "-p",
-    "--precision",
-    type=int,
-    default=3,
-    help="Decimal precision for output values (default: 3)",
-)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(),
-    help="Write data to file",
-)
+@compute_output_options
 @click.pass_context
 def macd(
     ctx,
@@ -3770,153 +3350,52 @@ def macd(
     Example:
         duk ti macd --input prices.csv --column close --output macd_result.csv
     """
-    # Get logger from context
-    logger = ctx.obj.get("logger", logging.getLogger("duk"))
-
-    # Adjust logging based on verbose flag
-    if verbose:
-        enable_console_logging(logger)
-
-    logger.info(f"Computing MACD from {input_file}")
-
-    # Validate windows
-    if fast_window <= 0:
-        logger.error("Fast window must be greater than 0")
-        click.echo("Error: Fast window must be greater than 0", err=True)
-        sys.exit(1)
-    if slow_window <= 0:
-        logger.error("Slow window must be greater than 0")
-        click.echo("Error: Slow window must be greater than 0", err=True)
-        sys.exit(1)
-    if signal_window <= 0:
-        logger.error("Signal window must be greater than 0")
-        click.echo("Error: Signal window must be greater than 0", err=True)
-        sys.exit(1)
-    if fast_window >= slow_window:
-        logger.error("Fast window must be less than slow window")
-        click.echo("Error: Fast window must be less than slow window", err=True)
-        sys.exit(1)
-
-    # Determine output format: the console's, and the -o file's (never a table).
-    console = output_format(ctx, output_table, output_csv, output_json)
-    file_format = "json" if console == "json" else "csv"
-
-    # Read input file
-    try:
-        input_path = Path(input_file)
-        if input_path.suffix.lower() == ".json":
-            df = pd.read_json(input_file)
-        else:
-            # Default to CSV
-            df = pd.read_csv(input_file)
-
-        logger.info(f"Read {len(df)} records from {input_file}")
-    except Exception as e:
-        logger.error(f"Failed to read input file: {e}")
-        click.echo(f"Error: Failed to read input file: {e}", err=True)
-        sys.exit(1)
-
-    if df.empty:
-        logger.warning("Input file contains no data")
-        click.echo("Error: Input file contains no data", err=True)
-        sys.exit(1)
-
-    # Validate column exists: `-c Close` finds a `close` column
-    column = match_column(df, column)
-    if column not in df.columns:
-        logger.error(f"Column '{column}' not found in input data")
-        click.echo(
-            f"Error: Column '{column}' not found in input data. "
-            f"Available columns: {list(df.columns)}",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Validate column is numeric
-    if not pd.api.types.is_numeric_dtype(df[column]):
-        logger.error(f"Column '{column}' is not numeric")
-        click.echo(f"Error: Column '{column}' must be numeric", err=True)
-        sys.exit(1)
-
-    # Check if we have enough data points
-    # MACD needs slow_window + signal_window records for full calculation
+    # MACD needs slow_window + signal_window records for full calculation.
     min_required = slow_window + signal_window
-    if len(df) < min_required:
-        msg = (
-            f"Input data has {len(df)} records, but MACD with "
+
+    def short_warning(rows):
+        if rows >= min_required:
+            return None
+        return (
+            f"Input data has {rows} records, but MACD with "
             f"slow_window={slow_window} and signal_window={signal_window} "
             f"requires at least {min_required} records. "
             f"MACD values will be NaN for early records."
         )
-        logger.warning(msg)
-        click.echo(f"Warning: {msg}", err=True)
 
-    # Calculate MACD
-    try:
-        result_df = calculate_macd(
+    _run_indicator(
+        ctx,
+        label="MACD",
+        checks=[
+            (fast_window <= 0, "Fast window must be greater than 0"),
+            (slow_window <= 0, "Slow window must be greater than 0"),
+            (signal_window <= 0, "Signal window must be greater than 0"),
+            (fast_window >= slow_window, "Fast window must be less than slow window"),
+        ],
+        short_warning=short_warning,
+        calculate=lambda df, col: calculate_macd(
             df,
-            column=column,
+            column=col,
             fast_window=fast_window,
             slow_window=slow_window,
             signal_window=signal_window,
-        )
-        logger.info(
+        ),
+        calculated=lambda col: (
             f"Calculated MACD with fast_window={fast_window}, "
             f"slow_window={slow_window}, signal_window={signal_window} "
-            f"on column '{column}'"
-        )
-    except Exception as e:
-        logger.error(f"Failed to calculate MACD: {e}")
-        click.echo(f"Error: Failed to calculate MACD: {e}", err=True)
-        sys.exit(1)
-
-    # Apply precision to numeric columns
-    result_df = apply_precision_to_dataframe(result_df, precision)
-
-    # Handle output to file
-    if output:
-        output_path = Path(output)
-
-        # Ensure parent directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to file based on format
-        try:
-            if file_format == "json":
-                result_df.to_json(output_path, orient="records", date_format="iso")
-            else:
-                result_df.to_csv(output_path, index=False)
-
-            logger.info(f"Data written to {output_path}")
-
-            if not quiet:
-                click.echo(f"Data written to {output_path}")
-        except Exception as e:
-            logger.error(f"Failed to write output file: {e}")
-            click.echo(f"Error: Failed to write output file: {e}", err=True)
-            sys.exit(1)
-
-    # Print to stdout unless quiet flag is set
-    if not quiet:
-        # Print summary statistics if requested
-        if summary:
-            stats = compute_summary_stats(result_df)
-            if console == "table":
-                echo_summary_table(stats, title="MACD summary statistics")
-            else:
-                click.echo(format_summary_stats(stats))
-        # Otherwise print data
-        elif console == "json":
-            click.echo(result_df.to_json(orient="records", date_format="iso"))
-        elif console == "table":
-            echo_table(
-                result_df,
-                decimals=precision,
-                footer=f"{tables.plural(len(result_df), 'row')} · MACD · "
-                f"{Path(input_file).name}",
-            )
-        else:
-            click.echo(result_df.to_csv(index=False))
+            f"on column '{col}'"
+        ),
+        verbose=verbose,
+        quiet=quiet,
+        input_file=input_file,
+        column=column,
+        output_table=output_table,
+        output_csv=output_csv,
+        output_json=output_json,
+        summary=summary,
+        precision=precision,
+        output=output,
+    )
 
 
 if __name__ == "__main__":
