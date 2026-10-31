@@ -93,12 +93,14 @@ def out_of_scope(
     None. Sharadar's category files a SPAC's unit as a common stock's secondary class,
     so only the ticker tells, and a dead one's carries the number Sharadar appends
     when the ticker was reused (``HCMAU1``): both spellings are read. A declared
-    symbol (``fafnir track add``) is kept, as those loads keep it."""
+    symbol (``fafnir track add``) is kept, as those loads and ``security descope``
+    keep it: by the ticker itself. ``HCMAU`` declared is the issue listed under it
+    today, not the dead ``HCMAU1``."""
     kind = sharadar_map.map_category(c.get("category"))
     ticker = c.get("ticker")
-    spellings = [s for s in dict.fromkeys((ticker, unnumbered(ticker))) if s]
-    if any(s in declared for s in spellings):
+    if ticker in declared:
         return None
+    spellings = [s for s in dict.fromkeys((ticker, unnumbered(ticker))) if s]
     for symbol in spellings:
         found = out_of_scope_kind(
             symbol,

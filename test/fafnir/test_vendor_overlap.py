@@ -223,6 +223,10 @@ def test_mintable_keeps_adr_0012_out():
         assert vo.mintable(c, excluded=()), ticker
         assert vo.mintable(c, excluded=("warrant",)) == (kind != "warrant"), ticker
         assert vo.mintable(c, declared=frozenset({ticker})), ticker
+    # A declaration names the issue listed under the ticker today, not the dead one
+    # Sharadar numbered when the ticker was reused: descope would remove that one.
+    numbered = dict(base, ticker="ZZABU1")
+    assert vo.out_of_scope(numbered, declared=frozenset({"ZZABU"})) == "unit"
     for ticker in ("ZZAB", "ZZAB1", "ZZAB-PA", "SNOW1"):
         assert vo.out_of_scope(dict(base, ticker=ticker)) is None, ticker
         assert vo.mintable(dict(base, ticker=ticker)), ticker
