@@ -99,8 +99,9 @@ and the night goes on, since it feeds the fundamentals, not the prices.
   of the window. Probe it (an unauthenticated `curl -s -o /dev/null -w '%{http_code}'
   .../SFP?ticker=SPY` answers 200 when it is up) and have the operator re-run.
 - **Exit status 1** is a fault, not an outage: read the run's `error_message` before
-  anyone re-runs. Its runs
-are all `source = 'sharadar'`:
+  anyone re-runs.
+
+The night's runs are all `source = 'sharadar'`:
 
 | Endpoint | Step | Read in `params` |
 |---|---|---|

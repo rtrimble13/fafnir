@@ -141,7 +141,9 @@ validate stops it before anything loads.
       space-separated; default `900 1800 3600 3600 3600`) and `FAFNIR_RETRY_WINDOW`
       (default `14400`). No attempt starts more than the window after the script
       did, so the night stays inside the unit's `TimeoutStartSec=6h`.
-      `FAFNIR_RETRY_WINDOW=0` turns retrying off.
+      `FAFNIR_RETRY_WINDOW=0` turns retrying off. A value of either that is not
+      whole seconds (`4h`) stops the retrying where it is read, with a line in the
+      journal saying so.
     - **Giving up** exits 75 and fails the unit as before. DQ still runs, and the
       operator re-runs the night once the vendor answers. FMP mode's night is not
       retried.

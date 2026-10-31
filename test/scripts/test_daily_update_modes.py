@@ -235,6 +235,22 @@ def test_no_retry_starts_past_the_window(tmp_path):
         assert f"past FAFNIR_RETRY_WINDOW ({window}s)" in done.stdout
 
 
+def test_a_window_that_is_not_seconds_stops_retrying(tmp_path):
+    """`4h` is not a number of seconds: no retry, rather than retries unbounded by
+    any window (`[` errors, and `if` reads the error as false)."""
+    done, calls = _night(
+        tmp_path,
+        "sharadar",
+        fail="ingest sharadar",
+        fail_code=75,
+        retry={"FAFNIR_RETRY_DELAYS": "0 0", "FAFNIR_RETRY_WINDOW": "4h"},
+    )
+    assert done.returncode == 75
+    assert calls.count("ingest sharadar") == 1
+    assert "FAFNIR_RETRY_WINDOW holds '4h', not seconds -- no retry." in done.stdout
+    assert "integer expression expected" not in done.stderr
+
+
 def test_the_defaults_wait_out_an_outage_within_the_units_timeout():
     """15 min, 30 min, then hourly, inside a 4 h window: the night ends inside
     fafnir-daily's TimeoutStartSec=6h even when the last attempt loads."""

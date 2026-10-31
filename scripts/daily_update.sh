@@ -92,6 +92,16 @@ retry_transient() {
                 return "${rc}"
                 ;;
         esac
+        # Checked here, not left to `[`: a window that is not a number would make the
+        # test below an error, which `if` reads as false, and the retries would go on
+        # with no window at all.
+        case "${RETRY_WINDOW}" in
+            '' | *[!0-9]*)
+                echo "!! FAFNIR_RETRY_WINDOW holds '${RETRY_WINDOW}', not seconds --" \
+                    "no retry."
+                return "${rc}"
+                ;;
+        esac
         if [ $(($(date -u +%s) + wait - START_EPOCH)) -gt "${RETRY_WINDOW}" ]; then
             echo "!! '$*': the vendor was unavailable; another attempt would start" \
                 "past FAFNIR_RETRY_WINDOW (${RETRY_WINDOW}s) -- the night stops here."
