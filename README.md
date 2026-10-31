@@ -96,7 +96,11 @@ fafnir source vendor-gaps                        # live names FMP stopped servin
 duk ph AAPL --adj
 duk ph cik:51143                          # or name a security by CIK/ISIN/CUSIP
 duk ph CC@2008-06-30                      # the security that traded as CC that day
-duk ls --sector Technology
+duk ls --sector technology               # names in any case
+duk ls --industries --sector energy      # each industry's sector and security count
+duk th FB                                 # which security a ticker named, and when
+duk ca AAPL --exact --json                # splits and dividends as stored
+duk tc NYSE -s 2024-12-20 -e 2024-12-31   # a venue's sessions
 duk fs AAPL --as-of 2015-06-30            # a statement as known on a date
 duk fa AAPL                               # the security's factor row
 duk -S fmp ph AAPL                        # the same series straight from a vendor
@@ -125,8 +129,9 @@ from that window load the same night.
 
 ## `duk` — one CLI, three sources
 
-`duk` keeps its full command surface (`ph`, `yc`, `ls`, `rc`, `ti`) and adds a
-global `--source/-S`:
+`duk` keeps its full command surface (`ph`, `yc`, `ls`, `rc`, `ti`, `fs`, `fa`),
+reads the warehouse's ticker history, corporate actions and trading calendar
+(`th`, `ca`, `tc`), and adds a global `--source/-S`:
 
 - `-S db` (**the default**): reads the fafnir warehouse. Without a DSN configured,
   `duk` says so and names the vendor flags rather than silently reading a vendor.
@@ -134,6 +139,11 @@ global `--source/-S`:
   works).
 - `-S sharadar`: reads Sharadar's price tables directly (`ph` only; needs
   `SHARADAR_API_KEY`).
+
+On a terminal every command prints a bordered, aligned table, with thousands
+separators and a dash for a missing value; in a pipe or a redirect it prints the
+CSV it always has, so scripts and agents are unaffected. `--table`, `--csv` and
+`--json` choose explicitly ([doc/duk.md › Console output](doc/duk.md#console-output)).
 
 Return and indicator commands (`rc`, `ti`) operate on input files and are
 source-agnostic. `yc` (yield curve) reads FMP's treasury rates in every mode.

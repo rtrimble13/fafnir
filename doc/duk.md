@@ -45,6 +45,8 @@ Each vendor source needs that vendor's key, and nothing else: `-S fmp` reads
 | `ls` (list, screen) | ✅ | ✅ | ✖ |
 | `ls SYMBOL` (company summary) | ✅ | ✖ | ✖ |
 | `fs`, `fa` (statements, factors) | ✅ | ✖ db mode only | ✖ db mode only |
+| `th`, `ca`, `tc` (ticker history, corporate actions, calendar) | ✅ | ✖ db mode only | ✖ db mode only |
+| `sid:` (a warehouse `security_id`) | ✅ | ✖ the warehouse's own key | ✖ |
 | `yc` | ⤳ falls back to FMP: the warehouse holds no treasury data | ✅ | ✖ no treasury data |
 | `rc`, `ti` | source-agnostic | source-agnostic | source-agnostic |
 
@@ -83,6 +85,7 @@ dsn = "host=localhost dbname=fafnir user=fafnir_app"   # or FAFNIR_DSN env (-S d
 
 [general]
 default_source = "db"     # "db" (default), "fmp" or "sharadar"
+console_format = "auto"   # "auto" (table on a terminal, CSV in a pipe), "table", "csv", "json"
 log_level = "info"
 ```
 
@@ -100,6 +103,9 @@ when symbol resolution still read `core`.
 | `ls SYMBOL\|NAME` | everything the warehouse holds on one company | ✅ `mart.v_security_*` | ✖ db only |
 | `fs SYMBOL` | a financial statement, point in time with `--as-of` | ✅ `mart.v_*_versions` | ✖ db only |
 | `fa SYMBOL` | one security's row of the factor panel | ✅ `mart.fundamental_panel` | ✖ db only |
+| `th SYMBOL` | which security a ticker named, and when | ✅ `mart.v_symbol_lookup` | ✖ db only |
+| `ca SYMBOL` | splits and cash dividends, one row per event | ✅ `mart.v_corporate_action` | ✖ db only |
+| `tc [EXCHANGE]` | a venue's sessions, or which venues have a calendar | ✅ `ref.trading_calendar` | ✖ db only |
 | `yc` | treasury yield curve | ⤳ falls back to FMP | ✅ FMP |
 | `rc` | return calculations from an input file | source-agnostic | source-agnostic |
 | `ti` | technical indicators (sma/ema/rsi/macd) from a file | source-agnostic | source-agnostic |
@@ -116,8 +122,47 @@ vendors return their own adjusted series — close, but a moving vendor snapshot
 rather than a reproducible one, so small differences on old dates are expected.
 
 > `yc` reads FMP in every mode: the warehouse holds no treasury data, and none is
-> planned (FRED was not adopted, 2026-10-30). In db mode it logs a warning and reads
-> FMP (requires an FMP key).
+> planned (FRED was not adopted, 2026-10-30). In db mode it reads FMP (requires an
+> FMP key) and says so on stderr -- `Note: the warehouse holds no treasury data; yc
+> reads FMP's curve` -- so a vendor's curve never passes for the warehouse's.
+> stdout is unchanged. `-S fmp` asks for FMP explicitly and prints no note.
+
+## Console output
+
+Every command that prints data chooses one of three formats:
+
+| Format | When | What |
+|---|---|---|
+| table | the default when stdout is a **terminal**, or `--table` | a bordered, aligned table: numbers right-aligned with thousands separators, prices at `-p` places (never floored to `0.00`), a dash for a missing value, and a footer saying what was shown (`61 bars · AAPL · raw · day · 2024-01-02 → 2024-03-28`) |
+| CSV | the default **in a pipe or redirect**, or `--csv` | exactly what duk printed before tables existed |
+| JSON | `--json` | records, as before |
+
+So `duk ph AAPL` reads as a table in a terminal, while `duk ph AAPL > a.csv`,
+`duk ph AAPL | head` and an agent's shell all get the CSV they always got, with
+no flag. `DUK_FORMAT` (environment) or `[general].console_format` (`~/.dukrc`)
+fixes the default: `table`, `csv`, `json` or `auto`. A flag beats both, and two
+flags at once are refused.
+
+- **Nothing found is still JSON.** With `--json` an empty answer is `[]` (`null`
+  for `fa`, which prints one object) on stdout, and the sentence -- `No data found
+  for X` -- goes to stderr, so a program parsing stdout never meets prose. As CSV
+  or a table it is the sentence on stdout, as before. Exit 0 either way; `-q`
+  prints neither, and `-o` writes no file.
+- **`-o` files are data, never a table**: CSV, or JSON with `--json`, whatever
+  the console shows.
+- **Text is shortened to fit the terminal, numbers never are.** A wide screen
+  ellipsises company and industry names; a number that does not fit overflows
+  rather than lose a digit. Piped output is never fitted.
+- **Borders** are box-drawing characters where stdout can encode them and ASCII
+  (`+-|`) where it cannot (a Windows code page). Headers are bold and borders
+  dim on a colour terminal; `NO_COLOR` turns that off.
+- **`ls SYMBOL`** keeps its sectioned report in every mode: on a terminal (or
+  with `--table`) it is drawn in a border with a rule per section; piped, it is
+  the plain text it was. `--csv` still flattens it to one row.
+- **`fs`** turns the statement round for a terminal: line items down, periods
+  across, as a statement is read, with as many of the latest periods as fit
+  (the footer says when some are left out). **`fa`** is a field / value table.
+- `--summary` on a terminal is a table of the statistics, one row per column.
 
 ## Examples
 
@@ -192,7 +237,8 @@ rounded under its name:
 - with `--summary`;
 - with `-p` (every stored digit is printed).
 
-portable reads prices this way (its ADR 0029).
+portable reads prices this way (its ADR 0029), naming each security by `sid:`
+(its ADR 0032).
 
 ## Naming a security by identifier
 
@@ -211,6 +257,7 @@ duk -S db ls  cik:0000051143       # zero-padding is optional
 | `cik:` | digits | leading zeros optional — `51143` and `0000051143` are the same filer |
 | `isin:` | 12 characters | case and grouping are ignored: `isin:"us4592 0010 14"` works |
 | `cusip:` | 8 or 9 characters | the check digit may be dropped |
+| `sid:` / `security_id:` | the warehouse's `security_id` | `-S db` only: exactly one security, whichever tickers it held. What a client that has already resolved a security names it by (`duk th` prints it) |
 | `ticker:` / `symbol:` | a ticker | an escape hatch, for when the argument must not be read as anything else |
 
 **The prefix is required.** An identifier is not guessable from its shape — `51143`
@@ -298,6 +345,104 @@ CC@2009-03-06  Circuit City Stores Inc  NYSE      delisted
 
 On the MCP surface, `resolve_symbol` takes `as_of`, and every tool taking a
 `symbol` accepts the `CC@2008-06-30` form.
+
+## `ls` lists: sectors, industries and how many securities each holds
+
+```bash
+duk ls --sectors                          # every sector, with security_count
+duk ls --industries                       # every industry, its sector, its count
+duk ls --industries --sector energy       # the industries within Energy
+duk ls --sectors --exchange nyse          # counts on NYSE only
+duk ls --sector=energy                    # a screen: energy, Energy, ENERGY alike
+duk ls --industry "furnishings, fixtures & appliances"
+```
+
+- **Names are case-insensitive** -- `--sector`, `--industry`, `--exchange` and
+  `--country` alike, and spacing does not matter either. A sector or industry
+  the source does not know is refused with the nearest names
+  (`Unknown sector 'enrgy'. Did you mean: Energy?`, exit 1), instead of a screen
+  that prints *No data found* as if it were a fact about the market. A name may
+  contain a comma (FMP's "Furnishings, Fixtures & Appliances"): the longest run
+  of comma-separated pieces that is a known name wins.
+- **`security_count`** is how many securities a screen with the same filters
+  returns in that sector or industry: actively trading unless
+  `--include-delisted`, scoped by any other screening flag. It is counted on
+  `mart.security_latest`, so as of the last `fafnir db refresh-marts`. Every
+  sector in `ref.sector` is listed, with 0 where none falls; the table's footer
+  totals the column and says how many screened securities have no sector at all.
+- **An industry's `sector_name`** is the sector its securities are classified in:
+  `ref.industry` carries none. An industry spanning two sectors is listed under
+  each with its count in each; one holding no security has no sector to name
+  (empty, and 0). `--industries --sector X` lists only the industries in X.
+- **`--sector=` / `--industry=` screens** carry `sector` and `industry` columns,
+  and the table's footer the number of securities found.
+- **`-S fmp`** lists names only: FMP's list endpoints carry no counts, and
+  computing them would page the vendor's whole screener on every call. The
+  `security_count` (and, for industries, `sector_name`) columns are there as
+  explicit nulls with a note on stderr, and a screening flag on a list is
+  refused there.
+- **`--dividend` is refused in the warehouse** (`-S db`):
+  `mart.security_latest` holds no dividend, and the filter used to be dropped
+  silently, printing the unfiltered screen. It still screens with `-S fmp`.
+
+## `th`, `ca`, `tc` — identity, actions and sessions, as stored
+
+Three reads for a program keeping its own books, which needs more than prices:
+which security a ticker named on each day, the splits and dividends at event
+grain, and the venue's sessions. They return the warehouse's rows as they are
+-- no resolution ladder, no fallback, no rounding -- and leave the policy to the
+caller. portable's `FafnirProvider` reads fafnir through these and `ph` alone,
+with no SQL of its own (its ADR 0032); the JSON they print is pinned by
+`test/duk/test_db_portable_reads_integration.py`, so change both together.
+
+**`duk th SYMBOL... [-s DATE] [-e DATE]`** -- ticker history.
+- A ticker lists every security that has traded under it, one row per period
+  from `valid_from` to `valid_to` inclusive (empty: still open), oldest first,
+  each with the security it named: `security_id`, its current
+  `primary_symbol`, name, `asset_type`, venue, currency, country, CIK, ISIN,
+  CUSIP and listing status. `-s` / `-e` keep the periods overlapping the range.
+- A security (`cik:`, `isin:`, `cusip:`, `sid:`, `TICKER@DATE`) lists every
+  ticker it has held: `duk th sid:7` is FB, then META. A CIK with several
+  classes lists them all: a listing, not a pick.
+- Several tickers are one read -- `duk th AAPL MSFT XOM` -- each one's periods
+  in the order the tickers were given, oldest first; every row's `symbol` says
+  which ticker it belongs to. Several securities work the same way. Tickers and
+  securities in one call are refused (exit 2): a ticker lists the securities it
+  named, a security the tickers it held. portable reads a whole portfolio's
+  histories this way, in one process.
+- A period starting `1900-01-01` is fafnir's "first seen" fallback for a ticker
+  whose start it never learned, not a listing date. Where two periods cover one
+  day both are printed; deciding between them is the caller's.
+- The table shows the narrow view; `--json` / `--csv` carry every column.
+
+**`duk ca SYMBOL [-s DATE] [-e DATE] [--type split|dividend] [--exact]`** --
+corporate actions, from `mart.v_corporate_action` (migration 0033; an older
+warehouse is refused, naming it).
+- One row per event, by ex-date: `action_type`, the split's
+  `split_numerator` / `split_denominator`, the `dividend_amount` per share and
+  its `currency`, the `record_date`, `payment_date` and `declaration_date`,
+  `corporate_action_id`, `security_id` and the `source` that supplied it.
+  `-s` / `-e` bound the ex-date.
+- `--exact` prints every number as the stored decimal text, JSON strings
+  included (`"0.242500"`, `"4.000000"`), as `ph --exact` does. CSV is always the
+  stored text.
+- Spinoffs, mergers and renames are not corporate actions here: a rename is a
+  ticker period (`duk th`), a delisting's reason is `mart.v_security_lifecycle`.
+
+**`duk tc [EXCHANGE] [-s DATE] [-e DATE]`** -- the trading calendar.
+- Without `EXCHANGE`, every venue with a calendar: `first_date`, `last_date`,
+  `open_days`, `closed_days`.
+- With one (any case), its rows in the range: `date`, `is_open`,
+  `session_note`. fafnir seeds open days only, so inside the span a weekday with
+  no row is closed, and a closure no rule predicts is a row with `is_open`
+  false (migration 0022). Outside the span nothing is known.
+- A venue with no calendar is reported as such, never answered with another
+  venue's; falling back (fafnir's own ingestion judges such a venue by NASDAQ's)
+  is the caller's decision.
+
+The MCP read profile has the same three reads as `ticker_history`,
+`corporate_actions` and `trading_calendar` ([agent.md](agent.md#the-tools)),
+over the same `duk.datasource.db` functions, so they return the same rows.
 
 ## `ls QUERY` — one company, everything held
 
@@ -451,6 +596,22 @@ the issuers that died before fafnir first ran, minted from Sharadar
   (acquired, merged away, liquidated, delisted), the acquirer, and the trading
   span ([data dictionary](data_dictionary.md)). A mart-only role reads it, through
   the MCP server's SQL tool or `psql`.
+
+## Start-up cost
+
+duk is a process per question, and portable asks several per ticker, so what a
+process pays before it reads anything matters. pandas, numpy and the vendor HTTP
+clients load when a command first uses them, not at start (`duk._deferred`,
+`duk._lazy`): `duk th`, `ca`, `tc` and `ph --exact` never load them, and run in
+about a third of the time they did (≈0.23s against ≈0.7s, measured on a local
+warehouse). Commands that compute on a frame load pandas as before.
+`test/duk/test_cli_startup.py` asserts what starting the CLI loads; a new module
+on the start-up path takes pandas as `from duk._deferred import pandas as pd`,
+because a plain `import pandas` loads it there and then.
+
+`ph --exact` reads its bars as rows (`duk.datasource.db.exact_bars`), never
+through a DataFrame; `price_history(exact=True)` builds its frame from the same
+rows, so the two cannot drift.
 
 ## Library use
 

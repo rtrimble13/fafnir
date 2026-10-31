@@ -9,6 +9,7 @@ rounded under its name.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from decimal import Decimal
 
@@ -20,13 +21,11 @@ from duk.cli import main
 from duk.datasource import db as ds_db
 from duk.format_utils import exact_records
 
-PRICES = pd.DataFrame(
-    {
-        "close": [Decimal("13247980.736555"), Decimal("189.120000")],
-        "volume": [100, 2000],
-    },
-    index=pd.to_datetime(["2024-01-02", "2024-01-03"]).rename("date"),
-)
+#: What ds_db.exact_bars returns: rows as psycopg hands them back.
+BARS = [
+    {"date": dt.date(2024, 1, 2), "close": Decimal("13247980.736555"), "volume": 100},
+    {"date": dt.date(2024, 1, 3), "close": Decimal("189.120000"), "volume": 2000},
+]
 
 DB_RC = '[database]\ndsn = "host=x dbname=fafnir"\n'
 FMP_RC = '[api]\nfmp_key = "k"\n'
@@ -44,11 +43,16 @@ def run(monkeypatch, tmp_path, calls):
 
     def fake(**kwargs):
         calls["kwargs"] = kwargs
-        frame = PRICES.copy()
-        fields = kwargs.get("fields")
-        return frame[fields] if fields else frame
+        fields = kwargs.get("fields") or ["close", "volume"]
+        return [
+            {"date": b["date"], **{f: b[f] for f in fields}}
+            for b in calls.get("bars", BARS)
+        ]
 
-    monkeypatch.setattr(ds_db, "price_history", fake)
+    monkeypatch.setattr(ds_db, "exact_bars", fake)
+    monkeypatch.setattr(
+        ds_db, "price_history", lambda **kw: pytest.fail("--exact reads exact_bars")
+    )
 
     def invoke(args, rc=DB_RC):
         cfg = tmp_path / "dukrc.toml"
@@ -66,7 +70,15 @@ def test_json_carries_the_stored_text_of_every_price(run, calls):
         {"date": "2024-01-02", "close": "13247980.736555"},
         {"date": "2024-01-03", "close": "189.120000"},
     ]
-    assert calls["kwargs"]["exact"] is True
+    assert calls["kwargs"]["fields"] == ["close"]
+    assert calls["kwargs"]["adjusted"] is False
+
+
+def test_adjusted_exact_reads_the_adjusted_series(run, calls):
+    result = run(["ph", "AAPL", "--exact", "--json", "--adj"])
+
+    assert result.exit_code == 0, result.output
+    assert calls["kwargs"]["adjusted"] is True
 
 
 def test_csv_carries_the_same_text(run):

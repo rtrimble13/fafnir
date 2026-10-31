@@ -19,12 +19,13 @@ float on the way in -- which would erase any scale the database applied anyway.
 
 from __future__ import annotations
 
+import datetime
 import math
 import numbers
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 # Columns carrying a price. Volume is a share count (never formatted as money) and
 # the date index is not numeric, so both are left alone.
@@ -173,3 +174,42 @@ def exact_records(frame: pd.DataFrame) -> list[dict[str, Optional[str]]]:
                 )
         records.append(out)
     return records
+
+
+def plain_value(value: Any, *, exact: bool = False) -> Any:
+    """A warehouse value as `th` / `ca` / `tc` print it in JSON and CSV.
+
+    Dates are ``YYYY-MM-DD``. A ``NUMERIC`` is a float, or with ``exact`` its
+    stored text (``"0.240000"``), so a reader parsing JSON numbers as floats
+    cannot round it -- the same contract as ``ph --exact``. With ``exact`` an
+    integer is text too, so every number in the record is. Text, booleans and
+    None pass through. A float is refused under ``exact``: it would mean a value
+    came through the float path, and printing it as exact is what ``--exact``
+    exists to rule out.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, datetime.datetime):
+        return (
+            value.date().isoformat()
+            if value.time() == datetime.time(0)
+            else (value.isoformat())
+        )
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return format(value, "f") if exact else float(value)
+    if isinstance(value, numbers.Integral):
+        return str(int(value)) if exact else int(value)
+    if isinstance(value, float):
+        if exact:
+            raise TypeError(f"{value!r} is a float; --exact will not print it")
+        return None if math.isnan(value) else value
+    return value
+
+
+def plain_records(rows, *, exact: bool = False) -> list[dict]:
+    """Each row through :func:`plain_value`."""
+    return [{k: plain_value(v, exact=exact) for k, v in row.items()} for row in rows]

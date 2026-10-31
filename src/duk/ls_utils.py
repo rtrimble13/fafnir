@@ -5,11 +5,13 @@ This module provides functions for processing sector and industry
 list data retrieved from APIs.
 """
 
+from __future__ import annotations
+
 import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 logger = logging.getLogger(__name__)
 

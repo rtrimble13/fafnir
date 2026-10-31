@@ -144,5 +144,11 @@ log_dir = "var/fafnir/log"
 # [database] (-S db). default_source: "db" (the default), "fmp" or "sharadar";
 # "live" is accepted as the older name for fmp.
 default_source = "db"
+# console_format: how a command prints with no --table/--csv/--json. "auto" (the
+# default) is a bordered table on a terminal and CSV in a pipe or redirect, so
+# scripts read what they always did; "table", "csv" or "json" fixes it. The
+# DUK_FORMAT environment variable overrides this. -o files are CSV, or JSON with
+# --json, whatever the console shows.
+# console_format = "auto"
 default_output_dir = "var/duk"
 default_output_type = "csv"

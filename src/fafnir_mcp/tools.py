@@ -609,6 +609,160 @@ def factor_row(*, dsn: str, symbol: str, as_of: Optional[str] = None) -> dict:
     }
 
 
+def ticker_history(
+    *,
+    dsn: str,
+    symbol: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """Which security a ticker named, and when -- the rows ``duk th`` prints.
+
+    A ticker lists every security that has traded under it; an identifier
+    (``cik:``, ``isin:``, ``cusip:``, ``sid:``, ``TICKER@DATE``) every ticker the
+    security has held. Each row carries the security's ``security_id`` and master
+    record. Nothing is picked: where two periods cover one day, both are rows.
+    """
+    from duk import identifiers
+    from duk.datasource.db import resolve_identifier
+    from duk.datasource.db import ticker_history as _duk_ticker_history
+
+    symbol = _require_symbol(symbol)
+    start = _parse_date(start_date, "start_date")
+    end = _parse_date(end_date, "end_date")
+    cap = clamp_limit(limit, DEFAULT_MAX_ROWS)
+    try:
+        identifier = identifiers.parse(symbol)
+    except identifiers.IdentifierError as exc:
+        raise ToolError(str(exc)) from None
+    try:
+        if identifier.is_ticker:
+            rows = _duk_ticker_history(
+                dsn=dsn, symbol=identifier.value, start_date=start, end_date=end
+            )
+        else:
+            candidates = resolve_identifier(dsn=dsn, identifier=identifier)
+            if not candidates:
+                raise ToolError(f"no security carries {identifier.describe()}")
+            rows = _duk_ticker_history(
+                dsn=dsn,
+                security_ids=[int(c["security_id"]) for c in candidates],
+                start_date=start,
+                end_date=end,
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise _wrap(exc, dsn) from None
+    return envelope(
+        rows,
+        max_rows=cap,
+        symbol=symbol,
+        note=(
+            "One row per period of a ticker naming a security, valid_from to "
+            "valid_to inclusive; valid_to null means still open. valid_from "
+            "1900-01-01 is fafnir's 'first seen' fallback, not a listing date. "
+            "Overlapping periods are all listed: choosing between them is the "
+            "caller's decision. Name a security to the other tools by "
+            "'sid:<security_id>' to be sure which one you mean."
+        ),
+    )
+
+
+def corporate_actions(
+    *,
+    dsn: str,
+    symbol: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    action_type: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """One security's splits and cash dividends, by ex-date -- ``duk ca``'s rows.
+
+    Amounts and ratios are the stored decimals as strings (:func:`jsonable`), so
+    nothing is rounded on the way to the agent.
+    """
+    from duk.datasource.db import ACTION_TYPES
+    from duk.datasource.db import corporate_actions as _duk_corporate_actions
+
+    symbol = _require_symbol(symbol)
+    start = _parse_date(start_date, "start_date")
+    end = _parse_date(end_date, "end_date")
+    kind = (action_type or "").strip().lower() or None
+    if kind is not None and kind not in ACTION_TYPES:
+        raise ToolError(f"action_type must be split or dividend, got {action_type!r}")
+    cap = clamp_limit(limit, DEFAULT_MAX_ROWS)
+    symbol, sec_id = _resolve_named(dsn, symbol)
+    try:
+        found = _duk_corporate_actions(
+            dsn=dsn,
+            security_id=sec_id,
+            start_date=start,
+            end_date=end,
+            action_type=kind,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _wrap(exc, dsn) from None
+    return envelope(
+        found["rows"],
+        max_rows=cap,
+        symbol=symbol,
+        security_id=sec_id,
+        note=(
+            "Splits and cash dividends only, one row per event. Entitlement is the "
+            "ex_date; the cash arrives on payment_date. A split is "
+            "split_numerator-for-split_denominator. Spinoffs, mergers and renames "
+            "are not corporate actions here: a rename is a ticker period "
+            "(ticker_history)."
+        ),
+    )
+
+
+def trading_calendar(
+    *,
+    dsn: str,
+    exchange: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """A venue's sessions, or which venues have a calendar -- ``duk tc``'s rows.
+
+    Never another venue's answer for the one asked: falling back to a
+    neighbouring venue's calendar is the caller's decision, and the note says so.
+    """
+    from duk.datasource.db import calendar_days, calendars
+
+    start = _parse_date(start_date, "start_date")
+    end = _parse_date(end_date, "end_date")
+    cap = clamp_limit(limit, DEFAULT_MAX_ROWS)
+    venue = (exchange or "").strip().upper() or None
+    if venue is None and (start or end):
+        raise ToolError("start_date and end_date select one venue's days: name it")
+    try:
+        if venue is None:
+            rows = calendars(dsn=dsn)
+        else:
+            rows = calendar_days(
+                dsn=dsn, exchange=venue, start_date=start, end_date=end
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise _wrap(exc, dsn) from None
+    note = (
+        "Every venue with a calendar, its span, and how many open and closed days "
+        "it marks."
+        if venue is None
+        else (
+            "fafnir seeds open days only: inside the calendar's span a weekday with "
+            "no row was not a session, and a closure no rule predicts is a row with "
+            "is_open false. Outside the span nothing is known. No other venue's "
+            "calendar is substituted; with no rows, call without exchange to see "
+            "which venues have one."
+        )
+    )
+    return envelope(rows, max_rows=cap, exchange=venue, note=note)
+
+
 # ---------------------------------------------------------------------------
 # ops profile -- the operational record (migration 0021, ADR 0010)
 # ---------------------------------------------------------------------------
