@@ -14,6 +14,7 @@ Config file: ``~/.dukrc`` (TOML). Reuses the original keys and adds:
   [api].sharadar_key, [api].sharadar_base_url
   [database].dsn
   [general].default_source
+  [general].console_format   ("auto" | "table" | "csv" | "json")
 """
 
 from __future__ import annotations
@@ -95,6 +96,13 @@ class DukConfig:
     @property
     def default_output_type(self) -> str:
         return self._get("general", "default_output_type", "csv")
+
+    @property
+    def console_format(self) -> str:
+        """How a command prints when no --table/--csv/--json is given: ``auto``
+        (the default: a table on a terminal, CSV in a pipe), ``table``, ``csv`` or
+        ``json``. ``DUK_FORMAT`` in the environment overrides it."""
+        return (self._get("general", "console_format", "") or "auto").strip().lower()
 
     @property
     def log_level(self) -> str:

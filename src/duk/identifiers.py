@@ -13,8 +13,11 @@ exactly what it has always been (a ticker, or for ``ls`` a company name), so thi
 feature cannot change the meaning of a command anyone is already running.
 
 For the same reason an unrecognised prefix is NOT an error: ``ls "Baker: A
-History"`` is a name search, not a typo'd scheme. Only the four known schemes
+History"`` is a name search, not a typo'd scheme. Only the known schemes
 below claim the colon.
+
+``sid:601133`` names a security by the warehouse's own ``security_id`` -- the db
+source only, since a vendor has no such key.
 
 A ticker may carry a date, ``CC@2008-06-30``: the security that traded under it
 on that day (#80). A ticker is reused across issuers -- Circuit City and Chemours
@@ -35,6 +38,7 @@ TICKER_AT = "ticker_at"
 CIK = "cik"
 ISIN = "isin"
 CUSIP = "cusip"
+SECURITY_ID = "security_id"
 
 # `symbol:` is an alias for `ticker:`, because the CLI argument is called SYMBOL
 # and the warehouse column is `symbol`. Both exist mainly as an escape hatch: a
@@ -45,6 +49,11 @@ _ALIASES = {
     "cik": CIK,
     "isin": ISIN,
     "cusip": CUSIP,
+    # The warehouse's own key: exactly one security, whatever tickers it has held.
+    # What a client that already resolved a security (portable, from `duk th`)
+    # names it by, so a second resolution cannot land somewhere else.
+    "sid": SECURITY_ID,
+    "security_id": SECURITY_ID,
 }
 
 LABELS = {
@@ -53,6 +62,7 @@ LABELS = {
     CIK: "CIK",
     ISIN: "ISIN",
     CUSIP: "CUSIP",
+    SECURITY_ID: "security_id",
 }
 
 # ISIN: 2-letter ISO country code, 9 alphanumeric NSIN, 1 check digit.
@@ -172,6 +182,17 @@ def _normalise(scheme: str, value: str, raw: str) -> str:
                 "e.g. isin:US4592001014"
             )
         return compact
+    if scheme == SECURITY_ID:
+        # Validated as typed, not after the grouping separators are stripped: an
+        # ISIN pasted as "US4592 0010 14" is one ISIN, but `sid:1.5` is not
+        # security 15 and `sid:-4` is not security 4.
+        compact = value.strip()
+        if not _DIGITS_RE.match(compact) or int(compact) == 0:
+            raise IdentifierError(
+                f"'{raw}' is not a security_id: expected a positive integer, "
+                "e.g. sid:601133"
+            )
+        return str(int(compact))
     if scheme == CUSIP:
         if not _CUSIP_RE.match(compact):
             raise IdentifierError(

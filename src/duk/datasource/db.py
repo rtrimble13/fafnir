@@ -202,6 +202,8 @@ def _resolve_by_identifier(cur, ident: identifiers.Identifier) -> list[dict]:
         if sec_id is None:
             return []
         return _rows(cur, _IDENT_BY_ID_SQL, (sec_id,))
+    if ident.scheme == identifiers.SECURITY_ID:
+        return _rows(cur, _IDENT_BY_ID_SQL, (int(ident.value),))
     if ident.scheme == identifiers.CIK:
         return _rows(cur, _CIK_RESOLVE_SQL, (ident.value,))
     if ident.scheme == identifiers.ISIN:
@@ -351,9 +353,22 @@ def price_history(
     )
 
 
-def screen(
+#: Screen filters the warehouse cannot honour. ``mart.security_latest`` carries no
+#: dividend column, and a filter dropped silently answers a different question
+#: with a confident list, so each is refused by name instead.
+UNSUPPORTED_SCREEN_FILTERS = {
+    "dividendMoreThan": "--dividend",
+    "dividendLowerThan": "--dividend",
+}
+
+
+def _norm_name(value: str) -> str:
+    """A sector or industry name as compared: case and spacing carry no meaning."""
+    return " ".join(str(value).split()).lower()
+
+
+def _screen_clauses(
     *,
-    dsn: str,
     sector: Optional[list[str]] = None,
     industry: Optional[list[str]] = None,
     exchange: Optional[str] = None,
@@ -370,16 +385,21 @@ def screen(
     isFund: Optional[bool] = None,
     isActivelyTrading: Optional[bool] = None,
     includeDelisted: bool = False,
-    limit: Optional[int] = None,
-    **_ignored,
-) -> pd.DataFrame:
-    """Screen securities from mart.security_latest. Mirrors the live screener columns.
+    **ignored,
+) -> tuple[list[str], list[Any]]:
+    """The WHERE clauses of a screen over ``mart.security_latest``, and their
+    parameters. Shared by :func:`screen` and the counted lists, so a count is the
+    number of rows the same screen returns.
 
-    Actively trading securities only, unless ``includeDelisted`` or an explicit
-    ``isActivelyTrading``: the warehouse keeps every security that stopped trading,
-    the dead issuers minted from Sharadar among them (#79), and a screen without
-    the filter returns several times the rows of the market as it trades now.
+    Text filters compare case- and space-insensitively: ``energy``, ``Energy``
+    and ``ENERGY`` are one sector, ``nyse`` one exchange.
     """
+    for key, flag in UNSUPPORTED_SCREEN_FILTERS.items():
+        if ignored.get(key) is not None:
+            raise DataSourceError(
+                f"{flag} cannot be screened in the warehouse: mart.security_latest "
+                "carries no dividend. Use -S fmp, or screen without it."
+            )
     clauses: list[str] = ["1=1"]
     params: list[Any] = []
 
@@ -387,14 +407,21 @@ def screen(
         clauses.append(cond)
         params.append(value)
 
+    norm = "lower(regexp_replace(btrim({col}), '\\s+', ' ', 'g'))"
     if sector:
-        add("sector_name = ANY(%s)", list(sector))
+        add(
+            f"{norm.format(col='sector_name')} = ANY(%s)",
+            [_norm_name(v) for v in sector],
+        )
     if industry:
-        add("industry_name = ANY(%s)", list(industry))
+        add(
+            f"{norm.format(col='industry_name')} = ANY(%s)",
+            [_norm_name(v) for v in industry],
+        )
     if exchange:
-        add("exchange_code = %s", exchange)
+        add("upper(btrim(exchange_code)) = %s", exchange.strip().upper())
     if country:
-        add("country = %s", country)
+        add("upper(btrim(country)) = %s", country.strip().upper())
     if marketCapMoreThan is not None:
         add("market_cap_usd > %s", marketCapMoreThan)
     if marketCapLowerThan is not None:
@@ -419,7 +446,21 @@ def screen(
         add("is_actively_trading = %s", isActivelyTrading)
     elif not includeDelisted:
         clauses.append("is_actively_trading")
+    return clauses, params
 
+
+def screen(*, dsn: str, limit: Optional[int] = None, **filters) -> pd.DataFrame:
+    """Screen securities from mart.security_latest. Mirrors the live screener columns.
+
+    Actively trading securities only, unless ``includeDelisted`` or an explicit
+    ``isActivelyTrading``: the warehouse keeps every security that stopped trading,
+    the dead issuers minted from Sharadar among them (#79), and a screen without
+    the filter returns several times the rows of the market as it trades now.
+
+    Sector, industry, exchange and country match case-insensitively. A dividend
+    filter is refused (:data:`UNSUPPORTED_SCREEN_FILTERS`), not ignored.
+    """
+    clauses, params = _screen_clauses(**filters)
     sql = (
         'SELECT symbol, company_name AS "companyName", market_cap_usd AS "marketCap", '
         "sector_name AS sector, industry_name AS industry, beta, last_close AS price, "
@@ -435,20 +476,93 @@ def screen(
     return pd.DataFrame(rows)
 
 
-def list_sectors(*, dsn: str) -> pd.DataFrame:
+def sector_names(*, dsn: str) -> list[str]:
+    """Every sector name the warehouse knows (``ref.sector``), alphabetically."""
     with _connect(dsn) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT sector_id, sector_name FROM ref.sector ORDER BY sector_name"
-        )
-        return pd.DataFrame(cur.fetchall())
+        cur.execute("SELECT sector_name FROM ref.sector ORDER BY sector_name")
+        return [r["sector_name"] for r in cur.fetchall()]
 
 
-def list_industries(*, dsn: str) -> pd.DataFrame:
+def industry_names(*, dsn: str) -> list[str]:
+    """Every industry name the warehouse knows (``ref.industry``), alphabetically."""
     with _connect(dsn) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT industry_id, industry_name FROM ref.industry ORDER BY industry_name"
-        )
-        return pd.DataFrame(cur.fetchall())
+        cur.execute("SELECT industry_name FROM ref.industry ORDER BY industry_name")
+        return [r["industry_name"] for r in cur.fetchall()]
+
+
+# Counted over the same rows a screen with these filters returns (the screen's
+# WHERE), from the refresh-lagged snapshot. Every sector in ref.sector is listed,
+# with 0 where no security falls in it -- unless an industry filter scopes the
+# list, when only the sectors holding that industry are.
+_SECTOR_COUNT_SQL = """
+    WITH counted AS (
+        SELECT sector_name, count(*) AS n
+          FROM mart.security_latest
+         WHERE {where}
+         GROUP BY sector_name
+    )
+    SELECT s.sector_id, s.sector_name, COALESCE(c.n, 0)::bigint AS security_count
+      FROM ref.sector s
+      LEFT JOIN counted c ON c.sector_name = s.sector_name
+     WHERE %s IS FALSE OR c.n IS NOT NULL
+     ORDER BY s.sector_name
+"""
+# ref.industry carries no sector: an industry's sector is the one its securities
+# are classified in. One that spans two sectors is listed once under each, with
+# its count in each; one holding no security has no sector to name (NULL, and 0).
+_INDUSTRY_COUNT_SQL = """
+    WITH counted AS (
+        SELECT industry_name, sector_name, count(*) AS n
+          FROM mart.security_latest
+         WHERE {where} AND industry_name IS NOT NULL
+         GROUP BY industry_name, sector_name
+    )
+    SELECT i.industry_id, i.industry_name, c.sector_name,
+           COALESCE(c.n, 0)::bigint AS security_count
+      FROM ref.industry i
+      LEFT JOIN counted c ON c.industry_name = i.industry_name
+     WHERE %s IS FALSE OR c.n IS NOT NULL
+     ORDER BY i.industry_name, c.sector_name NULLS LAST
+"""
+_UNCLASSIFIED_SQL = (
+    "SELECT count(*) AS n FROM mart.security_latest WHERE {where} AND {column} IS NULL"
+)
+
+
+def _counted(
+    dsn: str, sql: str, column: str, scoped: bool, filters: dict
+) -> pd.DataFrame:
+    clauses, params = _screen_clauses(**filters)
+    where = " AND ".join(clauses)
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(sql.format(where=where), [*params, scoped])
+        frame = pd.DataFrame(cur.fetchall())
+        cur.execute(_UNCLASSIFIED_SQL.format(where=where, column=column), params)
+        unclassified = int(cur.fetchone()["n"])
+    # Securities the screen matched that carry no sector (industry): not a row,
+    # since there is no name to list them under, but not dropped from the count
+    # either -- the table's footer says how many.
+    frame.attrs["unclassified"] = unclassified
+    return frame
+
+
+def list_sectors(*, dsn: str, **filters) -> pd.DataFrame:
+    """Sectors with ``security_count``: how many securities a screen with
+    ``filters`` returns in each (actively trading by default, as :func:`screen`).
+
+    ``frame.attrs["unclassified"]`` is how many of the screened securities have no
+    sector at all.
+    """
+    scoped = bool(filters.get("industry"))
+    return _counted(dsn, _SECTOR_COUNT_SQL, "sector_name", scoped, filters)
+
+
+def list_industries(*, dsn: str, **filters) -> pd.DataFrame:
+    """Industries with the ``sector_name`` their securities are classified in and
+    ``security_count``, scoped by ``filters`` as :func:`list_sectors` is. With a
+    sector filter, only the industries holding a security in it."""
+    scoped = bool(filters.get("sector"))
+    return _counted(dsn, _INDUSTRY_COUNT_SQL, "industry_name", scoped, filters)
 
 
 def list_actively_trading(*, dsn: str, limit: Optional[int] = None) -> pd.DataFrame:
@@ -863,3 +977,171 @@ def factor_row(
         row=dict(row) if row else None,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Ticker history, corporate actions, trading calendar (`duk th` / `ca` / `tc`)
+#
+# The reads a client keeping its own books needs besides prices: which security
+# a ticker named on each day, the splits and dividends at event grain, and the
+# venue's sessions. portable reads all three through these commands (its ADR
+# 0032), so they return the warehouse's rows as they are -- no resolution ladder,
+# no fallback, no rounding -- and leave the policy to the caller.
+# ---------------------------------------------------------------------------
+
+# Each period during which a ticker named a security, with the security it named
+# as it is described now. `valid_to` is the period's last day (NULL: still open);
+# a period starting 1900-01-01 is the "first seen" fallback for a ticker whose
+# start fafnir never learned. Periods overlap only where the xref records both.
+_TICKER_HISTORY_SQL = """
+    SELECT x.symbol, x.security_id, x.valid_from, x.valid_to, x.is_primary,
+           p.symbol AS primary_symbol, p.company_name, p.asset_type,
+           p.exchange_code, p.currency, p.country, p.cik, p.isin, p.cusip,
+           p.is_actively_trading, p.delisted_date
+      FROM mart.v_symbol_lookup x
+      JOIN mart.v_security_profile p ON p.security_id = x.security_id
+     WHERE {who}
+       AND (%(end)s::date IS NULL OR x.valid_from <= %(end)s::date)
+       AND (%(start)s::date IS NULL OR x.valid_to IS NULL
+            OR x.valid_to >= %(start)s::date)
+     ORDER BY x.valid_from, x.security_id, x.symbol
+"""
+
+
+def ticker_history(
+    *,
+    dsn: str,
+    symbol: Optional[str] = None,
+    security_ids: Optional[list[int]] = None,
+    start_date: Optional[str | date] = None,
+    end_date: Optional[str | date] = None,
+) -> list[dict]:
+    """The periods of a ticker's history, or of the given securities' tickers.
+
+    With ``symbol``, every security the ticker has named (matched in any case);
+    with ``security_ids``, every ticker those securities have held. ``start_date``
+    / ``end_date`` keep the periods that overlap the range. Oldest first.
+    """
+    if (symbol is None) == (security_ids is None):
+        raise DataSourceError("ticker_history needs a symbol or security_ids")
+    start = _parse_date(start_date, "start date")
+    end = _parse_date(end_date, "end date")
+    if start and end and end < start:
+        raise DataSourceError(f"the range ends ({end}) before it starts ({start})")
+    if symbol is not None:
+        who, value = "upper(x.symbol) = %(who)s", symbol.strip().upper()
+    else:
+        who, value = "x.security_id = ANY(%(who)s)", [int(i) for i in security_ids]
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            _TICKER_HISTORY_SQL.format(who=who),
+            {"who": value, "start": start, "end": end},
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+_CORPORATE_ACTIONS_SQL = """
+    SELECT ex_date, action_type, split_numerator, split_denominator,
+           dividend_amount, currency, record_date, payment_date, declaration_date,
+           corporate_action_id, security_id, source
+      FROM mart.v_corporate_action
+     WHERE security_id = %(sid)s
+       AND (%(start)s::date IS NULL OR ex_date >= %(start)s::date)
+       AND (%(end)s::date IS NULL OR ex_date <= %(end)s::date)
+       AND (%(kind)s::text IS NULL OR action_type = %(kind)s::text)
+     ORDER BY ex_date, action_type, corporate_action_id
+"""
+ACTION_TYPES = ("split", "dividend")
+
+
+def corporate_actions(
+    *,
+    dsn: str,
+    symbol: Optional[str] = None,
+    security_id: Optional[int] = None,
+    start_date: Optional[str | date] = None,
+    end_date: Optional[str | date] = None,
+    action_type: Optional[str] = None,
+) -> dict:
+    """One security's splits and cash dividends, one row per event, by ex-date.
+
+    Amounts and ratios stay the ``NUMERIC`` the warehouse stores (``Decimal``).
+    Returns ``security_id`` (None: no such security) and ``rows``.
+
+    Raises DataSourceError naming fafnir migration 0033 when the warehouse has no
+    ``mart.v_corporate_action`` yet.
+    """
+    if action_type is not None and action_type not in ACTION_TYPES:
+        raise DataSourceError(
+            f"Unknown action type '{action_type}': expected split or dividend"
+        )
+    start = _parse_date(start_date, "start date")
+    end = _parse_date(end_date, "end date")
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        sec_id = _sec_id(cur, symbol, security_id)
+        out: dict = {"security_id": sec_id, "rows": []}
+        if sec_id is None:
+            return out
+        try:
+            cur.execute(
+                _CORPORATE_ACTIONS_SQL,
+                {"sid": sec_id, "start": start, "end": end, "kind": action_type},
+            )
+        except Exception as exc:  # noqa: BLE001 -- one case is translated
+            if getattr(exc, "sqlstate", None) == "42P01":
+                raise DataSourceError(
+                    "this warehouse has no mart.v_corporate_action: it arrives with "
+                    "fafnir migration 0033 (`fafnir db migrate` on the host)"
+                ) from exc
+            raise
+        out["rows"] = [dict(r) for r in cur.fetchall()]
+    return out
+
+
+# Every venue with a calendar, and the span it holds. fafnir seeds open days only;
+# a closure no rule predicts is a row with is_open false (migration 0022), so a day
+# with no row inside the span is a closed day and outside it is unknown.
+_CALENDAR_SUMMARY_SQL = """
+    SELECT c.exchange_code, x.exchange_name,
+           min(c.trade_date) AS first_date, max(c.trade_date) AS last_date,
+           count(*) FILTER (WHERE c.is_open) AS open_days,
+           count(*) FILTER (WHERE NOT c.is_open) AS closed_days
+      FROM ref.trading_calendar c
+      LEFT JOIN ref.exchange x ON x.exchange_code = c.exchange_code
+     GROUP BY c.exchange_code, x.exchange_name
+     ORDER BY c.exchange_code
+"""
+_CALENDAR_DAYS_SQL = """
+    SELECT trade_date AS date, is_open, session_note
+      FROM ref.trading_calendar
+     WHERE upper(exchange_code) = %(exchange)s
+       AND (%(start)s::date IS NULL OR trade_date >= %(start)s::date)
+       AND (%(end)s::date IS NULL OR trade_date <= %(end)s::date)
+     ORDER BY trade_date
+"""
+
+
+def calendars(*, dsn: str) -> list[dict]:
+    """Each venue's calendar: its span, and how many open and closed days it marks."""
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(_CALENDAR_SUMMARY_SQL)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def calendar_days(
+    *,
+    dsn: str,
+    exchange: str,
+    start_date: Optional[str | date] = None,
+    end_date: Optional[str | date] = None,
+) -> list[dict]:
+    """``exchange``'s calendar rows from ``start_date`` to ``end_date``: each day it
+    marks, open or (an ad-hoc closure) not. No fallback to another venue."""
+    start = _parse_date(start_date, "start date")
+    end = _parse_date(end_date, "end date")
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            _CALENDAR_DAYS_SQL,
+            {"exchange": exchange.strip().upper(), "start": start, "end": end},
+        )
+        return [dict(r) for r in cur.fetchall()]

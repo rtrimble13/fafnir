@@ -468,9 +468,78 @@ def _wrap(text: str, *, indent: str = "") -> list[str]:
     )
 
 
-def render_text(summary: dict) -> str:
+#: The report's section headings: a boxed report draws each as a rule.
+SECTION_HEADINGS = (
+    "PRICE HISTORY",
+    "CORPORATE ACTIONS",
+    "FUNDAMENTALS",
+    "DATA QUALITY",
+)
+
+
+def render_text(summary: dict, *, style: Any = None) -> str:
     """The sectioned report. Sections are always present, even when empty --
-    "no section" and "nothing to report" are different claims about a warehouse."""
+    "no section" and "nothing to report" are different claims about a warehouse.
+
+    With ``style`` (a :class:`duk.table.Style`) the same lines are drawn in a
+    border, each section heading a rule across it: the terminal rendering. Without
+    it, the plain text a pipe has always received.
+    """
+    plain = _render_plain(summary)
+    if style is None:
+        return plain
+    return _boxed(plain.splitlines(), summary["meta"], style)
+
+
+def _boxed(lines: list[str], meta: dict, style: Any) -> str:
+    """``lines`` (the plain report) inside a border, fitted to the terminal."""
+    import textwrap
+
+    from duk.table import display_width
+
+    width = min(_terminal_width(), 92)
+    inner = width - 4
+    left, fill, _, right = style.top
+    v = style.vertical
+
+    def row(text: str) -> str:
+        return f"{v} {text}{' ' * max(0, inner - display_width(text))} {v}"
+
+    def rule(parts: tuple, label: str = "") -> str:
+        start, line, _, end = parts
+        if not label:
+            return start + line * (width - 2) + end
+        head = f"{line} {label} "
+        return start + head + line * max(0, width - 2 - len(head)) + end
+
+    title = f"{meta.get('symbol') or MISSING}  {meta.get('company_name') or MISSING}"
+    venue = " · ".join(
+        p
+        for p in (meta.get("exchange_code"), meta.get("country"), meta.get("currency"))
+        if p
+    )
+    gap = max(1, inner - display_width(title) - display_width(venue))
+    out = [rule(style.top), row(f"{title}{' ' * gap}{venue}"[:inner])]
+    out.append(rule(style.mid))
+    for line in lines[2:]:
+        if not line.strip():
+            continue
+        if line.startswith(SECTION_HEADINGS):
+            out.append(rule(style.mid, line))
+            continue
+        if display_width(line) <= inner:
+            out.append(row(line))
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        for piece in textwrap.wrap(
+            line, width=inner, subsequent_indent=indent + "    ", drop_whitespace=True
+        ) or [""]:
+            out.append(row(piece))
+    out.append(rule(style.bottom))
+    return "\n".join(out)
+
+
+def _render_plain(summary: dict) -> str:
     meta, prices = summary["meta"], summary["prices"]
     actions, dq = summary["actions"], summary["dq"]
     lines: list[str] = []

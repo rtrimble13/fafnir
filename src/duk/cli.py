@@ -6,6 +6,7 @@ This module provides the main command-line interface using Click.
 
 import csv
 import datetime as dt
+import difflib
 import io
 import json
 import logging
@@ -18,6 +19,7 @@ import pandas as pd
 from click.core import ParameterSource
 
 from duk import __version__, company_summary, identifiers
+from duk import table as tables
 from duk.config import get_config
 from duk.datasource import base as ds_base
 from duk.datasource import db as ds_db
@@ -33,6 +35,7 @@ from duk.format_utils import (
     DEFAULT_DECIMALS,
     exact_records,
     format_price_columns,
+    plain_records,
     round_price_columns,
 )
 from duk.indicators import (
@@ -51,10 +54,108 @@ from duk.return_utils import (
     price_difference,
     simple_return,
 )
-from duk.stats import compute_summary_stats, format_summary_stats
+from duk.stats import compute_summary_stats, format_summary_stats, summary_stats_rows
 
 # Key rate tenors for yield curve analysis
 KEY_RATE_TENORS = ["year1", "year5", "year10", "year20", "year30"]
+
+
+# ---------------------------------------------------------------------------
+# Output format: a table for a person, CSV or JSON for a program
+# ---------------------------------------------------------------------------
+
+TABLE_HELP = "Output a bordered table (the default when stdout is a terminal)"
+CSV_HELP = "Output data as CSV (the default when stdout is not a terminal)"
+
+
+def table_option(func):
+    """``--table``, beside every command's ``--csv`` and ``--json``."""
+    return click.option("--table", "output_table", is_flag=True, help=TABLE_HELP)(func)
+
+
+def output_format(ctx, output_table, output_csv, output_json):
+    """``table``, ``csv`` or ``json``: the flag given, else ``DUK_FORMAT`` /
+    ``[general].console_format``, else a table on a terminal and CSV in a pipe
+    (:func:`duk.table.resolve_format`). Two flags at once exit 1."""
+    cfg = ctx.obj.get("config") if ctx.obj else None
+    try:
+        return tables.resolve_format(
+            table=output_table,
+            csv=output_csv,
+            json=output_json,
+            configured=getattr(cfg, "console_format", None),
+        )
+    except tables.FormatError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+def echo_table(rows, columns=None, **kwargs):
+    """Render ``rows`` (records or a DataFrame) as a table on stdout, fitted to the
+    terminal, in the characters stdout can encode."""
+    style = tables.style_for_stream(sys.stdout)
+    footer = kwargs.pop("footer", None)
+    title = kwargs.pop("title", None)
+    notes = kwargs.pop("notes", None) or []
+    if isinstance(rows, pd.DataFrame):
+        records = rows.to_dict(orient="records")
+        columns = columns or list(rows.columns)
+    else:
+        records = list(rows)
+    built = tables.table_from_rows(
+        records, columns, style=style, title=title, footer=footer, **kwargs
+    )
+    built.notes = list(notes)
+    click.echo(
+        tables.render(
+            built,
+            style=style,
+            max_width=tables.terminal_width(sys.stdout),
+            color=tables.color_enabled(),
+        )
+    )
+
+
+def echo_summary_table(stats, *, title="Summary statistics", precision=4):
+    """`--summary` as a table: one row per numeric column."""
+    if stats is None:
+        click.echo("No statistics available")
+        return
+    footer = tables.plural(stats["n_observations"], "observation")
+    if stats.get("min_date") is not None and stats.get("max_date") is not None:
+        footer += f" · {stats['min_date']} → {stats['max_date']}"
+    rows = summary_stats_rows(stats)
+    if not rows:
+        click.echo(f"{title}: no numeric columns. {footer}")
+        return
+    echo_table(rows, title=title, footer=footer, decimals=precision)
+
+
+def bar_footer(frame, *, symbol, adjusted, frequency):
+    """``61 bars · AAPL · raw · day · 2024-01-02 → 2024-03-28``."""
+    parts = [
+        tables.plural(len(frame), "bar"),
+        symbol,
+        "adjusted" if adjusted else "raw",
+        frequency,
+    ]
+    if "date" in frame.columns and len(frame):
+        first, last = frame["date"].iloc[0], frame["date"].iloc[-1]
+        parts.append(
+            f"{pd.Timestamp(first).date().isoformat()} → "
+            f"{pd.Timestamp(last).date().isoformat()}"
+        )
+    return " · ".join(parts)
+
+
+def match_column(df, column):
+    """``column`` as ``df`` spells it, matched case-insensitively when there is
+    exactly one such column; otherwise unchanged, so the caller's "not found"
+    names what was typed."""
+    if column in df.columns:
+        return column
+    found = [c for c in df.columns if str(c).lower() == str(column).lower()]
+    return found[0] if len(found) == 1 else column
 
 
 def apply_precision_to_dataframe(df, precision, exclude_columns=None):
@@ -160,6 +261,13 @@ def resolve_security_identifier(ctx, identifier):
         click.echo(
             f"Error: {identifier.describe()} resolves through the warehouse's "
             "ticker history; use -S db.",
+            err=True,
+        )
+        sys.exit(1)
+    if identifier.scheme == identifiers.SECURITY_ID and source != "db":
+        click.echo(
+            f"Error: {identifier.describe()} is the warehouse's own key; a vendor "
+            "has no such identifier. Use -S db.",
             err=True,
         )
         sys.exit(1)
@@ -344,7 +452,8 @@ def main(ctx, config, source):
         "Applies to --output files only when given explicitly."
     ),
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -356,7 +465,7 @@ def main(ctx, config, source):
     "--output",
     type=click.Path(),
     help=(
-        "Write data to file. If path is a directory, "
+        "Write data to file (CSV, or JSON with --json). If path is a directory, "
         "format filename as <symbol>_<start>_<end>.<ext>"
     ),
 )
@@ -378,6 +487,7 @@ def ph(
     adj,
     exact,
     precision,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -443,17 +553,9 @@ def ph(
 
     logger.info(f"Requesting price history for {symbol}")
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Determine which fields to return
     fields = None
@@ -535,13 +637,14 @@ def ph(
     if exact:
         _print_exact(
             exact_records(output_df),
-            output_format=output_format,
+            console=console,
             output=output,
             symbol=symbol,
             start_date=start_date,
             end_date=end_date,
             quiet=quiet,
             logger=logger,
+            footer=bar_footer(output_df, symbol=symbol, adjusted=adj, frequency="day"),
         )
         return
 
@@ -565,15 +668,14 @@ def ph(
         if output_path.is_dir():
             start_str = start_date or "earliest"
             end_str = end_date or "latest"
-            ext = "json" if output_format == "json" else "csv"
-            filename = f"{symbol}_{start_str}_{end_str}.{ext}"
+            filename = f"{symbol}_{start_str}_{end_str}.{file_format}"
             output_path = output_path / filename
 
         # Ensure parent directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to file based on format
-        if output_format == "json":
+        if file_format == "json":
             file_df = _as_numbers(output_df) if precision_requested else output_df
             file_df.to_json(output_path, orient="records", date_format="iso")
         else:
@@ -590,50 +692,73 @@ def ph(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(df.reset_index())
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(
-                    _as_numbers(output_df).to_json(orient="records", date_format="iso")
-                )
+            if console == "table":
+                echo_summary_table(stats, title=f"{symbol} summary statistics")
             else:
-                click.echo(_as_text(output_df).to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(
+                _as_numbers(output_df).to_json(orient="records", date_format="iso")
+            )
+        elif console == "table":
+            echo_table(
+                output_df,
+                price_decimals=precision,
+                footer=bar_footer(
+                    output_df, symbol=symbol, adjusted=adj, frequency=frequency
+                ),
+            )
+        else:
+            click.echo(_as_text(output_df).to_csv(index=False))
+
+
+def _exact_text(records, file_format):
+    """Exact records as JSON (numbers as strings) or CSV (the same text)."""
+    if file_format == "json":
+        return json.dumps(records)
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer, fieldnames=list(records[0]) if records else [], lineterminator="\n"
+    )
+    writer.writeheader()
+    writer.writerows(records)
+    return buffer.getvalue()
 
 
 def _print_exact(
-    records, *, output_format, output, symbol, start_date, end_date, quiet, logger
+    records, *, console, output, symbol, start_date, end_date, quiet, logger, footer
 ):
     """`ph --exact` output: every value as the text the warehouse stores.
 
     JSON is a list of objects whose numbers are strings, so a reader that parses
-    JSON numbers as floats cannot round one by accident; CSV is the same text.
+    JSON numbers as floats cannot round one by accident; CSV is the same text. A
+    table shows the same digits, every one, with thousands separators.
     """
-    if output_format == "json":
-        text = json.dumps(records)
-    else:
-        buffer = io.StringIO()
-        writer = csv.DictWriter(
-            buffer, fieldnames=list(records[0]) if records else [], lineterminator="\n"
-        )
-        writer.writeheader()
-        writer.writerows(records)
-        text = buffer.getvalue()
-
+    file_format = "json" if console == "json" else "csv"
     if output:
         output_path = Path(output)
         if output_path.is_dir():
-            ext = "json" if output_format == "json" else "csv"
-            name = f"{symbol}_{start_date or 'earliest'}_{end_date or 'latest'}.{ext}"
+            name = (
+                f"{symbol}_{start_date or 'earliest'}_{end_date or 'latest'}."
+                f"{file_format}"
+            )
             output_path = output_path / name
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text, encoding="utf-8")
+        output_path.write_text(_exact_text(records, file_format), encoding="utf-8")
         logger.info(f"Data written to {output_path}")
         if not quiet:
             click.echo(f"Data written to {output_path}")
-    if not quiet:
-        click.echo(text.rstrip("\n"))
+    if quiet:
+        return
+    if console == "table":
+        exact_rows = [
+            {k: (v if k == "date" or v is None else Decimal(v)) for k, v in r.items()}
+            for r in records
+        ]
+        echo_table(exact_rows, exact=True, footer=footer + " · exact")
+    else:
+        click.echo(_exact_text(records, file_format).rstrip("\n"))
 
 
 @main.command()
@@ -681,7 +806,8 @@ def _print_exact(
     ),
     help="Interpolation interval between tenors",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -716,6 +842,7 @@ def yc(
     tenors,
     key_rates,
     interval,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -752,17 +879,9 @@ def yc(
     if source == "fmp":
         require_source_credentials(ctx, source)
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Handle tenors parameter and key-rates mutual exclusivity
     if tenors and key_rates:
@@ -778,7 +897,8 @@ def yc(
     if tenors:
         try:
             # Parse the tenors string (e.g., "month6, year10")
-            tenor_parts = [t.strip() for t in tenors.split(",")]
+            # Tenor names are the curve's lowercase columns: Month6 is month6.
+            tenor_parts = [t.strip().lower() for t in tenors.split(",")]
             if len(tenor_parts) != 2:
                 raise ValueError("tenors must have exactly 2 values")
             tenors_tuple = (tenor_parts[0], tenor_parts[1])
@@ -860,15 +980,14 @@ def yc(
         if output_path.is_dir():
             start_str = start_date or "earliest"
             end_str = end_date or "latest"
-            ext = "json" if output_format == "json" else "csv"
-            filename = f"yc_{start_str}_{end_str}.{ext}"
+            filename = f"yc_{start_str}_{end_str}.{file_format}"
             output_path = output_path / filename
 
         # Ensure parent directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to file based on format
-        if output_format == "json":
+        if file_format == "json":
             output_df.to_json(output_path, orient="records", date_format="iso")
         else:
             output_df.to_csv(output_path, index=False)
@@ -883,14 +1002,23 @@ def yc(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(df.reset_index())
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(output_df.to_json(orient="records", date_format="iso"))
+            if console == "table":
+                echo_summary_table(stats, title="Yield curve summary statistics")
             else:
-                click.echo(output_df.to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(output_df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            kind = "zero rates" if zero_rates else "par rates"
+            echo_table(
+                output_df,
+                decimals=precision,
+                footer=f"{tables.plural(len(output_df), 'row')} · US Treasury "
+                f"{kind}, percent · FMP",
+            )
+        else:
+            click.echo(output_df.to_csv(index=False))
 
 
 @main.command()
@@ -909,23 +1037,24 @@ def yc(
     "--sectors",
     "sectors_list_flag",
     is_flag=True,
-    help="List all market sectors",
+    help="List the market sectors, with how many securities each holds",
 )
 @click.option(
     "--industries",
     "industries_list_flag",
     is_flag=True,
-    help="List all industries",
+    help="List the industries, with each one's sector and how many securities it "
+    "holds",
 )
 @click.option(
     "--sector",
     "sectors_filter",
-    help="Screen by sectors (comma-separated values)",
+    help="Screen by sectors (comma-separated; case-insensitive)",
 )
 @click.option(
     "--industry",
     "industries_filter",
-    help="Screen by industries (comma-separated values)",
+    help="Screen by industries (comma-separated; case-insensitive)",
 )
 @click.option(
     "--market-cap",
@@ -969,11 +1098,11 @@ def yc(
 )
 @click.option(
     "--exchange",
-    help="Filter by exchange (e.g., NASDAQ, NYSE)",
+    help="Filter by exchange (e.g., NASDAQ, NYSE; case-insensitive)",
 )
 @click.option(
     "--country",
-    help="Filter by country code (e.g., US)",
+    help="Filter by country code (e.g., US; case-insensitive)",
 )
 @click.option(
     "--is-etf",
@@ -995,7 +1124,8 @@ def yc(
     is_flag=True,
     help="Screen the warehouse's delisted securities too (-S db only)",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -1030,6 +1160,7 @@ def ls(
     is_fund,
     is_actively_trading,
     include_delisted,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -1048,6 +1179,13 @@ def ls(
     securities with symbol and name.
     Use --sectors to list market sectors or --sector="Tech,Healthcare" to screen.
     Use --industries to list industries or --industry="Software,Banking" to screen.
+    Names are case-insensitive (--sector=energy), and a name that is not one the
+    source knows is refused with the nearest matches.
+
+    In the warehouse, --sectors and --industries count the securities in each
+    (actively trading unless --include-delisted), and --industries names each
+    industry's sector. Screening flags scope the counts:
+    `duk ls --industries --sector energy` lists the industries in Energy.
 
     Screening supports comparison operators:
     - Use > for greater than (e.g., --price=">50")
@@ -1078,6 +1216,7 @@ def ls(
             limit=limit,
             summary=summary,
             output=output,
+            output_table=output_table,
             output_csv=output_csv,
             output_json=output_json,
             screening_flags=(
@@ -1124,87 +1263,6 @@ def ls(
         sys.exit(1)
     require_source_credentials(ctx, source)
 
-    # Helper function to parse comparison operators
-    def parse_filter_values(value_tuple):
-        """Parse filter values with > or < operators, supporting ranges.
-
-        Args:
-            value_tuple: Tuple of strings like (">100",) or (">50", "<100")
-
-        Returns:
-            Tuple of (more_than, lower_than) where both can be set for ranges
-        """
-        if not value_tuple:
-            return None, None
-
-        more_than = None
-        lower_than = None
-
-        for value_str in value_tuple:
-            if not value_str:
-                continue
-
-            value_str = value_str.strip()
-
-            if value_str.startswith(">"):
-                try:
-                    val = float(value_str[1:])
-                    if more_than is not None:
-                        raise ValueError(
-                            "Cannot specify multiple '>' values for the same parameter"
-                        )
-                    more_than = val
-                except ValueError as e:
-                    if "Cannot specify" in str(e):
-                        raise
-                    raise ValueError(f"Invalid numeric value: {value_str[1:]}")
-            elif value_str.startswith("<"):
-                try:
-                    val = float(value_str[1:])
-                    if lower_than is not None:
-                        raise ValueError(
-                            "Cannot specify multiple '<' values for the same parameter"
-                        )
-                    lower_than = val
-                except ValueError as e:
-                    if "Cannot specify" in str(e):
-                        raise
-                    raise ValueError(f"Invalid numeric value: {value_str[1:]}")
-            else:
-                # No operator, treat as exact value (not used in screening API)
-                raise ValueError(
-                    f"Filter value must start with > or < operator: {value_str}"
-                )
-
-        return more_than, lower_than
-
-    # Determine if we're doing screening or listing
-    screening_params = [
-        market_cap,
-        price,
-        volume,
-        beta,
-        dividend,
-        exchange,
-        country,
-        is_etf,
-        is_fund,
-        is_actively_trading,
-        include_delisted,
-    ]
-    has_screening_params = any(param for param in screening_params)
-
-    # Parse sectors and industries
-    sectors_list = None
-    industries_list = None
-
-    if sectors_filter:
-        # Sectors with values - use for screening
-        sectors_list = [s.strip() for s in sectors_filter.split(",")]
-    if industries_filter:
-        # Industries with values - use for screening
-        industries_list = [i.strip() for i in industries_filter.split(",")]
-
     # Check for mutually exclusive options in list mode
     if sectors_list_flag and industries_list_flag:
         logger.error("Only one list type option can be specified")
@@ -1231,150 +1289,161 @@ def ls(
         )
         sys.exit(1)
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
-
-    # Decide between listing and screening
-    use_screening = sectors_list or industries_list or has_screening_params
+    screening_params = [
+        market_cap,
+        price,
+        volume,
+        beta,
+        dividend,
+        exchange,
+        country,
+        is_etf,
+        is_fund,
+        is_actively_trading,
+        include_delisted,
+    ]
+    has_screening_params = any(param for param in screening_params)
+    list_mode = sectors_list_flag or industries_list_flag
+    footer = None
 
     try:
-        if use_screening:
-            logger.info("Using security screening")
-
-            # Parse filter parameters
-            market_cap_more, market_cap_lower = parse_filter_values(market_cap)
-            price_more, price_lower = parse_filter_values(price)
-            beta_more, beta_lower = parse_filter_values(beta)
-            dividend_more, dividend_lower = parse_filter_values(dividend)
-
-            # Volume needs to be parsed as int
-            volume_more, volume_lower = None, None
-            if volume:
-                volume_more_float, volume_lower_float = parse_filter_values(volume)
-                if volume_more_float is not None:
-                    volume_more = int(volume_more_float)
-                if volume_lower_float is not None:
-                    volume_lower = int(volume_lower_float)
-
-            # Call the screener on the active source
-            screen_kwargs = dict(
-                marketCapMoreThan=market_cap_more,
-                marketCapLowerThan=market_cap_lower,
-                sector=sectors_list,
-                industry=industries_list,
-                betaMoreThan=beta_more,
-                betaLowerThan=beta_lower,
-                priceMoreThan=price_more,
-                priceLowerThan=price_lower,
-                dividendMoreThan=dividend_more,
-                dividendLowerThan=dividend_lower,
-                volumeMoreThan=volume_more,
-                volumeLowerThan=volume_lower,
-                exchange=exchange,
-                country=country,
-                isEtf=is_etf if is_etf else None,
-                isFund=is_fund if is_fund else None,
-                isActivelyTrading=is_actively_trading if is_actively_trading else None,
-                limit=limit,
+        # Sector and industry names as the source spells them, whatever the case
+        # typed: `energy`, `Energy` and `ENERGY` are one sector. Unknown names are
+        # refused here, with the nearest, rather than screened into "No data".
+        sectors_list = industries_list = None
+        if sectors_filter or industries_filter:
+            known_sectors, known_industries = _known_classification(
+                cfg,
+                source,
+                api_key,
+                need_sectors=bool(sectors_filter),
+                need_industries=bool(industries_filter),
             )
-            if source == "db":
-                df = ds_db.screen(
-                    dsn=cfg.dsn, includeDelisted=include_delisted, **screen_kwargs
+            if sectors_filter:
+                sectors_list = canonical_names(sectors_filter, known_sectors, "sector")
+            if industries_filter:
+                industries_list = canonical_names(
+                    industries_filter, known_industries, "industry"
                 )
-            else:
-                df = ds_live.screen(api_key=api_key, **screen_kwargs)
 
-            if df.empty:
-                logger.warning("No screening results returned")
-                if not quiet:
-                    click.echo("No data found")
-                sys.exit(0)
+        screen_kwargs = _screen_kwargs(
+            market_cap=market_cap,
+            price=price,
+            volume=volume,
+            beta=beta,
+            dividend=dividend,
+            sectors=sectors_list,
+            industries=industries_list,
+            exchange=exchange,
+            country=country,
+            is_etf=is_etf,
+            is_fund=is_fund,
+            is_actively_trading=is_actively_trading,
+            source=source,
+        )
 
-            logger.info(f"Retrieved {len(df)} screening results")
-
-            # Reset index if it was set to symbol
-            if df.index.name == "symbol":
-                df = df.reset_index()
-
-        elif source == "db":
-            # Traditional listing mode, served from the fafnir warehouse.
-            if sectors_list_flag:
-                logger.info("Requesting sector list (db)")
-                df = ds_db.list_sectors(dsn=cfg.dsn)
-            elif industries_list_flag:
-                logger.info("Requesting industry list (db)")
-                df = ds_db.list_industries(dsn=cfg.dsn)
-            else:
-                logger.info("Requesting actively trading list (db)")
-                df = ds_db.list_actively_trading(dsn=cfg.dsn, limit=limit)
-
-            if df.empty:
-                logger.warning("No data returned")
-                if not quiet:
-                    click.echo("No data found")
-                sys.exit(0)
-
-            # Apply limit if specified
+        if list_mode and source == "db":
+            # Counted lists: every filter given scopes the counts, so
+            # `--industries --sector energy` is the industries within Energy.
+            what = "sector" if sectors_list_flag else "industry"
+            logger.info(f"Requesting {what} list with counts (db)")
+            lister = ds_db.list_sectors if sectors_list_flag else ds_db.list_industries
+            df = lister(dsn=cfg.dsn, includeDelisted=include_delisted, **screen_kwargs)
             if limit is not None and limit > 0:
                 df = df.head(limit)
-                logger.debug(f"Limiting to {limit} records")
-
-        else:
-            # Traditional listing mode (live FMP)
+            footer = _count_footer(df, what, include_delisted=include_delisted)
+        elif list_mode:
+            # FMP lists names only. The counts, and an industry's sector, are
+            # the warehouse's: computing them from FMP's screener would page the
+            # whole universe on every call. The columns are there, as nulls, so a
+            # reader sees the same shape and cannot mistake "not known" for 0.
+            if sectors_list or industries_list or has_screening_params:
+                click.echo(
+                    "Error: with -S fmp, --sectors and --industries list names "
+                    "only; screening flags scope the warehouse's counts (-S db).",
+                    err=True,
+                )
+                sys.exit(1)
             if sectors_list_flag:
                 logger.info("Requesting sector list")
-                data = sector_list_api(api_key)
-            elif industries_list_flag:
+                df = process_sectors(sector_list_api(api_key))
+                df["security_count"] = None
+            else:
                 logger.info("Requesting industry list")
-                data = industry_list_api(api_key)
-            else:
-                logger.info("Requesting actively trading list")
-                data = actively_trading_list_api(api_key)
-
-            if not data:
-                logger.warning("No data returned")
-                if not quiet:
-                    click.echo("No data found")
-                sys.exit(0)
-
-            logger.info(f"Retrieved {len(data)} records")
-
-            # Process data based on list type
-            if sectors_list_flag:
-                df = process_sectors(data)
-            elif industries_list_flag:
-                df = process_industries(data)
-            else:
-                # Convert to DataFrame for actively trading list
-                df = pd.DataFrame(data)
-                # Filter to expected columns
-                expected_cols = ["symbol", "name"]
-                available_cols = [col for col in expected_cols if col in df.columns]
-                if available_cols:
-                    df = df[available_cols]
-
-            # Apply limit if specified
+                df = process_industries(industry_list_api(api_key))
+                df["sector_name"] = None
+                df["security_count"] = None
+            click.echo(
+                "Note: -S fmp lists names only; security counts and each "
+                "industry's sector come from the warehouse (-S db).",
+                err=True,
+            )
             if limit is not None and limit > 0:
                 df = df.head(limit)
-                logger.debug(f"Limiting to {limit} records")
+            footer = tables.plural(
+                len(df),
+                "sector" if sectors_list_flag else "industry",
+                None if sectors_list_flag else "industries",
+            )
+        elif sectors_list or industries_list or has_screening_params:
+            logger.info("Using security screening")
+            if source == "db":
+                df = ds_db.screen(
+                    dsn=cfg.dsn,
+                    includeDelisted=include_delisted,
+                    limit=limit,
+                    **screen_kwargs,
+                )
+            else:
+                df = ds_live.screen(api_key=api_key, limit=limit, **screen_kwargs)
+            logger.info(f"Retrieved {len(df)} screening results")
+            # Reset index if it was set to symbol
+            if not df.empty and df.index.name == "symbol":
+                df = df.reset_index()
+            footer = _screen_footer(df, limit=limit)
+        elif source == "db":
+            logger.info("Requesting actively trading list (db)")
+            df = ds_db.list_actively_trading(dsn=cfg.dsn, limit=limit)
+            if limit is not None and limit > 0:
+                df = df.head(limit)
+            footer = tables.plural(len(df), "security", "securities") + (
+                " · actively trading"
+            )
+        else:
+            logger.info("Requesting actively trading list")
+            data = actively_trading_list_api(api_key)
+            df = pd.DataFrame(data)
+            expected_cols = ["symbol", "name"]
+            available_cols = [col for col in expected_cols if col in df.columns]
+            if available_cols:
+                df = df[available_cols]
+            if limit is not None and limit > 0:
+                df = df.head(limit)
+            footer = tables.plural(len(df), "security", "securities") + (
+                " · actively trading · FMP"
+            )
 
     except ValueError as e:
         logger.error(f"Invalid parameter value: {e}")
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    except ds_base.DataSourceError as e:
+        logger.error(f"Invalid screen: {e}")
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Failed to fetch list data: {e}")
         click.echo(f"Error: Failed to fetch list data: {e}", err=True)
         sys.exit(1)
+
+    if df.empty:
+        logger.warning("No data returned")
+        if not quiet:
+            click.echo("No data found")
+        sys.exit(0)
 
     # Handle output to file
     if output:
@@ -1384,7 +1453,7 @@ def ls(
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to file based on format
-        if output_format == "json":
+        if file_format == "json":
             df.to_json(output_path, orient="records", date_format="iso")
         else:
             df.to_csv(output_path, index=False)
@@ -1400,11 +1469,202 @@ def ls(
         if summary:
             click.echo(f"Number of results: {len(df)}")
         # Otherwise print data
+        elif console == "json":
+            click.echo(df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            echo_table(df, decimals=2, footer=footer)
         else:
-            if output_format == "json":
-                click.echo(df.to_json(orient="records", date_format="iso"))
-            else:
-                click.echo(df.to_csv(index=False))
+            click.echo(df.to_csv(index=False))
+
+
+def parse_filter_values(value_tuple):
+    """Parse filter values with > or < operators, supporting ranges.
+
+    Args:
+        value_tuple: Tuple of strings like (">100",) or (">50", "<100")
+
+    Returns:
+        Tuple of (more_than, lower_than) where both can be set for ranges
+    """
+    if not value_tuple:
+        return None, None
+
+    more_than = None
+    lower_than = None
+
+    for value_str in value_tuple:
+        if not value_str:
+            continue
+
+        value_str = value_str.strip()
+
+        if value_str.startswith(">"):
+            try:
+                val = float(value_str[1:])
+                if more_than is not None:
+                    raise ValueError(
+                        "Cannot specify multiple '>' values for the same parameter"
+                    )
+                more_than = val
+            except ValueError as e:
+                if "Cannot specify" in str(e):
+                    raise
+                raise ValueError(f"Invalid numeric value: {value_str[1:]}")
+        elif value_str.startswith("<"):
+            try:
+                val = float(value_str[1:])
+                if lower_than is not None:
+                    raise ValueError(
+                        "Cannot specify multiple '<' values for the same parameter"
+                    )
+                lower_than = val
+            except ValueError as e:
+                if "Cannot specify" in str(e):
+                    raise
+                raise ValueError(f"Invalid numeric value: {value_str[1:]}")
+        else:
+            # No operator, treat as exact value (not used in screening API)
+            raise ValueError(
+                f"Filter value must start with > or < operator: {value_str}"
+            )
+
+    return more_than, lower_than
+
+
+def _screen_kwargs(
+    *,
+    market_cap,
+    price,
+    volume,
+    beta,
+    dividend,
+    sectors,
+    industries,
+    exchange,
+    country,
+    is_etf,
+    is_fund,
+    is_actively_trading,
+    source,
+):
+    """The screener's arguments, in FMP's names, from `ls`'s flags.
+
+    Exchange and country codes are uppercased, the spelling both sources use, so
+    `--exchange nyse` and `--country us` mean what they say.
+    """
+    market_cap_more, market_cap_lower = parse_filter_values(market_cap)
+    price_more, price_lower = parse_filter_values(price)
+    beta_more, beta_lower = parse_filter_values(beta)
+    dividend_more, dividend_lower = parse_filter_values(dividend)
+
+    # Volume needs to be parsed as int
+    volume_more, volume_lower = None, None
+    if volume:
+        volume_more_float, volume_lower_float = parse_filter_values(volume)
+        if volume_more_float is not None:
+            volume_more = int(volume_more_float)
+        if volume_lower_float is not None:
+            volume_lower = int(volume_lower_float)
+
+    return dict(
+        marketCapMoreThan=market_cap_more,
+        marketCapLowerThan=market_cap_lower,
+        sector=sectors,
+        industry=industries,
+        betaMoreThan=beta_more,
+        betaLowerThan=beta_lower,
+        priceMoreThan=price_more,
+        priceLowerThan=price_lower,
+        dividendMoreThan=dividend_more,
+        dividendLowerThan=dividend_lower,
+        volumeMoreThan=volume_more,
+        volumeLowerThan=volume_lower,
+        exchange=exchange.strip().upper() if exchange else None,
+        country=country.strip().upper() if country else None,
+        isEtf=is_etf if is_etf else None,
+        isFund=is_fund if is_fund else None,
+        isActivelyTrading=is_actively_trading if is_actively_trading else None,
+    )
+
+
+def _known_classification(cfg, source, api_key, *, need_sectors, need_industries):
+    """``(sector names, industry names)`` the source knows; a list not needed is
+    left empty rather than fetched."""
+    sectors: list = []
+    industries: list = []
+    if source == "db":
+        if need_sectors:
+            sectors = ds_db.sector_names(dsn=cfg.dsn)
+        if need_industries:
+            industries = ds_db.industry_names(dsn=cfg.dsn)
+    else:
+        if need_sectors:
+            sectors = [r["sector"] for r in sector_list_api(api_key)]
+        if need_industries:
+            industries = [r["industry"] for r in industry_list_api(api_key)]
+    return sectors, industries
+
+
+def _norm(text):
+    return " ".join(str(text).split()).lower()
+
+
+def canonical_names(typed, known, label):
+    """The names ``typed`` means, as ``known`` spells them, case-insensitively.
+
+    ``typed`` is the comma-separated flag value. A name may itself contain a comma
+    (FMP's "Furnishings, Fixtures & Appliances"), so the longest run of pieces
+    that is a known name wins before a piece is taken alone. A piece matching
+    nothing raises ValueError naming the closest known names: screening an unknown
+    sector would answer "No data found", which reads as a fact about the market.
+    """
+    by_norm = {_norm(name): name for name in known}
+    pieces = [p.strip() for p in str(typed).split(",") if p.strip()]
+    out = []
+    i = 0
+    while i < len(pieces):
+        for j in range(len(pieces), i, -1):
+            hit = by_norm.get(_norm(", ".join(pieces[i:j])))
+            if hit is not None:
+                if hit not in out:
+                    out.append(hit)
+                i = j
+                break
+        else:
+            close = difflib.get_close_matches(
+                _norm(pieces[i]), list(by_norm), n=3, cutoff=0.6
+            )
+            listing = "sectors" if label == "sector" else "industries"
+            hint = (
+                "Did you mean: " + ", ".join(by_norm[c] for c in close) + "?"
+                if close
+                else f"List them with `duk ls --{listing}`."
+            )
+            raise ValueError(f"Unknown {label} '{pieces[i]}'. {hint}")
+    return out
+
+
+def _count_footer(df, what, *, include_delisted):
+    """``11 sectors · 5,432 securities, actively trading · 12 unclassified``."""
+    noun = (what, None) if what == "sector" else ("industry", "industries")
+    parts = [tables.plural(len(df), *noun)]
+    if "security_count" in df.columns and len(df):
+        total = int(pd.to_numeric(df["security_count"]).sum())
+        scope = "including delisted" if include_delisted else "actively trading"
+        parts.append(f"{tables.plural(total, 'security', 'securities')}, {scope}")
+    unclassified = df.attrs.get("unclassified")
+    if unclassified:
+        parts.append(f"{unclassified:,} with no {what}")
+    parts.append("as of the last mart refresh")
+    return " · ".join(parts)
+
+
+def _screen_footer(df, *, limit):
+    """``142 securities`` and, when ``-n`` cut the screen short, that it did."""
+    text = tables.plural(len(df), "security", "securities")
+    if limit and len(df) >= limit:
+        text += f" (the first {limit:,}: -n limited the screen)"
+    return text
 
 
 def _ls_company_summary(
@@ -1415,6 +1675,7 @@ def _ls_company_summary(
     limit,
     summary,
     output,
+    output_table,
     output_csv,
     output_json,
     screening_flags,
@@ -1445,8 +1706,15 @@ def _ls_company_summary(
             err=True,
         )
         sys.exit(1)
-    if output_csv and output_json:
-        click.echo("Error: Only one of --csv or --json can be specified", err=True)
+    try:
+        asked = tables.requested_format(
+            table=output_table,
+            csv=output_csv,
+            json=output_json,
+            configured=ctx.obj["config"].console_format,
+        )
+    except tables.FormatError as exc:
+        click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
     if source != "db":
         # Deliberately not a fallback like `yc`'s: three of the four sections
@@ -1514,13 +1782,18 @@ def _ls_company_summary(
     report = company_summary.build_summary(raw)
     logger.info(f"Company summary for {report['meta'].get('symbol')}")
 
-    if output_json:
-        import json
-
+    # The sectioned report is the default in a terminal and a pipe alike, as it
+    # always was: only --csv (or a configured csv) flattens it. On a terminal, or
+    # with --table, it is drawn in a border; piped, it is the plain text it was.
+    if asked == "json":
         payload = json.dumps(report, indent=2, default=str)
-    elif output_csv:
+    elif asked == "csv":
         payload = pd.DataFrame([company_summary.render_flat(report)]).to_csv(
             index=False
+        )
+    elif asked == "table" or tables.is_terminal(sys.stdout):
+        payload = company_summary.render_text(
+            report, style=tables.style_for_stream(sys.stdout)
         )
     else:
         payload = company_summary.render_text(report)
@@ -1546,13 +1819,13 @@ def _ls_company_summary(
 FACTOR_DECIMALS = 4
 
 
-def _refuse_vendor_source(ctx, command):
-    """`fs` and `fa` read the warehouse's statements: no vendor backend, as `yc`
-    has none on Sharadar."""
+def _refuse_vendor_source(ctx, command, *, what="statements"):
+    """`fs`, `fa`, `th`, `ca` and `tc` read the warehouse: no vendor backend, as
+    `yc` has none on Sharadar."""
     source = ctx.obj.get("source", "db")
     if source != "db":
         click.echo(
-            f"Error: {command} reads the warehouse's statements; it has no "
+            f"Error: {command} reads the warehouse's {what}; it has no "
             f"{'FMP' if source == 'fmp' else 'Sharadar'} backend (db mode only). "
             "Re-run with -S db.",
             err=True,
@@ -1592,9 +1865,10 @@ def _plain(value):
     return value
 
 
-def _emit(payload, *, output, default_name, quiet, logger):
+def _emit(payload, *, output, default_name, quiet, logger, echo=True):
     """Write ``payload`` to ``output`` (a directory gets ``default_name``) and/or
-    stdout, as `ls QUERY` does."""
+    stdout, as `ls QUERY` does. ``echo`` False writes the file only: the console
+    gets a table instead."""
     if output:
         output_path = Path(output)
         if output_path.is_dir():
@@ -1606,8 +1880,77 @@ def _emit(payload, *, output, default_name, quiet, logger):
         logger.info(f"Data written to {output_path}")
         if not quiet:
             click.echo(f"Data written to {output_path}")
-    if not quiet:
+    if not quiet and echo:
         click.echo(payload.rstrip("\n"))
+
+
+#: Statement columns that say which period and version a row is, not an amount:
+#: a table heads its period columns with them instead of listing them as items.
+_STATEMENT_KEYS = ("fiscal_date", "fiscal_year", "fiscal_period", "period")
+
+
+def _echo_statement_table(frame, *, symbol, statement, period, as_of, precision):
+    """A statement as it is read: line items down, periods across, newest last.
+
+    As many of the latest periods as fit the terminal are shown, and the footer
+    says when some are not -- `-n`, or --csv, for the rest.
+    """
+    records = frame.to_dict(orient="records")
+    label_key = next(
+        (k for k in ("fiscal_date", "period_end") if k in frame.columns), None
+    )
+    labels = [
+        str(r.get(label_key) or r.get("fiscal_year") or i)
+        for i, r in enumerate(records)
+    ]
+    items = [c for c in frame.columns if c not in _STATEMENT_KEYS and c != label_key]
+    width = tables.terminal_width(sys.stdout)
+    shown = len(records)
+    if width:
+        label_width = max((len(str(item)) for item in items), default=4) + 4
+        per_period = 18
+        shown = max(1, min(len(records), (width - label_width) // per_period))
+    first = len(records) - shown
+    rows = []
+    for item in items:
+        row = {"item": item}
+        for label, record in zip(labels[first:], records[first:]):
+            row[label] = record.get(item)
+        rows.append(row)
+    columns = [tables.Column("item", header="ITEM", kind="text")]
+    for label in labels[first:]:
+        values = [r.get(label) for r in rows]
+        kind = "number" if any(isinstance(v, (int, float)) for v in values) else "text"
+        columns.append(
+            tables.Column(label, header=label, kind=kind, decimals=precision)
+        )
+    footer = (
+        f"{symbol} · {period} {statement} statement · as known on "
+        f"{as_of.isoformat() if hasattr(as_of, 'isoformat') else as_of}"
+    )
+    if first:
+        footer += (
+            f" · the latest {shown} of {len(records)} periods (-n, or --csv, for all)"
+        )
+    style = tables.style_for_stream(sys.stdout)
+    # Each cell is formatted by its row's own rule below, since one column holds a
+    # date, a year, a version and amounts.
+    body = []
+    for row in rows:
+        cells = [row["item"]]
+        kind = tables.infer_kind(row["item"], [row.get(c.key) for c in columns[1:]])
+        for column in columns[1:]:
+            cell_column = tables.Column(
+                column.key, kind=kind, decimals=precision if kind == "number" else None
+            )
+            cells.append(tables.format_cell(row.get(column.key), cell_column, style))
+        body.append(cells)
+    for column in columns[1:]:
+        column.kind = "number"
+    built = tables.Table(columns=columns, rows=body, footer=footer)
+    click.echo(
+        tables.render(built, style=style, max_width=width, color=tables.color_enabled())
+    )
 
 
 @main.command()
@@ -1648,7 +1991,8 @@ def _emit(payload, *, output, default_name, quiet, logger):
     default=DEFAULT_DECIMALS,
     help=f"Decimal places for amounts (default: {DEFAULT_DECIMALS})",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "-o",
@@ -1668,6 +2012,7 @@ def fs(
     as_of,
     limit,
     precision,
+    output_table,
     output_csv,
     output_json,
     output,
@@ -1690,9 +2035,7 @@ def fs(
     if verbose:
         enable_console_logging(logger)
     _refuse_vendor_source(ctx, "fs")
-    if output_csv and output_json:
-        click.echo("Error: Only one of --csv or --json can be specified", err=True)
-        sys.exit(1)
+    console = output_format(ctx, output_table, output_csv, output_json)
     if limit is not None and limit < 1:
         click.echo("Error: --limit must be at least 1", err=True)
         sys.exit(1)
@@ -1735,17 +2078,31 @@ def fs(
     frame = apply_precision_to_dataframe(
         frame, precision, exclude_columns=["fiscal_year", "version_no"]
     )
-    if output_json:
-        payload = frame.to_json(orient="records")
-    else:
-        payload = frame.to_csv(index=False)
+    file_format = "json" if console == "json" else "csv"
+    payload = (
+        frame.to_json(orient="records")
+        if file_format == "json"
+        else frame.to_csv(index=False)
+    )
     _emit(
         payload,
         output=output,
-        default_name=f"{symbol}_{statement}_{period}.{'json' if output_json else 'csv'}",
+        default_name=f"{symbol}_{statement}_{period}.{file_format}",
         quiet=quiet,
         logger=logger,
+        echo=console != "table",
     )
+    if console == "table" and not quiet:
+        _echo_statement_table(
+            frame,
+            symbol=(
+                found["statements_of"]["symbol"] if found["statements_of"] else symbol
+            ),
+            statement=statement,
+            period=period,
+            as_of=found["as_of"],
+            precision=precision,
+        )
 
 
 @main.command()
@@ -1771,8 +2128,12 @@ def fs(
     default=FACTOR_DECIMALS,
     help=f"Decimal places (default: {FACTOR_DECIMALS})",
 )
+@table_option
 @click.option(
-    "--csv", "output_csv", is_flag=True, help="Output field,value CSV (default)"
+    "--csv",
+    "output_csv",
+    is_flag=True,
+    help="Output field,value CSV (the default when stdout is not a terminal)",
 )
 @click.option("--json", "output_json", is_flag=True, help="Output a JSON object")
 @click.option(
@@ -1783,7 +2144,18 @@ def fs(
     "<symbol>_factors.<ext>",
 )
 @click.pass_context
-def fa(ctx, symbol, verbose, quiet, as_of, precision, output_csv, output_json, output):
+def fa(
+    ctx,
+    symbol,
+    verbose,
+    quiet,
+    as_of,
+    precision,
+    output_table,
+    output_csv,
+    output_json,
+    output,
+):
     """
     Print one security's row of the factor panel from the warehouse.
 
@@ -1799,9 +2171,7 @@ def fa(ctx, symbol, verbose, quiet, as_of, precision, output_csv, output_json, o
     if verbose:
         enable_console_logging(logger)
     _refuse_vendor_source(ctx, "fa")
-    if output_csv and output_json:
-        click.echo("Error: Only one of --csv or --json can be specified", err=True)
-        sys.exit(1)
+    console = output_format(ctx, output_table, output_csv, output_json)
     require_source_credentials(ctx, "db")
     symbol, security_id = _fundamentals_security(ctx, symbol)
 
@@ -1848,7 +2218,8 @@ def fa(ctx, symbol, verbose, quiet, as_of, precision, output_csv, output_json, o
         k: (None if isinstance(v, float) and v != v else v)
         for k, v in frame.to_dict(orient="records")[0].items()
     }
-    if output_json:
+    file_format = "json" if console == "json" else "csv"
+    if file_format == "json":
         payload = json.dumps(record)
     else:
         buffer = io.StringIO()
@@ -1859,9 +2230,437 @@ def fa(ctx, symbol, verbose, quiet, as_of, precision, output_csv, output_json, o
     _emit(
         payload,
         output=output,
-        default_name=f"{symbol}_factors.{'json' if output_json else 'csv'}",
+        default_name=f"{symbol}_factors.{file_format}",
         quiet=quiet,
         logger=logger,
+        echo=console != "table",
+    )
+    if console == "table" and not quiet:
+        click.echo(
+            tables.render_key_values(
+                list(record.items()),
+                title=f"{record.get('symbol') or symbol} factors",
+                footer=f"{found['source']} · as of "
+                f"{_plain(found['as_of_date']) or '-'}",
+                decimals=precision,
+                style=tables.style_for_stream(sys.stdout),
+                max_width=tables.terminal_width(sys.stdout),
+                color=tables.color_enabled(),
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# `duk th`, `duk ca`, `duk tc`: identity, actions and sessions, as stored
+# ---------------------------------------------------------------------------
+
+
+def emit_records(
+    rows,
+    *,
+    console,
+    output,
+    default_name,
+    quiet,
+    logger,
+    exact=False,
+    empty_message,
+    table_rows=None,
+    **table_kwargs,
+):
+    """Print ``rows`` (dicts of warehouse values) as a table, CSV or JSON, and
+    write them to ``output`` (CSV, or JSON with --json) when asked.
+
+    ``table_rows`` is a narrower view for the table, when every column would not
+    fit a terminal; CSV and JSON always carry every column.
+
+    JSON keeps types -- numbers, booleans, null -- or, with ``exact``, every
+    number as its stored decimal text. CSV is the same values as text, a NUMERIC
+    always in full.
+    """
+    if not rows:
+        logger.warning(empty_message)
+        if not quiet:
+            click.echo(empty_message)
+        return
+    file_format = "json" if console == "json" else "csv"
+
+    def as_text(fmt):
+        if fmt == "json":
+            return json.dumps(plain_records(rows, exact=exact))
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=list(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        for record in plain_records(rows, exact=True):
+            writer.writerow({k: "" if v is None else v for k, v in record.items()})
+        return buffer.getvalue()
+
+    if output:
+        output_path = Path(output)
+        if output_path.is_dir():
+            output_path = output_path / f"{default_name}.{file_format}"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(as_text(file_format), encoding="utf-8")
+        logger.info(f"Data written to {output_path}")
+        if not quiet:
+            click.echo(f"Data written to {output_path}")
+    if quiet:
+        return
+    if console == "table":
+        echo_table(table_rows or rows, exact=exact, **table_kwargs)
+    else:
+        click.echo(as_text(console).rstrip("\n"))
+
+
+def _split_ratio(row):
+    """``2-for-1`` from a split's numerator and denominator, as stored."""
+    num, den = row.get("split_numerator"), row.get("split_denominator")
+    if num is None or den is None:
+        return None
+
+    def text(value):
+        return f"{Decimal(value).normalize():f}"
+
+    return f"{text(num)}-for-{text(den)}"
+
+
+def _db_security(ctx, argument):
+    """``(symbol, security_id)`` for a db command's SYMBOL: an identifier,
+    ``sid:`` or ``TICKER@DATE`` resolved to one security here; a ticker left to
+    the datasource's ladder (security_id None), with the reused-ticker hint."""
+    identifier = parse_security_argument(argument)
+    if not identifier.is_ticker:
+        return resolve_security_identifier(ctx, identifier)
+    hint_reused_ticker(ctx, identifier)
+    return identifier.value, None
+
+
+@main.command()
+@click.argument("symbol")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress printing to stdout")
+@click.option("-s", "--start-date", help="Keep periods that end on or after this date")
+@click.option("-e", "--end-date", help="Keep periods that start on or before this date")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
+@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write to a file. If path is a directory, the filename is "
+    "<symbol>_history.<ext>",
+)
+@click.pass_context
+def th(
+    ctx,
+    symbol,
+    verbose,
+    quiet,
+    start_date,
+    end_date,
+    output_table,
+    output_csv,
+    output_json,
+    output,
+):
+    """
+    Ticker history: which security a ticker named, and when.
+
+    SYMBOL is a ticker -- every security that has traded under it, each period
+    from valid_from to valid_to inclusive (empty: still open) -- or a security
+    (cik:, isin:, cusip:, sid:, TICKER@YYYY-MM-DD), for every ticker it has held:
+    FB then META. Each row describes the security it names: its security_id,
+    current primary ticker, name, asset type, venue, currency, country and
+    identifiers. A period starting 1900-01-01 is fafnir's "first seen" fallback,
+    not a listing date. --start-date / --end-date keep the periods overlapping
+    the range. Nothing is resolved or picked: where two periods cover one day,
+    both are listed. The warehouse only (-S db).
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    _refuse_vendor_source(ctx, "th", what="ticker history")
+    console = output_format(ctx, output_table, output_csv, output_json)
+    require_source_credentials(ctx, "db")
+    identifier = parse_security_argument(symbol)
+    cfg = ctx.obj["config"]
+    try:
+        if identifier.is_ticker:
+            rows = ds_db.ticker_history(
+                dsn=cfg.dsn,
+                symbol=identifier.value,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            label = identifier.value
+        else:
+            candidates = ds_db.resolve_identifier(dsn=cfg.dsn, identifier=identifier)
+            if not candidates:
+                click.echo(f"No security found for {identifier.describe()}.", err=True)
+                sys.exit(1)
+            # A listing, not a pick: a CIK's several classes each get theirs.
+            rows = ds_db.ticker_history(
+                dsn=cfg.dsn,
+                security_ids=[c["security_id"] for c in candidates],
+                start_date=start_date,
+                end_date=end_date,
+            )
+            label = identifier.describe()
+    except ds_base.DataSourceError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error(f"Failed to read ticker history: {exc}")
+        click.echo(f"Error: Failed to read ticker history: {exc}", err=True)
+        sys.exit(1)
+
+    named = len({r["security_id"] for r in rows})
+    view = [
+        {
+            "symbol": r["symbol"],
+            "security_id": r["security_id"],
+            "valid_from": r["valid_from"],
+            "valid_to": r["valid_to"],
+            "is_primary": r["is_primary"],
+            "trades_now_as": r["primary_symbol"],
+            "company_name": r["company_name"],
+            "asset_type": r["asset_type"],
+            "exchange": r["exchange_code"],
+            "status": "active" if r["is_actively_trading"] else "delisted",
+        }
+        for r in rows
+    ]
+    emit_records(
+        rows,
+        table_rows=view,
+        console=console,
+        output=output,
+        default_name=f"{identifier.value}_history",
+        quiet=quiet,
+        logger=logger,
+        empty_message=f"No ticker history for {label}",
+        footer=f"{tables.plural(len(rows), 'period')} · {label} · "
+        f"{tables.plural(named, 'security', 'securities')} · --json for every "
+        "column, identifiers included",
+    )
+
+
+@main.command()
+@click.argument("symbol")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress printing to stdout")
+@click.option("-s", "--start-date", help="First ex-date (YYYY-MM-DD)")
+@click.option("-e", "--end-date", help="Last ex-date (YYYY-MM-DD)")
+@click.option(
+    "--type",
+    "action_type",
+    type=click.Choice(list(ds_db.ACTION_TYPES), case_sensitive=False),
+    help="Splits or dividends only (default: both)",
+)
+@click.option(
+    "--exact",
+    is_flag=True,
+    help="Print every number as the decimal text the warehouse stores (JSON "
+    "strings), never through a float",
+)
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
+@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write to a file. If path is a directory, the filename is "
+    "<symbol>_actions.<ext>",
+)
+@click.pass_context
+def ca(
+    ctx,
+    symbol,
+    verbose,
+    quiet,
+    start_date,
+    end_date,
+    action_type,
+    exact,
+    output_table,
+    output_csv,
+    output_json,
+    output,
+):
+    """
+    Corporate actions: one security's splits and cash dividends, by ex-date.
+
+    SYMBOL as for `duk ph`: a ticker, an identifier, sid:, or TICKER@YYYY-MM-DD.
+    One row per event from mart.v_corporate_action: the ex-date (entitlement),
+    record and payment dates (the cash), the split ratio or the dividend per
+    share, and the vendor that supplied it. Spinoffs, mergers and renames are not
+    corporate actions here: a rename is `duk th`. --exact prints the stored
+    NUMERIC text, as `ph --exact` does. The warehouse only (-S db).
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    _refuse_vendor_source(ctx, "ca", what="corporate actions")
+    console = output_format(ctx, output_table, output_csv, output_json)
+    require_source_credentials(ctx, "db")
+    symbol, security_id = _db_security(ctx, symbol)
+    try:
+        found = ds_db.corporate_actions(
+            dsn=ctx.obj["config"].dsn,
+            symbol=symbol,
+            security_id=security_id,
+            start_date=start_date,
+            end_date=end_date,
+            action_type=action_type.lower() if action_type else None,
+        )
+    except ds_base.DataSourceError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error(f"Failed to read corporate actions: {exc}")
+        click.echo(f"Error: Failed to read corporate actions: {exc}", err=True)
+        sys.exit(1)
+    if found["security_id"] is None:
+        click.echo(f"No security found for {symbol}.", err=True)
+        sys.exit(1)
+    rows = found["rows"]
+    splits = sum(1 for r in rows if r["action_type"] == "split")
+    view = [
+        {
+            "ex_date": r["ex_date"],
+            "type": r["action_type"],
+            "split": _split_ratio(r) if r["action_type"] == "split" else None,
+            "dividend_amount": r["dividend_amount"],
+            "currency": r["currency"] if r["action_type"] != "split" else None,
+            "record_date": r["record_date"],
+            "payment_date": r["payment_date"],
+            "source": r["source"],
+        }
+        for r in rows
+    ]
+    emit_records(
+        rows,
+        table_rows=view,
+        console=console,
+        output=output,
+        default_name=f"{symbol}_actions",
+        quiet=quiet,
+        logger=logger,
+        exact=exact,
+        empty_message=f"No corporate actions for {symbol}",
+        footer=f"{symbol} · {tables.plural(splits, 'split')} · "
+        f"{tables.plural(len(rows) - splits, 'dividend')}",
+    )
+
+
+@main.command()
+@click.argument("exchange", required=False)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress printing to stdout")
+@click.option("-s", "--start-date", help="First day (YYYY-MM-DD)")
+@click.option("-e", "--end-date", help="Last day (YYYY-MM-DD)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
+@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write to a file. If path is a directory, the filename is "
+    "<exchange>_calendar.<ext>",
+)
+@click.pass_context
+def tc(
+    ctx,
+    exchange,
+    verbose,
+    quiet,
+    start_date,
+    end_date,
+    output_table,
+    output_csv,
+    output_json,
+    output,
+):
+    """
+    Trading calendar: a venue's sessions, or which venues have one.
+
+    Without EXCHANGE, every venue the warehouse holds a calendar for, with its
+    span and how many open and closed days it marks. With one (case-insensitive),
+    its days from --start-date to --end-date: fafnir seeds open days only, so a
+    weekday absent inside the span is closed, and a closure no rule predicts is a
+    row with is_open false. Outside the span nothing is known. A venue with no
+    calendar is reported, never answered with another's. The warehouse only.
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    _refuse_vendor_source(ctx, "tc", what="trading calendar")
+    console = output_format(ctx, output_table, output_csv, output_json)
+    require_source_credentials(ctx, "db")
+    cfg = ctx.obj["config"]
+    try:
+        if exchange:
+            rows = ds_db.calendar_days(
+                dsn=cfg.dsn,
+                exchange=exchange,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        else:
+            if start_date or end_date:
+                raise click.UsageError(
+                    "--start-date / --end-date select one venue's days; name it."
+                )
+            rows = ds_db.calendars(dsn=cfg.dsn)
+    except ds_base.DataSourceError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except click.UsageError:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to read the trading calendar: {exc}")
+        click.echo(f"Error: Failed to read the trading calendar: {exc}", err=True)
+        sys.exit(1)
+    if exchange:
+        venue = exchange.strip().upper()
+        open_days = sum(1 for r in rows if r["is_open"])
+        footer = (
+            f"{venue} · {tables.plural(open_days, 'open day')} · "
+            f"{tables.plural(len(rows) - open_days, 'closure')}"
+        )
+        empty = f"No trading calendar for {venue} in that range"
+        name = f"{venue}_calendar"
+    else:
+        footer = tables.plural(len(rows), "calendar")
+        empty = "No trading calendars in the warehouse"
+        name = "calendars"
+    emit_records(
+        rows,
+        console=console,
+        output=output,
+        default_name=name,
+        quiet=quiet,
+        logger=logger,
+        empty_message=empty,
+        footer=footer,
     )
 
 
@@ -1935,7 +2734,8 @@ def fa(ctx, symbol, verbose, quiet, as_of, precision, output_csv, output_json, o
         "(default: 1)"
     ),
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -1970,6 +2770,7 @@ def rc(
     annual_simple,
     annual_log,
     lookback,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -1992,17 +2793,9 @@ def rc(
 
     logger.info(f"Computing returns from {input_file}")
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Check that at least one return calculation option is specified
     return_options = [
@@ -2044,12 +2837,8 @@ def rc(
         click.echo("Error: Input file contains no data", err=True)
         sys.exit(1)
 
-    # Identify date column
-    date_col = None
-    for col in ["date", "Date", "DATE"]:
-        if col in df.columns:
-            date_col = col
-            break
+    # Identify date column, whatever its case
+    date_col = next((col for col in df.columns if str(col).lower() == "date"), None)
 
     if date_col is None:
         logger.error("No date column found in input data")
@@ -2232,7 +3021,7 @@ def rc(
 
         # Write to file based on format
         try:
-            if output_format == "json":
+            if file_format == "json":
                 output_df.to_json(output_path, orient="records", date_format="iso")
             else:
                 output_df.to_csv(output_path, index=False)
@@ -2251,14 +3040,22 @@ def rc(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(output_df)
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(output_df.to_json(orient="records", date_format="iso"))
+            if console == "table":
+                echo_summary_table(stats, title="returns summary statistics")
             else:
-                click.echo(output_df.to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(output_df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            echo_table(
+                output_df,
+                decimals=precision,
+                footer=f"{tables.plural(len(output_df), 'row')} · returns · "
+                f"{Path(input_file).name}",
+            )
+        else:
+            click.echo(output_df.to_csv(index=False))
 
 
 @main.group()
@@ -2304,7 +3101,8 @@ def ti(ctx):
     required=True,
     help="Window size for SMA calculation (number of periods)",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -2332,6 +3130,7 @@ def sma(
     input_file,
     column,
     window,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -2362,17 +3161,9 @@ def sma(
         click.echo("Error: Window must be greater than 0", err=True)
         sys.exit(1)
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Read input file
     try:
@@ -2394,7 +3185,8 @@ def sma(
         click.echo("Error: Input file contains no data", err=True)
         sys.exit(1)
 
-    # Validate column exists
+    # Validate column exists: `-c Close` finds a `close` column
+    column = match_column(df, column)
     if column not in df.columns:
         logger.error(f"Column '{column}' not found in input data")
         click.echo(
@@ -2440,7 +3232,7 @@ def sma(
 
         # Write to file based on format
         try:
-            if output_format == "json":
+            if file_format == "json":
                 result_df.to_json(output_path, orient="records", date_format="iso")
             else:
                 result_df.to_csv(output_path, index=False)
@@ -2459,14 +3251,22 @@ def sma(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(result_df)
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(result_df.to_json(orient="records", date_format="iso"))
+            if console == "table":
+                echo_summary_table(stats, title="SMA summary statistics")
             else:
-                click.echo(result_df.to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(result_df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            echo_table(
+                result_df,
+                decimals=precision,
+                footer=f"{tables.plural(len(result_df), 'row')} · SMA · "
+                f"{Path(input_file).name}",
+            )
+        else:
+            click.echo(result_df.to_csv(index=False))
 
 
 @ti.command()
@@ -2500,7 +3300,8 @@ def sma(
     required=True,
     help="Window size for EMA calculation (number of periods)",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -2528,6 +3329,7 @@ def ema(
     input_file,
     column,
     window,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -2558,17 +3360,9 @@ def ema(
         click.echo("Error: Window must be greater than 0", err=True)
         sys.exit(1)
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Read input file
     try:
@@ -2590,7 +3384,8 @@ def ema(
         click.echo("Error: Input file contains no data", err=True)
         sys.exit(1)
 
-    # Validate column exists
+    # Validate column exists: `-c Close` finds a `close` column
+    column = match_column(df, column)
     if column not in df.columns:
         logger.error(f"Column '{column}' not found in input data")
         click.echo(
@@ -2636,7 +3431,7 @@ def ema(
 
         # Write to file based on format
         try:
-            if output_format == "json":
+            if file_format == "json":
                 result_df.to_json(output_path, orient="records", date_format="iso")
             else:
                 result_df.to_csv(output_path, index=False)
@@ -2655,14 +3450,22 @@ def ema(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(result_df)
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(result_df.to_json(orient="records", date_format="iso"))
+            if console == "table":
+                echo_summary_table(stats, title="EMA summary statistics")
             else:
-                click.echo(result_df.to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(result_df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            echo_table(
+                result_df,
+                decimals=precision,
+                footer=f"{tables.plural(len(result_df), 'row')} · EMA · "
+                f"{Path(input_file).name}",
+            )
+        else:
+            click.echo(result_df.to_csv(index=False))
 
 
 @ti.command()
@@ -2696,7 +3499,8 @@ def ema(
     default=14,
     help="Window size for RSI calculation (number of periods, default: 14)",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -2724,6 +3528,7 @@ def rsi(
     input_file,
     column,
     window,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -2759,17 +3564,9 @@ def rsi(
         click.echo("Error: Window must be greater than 0", err=True)
         sys.exit(1)
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Read input file
     try:
@@ -2791,7 +3588,8 @@ def rsi(
         click.echo("Error: Input file contains no data", err=True)
         sys.exit(1)
 
-    # Validate column exists
+    # Validate column exists: `-c Close` finds a `close` column
+    column = match_column(df, column)
     if column not in df.columns:
         logger.error(f"Column '{column}' not found in input data")
         click.echo(
@@ -2839,7 +3637,7 @@ def rsi(
 
         # Write to file based on format
         try:
-            if output_format == "json":
+            if file_format == "json":
                 result_df.to_json(output_path, orient="records", date_format="iso")
             else:
                 result_df.to_csv(output_path, index=False)
@@ -2858,14 +3656,22 @@ def rsi(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(result_df)
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(result_df.to_json(orient="records", date_format="iso"))
+            if console == "table":
+                echo_summary_table(stats, title="RSI summary statistics")
             else:
-                click.echo(result_df.to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(result_df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            echo_table(
+                result_df,
+                decimals=precision,
+                footer=f"{tables.plural(len(result_df), 'row')} · RSI · "
+                f"{Path(input_file).name}",
+            )
+        else:
+            click.echo(result_df.to_csv(index=False))
 
 
 @ti.command()
@@ -2910,7 +3716,8 @@ def rsi(
     default=9,
     help="Signal line EMA window size (number of periods, default: 9)",
 )
-@click.option("--csv", "output_csv", is_flag=True, help="Output data as CSV (default)")
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
 @click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
 @click.option(
     "--summary",
@@ -2940,6 +3747,7 @@ def macd(
     fast_window,
     slow_window,
     signal_window,
+    output_table,
     output_csv,
     output_json,
     summary,
@@ -2989,17 +3797,9 @@ def macd(
         click.echo("Error: Fast window must be less than slow window", err=True)
         sys.exit(1)
 
-    # Determine output format
-    if output_csv and output_json:
-        logger.error("Only one output format can be specified")
-        click.echo(
-            "Error: Only one of --csv or --json can be specified",
-            err=True,
-        )
-        sys.exit(1)
-
-    # Default to CSV if neither is specified
-    output_format = "json" if output_json else "csv"
+    # Determine output format: the console's, and the -o file's (never a table).
+    console = output_format(ctx, output_table, output_csv, output_json)
+    file_format = "json" if console == "json" else "csv"
 
     # Read input file
     try:
@@ -3021,7 +3821,8 @@ def macd(
         click.echo("Error: Input file contains no data", err=True)
         sys.exit(1)
 
-    # Validate column exists
+    # Validate column exists: `-c Close` finds a `close` column
+    column = match_column(df, column)
     if column not in df.columns:
         logger.error(f"Column '{column}' not found in input data")
         click.echo(
@@ -3081,7 +3882,7 @@ def macd(
 
         # Write to file based on format
         try:
-            if output_format == "json":
+            if file_format == "json":
                 result_df.to_json(output_path, orient="records", date_format="iso")
             else:
                 result_df.to_csv(output_path, index=False)
@@ -3100,14 +3901,22 @@ def macd(
         # Print summary statistics if requested
         if summary:
             stats = compute_summary_stats(result_df)
-            output_text = format_summary_stats(stats)
-            click.echo(output_text)
-        # Otherwise print data
-        else:
-            if output_format == "json":
-                click.echo(result_df.to_json(orient="records", date_format="iso"))
+            if console == "table":
+                echo_summary_table(stats, title="MACD summary statistics")
             else:
-                click.echo(result_df.to_csv(index=False))
+                click.echo(format_summary_stats(stats))
+        # Otherwise print data
+        elif console == "json":
+            click.echo(result_df.to_json(orient="records", date_format="iso"))
+        elif console == "table":
+            echo_table(
+                result_df,
+                decimals=precision,
+                footer=f"{tables.plural(len(result_df), 'row')} · MACD · "
+                f"{Path(input_file).name}",
+            )
+        else:
+            click.echo(result_df.to_csv(index=False))
 
 
 if __name__ == "__main__":
