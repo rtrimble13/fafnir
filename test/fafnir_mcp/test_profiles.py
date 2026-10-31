@@ -37,6 +37,10 @@ READ_TOOLS = {
     # Fundamentals, point in time (#107).
     "statements_as_of",
     "factor_row",
+    # Identity, actions and sessions as stored: what portable reads through duk.
+    "ticker_history",
+    "corporate_actions",
+    "trading_calendar",
 }
 
 # The operational record, and free-form reads. These need fafnir_ops (0021).

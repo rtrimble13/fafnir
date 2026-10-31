@@ -197,6 +197,9 @@ ADR 0008) only the first group. A tool the profile lacks does not exist on it
 | `dq_summary` | read | the open DQ flags of one security, without detail |
 | `statements_as_of` | read | one statement of one security, every period as known on `as_of` (#107) |
 | `factor_row` | read | one security's factor-panel row, latest or at a month-end (#107) |
+| `ticker_history` | read | which security a ticker named and when, or every ticker a security held (`duk th`) |
+| `corporate_actions` | read | one security's splits and cash dividends by ex-date, exact decimals (`duk ca`) |
+| `trading_calendar` | read | which venues have a calendar, or one venue's sessions over a range (`duk tc`) |
 | `dq_queue`, `dq_triage`, `dq_totals` | ops | the DQ queue with detail and history |
 | `ingestion_runs`, `watermarks`, `landing_payload`, `sharadar_files` | ops | the operational record |
 | `schema_state`, `sql_read` | ops | migrations; free-form read-only SQL |

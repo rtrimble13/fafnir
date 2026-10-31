@@ -440,6 +440,10 @@ warehouse is refused, naming it).
   venue's; falling back (fafnir's own ingestion judges such a venue by NASDAQ's)
   is the caller's decision.
 
+The MCP read profile has the same three reads as `ticker_history`,
+`corporate_actions` and `trading_calendar` ([agent.md](agent.md#the-tools)),
+over the same `duk.datasource.db` functions, so they return the same rows.
+
 ## `ls QUERY` — one company, everything held
 
 `ls` with a positional argument switches from listing many securities to
