@@ -797,6 +797,11 @@ def test_a_vendor_outage_exits_75_so_the_night_is_tried_again(
     )
     assert out.exit_code == cli.EX_TEMPFAIL == 75, out.output
     assert f"step {at} failed" in out.output
+    if at == 2:
+        # SF1's delta fails too here, as a fault (no full file on record), and
+        # still the night is retried: SF1 never stops the night, so it does not
+        # count against the outage.
+        assert "fundamentals  FAILED: the ledger holds no fundamentals" in out.output
     assert "Sharadar could not be reached, so a later run may succeed" in out.output
     assert f"[{at + 1}/7]" not in out.output
 
@@ -817,4 +822,6 @@ def test_an_outage_beside_a_fault_is_a_fault(db, tmp_path, monkeypatch):
         env={"FAFNIR_DSN": db.dsn},
     )
     assert out.exit_code == 1, out.output
-    assert "step 2 failed: stocks, funds. The night stopped there." in out.output
+    assert "stocks        FAILED: stocks: 1 of 2 rows repeat" in out.output
+    assert "funds         FAILED: GET https://api/SFP exhausted retries" in out.output
+    assert "step 2 failed: stocks, funds, fundamentals. The night stopped" in out.output
