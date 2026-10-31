@@ -122,8 +122,10 @@ vendors return their own adjusted series — close, but a moving vendor snapshot
 rather than a reproducible one, so small differences on old dates are expected.
 
 > `yc` reads FMP in every mode: the warehouse holds no treasury data, and none is
-> planned (FRED was not adopted, 2026-10-30). In db mode it logs a warning and reads
-> FMP (requires an FMP key).
+> planned (FRED was not adopted, 2026-10-30). In db mode it reads FMP (requires an
+> FMP key) and says so on stderr -- `Note: the warehouse holds no treasury data; yc
+> reads FMP's curve` -- so a vendor's curve never passes for the warehouse's.
+> stdout is unchanged. `-S fmp` asks for FMP explicitly and prints no note.
 
 ## Console output
 
@@ -141,6 +143,11 @@ no flag. `DUK_FORMAT` (environment) or `[general].console_format` (`~/.dukrc`)
 fixes the default: `table`, `csv`, `json` or `auto`. A flag beats both, and two
 flags at once are refused.
 
+- **Nothing found is still JSON.** With `--json` an empty answer is `[]` (`null`
+  for `fa`, which prints one object) on stdout, and the sentence -- `No data found
+  for X` -- goes to stderr, so a program parsing stdout never meets prose. As CSV
+  or a table it is the sentence on stdout, as before. Exit 0 either way; `-q`
+  prints neither, and `-o` writes no file.
 - **`-o` files are data, never a table**: CSV, or JSON with `--json`, whatever
   the console shows.
 - **Text is shortened to fit the terminal, numbers never are.** A wide screen
@@ -388,7 +395,7 @@ caller. portable's `FafnirProvider` reads fafnir through these and `ph` alone,
 with no SQL of its own (its ADR 0032); the JSON they print is pinned by
 `test/duk/test_db_portable_reads_integration.py`, so change both together.
 
-**`duk th SYMBOL [-s DATE] [-e DATE]`** -- ticker history.
+**`duk th SYMBOL... [-s DATE] [-e DATE]`** -- ticker history.
 - A ticker lists every security that has traded under it, one row per period
   from `valid_from` to `valid_to` inclusive (empty: still open), oldest first,
   each with the security it named: `security_id`, its current
@@ -397,6 +404,12 @@ with no SQL of its own (its ADR 0032); the JSON they print is pinned by
 - A security (`cik:`, `isin:`, `cusip:`, `sid:`, `TICKER@DATE`) lists every
   ticker it has held: `duk th sid:7` is FB, then META. A CIK with several
   classes lists them all: a listing, not a pick.
+- Several tickers are one read -- `duk th AAPL MSFT XOM` -- each one's periods
+  in the order the tickers were given, oldest first; every row's `symbol` says
+  which ticker it belongs to. Several securities work the same way. Tickers and
+  securities in one call are refused (exit 2): a ticker lists the securities it
+  named, a security the tickers it held. portable reads a whole portfolio's
+  histories this way, in one process.
 - A period starting `1900-01-01` is fafnir's "first seen" fallback for a ticker
   whose start it never learned, not a listing date. Where two periods cover one
   day both are printed; deciding between them is the caller's.
@@ -579,6 +592,22 @@ the issuers that died before fafnir first ran, minted from Sharadar
   (acquired, merged away, liquidated, delisted), the acquirer, and the trading
   span ([data dictionary](data_dictionary.md)). A mart-only role reads it, through
   the MCP server's SQL tool or `psql`.
+
+## Start-up cost
+
+duk is a process per question, and portable asks several per ticker, so what a
+process pays before it reads anything matters. pandas, numpy and the vendor HTTP
+clients load when a command first uses them, not at start (`duk._deferred`,
+`duk._lazy`): `duk th`, `ca`, `tc` and `ph --exact` never load them, and run in
+about a third of the time they did (≈0.23s against ≈0.7s, measured on a local
+warehouse). Commands that compute on a frame load pandas as before.
+`test/duk/test_cli_startup.py` asserts what starting the CLI loads; a new module
+on the start-up path takes pandas as `from duk._deferred import pandas as pd`,
+because a plain `import pandas` loads it there and then.
+
+`ph --exact` reads its bars as rows (`duk.datasource.db.exact_bars`), never
+through a DataFrame; `price_history(exact=True)` builds its frame from the same
+rows, so the two cannot drift.
 
 ## Library use
 

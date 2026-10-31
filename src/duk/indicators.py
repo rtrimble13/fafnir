@@ -6,10 +6,12 @@ such as simple moving averages (SMA), exponential moving averages (EMA),
 and relative strength index (RSI).
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Union
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 logger = logging.getLogger(__name__)
 

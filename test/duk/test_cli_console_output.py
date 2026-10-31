@@ -89,11 +89,14 @@ class TestPh:
         assert "MEDIAN" in result.output and "2 observations" in result.output
 
     def test_exact_table_shows_every_stored_digit(self, run, monkeypatch):
-        exact = pd.DataFrame(
-            {"close": [Decimal("13247980.736555")], "volume": [100]},
-            index=pd.to_datetime(["2024-01-02"]).rename("date"),
-        )
-        monkeypatch.setattr(ds_db, "price_history", lambda **kw: exact.copy())
+        exact = [
+            {
+                "date": pd.Timestamp("2024-01-02").date(),
+                "close": Decimal("13247980.736555"),
+                "volume": 100,
+            }
+        ]
+        monkeypatch.setattr(ds_db, "exact_bars", lambda **kw: list(exact))
         result = run(["ph", "AAPL", "--close", "--exact", "--table"])
         assert result.exit_code == 0, result.output
         assert "13,247,980.736555" in result.output

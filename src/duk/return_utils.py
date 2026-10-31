@@ -6,11 +6,13 @@ from price data, including simple returns, log returns, cumulative returns,
 and annualized returns.
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Union
 
-import numpy as np
-import pandas as pd
+from duk._deferred import numpy as np
+from duk._deferred import pandas as pd
 
 logger = logging.getLogger(__name__)
 

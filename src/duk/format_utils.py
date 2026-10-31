@@ -25,7 +25,7 @@ import numbers
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 # Columns carrying a price. Volume is a share count (never formatted as money) and
 # the date index is not numeric, so both are left alone.

@@ -104,7 +104,7 @@ class TestTh:
         )
         result = run(["th", "xyz", "-s", "2024-01-01", "--json"])
         assert result.exit_code == 0, result.output
-        assert seen[0]["symbol"] == "XYZ" and seen[0]["start_date"] == "2024-01-01"
+        assert seen[0]["symbols"] == ["XYZ"] and seen[0]["start_date"] == "2024-01-01"
         assert json.loads(result.output)[0]["valid_from"] == "2024-01-01"
 
     def test_an_identifier_lists_every_matching_securitys_tickers(
@@ -122,6 +122,40 @@ class TestTh:
         result = run(["th", "cik:1652044"])
         assert result.exit_code == 0, result.output
         assert seen[0]["security_ids"] == [1, 2], "a listing, not a pick"
+
+    def test_several_tickers_are_one_read(self, run, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            ds_db, "ticker_history", lambda **kw: seen.append(kw) or [dict(self.ROW)]
+        )
+        result = run(["th", "ticker:xyz", "abc", "XYZ", "--json"])
+        assert result.exit_code == 0, result.output
+        assert len(seen) == 1, "one query, however many tickers"
+        assert seen[0]["symbols"] == ["XYZ", "ABC", "XYZ"]  # the datasource dedupes
+
+    def test_tickers_and_securities_are_not_mixed(self, run, monkeypatch):
+        monkeypatch.setattr(
+            ds_db, "ticker_history", lambda **kw: pytest.fail("refused first")
+        )
+        result = run(["th", "AAPL", "sid:5"])
+        assert result.exit_code == 2
+        assert "not both" in result.output
+
+    def test_several_securities_are_one_read(self, run, monkeypatch):
+        seen = []
+        found = {
+            "sid:1": [{"security_id": 1}],
+            "cik:9": [{"security_id": 2}, {"security_id": 1}],
+        }
+        monkeypatch.setattr(
+            ds_db, "resolve_identifier", lambda **kw: found[kw["identifier"].raw]
+        )
+        monkeypatch.setattr(
+            ds_db, "ticker_history", lambda **kw: seen.append(kw) or [dict(self.ROW)]
+        )
+        result = run(["th", "sid:1", "cik:9"])
+        assert result.exit_code == 0, result.output
+        assert seen[0]["security_ids"] == [1, 2]
 
     def test_the_table_is_the_narrow_view(self, run, monkeypatch):
         monkeypatch.setattr(ds_db, "ticker_history", lambda **kw: [dict(self.ROW)])

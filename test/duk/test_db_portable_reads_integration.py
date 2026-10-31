@@ -72,6 +72,17 @@ class TestTickerHistory:
         )
         assert rows[1]["primary_symbol"] == "XYZ" and rows[1]["asset_type"] == "equity"
 
+    def test_several_tickers_in_the_order_given(self, migrated_dsn, reused):
+        _, one, two = reused
+        rows = ds_db.ticker_history(
+            dsn=migrated_dsn, symbols=["abc", "XYZ", "NOPE", "abc"]
+        )
+        assert [(r["symbol"], r["security_id"]) for r in rows] == [
+            ("ABC", two),
+            ("XYZ", one),
+            ("XYZ", two),
+        ], "ABC first as asked, each ticker's periods oldest first, repeats once"
+
     def test_a_range_keeps_the_overlapping_periods(self, migrated_dsn, reused):
         _, one, two = reused
         rows = ds_db.ticker_history(
@@ -249,6 +260,10 @@ class TestTheContractPortableReads:
         }
         assert rows[1]["security_id"] == two and rows[1]["valid_to"] is None
 
+    def test_th_several_tickers(self, duk, reused):
+        rows = duk("th", "ticker:ABC", "ticker:XYZ", "--json")
+        assert [r["symbol"] for r in rows] == ["ABC", "XYZ", "XYZ"]
+
     def test_ca_exact(self, duk, actions):
         rows = duk("ca", f"sid:{actions}", "--json", "--exact")
         assert set(rows[0]) == {
@@ -300,6 +315,37 @@ class TestTheContractPortableReads:
             {"date": "2024-12-26", "is_open": True, "session_note": None},
         ]
 
+    def test_nothing_found_is_an_empty_list(self, duk, actions):
+        """An empty answer is `[]` on stdout, never a sentence (portable reads both)."""
+        assert duk("th", "ticker:NOPE", "--json") == []
+        assert (
+            duk(
+                "ca",
+                f"sid:{actions}",
+                "--start-date",
+                "2030-01-01",
+                "--json",
+                "--exact",
+            )
+            == []
+        )
+        assert (
+            duk(
+                "tc",
+                "NYSE",
+                "--start-date",
+                "2024-12-25",
+                "--end-date",
+                "2024-12-25",
+                "--json",
+            )
+            == []
+        )
+        assert duk(
+            "ph", f"sid:{actions}", "--start-date", "2030-01-02", "--end-date", "2030-01-03",
+            "--close", "--json", "--exact",
+        ) == []  # fmt: skip
+
     def test_ph_by_sid_exact(self, duk, actions):
         bars = duk(
             "ph", f"sid:{actions}", "--start-date", "2024-02-09", "--end-date", "2024-02-09",
@@ -313,3 +359,94 @@ class TestTheContractPortableReads:
                 "close": "13247980.736555",
             }
         ]
+
+
+class TestExactBars:
+    """`ph --exact`'s read: rows as stored, shaped as price_history shapes a series."""
+
+    @pytest.fixture()
+    def bars(self, db):
+        sid = _security(db, "BAR", cusip="000000044")
+        _period(db, sid, "BAR", "1900-01-01")
+        repo.upsert_daily_prices(
+            db,
+            [
+                {
+                    "security_id": sid,
+                    "trade_date": dt.date(2024, 1, day),
+                    "open": Decimal(f"{day}.5"),
+                    "high": Decimal(f"{day}.9"),
+                    "low": Decimal(f"{day}.1"),
+                    "close": Decimal(f"{day}.25"),
+                    "volume": day * 100,
+                }
+                for day in (2, 3, 4, 5, 8)
+            ],
+        )
+        return sid
+
+    def test_rows_are_the_stored_values(self, migrated_dsn, bars):
+        rows = ds_db.exact_bars(
+            dsn=migrated_dsn,
+            security_id=bars,
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+        )
+        assert rows == [
+            {
+                "date": dt.date(2024, 1, 2),
+                "open": Decimal("2.500000"),
+                "high": Decimal("2.900000"),
+                "low": Decimal("2.100000"),
+                "close": Decimal("2.250000"),
+                "volume": 200,
+            },
+            {
+                "date": dt.date(2024, 1, 3),
+                "open": Decimal("3.500000"),
+                "high": Decimal("3.900000"),
+                "low": Decimal("3.100000"),
+                "close": Decimal("3.250000"),
+                "volume": 300,
+            },
+        ]
+
+    def test_fields_and_limit_shape_as_price_history_does(self, migrated_dsn, bars):
+        first_two = ds_db.exact_bars(
+            dsn=migrated_dsn,
+            symbol="bar",
+            start_date="2024-01-02",
+            limit=2,
+            fields=["close"],
+        )
+        assert first_two == [
+            {"date": dt.date(2024, 1, 2), "close": Decimal("2.250000")},
+            {"date": dt.date(2024, 1, 3), "close": Decimal("3.250000")},
+        ], "only a start date: the first N"
+        last_two = ds_db.exact_bars(
+            dsn=migrated_dsn,
+            security_id=bars,
+            end_date="2024-01-08",
+            limit=2,
+            fields=["close"],
+        )
+        assert [r["date"] for r in last_two] == [
+            dt.date(2024, 1, 5),
+            dt.date(2024, 1, 8),
+        ]
+        floats = ds_db.price_history(
+            dsn=migrated_dsn, security_id=bars, start_date=None, end_date="2024-01-08",
+            limit=2, fields=["close"],
+        )  # fmt: skip
+        assert [d.date() for d in floats.index] == [r["date"] for r in last_two]
+
+    def test_the_frame_form_is_built_from_the_same_rows(self, migrated_dsn, bars):
+        frame = ds_db.price_history(
+            dsn=migrated_dsn, security_id=bars, start_date="2024-01-04",
+            end_date="2024-01-05", fields=["high", "low"], exact=True,
+        )  # fmt: skip
+        assert list(frame.columns) == ["high", "low"]
+        assert frame["high"].tolist() == [Decimal("4.900000"), Decimal("5.900000")]
+
+    def test_an_unknown_security_has_no_rows(self, migrated_dsn, bars):
+        assert ds_db.exact_bars(dsn=migrated_dsn, symbol="NOPE") == []

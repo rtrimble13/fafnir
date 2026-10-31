@@ -5,9 +5,11 @@ This module provides functions to compute and format summary statistics
 for financial data, including date ranges and column-wise statistics.
 """
 
+from __future__ import annotations
+
 import logging
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 
 def compute_summary_stats(df, date_column="date"):

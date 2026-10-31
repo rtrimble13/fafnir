@@ -12,7 +12,6 @@ import pandas as pd
 import pytest
 from click.testing import CliRunner
 
-from duk import cli
 from duk.cli import canonical_names, main
 from duk.datasource import db as ds_db
 from duk.datasource import live as ds_live
@@ -200,10 +199,11 @@ class TestFmp:
     @pytest.fixture(autouse=True)
     def _fmp(self, monkeypatch):
         monkeypatch.setattr(
-            cli, "sector_list_api", lambda key: [{"sector": s} for s in SECTORS]
+            "duk.fmp_api.sector_list_api", lambda key: [{"sector": s} for s in SECTORS]
         )
         monkeypatch.setattr(
-            cli, "industry_list_api", lambda key: [{"industry": i} for i in INDUSTRIES]
+            "duk.fmp_api.industry_list_api",
+            lambda key: [{"industry": i} for i in INDUSTRIES],
         )
         self.screens = []
 

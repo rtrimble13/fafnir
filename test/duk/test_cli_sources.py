@@ -151,3 +151,35 @@ class TestCommandsAVendorCannotServe:
         result = harness(["-S", "fmp", "ls", "AAPL"], rc=FMP_RC)
         assert result.exit_code == 1
         assert "re-run with -S db" in result.output
+
+
+class TestYieldCurveSource:
+    """The warehouse holds no treasury data: under -S db, yc reads FMP and says so."""
+
+    CURVE = pd.DataFrame(
+        {"month3": [4.31], "year10": [4.25]},
+        index=pd.to_datetime(["2025-06-27"]).rename("date"),
+    )
+
+    @pytest.fixture()
+    def curve(self, monkeypatch):
+        monkeypatch.setattr(
+            "duk.fmp_api.get_yield_curve", lambda **kw: self.CURVE.copy()
+        )
+
+    def test_db_says_on_stderr_that_the_curve_is_fmps(self, harness, curve):
+        result = harness(["yc"], rc=DB_RC + FMP_RC)
+        assert result.exit_code == 0, result.output
+        assert "yc reads FMP's curve" in result.stderr
+        assert "Note:" not in result.stdout, "stdout is the data, unchanged"
+        assert result.stdout.startswith("date,month3,year10")
+
+    def test_fmp_asked_explicitly_prints_no_note(self, harness, curve):
+        result = harness(["-S", "fmp", "yc"], rc=FMP_RC)
+        assert result.exit_code == 0, result.output
+        assert "Note:" not in result.stderr
+
+    def test_db_without_an_fmp_key_is_still_refused(self, harness, curve):
+        result = harness(["yc"], rc=DB_RC)
+        assert result.exit_code == 1
+        assert "yc requires the FMP API" in result.output

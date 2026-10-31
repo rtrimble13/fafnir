@@ -19,9 +19,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
-import pandas as pd
-
 from duk import identifiers
+from duk._deferred import pandas as pd
 from duk.datasource.base import DataSourceError, shape_price_dataframe
 from duk.date_utils import get_api_date_range
 
@@ -251,6 +250,76 @@ def resolve_identifier(*, dsn: str, identifier: identifiers.Identifier) -> list[
         return _resolve_by_identifier(cur, identifier)
 
 
+#: A daily bar's columns, in the order a bar is printed.
+BAR_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def _daily_bars(cur, symbol, security_id, start, end, adjusted) -> list[dict]:
+    """One security's daily bars from ``start`` to ``end`` (None: unbounded), raw or
+    adjusted, oldest first, as psycopg returns them: ``Decimal`` prices."""
+    sec_id = security_id
+    if sec_id is None:
+        sec_id = _resolve_security_id(cur, symbol.upper())
+    if sec_id is None:
+        return []
+    relation = "mart.v_daily_price_adjusted" if adjusted else "mart.v_daily_price_raw"
+    clauses = ["security_id = %s"]
+    params: list[Any] = [sec_id]
+    if start is not None:
+        clauses.append("trade_date >= %s")
+        params.append(start)
+    if end is not None:
+        clauses.append("trade_date <= %s")
+        params.append(end)
+    cur.execute(
+        f"SELECT trade_date AS date, open, high, low, close, volume "
+        f"FROM {relation} WHERE {' AND '.join(clauses)} ORDER BY trade_date ASC",
+        params,
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def exact_bars(
+    *,
+    dsn: str,
+    symbol: Optional[str] = None,
+    security_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+    fields: Optional[list[str]] = None,
+    adjusted: bool = False,
+) -> list[dict]:
+    """Daily bars exactly as stored, as plain rows: `ph --exact`.
+
+    Each row is ``{"date": date, <field>: Decimal | int | None, ...}``, with no
+    pandas anywhere on the way -- nothing to turn a NUMERIC into a float, a NULL
+    volume into NaN, or a process into one that pays to load it. Shaped as
+    :func:`price_history` shapes a daily series: ``fields`` keeps those columns
+    (all of them when none is a bar column), and ``limit`` keeps the first rows
+    when only ``start_date`` was given, else the last.
+    """
+    if security_id is None and not symbol:
+        raise DataSourceError("exact_bars needs either a symbol or a security_id")
+    start, end = get_api_date_range(
+        _parse_date(start_date, "start date"),
+        _parse_date(end_date, "end date"),
+        limit,
+        "day",
+    )
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        rows = _daily_bars(cur, symbol, security_id, start, end, adjusted)
+    keep = [c for c in (fields or ()) if c in BAR_COLUMNS] or list(BAR_COLUMNS)
+    rows = [{"date": r["date"], **{c: r[c] for c in keep}} for r in rows]
+    if limit is not None and limit > 0:
+        rows = (
+            rows[:limit]
+            if start_date is not None and end_date is None
+            else (rows[-limit:])
+        )
+    return rows
+
+
 def price_history(
     *,
     dsn: str,
@@ -287,48 +356,36 @@ def price_history(
         frequency,
     )
 
-    with _connect(dsn) as conn, conn.cursor() as cur:
-        sec_id = security_id
-        if sec_id is None:
-            sec_id = _resolve_security_id(cur, symbol.upper())
-        if sec_id is None:
+    if exact:
+        if frequency.lower() != "day":
+            raise DataSourceError(
+                "exact prices are daily bars; frequency must be 'day'"
+            )
+        # One implementation of the exact read: exact_bars, here put in a frame.
+        bars = exact_bars(
+            dsn=dsn,
+            symbol=symbol,
+            security_id=security_id,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            fields=fields,
+            adjusted=adjusted,
+        )
+        if not bars:
             return pd.DataFrame()
-        relation = (
-            "mart.v_daily_price_adjusted" if adjusted else "mart.v_daily_price_raw"
-        )
-        clauses = ["security_id = %s"]
-        params: list[Any] = [sec_id]
-        if start is not None:
-            clauses.append("trade_date >= %s")
-            params.append(start)
-        if end is not None:
-            clauses.append("trade_date <= %s")
-            params.append(end)
-        cur.execute(
-            f"SELECT trade_date AS date, open, high, low, close, volume "
-            f"FROM {relation} WHERE {' AND '.join(clauses)} ORDER BY trade_date ASC",
-            params,
-        )
-        rows = cur.fetchall()
+        df = pd.DataFrame(bars)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date")
+
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        rows = _daily_bars(cur, symbol, security_id, start, end, adjusted)
 
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
-    if exact:
-        if frequency.lower() != "day":
-            raise DataSourceError(
-                "exact prices are daily bars; frequency must be 'day'"
-            )
-        return shape_price_dataframe(
-            df,
-            frequency="day",
-            limit=limit,
-            fields=fields,
-            start_date=start_date,
-            end_date=end_date,
-        )
     # Prices: exact decimals -> float for downstream numeric ops (matches live).
     for col in ("open", "high", "low", "close"):
         if col in df.columns:
@@ -1004,7 +1061,7 @@ _TICKER_HISTORY_SQL = """
        AND (%(end)s::date IS NULL OR x.valid_from <= %(end)s::date)
        AND (%(start)s::date IS NULL OR x.valid_to IS NULL
             OR x.valid_to >= %(start)s::date)
-     ORDER BY x.valid_from, x.security_id, x.symbol
+     ORDER BY {order}
 """
 
 
@@ -1012,29 +1069,40 @@ def ticker_history(
     *,
     dsn: str,
     symbol: Optional[str] = None,
+    symbols: Optional[list[str]] = None,
     security_ids: Optional[list[int]] = None,
     start_date: Optional[str | date] = None,
     end_date: Optional[str | date] = None,
 ) -> list[dict]:
-    """The periods of a ticker's history, or of the given securities' tickers.
+    """The periods of tickers' histories, or of the given securities' tickers.
 
-    With ``symbol``, every security the ticker has named (matched in any case);
-    with ``security_ids``, every ticker those securities have held. ``start_date``
-    / ``end_date`` keep the periods that overlap the range. Oldest first.
+    With ``symbol`` or ``symbols``, every security each ticker has named
+    (matched in any case), the tickers in the order given and each one's
+    periods oldest first -- so one read answers for a whole portfolio. With
+    ``security_ids``, every ticker those securities have held, oldest first.
+    ``start_date`` / ``end_date`` keep the periods that overlap the range.
     """
-    if (symbol is None) == (security_ids is None):
-        raise DataSourceError("ticker_history needs a symbol or security_ids")
+    tickers = [symbol] if symbol is not None else symbols
+    if (tickers is None) == (security_ids is None):
+        raise DataSourceError("ticker_history needs symbols or security_ids")
     start = _parse_date(start_date, "start date")
     end = _parse_date(end_date, "end date")
     if start and end and end < start:
         raise DataSourceError(f"the range ends ({end}) before it starts ({start})")
-    if symbol is not None:
-        who, value = "upper(x.symbol) = %(who)s", symbol.strip().upper()
+    if tickers is not None:
+        value = list(dict.fromkeys(t.strip().upper() for t in tickers))
+        who = "upper(x.symbol) = ANY(%(who)s::text[])"
+        order = (
+            "array_position(%(who)s::text[], upper(x.symbol)), "
+            "x.valid_from, x.security_id"
+        )
     else:
-        who, value = "x.security_id = ANY(%(who)s)", [int(i) for i in security_ids]
+        value = [int(i) for i in security_ids]
+        who = "x.security_id = ANY(%(who)s)"
+        order = "x.valid_from, x.security_id, x.symbol"
     with _connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
-            _TICKER_HISTORY_SQL.format(who=who),
+            _TICKER_HISTORY_SQL.format(who=who, order=order),
             {"who": value, "start": start, "end": end},
         )
         return [dict(r) for r in cur.fetchall()]

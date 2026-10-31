@@ -15,25 +15,17 @@ from decimal import Decimal
 from pathlib import Path
 
 import click
-import pandas as pd
 from click.core import ParameterSource
 
 from duk import __version__, company_summary, identifiers
 from duk import table as tables
+from duk._deferred import pandas as pd
+from duk._lazy import lazy_import
 from duk.config import get_config
 from duk.datasource import base as ds_base
 from duk.datasource import db as ds_db
-from duk.datasource import live as ds_live
-from duk.datasource import sharadar as ds_sharadar
-from duk.fmp_api import (
-    actively_trading_list_api,
-    get_yield_curve,
-    industry_list_api,
-    sector_list_api,
-)
 from duk.format_utils import (
     DEFAULT_DECIMALS,
-    exact_records,
     format_price_columns,
     plain_records,
     round_price_columns,
@@ -55,6 +47,12 @@ from duk.return_utils import (
     simple_return,
 )
 from duk.stats import compute_summary_stats, format_summary_stats, summary_stats_rows
+
+# The vendor clients, loaded when a command reaches a vendor: they bring requests
+# and HTTP plumbing a warehouse read never needs (duk._lazy).
+fmp_api = lazy_import("duk.fmp_api")
+ds_live = lazy_import("duk.datasource.live")
+ds_sharadar = lazy_import("duk.datasource.sharadar")
 
 # Key rate tenors for yield curve analysis
 KEY_RATE_TENORS = ["year1", "year5", "year10", "year20", "year30"]
@@ -116,6 +114,24 @@ def echo_table(rows, columns=None, **kwargs):
     )
 
 
+def echo_empty(console, message, *, quiet, json_value="[]"):
+    """Say that a command found nothing, in the form its output takes.
+
+    With --json the answer is still JSON -- ``[]`` for a list of records, ``null``
+    where the command prints one object -- and the sentence goes to stderr, so a
+    program parsing stdout never meets prose. As CSV or a table it is the
+    sentence on stdout, as it always was. Exit 0 either way: nothing found is an
+    answer, not a failure. ``-q`` prints neither.
+    """
+    if quiet:
+        return
+    if console == "json":
+        click.echo(json_value)
+        click.echo(message, err=True)
+    else:
+        click.echo(message)
+
+
 def echo_summary_table(stats, *, title="Summary statistics", precision=4):
     """`--summary` as a table: one row per numeric column."""
     if stats is None:
@@ -131,21 +147,31 @@ def echo_summary_table(stats, *, title="Summary statistics", precision=4):
     echo_table(rows, title=title, footer=footer, decimals=precision)
 
 
-def bar_footer(frame, *, symbol, adjusted, frequency):
-    """``61 bars · AAPL · raw · day · 2024-01-02 → 2024-03-28``."""
+def bars_footer(count, first, last, *, symbol, adjusted, frequency):
+    """``61 bars · AAPL · raw · day · 2024-01-02 → 2024-03-28``; ``first`` and
+    ``last`` are dates, or None to leave the span out."""
     parts = [
-        tables.plural(len(frame), "bar"),
+        tables.plural(count, "bar"),
         symbol,
         "adjusted" if adjusted else "raw",
         frequency,
     ]
-    if "date" in frame.columns and len(frame):
-        first, last = frame["date"].iloc[0], frame["date"].iloc[-1]
-        parts.append(
-            f"{pd.Timestamp(first).date().isoformat()} → "
-            f"{pd.Timestamp(last).date().isoformat()}"
-        )
+    if first is not None and last is not None:
+        parts.append(f"{first.isoformat()} → {last.isoformat()}")
     return " · ".join(parts)
+
+
+def bar_footer(frame, *, symbol, adjusted, frequency):
+    """:func:`bars_footer` for a frame with a ``date`` column."""
+    dated = "date" in frame.columns and len(frame)
+    return bars_footer(
+        len(frame),
+        pd.Timestamp(frame["date"].iloc[0]).date() if dated else None,
+        pd.Timestamp(frame["date"].iloc[-1]).date() if dated else None,
+        symbol=symbol,
+        adjusted=adjusted,
+        frequency=frequency,
+    )
 
 
 def match_column(df, column):
@@ -579,6 +605,48 @@ def ph(
     elif cv:
         fields = ["close", "volume"]
 
+    if exact:
+        # Exact bars never pass through pandas: read as stored, printed as text.
+        try:
+            rows = ds_db.exact_bars(
+                dsn=cfg.dsn,
+                symbol=symbol,
+                security_id=security_id,
+                start_date=start_date,
+                end_date=end_date,
+                limit=limit,
+                fields=fields,
+                adjusted=adj,
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch price history: {e}")
+            click.echo(f"Error: Failed to fetch price history: {e}", err=True)
+            sys.exit(1)
+        if not rows:
+            logger.warning(f"No data returned for {symbol}")
+            echo_empty(console, f"No data found for {symbol}", quiet=quiet)
+            sys.exit(0)
+        logger.info(f"Retrieved {len(rows)} records for {symbol}")
+        _print_exact(
+            plain_records(rows, exact=True),
+            console=console,
+            output=output,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            quiet=quiet,
+            logger=logger,
+            footer=bars_footer(
+                len(rows),
+                rows[0]["date"],
+                rows[-1]["date"],
+                symbol=symbol,
+                adjusted=adj,
+                frequency="day",
+            ),
+        )
+        return
+
     # Fetch price history from the active source
     try:
         if source == "db":
@@ -592,7 +660,6 @@ def ph(
                 limit=limit,
                 fields=fields,
                 adjusted=adj,
-                exact=exact,
             )
         elif source == "sharadar":
             df = ds_sharadar.price_history(
@@ -624,8 +691,7 @@ def ph(
 
     if df.empty:
         logger.warning(f"No data returned for {symbol}")
-        if not quiet:
-            click.echo(f"No data found for {symbol}")
+        echo_empty(console, f"No data found for {symbol}", quiet=quiet)
         sys.exit(0)
 
     logger.info(f"Retrieved {len(df)} records for {symbol}")
@@ -633,20 +699,6 @@ def ph(
     # Prepare output
     # Reset index to include date as a column in output
     output_df = df.reset_index()
-
-    if exact:
-        _print_exact(
-            exact_records(output_df),
-            console=console,
-            output=output,
-            symbol=symbol,
-            start_date=start_date,
-            end_date=end_date,
-            quiet=quiet,
-            logger=logger,
-            footer=bar_footer(output_df, symbol=symbol, adjusted=adj, frequency="day"),
-        )
-        return
 
     # Display precision is applied at the output boundary only: `df` itself keeps
     # full precision, so the library contract and the db/live parity guarantee are
@@ -915,8 +967,10 @@ def yc(
     if key_rates:
         tenors_tuple = (KEY_RATE_TENORS[0], KEY_RATE_TENORS[-1])
 
-    # Yield-curve data is not yet in the fafnir warehouse (economic-series is a
-    # fast-follow), so yc always reads live from FMP regardless of --source.
+    # The warehouse holds no treasury data, so yc reads FMP whatever --source says.
+    # Under -S db that is a different source from the one asked for, so it is said
+    # on stderr, not only in the log: a curve that came from a vendor must not read
+    # as the warehouse's. stdout is untouched, so a pipe reads what it always did.
     if source == "db":
         logger.warning("yc has no db backend yet; falling back to the FMP source")
         if not api_key:
@@ -925,10 +979,15 @@ def yc(
                 err=True,
             )
             sys.exit(1)
+        click.echo(
+            "Note: the warehouse holds no treasury data; yc reads FMP's curve "
+            "(-S fmp says so explicitly).",
+            err=True,
+        )
 
     # Fetch yield curve
     try:
-        df = get_yield_curve(
+        df = fmp_api.get_yield_curve(
             api_key=api_key,
             start_date=start_date,
             end_date=end_date,
@@ -944,8 +1003,7 @@ def yc(
 
     if df.empty:
         logger.warning("No data returned for yield curve")
-        if not quiet:
-            click.echo("No yield curve data found")
+        echo_empty(console, "No yield curve data found", quiet=quiet)
         sys.exit(0)
 
     # Apply precision to yield rates
@@ -1369,11 +1427,11 @@ def ls(
                 sys.exit(1)
             if sectors_list_flag:
                 logger.info("Requesting sector list")
-                df = process_sectors(sector_list_api(api_key))
+                df = process_sectors(fmp_api.sector_list_api(api_key))
                 df["security_count"] = None
             else:
                 logger.info("Requesting industry list")
-                df = process_industries(industry_list_api(api_key))
+                df = process_industries(fmp_api.industry_list_api(api_key))
                 df["sector_name"] = None
                 df["security_count"] = None
             click.echo(
@@ -1414,7 +1472,7 @@ def ls(
             )
         else:
             logger.info("Requesting actively trading list")
-            data = actively_trading_list_api(api_key)
+            data = fmp_api.actively_trading_list_api(api_key)
             df = pd.DataFrame(data)
             expected_cols = ["symbol", "name"]
             available_cols = [col for col in expected_cols if col in df.columns]
@@ -1441,8 +1499,7 @@ def ls(
 
     if df.empty:
         logger.warning("No data returned")
-        if not quiet:
-            click.echo("No data found")
+        echo_empty(console, "No data found", quiet=quiet)
         sys.exit(0)
 
     # Handle output to file
@@ -1599,9 +1656,9 @@ def _known_classification(cfg, source, api_key, *, need_sectors, need_industries
             industries = ds_db.industry_names(dsn=cfg.dsn)
     else:
         if need_sectors:
-            sectors = [r["sector"] for r in sector_list_api(api_key)]
+            sectors = [r["sector"] for r in fmp_api.sector_list_api(api_key)]
         if need_industries:
-            industries = [r["industry"] for r in industry_list_api(api_key)]
+            industries = [r["industry"] for r in fmp_api.industry_list_api(api_key)]
     return sectors, industries
 
 
@@ -2064,11 +2121,12 @@ def fs(
     _note_issuer_class(symbol, found["statements_of"])
     if not found["rows"]:
         logger.warning(f"No {statement} statements for {symbol}")
-        if not quiet:
-            click.echo(
-                f"No {period} {statement} statements for {symbol} as known on "
-                f"{found['as_of'].isoformat()}"
-            )
+        echo_empty(
+            console,
+            f"No {period} {statement} statements for {symbol} as known on "
+            f"{found['as_of'].isoformat()}",
+            quiet=quiet,
+        )
         sys.exit(0)
     logger.info(f"Retrieved {len(found['rows'])} {period} periods for {symbol}")
 
@@ -2206,8 +2264,8 @@ def fa(
                 "trade in the week to that date"
             )
         logger.warning(message)
-        if not quiet:
-            click.echo(message)
+        # fa prints one object, so its JSON for "no row" is null, not [].
+        echo_empty(console, message, quiet=quiet, json_value="null")
         sys.exit(0)
 
     frame = pd.DataFrame([{k: _plain(v) for k, v in found["row"].items()}])
@@ -2280,8 +2338,7 @@ def emit_records(
     """
     if not rows:
         logger.warning(empty_message)
-        if not quiet:
-            click.echo(empty_message)
+        echo_empty(console, empty_message, quiet=quiet)
         return
     file_format = "json" if console == "json" else "csv"
 
@@ -2336,7 +2393,7 @@ def _db_security(ctx, argument):
 
 
 @main.command()
-@click.argument("symbol")
+@click.argument("symbols", metavar="SYMBOL...", nargs=-1, required=True)
 @click.option(
     "-v",
     "--verbose",
@@ -2359,7 +2416,7 @@ def _db_security(ctx, argument):
 @click.pass_context
 def th(
     ctx,
-    symbol,
+    symbols,
     verbose,
     quiet,
     start_date,
@@ -2375,7 +2432,9 @@ def th(
     SYMBOL is a ticker -- every security that has traded under it, each period
     from valid_from to valid_to inclusive (empty: still open) -- or a security
     (cik:, isin:, cusip:, sid:, TICKER@YYYY-MM-DD), for every ticker it has held:
-    FB then META. Each row describes the security it names: its security_id,
+    FB then META. Several tickers are read in one go, each one's periods in the
+    order the tickers were given; several securities likewise. Name tickers or
+    securities, not both. Each row describes the security it names: its security_id,
     current primary ticker, name, asset type, venue, currency, country and
     identifiers. A period starting 1900-01-01 is fafnir's "first seen" fallback,
     not a listing date. --start-date / --end-date keep the periods overlapping
@@ -2388,30 +2447,48 @@ def th(
     _refuse_vendor_source(ctx, "th", what="ticker history")
     console = output_format(ctx, output_table, output_csv, output_json)
     require_source_credentials(ctx, "db")
-    identifier = parse_security_argument(symbol)
+    named_as = [parse_security_argument(argument) for argument in symbols]
+    tickers = [i for i in named_as if i.is_ticker]
+    if tickers and len(tickers) != len(named_as):
+        raise click.UsageError(
+            "name tickers or securities (cik:, isin:, cusip:, sid:, TICKER@DATE), "
+            "not both: a ticker lists the securities it named, a security the "
+            "tickers it held."
+        )
     cfg = ctx.obj["config"]
     try:
-        if identifier.is_ticker:
+        if tickers:
             rows = ds_db.ticker_history(
                 dsn=cfg.dsn,
-                symbol=identifier.value,
+                symbols=[i.value for i in tickers],
                 start_date=start_date,
                 end_date=end_date,
             )
-            label = identifier.value
+            label = ", ".join(dict.fromkeys(i.value for i in tickers))
         else:
-            candidates = ds_db.resolve_identifier(dsn=cfg.dsn, identifier=identifier)
-            if not candidates:
-                click.echo(f"No security found for {identifier.describe()}.", err=True)
-                sys.exit(1)
-            # A listing, not a pick: a CIK's several classes each get theirs.
+            security_ids: list = []
+            for identifier in named_as:
+                candidates = ds_db.resolve_identifier(
+                    dsn=cfg.dsn, identifier=identifier
+                )
+                if not candidates:
+                    click.echo(
+                        f"No security found for {identifier.describe()}.", err=True
+                    )
+                    sys.exit(1)
+                # A listing, not a pick: a CIK's several classes each get theirs.
+                security_ids += [
+                    c["security_id"]
+                    for c in candidates
+                    if c["security_id"] not in security_ids
+                ]
             rows = ds_db.ticker_history(
                 dsn=cfg.dsn,
-                security_ids=[c["security_id"] for c in candidates],
+                security_ids=security_ids,
                 start_date=start_date,
                 end_date=end_date,
             )
-            label = identifier.describe()
+            label = ", ".join(i.describe() for i in named_as)
     except ds_base.DataSourceError as exc:
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
@@ -2441,7 +2518,7 @@ def th(
         table_rows=view,
         console=console,
         output=output,
-        default_name=f"{identifier.value}_history",
+        default_name=f"{named_as[0].value}_history",
         quiet=quiet,
         logger=logger,
         empty_message=f"No ticker history for {label}",

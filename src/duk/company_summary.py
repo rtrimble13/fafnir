@@ -20,8 +20,7 @@ import math
 from decimal import Decimal
 from typing import Any, Iterable, Optional, Sequence
 
-import pandas as pd
-
+from duk._deferred import pandas as pd
 from duk.format_utils import DEFAULT_DECIMALS, round_price
 
 MISSING = "-"
