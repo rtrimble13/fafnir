@@ -1,16 +1,112 @@
 # Fafnir Data Dictionary
 
-Every table and column in the initial release, with its **grain**, **source**,
-**units**, **adjustment status**, and **update cadence**. This is the contract
-between the warehouse and everything that reads it.
+Every schema, table, view, materialized view and function fafnir stores or serves,
+with its **grain**, **source**, **units**, **adjustment status** and **update
+cadence**. This is the contract between the warehouse and everything that reads it.
+
+It describes the schema at migration **0040** (`industry_aliases`, release v3.0.4).
+It was checked against the live catalog (`pg_class`, `pg_attribute`,
+`pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
+on 2026-10-31. A migration that adds, drops or re-types a column updates this file in
+the same pull request: the PR template's first box.
 
 Conventions:
-- Money/prices are exact `NUMERIC` — never floating point.
-- Temporal columns are suffixed by meaning: `*_date` (observation), `loaded_at`
-  / `computed_at` / `fetched_at` (process time), `valid_from`/`valid_to`
-  (knowledge interval).
+- Money/prices are exact `NUMERIC` — never floating point. The factor panel's ratios
+  are the one deliberate exception (`double precision`, see
+  [the factor panel](#the-factor-panel-materialized-view-and-functions)).
+- Temporal columns are suffixed by meaning:
+  - `*_date` is the observation;
+  - `loaded_at`, `computed_at`, `fetched_at`, `created_at` and `updated_at` are
+    process time;
+  - `valid_from`/`valid_to` and `known_from`/`known_to` are the knowledge interval.
 - "Adjustment status" states whether price values are **raw** (unadjusted) or
   **adjusted** (split/dividend back-adjusted).
+- A `source` column says **who supplied the row**: `fmp`, `sharadar`, or `operator`
+  for a row a person wrote through the CLI. ADR 0015 also reserves `tiingo`, and the
+  vendor tables' CHECKs allow it, but Tiingo was not adopted (2026-10-30) and no row
+  carries it. Only the statement tables constrain `source` with a CHECK. Everywhere
+  else the value is the loader's.
+- **Vendor text is data.** `company_name`, `core.company_profile.description` and the
+  vendor master's names are third-party strings, stored as sent.
+
+---
+
+## Inventory
+
+Seven schemas: the six below plus `public`, which holds only the `pg_stat_statements`
+extension's two views and three functions (query statistics, no fafnir data). Row
+counts are as of 2026-10-31, to give the scale: exact where a section below quotes a
+count, the planner's estimate otherwise. They are not maintained.
+
+| Relation | Kind | Grain | Written by | ≈ rows |
+|---|---|---|---|---|
+| [`core.security`](#coresecurity--security-master) | table | `security_id` | security-master loads, `vendor mint-delisted`, `security split-history` | 33.9k |
+| [`core.symbol_xref`](#coresymbol_xref--ticker-history--cross-reference) | table | `(symbol, valid_from)` | security-master loads, renames | 40.2k |
+| [`core.symbol_change`](#coresymbol_change--applied-ticker-renames) | table | `symbol_change_id` | `ingest symbol-changes`, `ingest sharadar-universe` | 243 |
+| [`core.company_profile`](#corecompany_profile--long-form-description) | table | `security_id` | `ingest securities --enrich` | 20.6k |
+| [`core.daily_price`](#coredaily_price--raw-daily-ohlcv---primary-fact) | partitioned table | `(security_id, trade_date)` | price loaders, `prices shift\|rescale` | ≈ 99M |
+| [`core.corporate_action`](#corecorporate_action--splits--cash-dividends) | table | `(security_id, action_type, ex_date)` | action loaders, `actions add\|redate` | 931k |
+| [`core.adjustment_factor`](#coreadjustment_factor--derived-back-adjustment-factors) | table | `(security_id, effective_date)` | `fafnir adjust` | 894k |
+| [`core.vendor_security`](#corevendor_security--a-vendors-own-security-master-grain-vendor-vendor_table-vendor_key) | table | `(vendor, vendor_table, vendor_key)` | `ingest sharadar-master` | 61.2k |
+| [`core.security_vendor_xref`](#coresecurity_vendor_xref--fafnirs-security--a-vendors-key-over-time-grain-vendor-vendor_key-valid_from) | table | `(vendor, vendor_key, valid_from)` | `vendor link`, `vendor mint-delisted`, minting | 27.5k |
+| [`core.security_vendor_rejection`](#coresecurity_vendor_rejection--this-security-is-not-that-key-0032-63-grain-security_id-vendor-vendor_key) | table | `(security_id, vendor, vendor_key)` | `vendor link reject` | 0 |
+| [`core.vendor_security_event`](#corevendor_security_event--a-vendors-lifecycle-events-grain-vendor-vendor_key-event_date-action-contra_ticker) | table | `(vendor, vendor_key, event_date, action, contra_ticker)` | `ingest sharadar-master` | 154k |
+| [`core.income_statement`, `core.balance_sheet`, `core.cash_flow_statement`](#coreincome_statement-corebalance_sheet-corecash_flow_statement) | tables | `(security_id, period_type, fiscal_date, version_no, loaded_at)` | `ingest fundamentals` | 1.29M, 1.04M, 1.22M |
+| [`core.v_security_classification`](#corev_security_classification--the-classification-readers-see-view) | view | `security_id` | — | — |
+| [`mart.v_daily_price_raw`](#martv_daily_price_raw--unadjusted-ohlcv-view) | view | `(security_id, trade_date)` | — | — |
+| [`mart.v_daily_price_adjusted`](#martv_daily_price_adjusted--adjusted-ohlcv-view) | view | `(security_id, trade_date)` | — | — |
+| [`mart.v_symbol_lookup`](#martv_symbol_lookup--ticker--security_id-view) | view | `(symbol, valid_from)` | — | — |
+| [`mart.v_security_profile`](#martv_security_profile--descriptive-profile-view) | view | `security_id` | — | — |
+| [`mart.v_security_price_coverage`](#martv_security_price_coverage--what-is-held-per-security-view) | view | `security_id` with bars | — | — |
+| [`mart.v_security_action_summary`](#martv_security_action_summary--corporate-actions-per-security-view) | view | `security_id` with actions | — | — |
+| [`mart.v_corporate_action`](#martv_corporate_action--corporate-actions-one-row-per-event-view) | view | `(security_id, action_type, ex_date)` | — | — |
+| [`mart.v_security_lifecycle`](#martv_security_lifecycle--when-a-security-traded-and-why-it-stopped-view) | view | `security_id` | — | — |
+| [`mart.v_income_statement_versions`, `_balance_sheet_`, `_cash_flow_statement_`](#the-statements-point-in-time-views-and-functions) | views | the core table's | — | — |
+| [`mart.v_statements_current`, `mart.v_fundamentals_ttm`](#the-statements-point-in-time-views-and-functions) | views | `(security_id, period_type)`; `(security_id, fiscal_date)` | — | — |
+| [`mart.fundamental_panel`](#the-factor-panel-materialized-view-and-functions) | materialized view | `(security_id, as_of_date)` | `db refresh-marts` | 1.83M |
+| [`mart.v_industry_fundamentals`](#martv_industry_fundamentals--the-panel-by-sector-and-industry-view) | view | `(group_level, as_of_date, sector_name, industry_name)` | — | — |
+| [`mart.security_fundamentals_latest`](#martsecurity_fundamentals_latest--each-securitys-factors-now-materialized-view) | materialized view | `security_id` | `db refresh-marts` | 5.4k |
+| [`mart.v_security_dq_open`](#martv_security_dq_open--open-dq-flags-per-security-view) | view | open `dq_flag_id` with a security | — | — |
+| [`mart.security_latest`](#martsecurity_latest--screening-snapshot-materialized-view) | materialized view | `security_id` | `db refresh-marts` | 33.9k |
+| [`mart.v_security_attributes`](#martv_security_attributes--the-screeners-attributes-by-precedence-view) | view | `security_id` | — | — |
+| [`ref.exchange`](#refexchange--grain-exchange_code) | table | `exchange_code` | seed `0001_exchanges.sql` | 8 |
+| [`ref.tracked_symbol`](#reftracked_symbol--declared-universe-grain-source-symbol) | table | `(source, symbol)` | `track add\|rm` | 7 |
+| [`ref.sector`, `ref.industry`](#refsector--refindustry--the-sector-and-industry-names) | tables | `sector_id`; `industry_id` | security-master loads | 11; 111 |
+| [`ref.statement_line_item`](#refstatement_line_item--the-fundamentals-taxonomy-grain-statement-column_name) | table | `(statement, column_name)` | migration 0035 | 58 |
+| [`ref.trading_calendar`](#reftrading_calendar--grain-exchange_code-trade_date) | table | `(exchange_code, trade_date)` | `db seed`, the nightly horizon | 49.1k |
+| [`ops.ingestion_run`](#opsingestion_run--lineage-grain-ingestion_run_id) | table | `ingestion_run_id` | every load and every operator edit | 635 |
+| [`ops.data_quality_flag`](#opsdata_quality_flag--quarantineanomaly-queue-grain-dq_flag_id) | table | `dq_flag_id` | the loaders, `dq run`, dorq | 1.56M |
+| [`ops.load_watermark`](#opsload_watermark--incremental-marks-grain-source-endpoint-security_id) | table | `(source, endpoint, security_id)` | the loaders, dorq | 128k |
+| [`ops.operator_override`](#opsoperator_override--operator-corrections-grain-override_id) | table | `override_id` | `actions`, `prices`, `security split-history` | 343k |
+| [`ops.vendor_correction`](#opsvendor_correction--rows-one-vendor-replaced-grain-correction_id) | table | `correction_id` | `vendor correct` | 704k |
+| [`ops.dq_label`](#opsdq_label--labels-a-person-stated-grain-label_id) | table | `label_id` | `dq label`, `dq accept\|resolve --label` | 129 |
+| [`landing.fmp_raw`](#landingfmp_raw--raw-immutable-payloads-grain-raw_id) | table | `raw_id` | the FMP loaders | 915k (6.2 GB) |
+| [`landing.sharadar_file`](#landingsharadar_file--the-sharadar-file-ledger-grain-file_id) | table | `file_id` | `source sharadar-bulk\|delta\|prune` | 34 |
+| [`meta.schema_migration`](#metaschema_migration--migration-bookkeeping-grain-version) | table | `version` | `db migrate` | 40 |
+
+The mart functions are `mart.fn_statements_as_of` (two forms),
+`mart.fn_fundamentals_ttm`, `mart.fn_fundamental_panel`,
+`mart.fn_fundamental_snapshot`, `mart.fn_ratio`, `mart.fn_growth` and
+`mart.fn_security_betas`, described with the views they serve.
+
+## Roles and privileges
+
+| Role | Schemas it can use | Reads | Writes |
+|---|---|---|---|
+| `fafnir_ingest` | all six | everything | `landing`, `core`, `ref`, `ops` (0001's default privileges). `meta` and the mart objects belong to the role that runs the migrations. |
+| `fafnir_read` | `core`, `mart`, `ref` | the same | — |
+| `fafnir_app` | `mart`, `ref` | the same | — |
+| `fafnir_ops` | all six | everything (SELECT only; the agent tier, migration 0021, ADR 0010) | — |
+
+- **`mart` is the read seam** ([ADR 0009](adr/0009-mart-is-the-read-seam.md)). Its
+  views run with their owner's rights, so `fafnir_app` reads core-derived data without
+  any grant on `core`. A `mart` view must never set `security_invoker = true`. Adding
+  one is a grant to every reader.
+- **The mart functions** run with their caller's rights. They read only mart views,
+  so the same holds. EXECUTE is granted to `fafnir_read`, `fafnir_app` and
+  `fafnir_ops`, and revoked from PUBLIC.
+- **Login roles.** Per-person and per-agent login roles are members of these groups.
+  They are deployment facts, not migrations.
 
 ---
 
@@ -35,33 +131,51 @@ fields on enrichment.
 | `currency` | TEXT | Default `USD`. |
 | `country` | TEXT | |
 | `cik` / `isin` / `cusip` | TEXT | External identifiers (nullable). Populated from the vendor profile, so a security never profiled carries none. A lookup key for `duk ph cik:51143` / `duk ls cusip:459200101`, matched on a normalised form (zero-padding, case and grouping ignored) and indexed as such by migration 0023. Not unique: one CIK covers every share class of an issuer. |
-| `is_actively_trading` | BOOLEAN | False for delisted/inactive. The vendor's view, copied by the nightly load: it is not evidence that a listed security stopped trading (FMP called ET inactive the week it moved to TXSE), so the nightly universes also poll a listed row with a bar in the last 30 days (ADR 0014). |
-| `is_etf` / `is_fund` | BOOLEAN | |
+| `is_actively_trading` | BOOLEAN NOT NULL | Default TRUE. False for delisted/inactive. The vendor's view, copied by the nightly load: it is not evidence that a listed security stopped trading (FMP called ET inactive the week it moved to TXSE), so the nightly universes also poll a listed row with a bar in the last 30 days (ADR 0014). |
+| `is_etf` / `is_fund` | BOOLEAN NOT NULL | The vendor's flags (default FALSE), independent of `asset_type`. **Every fund is stored `asset_type = 'equity'` with `is_fund = true`** (5,657 rows on 2026-10-31; none carries `asset_type = 'fund'`). The price loader treats a security as NAV-priced when `asset_type = 'fund'`, or `is_fund` and `asset_type <> 'etf'` (`daily_price._is_nav_priced`). It then reads a bar with no volume as a NAV strike: a closed-end fund with real volume is still a session. |
 | `ipo_date` | DATE | |
+| `market_cap_usd` | NUMERIC(24,2) | The vendor's market-cap snapshot: FMP's `company-screener`, refreshed by each FMP security-master load (moved here from `core.company_profile` by migration 0010), and frozen since the cutover for the securities Sharadar feeds. **Not history**: never use it in a backtest. `mart.v_security_attributes` derives its own where SF1 holds the shares (#109). |
+| `beta` | NUMERIC(12,6) | The vendor's beta, from the same snapshot and with the same caveats. `mart.v_security_attributes` derives its own from a year of returns. |
 | `venue_override` / `venue_override_left` | TEXT | An operator-recorded venue (`fafnir security venue-transfer`, migration 0027), and the venue the security left. While set, the nightly upsert keeps `exchange_code` and `is_actively_trading` as they are, until the vendor reports a venue other than `venue_override_left`; then both clear. ADR 0014. |
 | `delisted_date` | DATE | NULL while listed; set (never deleted) on delist. |
-| `source` | TEXT | The party that **minted** the security, not the one that feeds it now ([ADR 0015](adr/0015-multi-vendor-provenance-and-precedence.md)). Values: `fmp` (default), `operator`, and, from the Sharadar work on, `sharadar` and `tiingo`. The FMP loaders feed `source = 'fmp'` rows and nothing else: their universes filter on it, and a per-symbol pull that resolves to any other row is refused, because FMP serves that ticker for a different issuer. `operator` is a security minted by `fafnir security split-history` to hold one issuer's history split off a reused ticker: delisted, carrying a closed `symbol_xref` period, fed by nobody. `sharadar` is a dead issuer minted by `fafnir vendor mint-delisted` (#71, ADR 0016 §3): delisted, `is_actively_trading` false, the vendor's ticker as `primary_symbol`, a closed `symbol_xref` period (`source = 'sharadar'`) per ticker it traded under, and a `minted`, feeding link to its permaticker. It holds no bars until the Sharadar backfill (#75). |
-| `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. |
+| `source` | TEXT | The party that **minted** the security, not the one that feeds it now ([ADR 0015](adr/0015-multi-vendor-provenance-and-precedence.md)). Values: `fmp` (default), `operator` and `sharadar` (`tiingo` is reserved and unused). The FMP loaders feed `source = 'fmp'` rows and nothing else: their universes filter on it, and a per-symbol pull that resolves to any other row is refused, because FMP serves that ticker for a different issuer. `operator` is a security minted by `fafnir security split-history` to hold one issuer's history split off a reused ticker: delisted, carrying a closed `symbol_xref` period, fed by nobody. `sharadar` is a dead issuer minted by `fafnir vendor mint-delisted` (#71, ADR 0016 §3): delisted, `is_actively_trading` false, the vendor's ticker as `primary_symbol`, a closed `symbol_xref` period (`source = 'sharadar'`) per ticker it traded under, and a `minted`, feeding link to its permaticker. Its bars come from the Sharadar backfill (#75). Since the cutover `ingest sharadar-universe` also mints new listings as `sharadar` rows: active, with an open ticker period (#93). |
+| `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. The nightly FMP load stamps `updated_at` on every row the screener still lists, so it is the record of what the screener returned (the screener payload is not kept in landing). |
 
 Soft natural key: `UNIQUE (source, primary_symbol) WHERE delisted_date IS NULL`
-makes the security upsert idempotent without keying on the ticker globally. Scoped
-to *listed* rows (0009) so a reused ticker mints a new `security_id` instead of
-overwriting a dead issuer. The **exchange is deliberately not part of it** (0012):
-it is an attribute of the listing, not the company, so a venue transfer
-(NYSE → NASDAQ) updates the security that already holds the history rather than
-forking it into a second row.
+(`ux_security_active_source_symbol`) makes the security upsert idempotent without
+keying on the ticker globally. Scoped to *listed* rows (0009) so a reused ticker mints
+a new `security_id` instead of overwriting a dead issuer. The **exchange is
+deliberately not part of it** (0012): it is an attribute of the listing, not the
+company, so a venue transfer (NYSE → NASDAQ) updates the security that already holds
+the history rather than forking it into a second row.
+
+**Constraints and indexes.**
+- `asset_type` is CHECKed to `equity`, `etf`, `fund` and `other`.
+- Foreign keys: `exchange_code` and `venue_override` → `ref.exchange`, `sector_id` →
+  `ref.sector`, `industry_id` → `ref.industry`.
+- `source` has no CHECK.
+- Indexes: `primary_symbol`; `(primary_symbol, delisted_date)` for delisted rows;
+  `is_actively_trading`; `first_seen_at DESC`; and the normalised `cik`, `isin` and
+  `cusip` (0023).
+
+**On 2026-10-31:** 33,889 rows. By minter: 21,850 `fmp`, 11,981 `sharadar` and 58
+`operator`. 16,344 are delisted and 15,821 actively trading. 25,294 are `equity`,
+8,592 `etf` and 3 `other`. 11 hold a venue override.
 
 ### `core.symbol_xref` — ticker history / cross-reference
-**Grain:** `(symbol, valid_from)`. **Source:** derived. **Cadence:** on security loads.
+**Grain:** `(symbol, valid_from)`, the primary key. **Source:** derived by the
+security-master loads, renames, minting and `security split-history`. **Cadence:** on
+security loads.
 
 | Column | Type | Notes |
 |---|---|---|
-| `security_id` | BIGINT → core.security | |
-| `symbol` | TEXT | External ticker. |
-| `valid_from` | DATE | Start of validity (default `1900-01-01`). |
-| `valid_to` | DATE | NULL = currently valid. |
-| `is_primary` | BOOLEAN | The security's primary ticker in the interval. |
-| `source` | TEXT | |
+| `security_id` | BIGINT NOT NULL → core.security | Indexed. |
+| `symbol` | TEXT NOT NULL | External ticker. |
+| `valid_from` | DATE NOT NULL | Start of validity (default `1900-01-01`). |
+| `valid_to` | DATE | NULL = currently valid. `CHECK (valid_to IS NULL OR valid_to >= valid_from)`. |
+| `is_primary` | BOOLEAN NOT NULL | Default TRUE. The security's primary ticker in the interval. |
+| `source` | TEXT NOT NULL | Who wrote the period: `fmp` (default), `sharadar` (a minted dead issuer's tickers, a Sharadar rename or listing) or `operator` (`security split-history`). |
+| `created_at` | TIMESTAMPTZ NOT NULL | When the row was written. |
 
 Resolves a ticker to a `security_id` at any point in time (handles renames/relists).
 A rename closes the old ticker's period the day *before* the change and opens a new
@@ -92,8 +206,11 @@ FMP `symbol-change` (`source = 'fmp'`) and, since the cutover, Sharadar's rename
 | `company_name` | TEXT | As reported with the rename. |
 | `status` | TEXT CHECK | `applied` / `conflict` / `ignored` / `dismissed` — see below. |
 | `detail` | JSONB | Context: the `folded_security_id` of an absorbed duplicate, the `merged_security_id` of one merged by hand, or `dismissed_by` / `dismissed_note` / `dismissed_at`. A `conflict` refused because it would change the instrument carries that as `reason`. An applied rename records `old_company_name`, the security's name before the rename overwrote it: the security-master load declines a screener entry for the old ticker under that name (or the security's current name, or `company_name` above) as an echo instead of minting a copy of the company. `echo_names` lists further names it declines on that ticker: each one recorded by `security merge` from a re-minted echo it folded back in. |
-| `source` | TEXT | |
+| `source` | TEXT NOT NULL | `fmp` (default) or `sharadar`. Part of the natural key (`ux_symbol_change_natural`), so the two vendors' records of one rename are two rows. |
 | `first_seen_at` / `updated_at` | TIMESTAMPTZ | |
+
+Indexed on `old_symbol`, on `new_symbol`, and on `change_date DESC` where the status is
+not `applied` (the sweep's retry list).
 
 - `applied` — carried onto an existing `security_id` (terminal; never downgraded).
 - `conflict` — the new ticker already belongs to another **listed** security that
@@ -117,24 +234,23 @@ FMP `symbol-change` (`source = 'fmp'`) and, since the cutover, Sharadar's rename
 Renames of tickers fafnir does not track are counted but not stored — the feed is
 global across every venue.
 
-### `core.company_profile` — descriptive attributes (current snapshot)
-**Grain:** one row per `security_id`. **Source:** FMP `profile`. **Cadence:** on
-enrichment. History is retained in `landing.fmp_raw`.
+### `core.company_profile` — long-form description
+**Grain:** one row per `security_id`. **Source:** FMP `profile`. **Cadence:** only when
+`fafnir ingest securities --enrich` runs (one request per symbol, so it is optional).
+Every profile payload is kept in `landing.fmp_raw`.
 
 | Column | Type | Notes |
 |---|---|---|
 | `security_id` | BIGINT PK → core.security | |
-| `description` | TEXT | |
-| `ceo` | TEXT | |
-| `full_time_employees` | BIGINT | |
-| `website` | TEXT | |
-| `beta` | NUMERIC(12,6) | |
-| `market_cap_usd` | NUMERIC(24,2) | USD. |
-| `last_dividend` | NUMERIC(20,6) | Per share. |
-| `price_range` | TEXT | 52-week range string from FMP. |
-| `image_url` | TEXT | |
-| `loaded_at` | TIMESTAMPTZ | |
-| `source` | TEXT | |
+| `description` | TEXT | The vendor's company description, as sent: third-party text. |
+| `loaded_at` | TIMESTAMPTZ NOT NULL | When the description was loaded; `mart.v_security_profile` exposes it as `description_loaded_at`. |
+| `source` | TEXT NOT NULL | `fmp` (default; every row on 2026-10-31). |
+
+Migration 0010 trimmed this table to the description. It moved `market_cap_usd` and
+`beta` to `core.security`, where the screener supplies them on every load, and dropped
+`ceo`, `full_time_employees`, `website`, `last_dividend`, `price_range` and
+`image_url`. Those fields survive only in the `profile` payloads in landing. 20,565
+rows on 2026-10-31.
 
 ### `core.daily_price` — raw daily OHLCV  ⟵ primary fact
 **Grain:** `(security_id, trade_date)`. **Source:** since the cutover (2026-10-22),
@@ -144,32 +260,48 @@ still feeds and for the history it loaded. `.../full` is already split-adjusted 
 must not be used here; see [adr/0004](adr/0004-unadjusted-price-feed.md).
 **Units:** price NUMERIC(20,6) in the security's currency; volume shares (BIGINT).
 **Adjustment status:** **RAW (unadjusted).** **Cadence:** daily; immutable once the
-day closes. Range-partitioned by `trade_date` (yearly).
+day closes.
+
+**Partitions.** Range-partitioned by `trade_date`, one partition a year:
+`core.daily_price_y1990` … `core.daily_price_y2028`. `fafnir db` maintenance
+(`ensure_horizon`) creates the next years' partitions and calendar ahead of time.
+`core.daily_price_default` catches any date outside them: on 2026-10-31 it held two
+FMP bars dated 1989-12-28 and 1989-12-29 (security 4864). The only index is the
+primary key `(security_id, trade_date)`, created on every partition. A query that does
+not bound `trade_date` or name a `security_id` touches all 40 partitions. The table
+held about 99 million bars on 2026-10-31.
 
 Because these are the prices as traded, the series contains split-sized jumps. That
 is correct: a 4:1 split shows a ~75% drop with no gap in the data.
 
-**NAV-priced securities** (`asset_type = 'fund'`) share this table and this grain. A
-fund is struck once a day and does not trade, so its bar carries
-`open = high = low = close = NAV` and `volume = 0`. That is the whole truth about the
-day, not three missing fields: the price loader expands a NAV-only payload for a
-fund and still quarantines one for an equity. Distributions back-adjust through
+**NAV-priced securities** share this table and this grain: `asset_type = 'fund'`, or
+`is_fund` on anything but an ETF (see `core.security.is_fund`). A fund is struck once
+a day and does not trade, so its bar carries `open = high = low = close = NAV` and
+`volume = 0`. That is the whole truth about the day, not three missing fields: the
+price loader expands a NAV-only payload for a NAV-priced security and still
+quarantines one for an equity. Distributions back-adjust through
 `core.adjustment_factor` exactly as cash dividends do, so `mart.v_daily_price_adjusted`
 returns a total-return NAV series with no special case.
 
 | Column | Type | Notes |
 |---|---|---|
-| `security_id` | BIGINT → core.security | |
-| `trade_date` | DATE | Exchange trading day. |
-| `open` `high` `low` `close` | NUMERIC(20,6) | **Raw** prices. |
-| `volume` | BIGINT | **Raw** volume (shares), in the share count of the day it traded. Taken from `unadjustedVolume` where the payload offers it, else `volume`. |
+| `security_id` | BIGINT NOT NULL → core.security | |
+| `trade_date` | DATE NOT NULL | Exchange trading day. |
+| `open` `high` `low` `close` | NUMERIC(20,6) NOT NULL | **Raw** prices. Six decimal places: a price that rounds to zero at that scale is quarantined (`price_subresolution_price`), as is one too large for it (`price_price_out_of_range`). |
+| `volume` | BIGINT NOT NULL | Default 0. **Raw** volume (shares), in the share count of the day it traded. Taken from `unadjustedVolume` where the payload offers it, else `volume`. |
 | `vwap` | NUMERIC(20,6) | Volume-weighted average price (nullable). |
 | `source` | TEXT | Who supplied the bar (a `sharadar` bar is **vendor-derived raw**: recovered from SEP/SFP's `closeunadj` and the ACTIONS split product by `fafnir ingest sharadar-prices`, #75 and ADR 0004's amendment): `fmp`, `sharadar`, `tiingo`, or `operator` for a vendor bar an operator re-dated or re-scaled with `fafnir prices shift` / `rescale` (see `ops.operator_override`, migration 0026). Writes follow ADR 0015 precedence (`operator > sharadar > tiingo > fmp`): a vendor revises its own bars and leaves every other party's alone; a higher-ranked vendor replaces a lower one's bar only in an explicit correction, which keeps the replaced bar in `ops.vendor_correction` (0029). No vendor overwrites an `operator` bar: a vendor bar on its date is set aside. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | Lineage. NULL on an `operator` bar; the vendor bar it replaced, with its run, is kept in the override's `detail.row`. |
-| `loaded_at` | TIMESTAMPTZ | |
+| `loaded_at` | TIMESTAMPTZ NOT NULL | |
 
-Constraints reject impossible bars: `high>=low,open,close`; `low<=open,close`;
-`volume>=0`; all prices `>0`.
+Constraints reject impossible bars (`ck_daily_price_*`): `high>=low,open,close`;
+`low<=open,close`; `volume>=0`; all prices `>0`. A bar that fails them never reaches
+the table: the loader quarantines it as a `price_*` flag instead.
+
+**Who wrote the bars.** The planner's statistics on 2026-10-31 show `fmp`,
+`sharadar` and `operator` bars in every yearly partition from 1997 on, and `fmp` and
+`operator` only in 1990–1996. The universe is survivorship-complete only from
+1998-01-01 (ADR 0016; `mart.v_security_lifecycle.survivorship_complete_from`).
 
 ### `core.corporate_action` — splits & cash dividends
 **Grain:** `(security_id, action_type, ex_date)`. **Source:** Sharadar's ACTIONS for
@@ -182,16 +314,21 @@ happened (ADR 0007).
 | Column | Type | Notes |
 |---|---|---|
 | `corporate_action_id` | BIGINT IDENTITY PK | |
-| `security_id` | BIGINT → core.security | |
-| `action_type` | TEXT CHECK | `split` or `dividend`. |
-| `ex_date` | DATE | Ex-date (the adjustment boundary). |
+| `security_id` | BIGINT NOT NULL → core.security | |
+| `action_type` | TEXT NOT NULL CHECK | `split` or `dividend`. |
+| `ex_date` | DATE NOT NULL | Ex-date (the adjustment boundary). |
 | `record_date` `payment_date` `declaration_date` | DATE | Dividend dates (nullable). |
-| `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. |
-| `dividend_amount` | NUMERIC(20,6) | Cash per share. |
-| `currency` | TEXT | |
+| `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. Both `> 0` on a split (`ck_corp_action_split`). |
+| `dividend_amount` | NUMERIC(20,6) | Cash per share. NOT NULL and `>= 0` on a dividend (`ck_corp_action_dividend`). |
+| `currency` | TEXT NOT NULL | Default `USD`. |
 | `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
+
+Unique on `(security_id, action_type, ex_date)`, so a security holds at most one split
+and one dividend per ex-date; also indexed on `(security_id, ex_date)`. On 2026-10-31:
+912,080 dividends (815,947 `fmp`, 95,840 `sharadar`, 293 `operator`) and 18,580 splits
+(13,609 `fmp`, 4,927 `sharadar`, 44 `operator`).
 
 ### `core.adjustment_factor` — derived back-adjustment factors
 **Grain:** `(security_id, effective_date)`. **Source:** derived from
@@ -200,20 +337,26 @@ actions load. Deterministic and point-in-time stable.
 
 | Column | Type | Notes |
 |---|---|---|
-| `security_id` | BIGINT → core.security | |
-| `effective_date` | DATE | An ex-date boundary. |
-| `cumulative_price_factor` | NUMERIC | Multiply RAW price by this for `trade_date < effective_date`. |
-| `cumulative_volume_factor` | NUMERIC | Multiply RAW volume by this for `trade_date < effective_date`. Moves inversely to the price factor. |
-| `computed_at` | TIMESTAMPTZ | |
+| `security_id` | BIGINT NOT NULL → core.security | Primary key `(security_id, effective_date)`. |
+| `effective_date` | DATE NOT NULL | An ex-date boundary. |
+| `cumulative_price_factor` | NUMERIC NOT NULL | Default 1.0. Multiply RAW price by this for `trade_date < effective_date`. Unconstrained scale (0013); `> 0` (`ck_adj_factor_positive`). |
+| `cumulative_volume_factor` | NUMERIC NOT NULL | Default 1.0. Multiply RAW volume by this for `trade_date < effective_date`. Moves inversely to the price factor. `> 0`. |
+| `computed_at` | TIMESTAMPTZ NOT NULL | |
+
+A bar reads the factor of the **first boundary after its date**. A bar on or after
+the latest ex-date has no factor row and reads 1.0 (`mart.v_daily_price_adjusted`).
 
 ---
 
 ### Vendor identity (migration 0031, ADR 0015)
 
-A vendor's view of a security lives beside `core.security`, never in it. These
-tables arrive empty. The Sharadar master and events load from TICKERS and ACTIONS
+A vendor's view of a security lives beside `core.security`, never in it. Migrations
+0031 and 0032 create these tables empty. The Sharadar master and events load from TICKERS and ACTIONS
 (#58). Links come from the linking engine (#62), manual review (#63) and minting
-(#71). `fafnir_read` and `fafnir_ops` read them; no mart view exposes them yet (#79).
+(#71). `fafnir_read` and `fafnir_ops` read them. No mart view exposes them directly:
+`mart.v_security_lifecycle` reads the events, and `core.v_security_classification`
+the master's sectors. The `vendor` column is CHECKed to `fmp`, `sharadar` and `tiingo`
+on all four tables. On 2026-10-31 every row is `sharadar`.
 
 #### `core.vendor_security` — a vendor's own security master. **Grain:** `(vendor, vendor_table, vendor_key)`.
 
@@ -248,19 +391,22 @@ tables arrive empty. The Sharadar master and events load from TICKERS and ACTION
   row the vendor stops sending stays.
 
 Measured on the 2026-10-19 full file: 74,420 rows, 61,146 loaded, 13,274 investors
-skipped.
+skipped. On 2026-10-31 the table held 21,025 `stocks`, 17,877 `fundamentals`, 12,270
+`insiders` and 10,037 `funds` rows. Indexed on `(vendor, ticker)`.
 
-**Cadence:** each full TICKERS file the bulk download records. A nightly delta is
-not built yet.
+**Cadence:** nightly in Sharadar mode. `fafnir ingest sharadar` downloads TICKERS and
+ACTIONS whole each night (step 1) and loads them here (step 3,
+[ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98)). TICKERS has
+no delta: the whole file is under 0.1 GB with ACTIONS.
 
 #### `core.security_vendor_xref` — fafnir's security ↔ a vendor's key, over time. **Grain:** `(vendor, vendor_key, valid_from)`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `security_id` | BIGINT FK → core.security | |
-| `vendor` / `vendor_key` | TEXT | |
+| `security_id` | BIGINT NOT NULL FK → core.security | Indexed. |
+| `vendor` / `vendor_key` | TEXT NOT NULL | |
 | `valid_from` / `valid_to` | DATE | Open = `valid_to IS NULL`; `valid_to ≥ valid_from`. |
-| `is_feed` | BOOLEAN | This vendor loads the security's new rows (ADR 0015 §2). Only on an open link. |
+| `is_feed` | BOOLEAN NOT NULL | Default FALSE. This vendor loads the security's new rows (ADR 0015 §2). Only on an open link (`ck_svx_feed_open`). |
 | `match_method` | TEXT CHECK | `minted` (#71); `ticker_span_price`, written by `fafnir vendor link` (#62): a shared ticker over overlapping spans, confirmed by ≥ 4 of 5 sampled raw closes (`evidence.basis = price_history`) or by the latest of them (`latest_price`, FMP's history being wrong); `identifier` (a shared CUSIP/FIGI/CIK alone; `fafnir vendor link` writes it when no sample decides and one candidate shares a CIK or CUSIP); `manual`, written by `fafnir vendor link accept` (#63) with `created_by` the person and `confidence` NULL. |
 | `confidence` | NUMERIC(4,3) | 0–1. |
 | `evidence` | JSONB | What the match rests on, so a link can be reviewed without re-running the matcher. For `fafnir vendor link`'s links: `basis` (`price_history`, `latest_price`, `identifier`), `samples` (date, `fmp`, `sharadar`), `agreed` of `of`, `ticker`, `matched_on`, `identifier`, `name_similarity`, the `others` considered and the `run_id`. Vendor data: never posted. |
@@ -279,7 +425,12 @@ When a security goes away:
 - **`security split-history --undo`** keeps a destination that holds links instead of
   deleting it.
 
-**Cadence:** written by #62, #63 and #71.
+**Cadence:** written by #62, #63 and #71, and by `ingest sharadar-universe` when it
+mints a new listing.
+
+On 2026-10-31 there were 27,549 Sharadar links: 15,368 `ticker_span_price`, 11,981
+`minted`, 198 `identifier` and 1 `manual`. All but one are open and feeding; the
+exception is a closed `ticker_span_price` link.
 
 #### `core.security_vendor_rejection` — "this security is not that key" (0032, #63). **Grain:** `(security_id, vendor, vendor_key)`.
 
@@ -289,6 +440,8 @@ When a security goes away:
 | `vendor` / `vendor_key` | TEXT | |
 | `rejected_by` / `rejected_at` / `note` | | Who, when and why; `rejected_by` and `note` may not be blank. |
 | `evidence` | JSONB | The link the rejection closed, if any. |
+
+Indexed on `(vendor, vendor_key)`. Empty on 2026-10-31.
 
 **Population:**
 - **Written by** `fafnir vendor link reject`. Rejecting again restates the note
@@ -302,13 +455,24 @@ would answer "who was this key on date D" wrongly.
 
 #### `core.vendor_security_event` — a vendor's lifecycle events. **Grain:** `(vendor, vendor_key, event_date, action, contra_ticker)`.
 
-`vendor`, `vendor_key`, `event_date`, `action` (ACTIONS other than splits and
-dividends: `listed`, `delisted`, `tickerchangefrom`/`to`, `acquisitionby`,
-`mergerfrom`, `relation`, …), `ticker`, `value` (as given: a price, a deal value in
-millions, or NULL), `contra_ticker`, `contra_name`, `contra_vendor_key` (when it
-resolves), `ingestion_run_id`, `loaded_at`. The grain is a unique index with
-`COALESCE(contra_ticker, '')`, since most events have no contra party. ACTIONS rows
-carry only a ticker, so #58 resolves each to its permaticker through TICKERS
+| Column | Type | Notes |
+|---|---|---|
+| `vendor` | TEXT NOT NULL CHECK | `sharadar`, `tiingo`, `fmp`. |
+| `vendor_key` | TEXT NOT NULL | The permaticker the row's ticker resolved to. |
+| `event_date` | DATE NOT NULL | ACTIONS' `date`. Indexed. |
+| `action` | TEXT NOT NULL | ACTIONS other than splits and dividends: `listed`, `delisted`, `tickerchangefrom`/`to`, `acquisitionby`, `mergerfrom`/`to`, `relation`, `initiated`, `spinoff`, … (54 distinct on 2026-10-31). |
+| `ticker` | TEXT | The ticker as the row gave it. |
+| `value` | NUMERIC | As given: a price, a deal value in millions, or NULL. |
+| `contra_ticker`, `contra_name` | TEXT | The other party, as the vendor spells it. |
+| `contra_vendor_key` | TEXT | The other party's permaticker, when it resolves. |
+| `ingestion_run_id` | BIGINT → ops.ingestion_run | |
+| `loaded_at` | TIMESTAMPTZ NOT NULL | |
+
+The table has **no primary key and no foreign key to `core.security`**: it is keyed by
+the vendor's identity, and reaches a fafnir security only through
+`core.security_vendor_xref`. The grain is the unique index `ux_vendor_security_event`,
+with `COALESCE(contra_ticker, '')`, since most events have no contra party. ACTIONS
+rows carry only a ticker, so #58 resolves each to its permaticker through TICKERS
 before writing here. Splits and dividends go to `core.corporate_action` (#73).
 
 **Population (`fafnir ingest sharadar-master`, #58).**
@@ -333,7 +497,8 @@ Loading both files took 12.5 s; a re-run took 7.6 s and wrote nothing.
 
 Statements from Sharadar SF1, one table per statement, written by `fafnir ingest
 fundamentals` (#90; [ingestion.md](ingestion.md#statements-from-sf1-90)). The
-backfill on the host is #92. **Adjustment status: as reported, in the share terms of
+backfill on the host (#92) ran on 2026-10-26 and 2026-10-27. The nightly delta has
+run since 2026-10-28 (`ops.ingestion_run` endpoint `fundamentals:nightly`). **Adjustment status: as reported, in the share terms of
 `known_from`.** No column is split-adjusted to today, and no per-share value is
 stored (ADR 0019). The design is
 [plans/fundamentals-sf1.md](plans/fundamentals-sf1.md) §4.
@@ -367,8 +532,29 @@ Every table shares these columns, then its line items, then `content_hash`,
 | `loaded_at` / `superseded_at` | TIMESTAMPTZ | The load timeline. `superseded_at` is set when a vendor correction replaced the row, which keeps its knowledge interval. |
 | `reported_currency` | TEXT | TICKERS' `currency`, per security. |
 | `content_hash` | TEXT CHECK | SHA-256 (64 hex) over the typed values and `filing_date`; share counts at 1,000-share precision, so a split's re-expression is no change. The loader also leaves a row whose share counts moved by no more than a recovery's rounding (1,000 shares, or a millionth). |
-| `extra` | JSONB | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions; `unmapped`: any column SF1 adds later), once per SF1 row, on `core.income_statement`, its numbers exactly as SF1 wrote them. `{}` on the other two tables. **Never read by mart.** Measured at about 965 bytes a row, about 1.35 GB at full scale. |
+| `extra` | JSONB NOT NULL | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions; `unmapped`: any column SF1 adds later), once per SF1 row, on `core.income_statement`, its numbers exactly as SF1 wrote them. `{}` on the other two tables. **Never read by mart.** Measured at about 965 bytes a row, about 1.35 GB at full scale; `core.income_statement` was 1.96 GB with its indexes on 2026-10-31. |
+| `source` | TEXT NOT NULL CHECK | Always `sharadar` (`ck_*_source`). |
 | `ingestion_run_id` | BIGINT FK | The load. |
+
+**CHECK constraints** (named `ck_inc_*`, `ck_bal_*`, `ck_cfs_*`), the same on all three
+tables:
+
+| Constraint | Rule |
+|---|---|
+| `_period_type`, `_fiscal_period`, `_period_label` | `period_type` is `annual` or `quarter`; `fiscal_period` is `FY` or `Q1`–`Q4`; `annual` ⇔ `FY`. |
+| `_knowledge_source` | `filed`, `observed` or `estimated`. |
+| `_filed` | `filed` ⇔ `filing_date IS NOT NULL`, and a `filed` row has `known_from = filing_date`. |
+| `_known_after_period` | `known_from >= fiscal_date`: the look-ahead tripwire. |
+| `_known_range` | `known_to IS NULL OR known_to > known_from`. |
+| `_restatement_observed` | `version_no = 1 OR knowledge_source = 'observed'`. |
+| `_version` | `version_no >= 1`. |
+| `_period_start` | `period_start_date IS NULL OR period_start_date < fiscal_date`. |
+| `_superseded` | `superseded_at IS NULL OR superseded_at >= loaded_at`. |
+| `_content_hash` | 64 lowercase hex digits. |
+| `_source` | `source = 'sharadar'`. |
+
+Rows on 2026-10-31: about 1.29M income statements, 1.04M balance sheets and 1.22M cash
+flows (planner estimates).
 
 **Line items:** 19 on the income statement, 26 on the balance sheet, 13 on the cash
 flow. Money is `NUMERIC(24,2)`; share counts (`weighted_average_shares`,
@@ -382,6 +568,86 @@ and sign are in `ref.statement_line_item`. Two conventions are SF1's own:
   non-current splits of a balance sheet that is not classified.
 - **No minority interest in the balance sheet.** `total_equity_parent` excludes
   noncontrolling interest, and there is no balance item for it.
+
+The line items, in column order, as `ref.statement_line_item` states them. **Sign** is
+`sign_convention`: *inflow* = `positive_is_inflow`, *outflow* = `positive_is_outflow`.
+**Σ** marks a subtotal (`is_subtotal`). **FMP** is the FMP field of the same meaning,
+kept for cross-vendor checks; fafnir loads no FMP statements.
+
+**`core.income_statement`** (19):
+
+| Column | SF1 | FMP | Class | Sign | Σ | Meaning |
+|---|---|---|---|---|---|---|
+| `revenue` | `revenue` | `revenue` | flow | inflow | | Revenue for the period |
+| `cost_of_revenue` | `cor` | `costOfRevenue` | flow | outflow | | Cost of the goods and services sold |
+| `gross_profit` | `gp` | `grossProfit` | flow | signed | Σ | Revenue less cost of revenue |
+| `research_and_development` | `rnd` | `researchAndDevelopmentExpenses` | flow | outflow | | R&D expense; 0 when the filing does not carry it |
+| `selling_general_and_administrative` | `sgna` | `sellingGeneralAndAdministrativeExpenses` | flow | outflow | | SG&A expense |
+| `operating_expenses` | `opex` | `operatingExpenses` | flow | outflow | Σ | SG&A, R&D and other operating costs |
+| `operating_income` | `opinc` | `operatingIncome` | flow | signed | Σ | Operating income |
+| `interest_expense` | `intexp` | `interestExpense` | flow | outflow | | Interest expense; 0 when the filing does not carry it |
+| `ebit` | `ebit` | `ebit` | flow | signed | Σ | Net income + tax + interest |
+| `income_before_tax` | `ebt` | `incomeBeforeTax` | flow | signed | Σ | Net income + tax |
+| `income_tax_expense` | `taxexp` | `incomeTaxExpense` | flow | outflow | | Income tax; a benefit is negative |
+| `consolidated_income` | `consolinc` | — | flow | signed | Σ | After tax, before noncontrolling interest |
+| `net_income_noncontrolling` | `netincnci` | — | flow | signed | | Attributable to noncontrolling interests |
+| `net_income_discontinued` | `netincdis` | `netIncomeFromDiscontinuedOperations` | flow | signed | | From discontinued operations |
+| `net_income` | `netinc` | `netIncome` | flow | signed | Σ | Attributable to the parent |
+| `preferred_dividends` | `prefdivis` | — | flow | outflow | | Preferred dividends charged against net income |
+| `net_income_common` | `netinccmn` | — | flow | signed | Σ | Available to common shareholders: EPS's numerator |
+| `weighted_average_shares` | `shareswa` | `weightedAverageShsOut` | share_count | signed | | Basic, in the version's share terms |
+| `weighted_average_shares_diluted` | `shareswadil` | `weightedAverageShsOutDil` | share_count | signed | | Diluted, in the version's share terms |
+
+**`core.balance_sheet`** (26). Every item is `signed`. The current and non-current
+splits are NULL on a balance sheet that is not classified.
+
+| Column | SF1 | FMP | Class | Σ | Meaning |
+|---|---|---|---|---|---|
+| `cash_and_equivalents` | `cashneq` | `cashAndCashEquivalents` | stock | | Cash and cash equivalents |
+| `investments_current` | `investmentsc` | `shortTermInvestments` | stock | | Current investments |
+| `investments_noncurrent` | `investmentsnc` | `longTermInvestments` | stock | | Non-current investments |
+| `investments_total` | `investments` | `totalInvestments` | stock | Σ | Current and non-current |
+| `receivables` | `receivables` | `netReceivables` | stock | | Trade and non-trade receivables |
+| `inventory` | `inventory` | `inventory` | stock | | Inventory |
+| `tax_assets` | `taxassets` | `taxAssets` | stock | | Tax assets |
+| `total_current_assets` | `assetsc` | `totalCurrentAssets` | stock | Σ | Current assets |
+| `property_plant_equipment_net` | `ppnenet` | `propertyPlantEquipmentNet` | stock | | PP&E, net |
+| `goodwill_and_intangibles` | `intangibles` | `goodwillAndIntangibleAssets` | stock | | Goodwill and intangible assets |
+| `total_noncurrent_assets` | `assetsnc` | `totalNonCurrentAssets` | stock | Σ | Non-current assets |
+| `total_assets` | `assets` | `totalAssets` | stock | Σ | Total assets |
+| `payables` | `payables` | `totalPayables` | stock | | Trade and non-trade payables |
+| `deferred_revenue` | `deferredrev` | `deferredRevenue` | stock | | Deferred revenue |
+| `deposit_liabilities` | `deposits` | — | stock | | Deposit liabilities (banks) |
+| `debt_current` | `debtc` | `shortTermDebt` | stock | | Current debt |
+| `debt_noncurrent` | `debtnc` | `longTermDebt` | stock | | Non-current debt |
+| `total_debt` | `debt` | `totalDebt` | stock | Σ | Current and non-current debt |
+| `tax_liabilities` | `taxliabilities` | — | stock | | Tax liabilities |
+| `total_current_liabilities` | `liabilitiesc` | `totalCurrentLiabilities` | stock | Σ | Current liabilities |
+| `total_noncurrent_liabilities` | `liabilitiesnc` | `totalNonCurrentLiabilities` | stock | Σ | Non-current liabilities |
+| `total_liabilities` | `liabilities` | `totalLiabilities` | stock | Σ | Total liabilities |
+| `accumulated_other_comprehensive_income` | `accoci` | `accumulatedOtherComprehensiveIncomeLoss` | stock | | AOCI (loss) |
+| `retained_earnings` | `retearn` | `retainedEarnings` | stock | | Retained earnings (deficit) |
+| `total_equity_parent` | `equity` | `totalStockholdersEquity` | stock | Σ | Equity attributable to the parent; no noncontrolling interest |
+| `shares_outstanding` | `sharesbas` | — | share_count | | The filing's cover count, in the version's share terms; first-reported rows only |
+
+**`core.cash_flow_statement`** (13). Every item is a `flow`, signed as cash moves
+(`positive_is_inflow`): an outflow is negative.
+
+| Column | SF1 | FMP | Σ | Meaning |
+|---|---|---|---|---|
+| `net_cash_operating` | `ncfo` | `netCashProvidedByOperatingActivities` | Σ | From operating activities |
+| `depreciation_amortization` | `depamor` | `depreciationAndAmortization` | | D&A and accretion, added back |
+| `share_based_compensation` | `sbcomp` | `stockBasedCompensation` | | Added back |
+| `capital_expenditure` | `capex` | `capitalExpenditure` | | Capex; negative as spent |
+| `net_cash_business_acquisitions` | `ncfbus` | `acquisitionsNet` | | Business acquisitions and disposals |
+| `net_cash_investment_acquisitions` | `ncfinv` | — | | Purchases and sales of investments |
+| `net_cash_investing` | `ncfi` | `netCashProvidedByInvestingActivities` | Σ | From investing activities |
+| `net_debt_issuance` | `ncfdebt` | `netDebtIssuance` | | Issuing and repaying debt |
+| `net_equity_issuance` | `ncfcommon` | `netCommonStockIssuance` | | Issuing and repurchasing equity; a buyback is negative |
+| `dividends_paid` | `ncfdiv` | `netDividendsPaid` | | Dividends and other distributions; negative as paid |
+| `net_cash_financing` | `ncff` | `netCashProvidedByFinancingActivities` | Σ | From financing activities |
+| `fx_effect_on_cash` | `ncfx` | `effectOfForexChangesOnCash` | | Effect of exchange rates on cash |
+| `net_change_in_cash` | `ncf` | `netChangeInCash` | Σ | Net change in cash and equivalents |
 
 **Indexes:**
 - `ux_<table>_current`: one current row per version;
@@ -449,8 +715,14 @@ reads `mart.v_security_profile`, which is why resolution reads two views.
 `sector_name` and `industry_name` are the feeding vendor's, as in `security_latest`;
 the columns are unchanged.
 
+Columns: `security_id, symbol` (`primary_symbol`), `company_name, asset_type,
+exchange_code, exchange_name, sector_name, industry_name, currency, country, cik, isin,
+cusip, is_actively_trading, is_etf, is_fund, ipo_date, delisted_date, market_cap_usd,
+beta, source, first_seen_at, updated_at, description, description_loaded_at`.
+
 Adds over `security_latest`: `exchange_name`, `cik`/`isin`/`cusip`, `ipo_date`,
-`delisted_date`, `source`, `first_seen_at`, `updated_at`, `description`. It is also
+`delisted_date`, `source`, `first_seen_at`, `updated_at`, `description` and
+`description_loaded_at` (`core.company_profile.loaded_at`). It has no last bar. It is also
 the relation `duk` resolves `cik:`/`isin:`/`cusip:` arguments against, which is why
 the identifier columns belong on this view and not only on `core.security`. Its
 `market_cap_usd` and `beta` are `core.security`'s: the vendor's company-screener
@@ -692,7 +964,8 @@ clipped or filled.
   not inlined: a filter on `security_id` applies to its result.
 - **Cost, on a synthetic load** of 1,000 securities, 1998–2026, 6.6 million daily bars
   and a third of quarters restated: the full refresh took **45 s** (291,430 rows), and
-  one date about 3 s. Production's is recorded on #92, after the backfill (step 9).
+  one date about 3 s. Production's is recorded on #92, after the backfill (step 9). On
+  2026-10-31 the production panel held about 1.83M rows (1.16 GB).
 
 ### `mart.v_industry_fundamentals` — the panel by sector and industry (VIEW)
 Added by migration 0038 (#101; build prompt §5.4). **Grain:** `(group_level, as_of_date,
@@ -731,10 +1004,16 @@ db refresh-marts`, after the panel (`maintenance.MATVIEWS`).
   ones run concurrently. About 3 s on the synthetic thousand securities.
 
 ### `mart.v_security_dq_open` — open DQ flags per security (VIEW)
-**Grain:** one row per open `dq_flag_id`. **Source:** `ops.data_quality_flag`.
+**Grain:** one row per open `dq_flag_id` that names a security. **Source:**
+`ops.data_quality_flag WHERE resolved_at IS NULL AND security_id IS NOT NULL`.
 
 Columns: `dq_flag_id, security_id, check_name, severity, table_name, record_key,
 detected_at`.
+
+Flags with no security never appear: dorq's cross-sectional `dorq_cohort_*` and
+`fundamentals_unmapped_fields`. Accepted flags never appear either, since an
+accepted flag is resolved. The open queue's total is therefore
+`ops.data_quality_flag`'s, not this view's.
 
 The only relation exposing `ops` outside `fafnir_ingest`, and a deliberately narrow
 one ([ADR 0009](adr/0009-mart-is-the-read-seam.md)). Open flags only; `record_key`
@@ -760,6 +1039,13 @@ contract). Where each comes from:
 | `market_cap_usd` | **derived** where SF1 holds the shares (`mart.v_security_attributes`), else `core.security`'s vendor snapshot |
 | `beta` | **derived** from a year of daily returns on SPY's where there are 120 of them, else `core.security`'s |
 | `last_trade_date`, `last_close`, `last_volume` | the latest raw bar in `core.daily_price` |
+
+`market_cap_usd` is cast to `NUMERIC(24,2)` and `beta` to `NUMERIC(12,6)`, the types
+the contract always had. A derived value is therefore rounded here, unlike in
+`mart.v_security_attributes`. Unique on `security_id` (`ux_security_latest_id`, which
+lets the refresh run concurrently) and indexed on `symbol`. It holds every security,
+delisted ones included (33,889 rows on 2026-10-31); `duk ls` and `screen_securities`
+filter to `is_actively_trading` unless asked not to.
 
 Which values are derived, and as of when, is in `mart.v_security_attributes`.
 
@@ -794,6 +1080,14 @@ of `core.security` is written.
   - **Otherwise:** with fewer than 120 returns, or no SPY in the warehouse, it is
     `core.security.beta`, and `beta_source` names its vendor.
 - **`last_trade_date`, `last_close`, `last_volume`:** the latest raw bar.
+- **Columns, in order:** `security_id, symbol, company_name, asset_type,
+  exchange_code, sector_name, industry_name, attributes_source, currency, country,
+  is_actively_trading, is_etf, is_fund, market_cap_usd` (numeric), `market_cap_source,
+  market_cap_as_of, market_cap_fiscal_date, beta` (double precision), `beta_source,
+  beta_as_of, beta_returns, last_trade_date, last_close, last_volume`.
+- **A guard on beta:** a derived beta whose absolute value is 10⁶ or more is discarded
+  for the vendor's (migration 0039): a slope too steep for `security_latest`'s
+  `NUMERIC(12,6)` comes from a degenerate series, not a beta.
 
 **`mart.fn_security_betas(as_of DATE)`** (FUNCTION, 0039) returns `security_id, beta,
 returns, as_of_date`: the regression of each security's daily adjusted returns over the
@@ -827,10 +1121,27 @@ Added by 0039 (#109); 0040 completes its industry aliases. **Grain:** one row pe
 ## Schema: `ref`
 
 ### `ref.exchange` — **Grain:** `exchange_code`.
-`exchange_code` (PK), `exchange_name`, `country`, `timezone` (IANA), `is_active`,
-`created_at`, `updated_at`. `MUTF` is a pseudo-venue for open-end mutual funds,
-which are struck at NAV and have no trading venue; it is deliberately not one of
-`SCREENER_EXCHANGES`, which is what keeps the delisting sweep away from funds.
+`exchange_code` (PK), `exchange_name`, `country`, `timezone` (IANA, to recover local
+market time from UTC), `is_active` (default TRUE), `created_at`, `updated_at`.
+**Source:** the seed `sql/seeds/0001_exchanges.sql`, plus
+`repository.ensure_exchange` for a venue first met in a payload. That call creates the
+row bare and fills a missing attribute later, never overwriting one.
+
+| Code | Name | Timezone | Calendar rows | Note |
+|---|---|---|---|---|
+| `NASDAQ` | Nasdaq Stock Market | America/New_York | yes | The calendar fallback (below). |
+| `NYSE` | New York Stock Exchange | America/New_York | yes | The panel's month-ends are NYSE's sessions. |
+| `AMEX` | NYSE American | America/New_York | yes | |
+| `BATS` | Cboe BZX Exchange | America/New_York | yes | Seeded over 1990–2028, though BZX opened in 2008. |
+| `OTC` | Over-the-Counter | America/New_York | yes | A pseudo-venue. |
+| `TXSE` | Texas Stock Exchange | America/Chicago | **no** | Seeded after the calendar was. |
+| `CBOE` | (none) | (none) | **no** | Created bare by a security-master load (`ensure_venue`); one of `SCREENER_EXCHANGES`. |
+| `MUTF` | US open-end mutual funds (NAV, no venue) | America/New_York | **no** | Created by `ingest tracked` for a declared fund. See below. |
+
+`MUTF` is a pseudo-venue for open-end mutual funds, which are struck at NAV and have
+no trading venue; it is deliberately not one of `SCREENER_EXCHANGES`, which is what
+keeps the delisting sweep away from funds. A venue with no calendar rows is read with
+NASDAQ's sessions (`daily_price.CALENDAR_FALLBACK_EXCHANGE`).
 
 ### `ref.tracked_symbol` — declared universe. **Grain:** `(source, symbol)`.
 **Source:** the operator (`fafnir track add`). **Cadence:** on demand; read nightly
@@ -845,16 +1156,26 @@ rather than forking. See [ADR 0006](adr/0006-curated-fund-universe.md).
 
 | Column | Type | Notes |
 |---|---|---|
-| `source` | TEXT | Feed the symbol is declared against (default `fmp`). |
-| `symbol` | TEXT | The ticker. Kept in step with `core.security.primary_symbol` — `ingest tracked` follows a rename rather than minting a second security. |
-| `asset_type` | TEXT CHECK | `equity`/`etf`/`fund`/`other`. **Authoritative over the vendor profile**: the price loader reads it to decide whether a NAV-shaped bar is valid. |
+| `source` | TEXT NOT NULL | Feed the symbol is declared against (default `fmp`). |
+| `symbol` | TEXT NOT NULL | The ticker. Kept in step with `core.security.primary_symbol` — `ingest tracked` follows a rename rather than minting a second security. |
+| `asset_type` | TEXT NOT NULL CHECK | `equity`/`etf`/`fund`/`other` (default `fund`). **Authoritative over the vendor profile**: the price loader reads it to decide whether a NAV-shaped bar is valid. |
 | `exchange_code` | TEXT → ref.exchange | Venue to record. `MUTF` for open-end funds. |
 | `note` | TEXT | Why this symbol is tracked — the one thing a hand-inserted `core.security` row could never carry. |
-| `is_tracked` | BOOLEAN | FALSE stops the nightly pulls. It does **not** delist; retiring a security is `mark_delisted`'s job and history is retained either way. |
-| `added_at` / `untracked_at` | TIMESTAMPTZ | Preserved across a re-declaration, so the row still answers "since when". |
+| `is_tracked` | BOOLEAN NOT NULL | FALSE stops the nightly pulls. It does **not** delist; retiring a security is `mark_delisted`'s job and history is retained either way. |
+| `added_at` / `untracked_at` | TIMESTAMPTZ | Preserved across a re-declaration, so the row still answers "since when". `untracked_at` is set exactly when `is_tracked` is false (`ck_tracked_symbol_untracked`). |
 
-### `ref.sector` / `ref.industry` — FMP taxonomy.
-`sector_id`/`industry_id` (IDENTITY PK), `*_name` (UNIQUE), `created_at`.
+Indexed on `symbol` where tracked. On 2026-10-31: seven rows, five tracked (three
+ETFs, two equities); the one fund declared is untracked.
+
+### `ref.sector` / `ref.industry` — the sector and industry names
+`sector_id`/`industry_id` (IDENTITY PK), `*_name` (UNIQUE), `created_at`. FMP's
+vocabulary: a security-master load adds a name the first time it meets one
+(`get_or_create_sector` / `_industry`). Sharadar's names are mapped onto these, never
+added (`core.v_security_classification`; `sharadar_map.map_classification` when
+minting). On 2026-10-31: 11 sectors (Basic Materials, Communication Services,
+Consumer Cyclical, Consumer Defensive, Energy, Financial Services, Healthcare,
+Industrials, Real Estate, Technology, Utilities) and 111 industries. The ids are
+sparse: an identity sequence also advances on a conflicting insert.
 
 ### `ref.statement_line_item` — the fundamentals taxonomy. **Grain:** `(statement, column_name)`.
 **Source:** migration 0035, equal to `fafnir.ingest.fundamentals_map` (a test holds
@@ -873,28 +1194,121 @@ them equal). One row per typed line item of the statement tables:
 `fafnir_app` reads it, as it reads the rest of `ref`.
 
 ### `ref.trading_calendar` — **Grain:** `(exchange_code, trade_date)`.
-Generated US calendar (weekdays minus NYSE holidays). `is_open` BOOLEAN,
-`session_note` (e.g. half-day). Used for gap detection and EOD DATE semantics.
+**Source:** generated by `fafnir.db.seed.seed_calendar` (`fafnir db seed`) for every
+`ref.exchange` row with `country = 'US'` at the time. The nightly `ensure_horizon`
+extends the tail year by year. **Used by** the gap, stale and sparse checks, dorq,
+`dq recheck`, the price loader's session test and the panel's month-ends.
+
+| Column | Type | Notes |
+|---|---|---|
+| `exchange_code` | TEXT NOT NULL → ref.exchange | |
+| `trade_date` | DATE NOT NULL | A weekday. |
+| `is_open` | BOOLEAN NOT NULL | Default TRUE. FALSE only on a known ad hoc closure (below). |
+| `session_note` | TEXT | Unused: NULL on every row. A half-day is an open session. |
+
+**How a closed day is represented.**
+- **Recurring holidays:** by *absence*. The seed inserts open weekdays only, so no
+  weekend and no recurring NYSE holiday has a row. A date with no row is closed
+  inside the calendar's span and *unknown* outside it
+  (`repository.open_sessions`).
+- **Ad hoc closures:** the eleven 1990–2028 days with no annual rule are rows with
+  `is_open = FALSE`, written by migration 0022: 1994-04-27, 2001-09-11 to 09-14,
+  2004-06-11, 2007-01-02, 2012-10-29 and 10-30, 2018-12-05, 2025-01-09. A fresh install
+  seeds after migrating, and the seed skips them (`seed.AD_HOC_CLOSURES`), so there
+  they are absent rather than closed.
+- **Every reader** filters on `is_open`, so the two forms read alike.
+
+On 2026-10-31 the calendar covers AMEX, BATS, NASDAQ, NYSE and OTC, 1990-01-02 to
+2028-12-29: 9,812 open sessions and 11 closed rows each. TXSE, CBOE and MUTF have
+none and fall back to NASDAQ's.
+
+**Known defect:** the seed closes Martin Luther King Jr. Day in 1990–1997, when NYSE
+was open (it first closed for it in 1998). Those eight sessions are missing, so a bar
+on one of them reads as a non-session date.
 
 ---
 
 ## Schema: `ops`
 
 ### `ops.ingestion_run` — lineage. **Grain:** `ingestion_run_id`.
-`source`, `endpoint`, `params` (JSONB), `window_from/to`, `symbols_requested`,
-`rows_inserted/updated/quarantined`, `bytes_downloaded` (vs 50 GB/mo budget),
-`response_hash`, `status` (`started`/`success`/`partial`/`failed`), `error_message`,
-`started_at`, `finished_at`. A long load can write its counts so far to its open run
-(`RunLog.checkpoint`); the Sharadar scans do every minute, with `params.progress`.
-A `started` row with no `finished_at` and no live process was killed outright: its
-counts are as of the last checkpoint.
+One row per load, and per operator command that changes identity. Written through
+`RunLog`; `fafnir_ops` reads it (MCP `ingestion_runs`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `ingestion_run_id` | BIGINT IDENTITY PK | Referenced by every lineage column (`core.daily_price`, `core.corporate_action`, the statements, the vendor tables, `ops.data_quality_flag`, `landing.*`). |
+| `source` | TEXT NOT NULL | `fmp` (default), `sharadar`, `operator` or `dorq`. |
+| `endpoint` | TEXT NOT NULL | What ran (below). |
+| `params` | JSONB NOT NULL | The arguments, and what the run reports about itself: `params.progress` (checkpoints), `params.counts` and `params.through` (the Sharadar nightly), `params.mode` (`corporate-actions`: per-symbol or calendar), `params.by` and `params.changed` (`feed`), `params.skipped` (the master load). |
+| `window_from` / `window_to` | DATE | The date window asked for, where there is one. |
+| `symbols_requested` | INTEGER NOT NULL | |
+| `rows_inserted` / `rows_updated` / `rows_quarantined` | INTEGER NOT NULL | |
+| `bytes_downloaded` | BIGINT NOT NULL | Against FMP's 50 GB/month budget. |
+| `response_hash` | TEXT | |
+| `status` | TEXT NOT NULL CHECK | `started` (default) / `success` / `partial` / `failed`. Indexed where `failed` or `partial`. |
+| `error_message` | TEXT | |
+| `started_at` / `finished_at` | TIMESTAMPTZ | Indexed with `(source, endpoint)`. |
+
+A long load can write its counts so far to its open run (`RunLog.checkpoint`); the
+Sharadar scans do every minute, with `params.progress`. A `started` row with no
+`finished_at` and no live process was killed outright: its counts are as of the last
+checkpoint.
+
+**The vocabulary**, as recorded by 2026-10-31. A command not yet run on a warehouse
+has no rows.
+
+| `source` | `endpoint` | Written by |
+|---|---|---|
+| `fmp` | `stock-list` | `ingest securities` (the screener universe) |
+| `fmp` | `profile` | `ingest securities --enrich`, and `ingest tracked` |
+| `fmp` | `historical-price-eod/non-split-adjusted` | `ingest prices` |
+| `fmp` | `historical-price-eod/full` | the legacy split-adjusted feed, before 2026-08-26 ([ADR 0004](adr/0004-unadjusted-price-feed.md)) |
+| `fmp` | `corporate-actions` | `ingest actions`, in `symbol`, `calendar` or `auto` mode (`params.mode`) |
+| `fmp` | `symbol-change` | `ingest symbol-changes` |
+| `fmp` | `delisted-companies` | `ingest delisted` |
+| `fmp`, `sharadar` | `feed` | `vendor feed`: a security's feed moved to (`source`) that vendor |
+| `sharadar` | `bulk:<table>`, `delta:<table>` | `source sharadar-bulk`, `source sharadar-delta` (`tickers`, `actions`, `stocks`, `funds`, `fundamentals`) |
+| `sharadar` | `master:tickers`, `master:actions` | `ingest sharadar-master` |
+| `sharadar` | `universe` | `ingest sharadar-universe` |
+| `sharadar` | `prices`, `prices:nightly` | `ingest sharadar-prices`, bulk and `--nightly` |
+| `sharadar` | `actions`, `actions:prune` | `ingest sharadar-actions`, and its prune of withdrawn rows |
+| `sharadar` | `fundamentals`, `fundamentals:nightly` | `ingest fundamentals`, `--backfill` and nightly |
+| `sharadar` | `link`, `link:new` | `vendor link`, over everything and over new keys only |
+| `sharadar` | `mint-delisted` | `vendor mint-delisted` |
+| `sharadar` | `correct` | `vendor correct` |
+| `sharadar` | `overlap` | `vendor overlap` |
+| `sharadar` | `prune` | `source sharadar-prune` |
+| `operator` | `security-delist`, `security-relist`, `security-venue-transfer`, `security-descope`, `security-merge-across-vendors` | the `fafnir security` commands of those names |
+| `dorq` | `dq-shadow`, `dq-run` | `dq run --engine dorq`, in shadow or queue mode |
 
 ### `ops.data_quality_flag` — quarantine/anomaly queue. **Grain:** `dq_flag_id`.
-`ingestion_run_id`, `security_id`, `table_name`, `record_key` (JSONB),
-`check_name` (`gap`/`outlier`/`stale`/`price_*`/`split_invalid`/`dorq_*`/...), `severity`
-(`info`/`warn`/`error`), `detail` (JSONB), `detected_at`, `resolved_at`,
-`resolved_by`, `resolution_note`, `accepted_at`/`accepted_by`/`accepted_note` (0024),
-`judgement_basis` (0028).
+
+| Column | Type | Notes |
+|---|---|---|
+| `dq_flag_id` | BIGINT IDENTITY PK | |
+| `ingestion_run_id` | BIGINT → ops.ingestion_run | The load that raised it. NULL on every flag from `dq run`'s SQL checks and from `fafnir adjust`, which open no run. |
+| `security_id` | BIGINT | The security it is about, or NULL for a cross-sectional or vendor-key-only condition. **No foreign key**, so a merge or descope is not blocked; `security merge` retargets a victim's flags. |
+| `table_name` | TEXT | The relation the condition is in (below). NULL for the fundamentals loader's run-level flags. |
+| `record_key` | JSONB | What tells one occurrence from another on the same security and check (below). Part of the open-condition key. |
+| `check_name` | TEXT NOT NULL | Which check (the catalogue below). |
+| `severity` | TEXT NOT NULL CHECK | `info`, `warn` (default) or `error`. |
+| `detail` | JSONB | The check's evidence. Free-form per check, and it can hold a raw exception string (`adjustment_failed`), which is why no mart view exposes it. |
+| `detected_at` | TIMESTAMPTZ NOT NULL | When first seen: re-detection does not write a second row. |
+| `resolved_at` / `resolved_by` / `resolution_note` | | The closure (0017). Provenance only on a closed flag (`ck_dq_flag_resolution_provenance`). |
+| `accepted_at` / `accepted_by` / `accepted_note` | | Set with `dq accept` (0024): the condition is real and permanent. Only on a resolved flag (`ck_dq_flag_accepted_is_resolved`); the checks skip an accepted condition, so it is not re-detected. |
+| `judgement_basis` | TEXT CHECK | `per_flag`, `by_rule` or NULL (0028); only on a resolved flag (`ck_dq_flag_judgement_basis`). |
+
+**Indexes.**
+- `ux_dq_flag_open_condition`: unique on `(check_name, COALESCE(security_id, -1),
+  COALESCE(record_key, '{}'))` where open and not `price_*`.
+- `ix_dq_flag_open_condition`, `ix_dq_flag_accepted_condition`: the write path's
+  look-ups.
+- `ix_dq_flag_open`: `(check_name, detected_at DESC)` where open.
+- `ix_dq_flag_resolved`: `resolved_at DESC` where closed.
+- `ix_dq_flag_security`: `security_id` where set.
+
+**Size.** On 2026-10-31: 1,562,483 rows (1.95 GB), of which 10,988 open and 462,829
+accepted.
 
 `judgement_basis` says how a closure was judged: `per_flag` (`dq accept|resolve
 --per-flag`: this flag's own evidence was looked at), `by_rule` (`--by-rule`: closed as
@@ -967,16 +1381,77 @@ of one ratio within ten sessions; keyed `{"ex_dates": [d1, d2]}`) and
 `tracked_symbol_delisted` (`ingest tracked`: a declared ticker whose identity is a
 delisted security; keyed `{"symbol": ...}`).
 
-### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
-`last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
-whole-endpoint (non per-symbol) mark.
+#### The check catalogue
 
-| Endpoint | `security_id` | `last_loaded_date` means |
-|---|---|---|
-| `historical-price-eod/non-split-adjusted` | the security | bars are loaded through this date |
-| `corporate-actions` | the security | its full action history has been pulled, as of this date |
-| `corporate-actions-calendar` | `0` | the market-wide calendars have been read through this date |
-| `dq-run`, `dq-shadow` (source `dorq`) | `0` | dorq has judged bars through this as-of date, into the queue or the shadow file; the next nightly run reports from five sessions before it, and a re-run for the same date over the same span as that night's run |
+Every `check_name` the code writes, with the relation it names and the shape of its
+`record_key`. **What each one means, how to tell a defect from a market fact, and how
+to close it** are in the DQ playbooks
+([`.claude/skills/fafnir-dba/references/dq-playbooks.md`](../.claude/skills/fafnir-dba/references/dq-playbooks.md)).
+A check marked † had written no row by 2026-10-31.
+
+| `check_name` | Written by | `table_name` | `record_key` |
+|---|---|---|---|
+| `gap`, `outlier` | `dq run` | `core.daily_price` | `trade_date` |
+| `stale` | `dq run` | `core.daily_price` | `last_date` |
+| `sparse_coverage` | `dq run` | `core.daily_price` | `{}`: one per security |
+| `security_duplicate_identity`, `security_missing_classification` | `dq run` | `core.security` | `symbol` |
+| `price_<reason>`: `missing_or_nonnumeric_ohlc`†, `non_positive_price`, `price_out_of_range`†, `subresolution_price`, `cross_field_violation`, `volume_out_of_range`† | `ingest prices`, `ingest sharadar-prices` (a rejected bar) | `core.daily_price` | `symbol`, `date` |
+| `price_scale_collapse`, `price_restatement_conflict`, `price_split_scale_mismatch`† | `ingest prices` | `core.daily_price` | `symbol`, `date` |
+| `split_invalid`†, `dividend_invalid`† | `ingest actions` | `core.corporate_action` | `symbol`, `date` |
+| `corporate_action_drift` | `ingest actions` (the calendar reconciliation) | `core.corporate_action` | `symbol` |
+| `split_duplicate_suspect` | `fafnir adjust` | `core.corporate_action` | `ex_dates` (two) |
+| `dividend_no_prior_close`, `dividend_exceeds_price` | `fafnir adjust` (`ingest sharadar-actions` closes those of a dividend it removes) | `core.adjustment_factor` | `ex_date` |
+| `adjustment_factor_extreme` | `fafnir adjust` | `core.adjustment_factor` | `effective_date` |
+| `adjustment_failed`† | `fafnir adjust` | `core.adjustment_factor` | none; `detail.error` is the exception |
+| `security_company_name_drift`, `security_inactive_but_trading` | `ingest securities`; the second also `ingest sharadar-universe` | `core.security` | `symbol` |
+| `security_market_cap_usd_out_of_range`†, `security_beta_out_of_range`† | `ingest securities` (value stored as NULL) | `core.security` | `symbol` |
+| `security_delisting_contradicted` | `ingest delisted`, `ingest sharadar-universe`; `security venue-transfer` writes and accepts one to record its decision | `core.security` | `symbol`, `delisted_date` |
+| `symbol_change_conflict` | `ingest symbol-changes`, `ingest sharadar-universe` | `core.security` | `old_symbol`, `new_symbol` |
+| `tracked_symbol_delisted`†, `tracked_symbol_unknown_to_source`† | `ingest tracked` | `ref.tracked_symbol` | `symbol` |
+| `vendor_xref_unmatched`, `vendor_xref_ambiguous` | `vendor link` | `core.security_vendor_xref` | `vendor` |
+| `vendor_history_disagrees` | `vendor link` | `core.daily_price` | `vendor`, `vendor_key` |
+| `vendor_history_overlap` | `vendor overlap` | `core.daily_price` | `kind`, `vendor`, `vendor_key` |
+| `sharadar_split_ratio_mismatch` | `ingest sharadar-prices` | `core.daily_price` | `vendor`, `vendor_key` |
+| `fundamentals_duplicate_period`, `fundamentals_filing_before_period`, `fundamentals_missing_period_label`†, `fundamentals_value_out_of_range`† | `ingest fundamentals` (a quarantined SF1 row) | `landing.sharadar_file` | `ticker`, `dimension`, `reportperiod` |
+| `fundamentals_restatement`, `fundamentals_vendor_correction` | `ingest fundamentals`, once per security and run | NULL | `ingestion_run_id` |
+| `fundamentals_estimated_knowledge_date` | `ingest fundamentals` | NULL | `vendor`, `vendor_key` |
+| `fundamentals_unlinked` | `ingest fundamentals` (no security for the permaticker; `security_id` NULL) | `core.security_vendor_xref` | `vendor`, `vendor_key` |
+| `balance_sheet_identity`, `cash_flow_tie` | `dq run` | `core.balance_sheet`, `core.cash_flow_statement` | `period_type`, `fiscal_date`; the rows of 2026-10-28 also carry `version_no` |
+| `cash_balance_tie` | `dq run` | `core.cash_flow_statement`; or `core.balance_sheet`, keyed with `item` too | `period_type`, `fiscal_date` (+ `item`) |
+| `fundamentals_negative_impossible` | `dq run` | `core.income_statement` | `statement`, `period_type`, `fiscal_date`, `version_no` |
+| `fundamentals_suspicious_zero` | `dq run` | the statement's table | `statement`, `period_type`, `fiscal_date` |
+| `fundamentals_implausible_filing_lag` | `dq run` | `core.income_statement` | `period_type`, `fiscal_date`, `version_no` |
+| `fundamentals_gap` | `dq run` | `core.income_statement` | `from`, `to` |
+| `fundamentals_stale` | `dq run` | `core.income_statement` | `latest_fiscal_date` |
+| `fundamentals_ttm_incomplete` | `dq run` | `core.income_statement` | `fiscal_year` |
+| `fundamentals_ytd_suspect` | `dq run` | the statement's table | `fiscal_year`, `item` |
+| `fundamentals_currency_mismatch` | `dq run` | `core.income_statement` | `reported_currency` |
+| `fundamentals_coverage`† | `dq run` | `core.income_statement` | `{}` |
+| `fundamentals_unmapped_fields`† | `dq run` (no security) | `core.income_statement` | `field` |
+| `fundamentals_version_chain`† | `dq run` | the statement's table | the period |
+| `dorq_*` (`dorq_bad_print`, `dorq_scale_shift`, `dorq_stale_feed`, `dorq_cohort_gap`, `dorq_cohort_move`, …)† | `dq run --engine dorq --no-shadow` | `core.daily_price` | `trade_date`; a cohort row also `ratio`, with `security_id` NULL |
+
+dorq has run in shadow mode throughout (`[dq] dorq_shadow = true`), so its findings
+are in `<dorq_shadow_dir>/<as-of>.jsonl` and the queue holds no `dorq_*` row.
+
+### `ops.load_watermark` — incremental marks. **Grain:** `(source, endpoint, security_id)`.
+`source` (TEXT, default `fmp`), `endpoint`, `security_id` (BIGINT, default 0),
+`last_loaded_date`, `last_run_at`, `updated_at`. `security_id = 0` denotes a
+whole-endpoint (non per-symbol) mark. No foreign key: `security merge` deletes a
+victim's marks.
+
+| `source` | Endpoint | `security_id` | `last_loaded_date` means |
+|---|---|---|---|
+| `fmp` | `historical-price-eod/non-split-adjusted` | the security | bars are loaded through this date |
+| `fmp` | `corporate-actions` | the security | its full action history has been pulled, as of this date |
+| `fmp` | `corporate-actions-calendar` | `0` | the market-wide calendars have been read through this date |
+| `sharadar` | `SEP`, `SFP` | the security | Sharadar's equity (`stocks`) or fund (`funds`) bars are applied through this date (`ingest sharadar-prices`) |
+| `sharadar` | `SF1:ARQ`, `SF1:ARY`, `SF1:MRQ`, `SF1:MRY` | the security | the latest `reportperiod` applied from that SF1 dimension (`ingest fundamentals`): as-reported (`AR*`) or most-recent (`MR*`), quarterly or annual |
+| `dorq` | `dq-run`, `dq-shadow` | `0` | dorq has judged bars through this as-of date, into the queue or the shadow file; the next nightly run reports from five sessions before it, and a re-run for the same date over the same span as that night's run |
+
+On 2026-10-31: 21,705 FMP price marks and 15,914 FMP action marks, which stopped
+advancing at the cutover for what Sharadar feeds. Sharadar had 15,751 `SEP`, 7,966
+`SFP` and about 16,400–17,100 marks per SF1 dimension. dorq had only `dq-shadow`.
 
 The `corporate-actions` row is a presence flag as much as a date: its *absence* is what
 puts a newly minted security on the full-history path, so it is stamped with the run
@@ -1002,8 +1477,15 @@ and `fafnir security split-history`; undone by `fafnir override revoke`
 | `revoked_at` / `revoked_by` / `revoked_note` | | Set by `override revoke`. Revoking a `delete` lifts the suppression only; revoking an `add` removes the operator's row. A bar shift or rescale is revoked whole: any of its overrides revokes every one of the `edit`, removes the operator bars and writes the vendor bars back from `detail.row`. A bar shift or rescale undone this way also puts back any corporate action a `--with-actions` shift re-dated. A key carrying a `split` marker is refused: revoking it alone would lift the suppression while the destination kept its copy, so a split is reversed whole by `security split-history --undo`. |
 
 At most one active override per `(security_id, target, action_type, key_date,
-operation)`: a `delete` and an `add` may share a key, which is how a wrong vendor row
-is replaced by a corrected one.
+operation)` (`ux_operator_override_active`): a `delete` and an `add` may share a key,
+which is how a wrong vendor row is replaced by a corrected one. Indexed on
+`security_id`.
+
+On 2026-10-31: 342,685 overrides.
+- **Bars:** 233,167 `delete`/`data_error`, 100,936 `add`/`data_error` (the shift and
+  rescale transforms), 4,403 `delete`/`out_of_scope` and 388 `delete`/`cleanup`.
+- **Actions:** 702 `delete`/`data_error`, 2,748 `delete`/`cleanup` and 341
+  `add`/`data_error`.
 
 ### `ops.vendor_correction` — rows one vendor replaced. **Grain:** `correction_id`.
 Every `core.daily_price` / `core.corporate_action` row a higher-ranked vendor
@@ -1028,7 +1510,10 @@ deleted under that vendor's licence, like `landing.fmp_raw`.
 | `corrected_at` | TIMESTAMPTZ | |
 | `reverted_at` / `reverted_by` / `revert_note` | | Set by `vendor corrections revert`; `reverted_at` and `reverted_by` are set together. |
 
-At most one active correction per `(security_id, target, action_type, key_date)`.
+At most one active correction per `(security_id, target, action_type, key_date)`
+(`ux_vendor_correction_active`); indexed on `security_id`. On 2026-10-31: 704,351
+corrections, every one a `daily_price` bar FMP → Sharadar for `reconcile_divergence`;
+57 of them reverted.
 
 ### `ops.dq_label` — labels a person stated. **Grain:** `label_id`.
 What someone checked and found true about a stretch of one series, or a cohort, for
@@ -1058,9 +1543,26 @@ Changes no data and no flag (migration 0028). Active means `revoked_at IS NULL`.
 ## Schema: `landing`
 
 ### `landing.fmp_raw` — raw immutable payloads. **Grain:** `raw_id`.
-`ingestion_run_id`, `endpoint`, `params` (JSONB), `symbol`, `http_status`,
-`payload` (JSONB), `payload_hash`, `bytes`, `fetched_at`. Ground truth for any
-field whose meaning is later questioned.
+Ground truth for any field whose meaning is later questioned. Kept or deleted under
+FMP's licence.
+
+| Column | Type | Notes |
+|---|---|---|
+| `raw_id` | BIGINT IDENTITY PK | |
+| `ingestion_run_id` | BIGINT → ops.ingestion_run | |
+| `endpoint` | TEXT NOT NULL | FMP's path: `historical-price-eod/non-split-adjusted`, `splits`, `dividends`, `splits-calendar`, `dividends-calendar`, `profile`, `symbol-change`, and from v1.5.0 `delisted-companies`. |
+| `params` | JSONB NOT NULL | The request's query, as sent. |
+| `symbol` | TEXT | NULL for a market-wide endpoint (the calendars, the delisted sweep). |
+| `http_status` | INTEGER | 200 on every row on 2026-10-31. |
+| `payload` | JSONB | The response body, as received. |
+| `payload_hash` | TEXT | Indexed, to find repeated payloads. |
+| `bytes` | BIGINT NOT NULL | |
+| `fetched_at` | TIMESTAMPTZ NOT NULL | Indexed with `(endpoint, symbol)`, newest first. |
+
+**What it does not hold:** `stock-list`/`company-screener`, the security-master
+universe. The screener cannot be audited after the fact; `core.security.updated_at`
+is its trace. 914,989 rows, 6.2 GB, on 2026-10-31 (the largest relation outside
+`core.daily_price`). Nothing new lands for the securities Sharadar feeds.
 
 ### `landing.sharadar_file` — the Sharadar file ledger. **Grain:** `file_id`.
 One row per file downloaded from Sharadar (migration 0030, plan v2). The file is
@@ -1073,7 +1575,7 @@ data. A restore of the database brings the ledger back without the files (see
 | Column | Type | Notes |
 |---|---|---|
 | `file_id` | BIGINT IDENTITY PK | |
-| `vendor_table` | TEXT CHECK | Sharadar's modern name: `stocks` (not `SEP`), `funds`, `fundamentals`, `tickers`, `actions`, … |
+| `vendor_table` | TEXT CHECK | Sharadar's modern name: `stocks` (not `SEP`), `funds` (SFP), `fundamentals` (SF1), `tickers`, `actions`, `daily`, `metrics`, `descriptions`, `events`, `sp500`, `insiders`, `holdings`, `holdings_investor`, `holdings_ticker`. Only the first five have been fetched. |
 | `kind` | TEXT CHECK | `full` (a bulk file, `years=5\|10\|full`) or `delta` (a slice: a date, a `lastupdated` window). |
 | `filters` | JSONB | What was asked for, as sent. |
 | `path` | TEXT CHECK | Relative to `bulk_dir`: `<sha256><suffix>`. Never absolute, never `..`. |
@@ -1082,30 +1584,67 @@ data. A restore of the database brings the ledger back without the files (see
 | `bytes` / `rows` | BIGINT | Size on disk; data rows, NULL until first read. |
 | `columns` | TEXT[] | The CSV header as found, for drift checks against the next file. |
 | `fetched_at` / `ingestion_run_id` | | When, and the run that fetched it. |
-| `status` / `status_at` | TEXT CHECK | The file's lifecycle: `downloaded`, `superseded` (a newer full of the table), `deleted` (gone from disk). Not a loader's progress: several loaders read one file, and each keeps its own record. |
+| `status` / `status_at` | TEXT CHECK | The file's lifecycle: `downloaded` (default), `superseded` (a newer full of the table), `deleted` (gone from disk; `source sharadar-prune`). Not a loader's progress: several loaders read one file, and each keeps its own record. |
+
+Indexed on `(vendor_table, kind, fetched_at DESC)`. On 2026-10-31: 34 rows. The
+current full file of each of `stocks`, `funds`, `fundamentals`, `tickers` and
+`actions`, older fulls `superseded` or `deleted`, and 22 nightly deltas (`stocks`,
+`funds`, `fundamentals`). MCP `sharadar_files` reads it.
 
 ---
 
 ## Schema: `meta`
 
 ### `meta.schema_migration` — migration bookkeeping. **Grain:** `version`.
-`version` (PK), `name`, `checksum` (SHA-256 of the up-migration), `applied_at`.
+`version` (TEXT PK, `0001`…), `name`, `checksum` (SHA-256 of the up-migration),
+`applied_at`. Written by `fafnir db migrate`, removed by `fafnir db rollback`. On
+2026-10-31 it holds 0001–0040, the repository's full set (MCP `schema_state`).
 
 ---
 
-## Source → table map (initial release)
+## Source → table map
 
-| FMP endpoint (stable/) | Target | Grain |
-|---|---|---|
-| `stock-list`, `etf-list` | `core.security`, `core.symbol_xref` | security_id |
-| `profile` | `core.security` (enrich), `core.company_profile` | security_id |
-| `historical-price-eod/non-split-adjusted` | `core.daily_price` | (security_id, trade_date) |
-| `splits` | `core.corporate_action` (split) | (security_id, split, ex_date) |
-| `dividends` | `core.corporate_action` (dividend) | (security_id, dividend, ex_date) |
-| `splits-calendar` | `core.corporate_action` (split) | (security_id, split, ex_date) |
-| `dividends-calendar` | `core.corporate_action` (dividend) | (security_id, dividend, ex_date) |
-| `available-sectors` / `available-industries` | `ref.sector` / `ref.industry` | name |
-| (derived) | `core.adjustment_factor`, `mart.*` | — |
+Since the cutover (2026-10-22) Sharadar is the primary vendor
+(`[general] primary_price_vendor = "sharadar"`). FMP still feeds what Sharadar does
+not: the `source = 'fmp'` securities with no feeding Sharadar link (`repo.fmp_fed`).
+[ingestion.md](ingestion.md) has every command's request, target and natural key.
 
-Fast-follow domains (fundamentals, economic series) are mapped in
+**Sharadar** (files under `[sharadar] bulk_dir`, ledger `landing.sharadar_file`):
+
+| Sharadar table | Command | Target | Grain |
+|---|---|---|---|
+| TICKERS (`tickers`) | `ingest sharadar-master` | `core.vendor_security` | (vendor, vendor_table, vendor_key) |
+| ACTIONS (`actions`), lifecycle events | `ingest sharadar-master` | `core.vendor_security_event` | the event grain |
+| the master's events | `ingest sharadar-universe` | `core.security`, `core.symbol_xref`, `core.symbol_change` | security_id |
+| TICKERS (dead issuers) | `vendor mint-delisted` | `core.security`, `core.symbol_xref`, `core.security_vendor_xref` | security_id |
+| SEP (`stocks`), SFP (`funds`) | `ingest sharadar-prices` | `core.daily_price` (`source = 'sharadar'`, raw recovered) | (security_id, trade_date) |
+| ACTIONS (splits, dividends) | `ingest sharadar-actions` | `core.corporate_action` (`source = 'sharadar'`) | (security_id, action_type, ex_date) |
+| SF1 (`fundamentals`) | `ingest fundamentals` | `core.income_statement`, `core.balance_sheet`, `core.cash_flow_statement` | (security_id, period_type, fiscal_date, version_no, loaded_at) |
+| SEP/SFP against FMP's bars | `vendor link`, `vendor correct` | `core.security_vendor_xref`; `core.daily_price` with `ops.vendor_correction` | — |
+
+**FMP** (`stable/` endpoints; payloads in `landing.fmp_raw`):
+
+| FMP endpoint | Command | Target | Grain |
+|---|---|---|---|
+| `company-screener` (`stock-list` run) | `ingest securities` | `core.security` (incl. `market_cap_usd`, `beta`), `core.symbol_xref`, `ref.sector`, `ref.industry` | security_id |
+| `profile` | `ingest securities --enrich`, `ingest tracked` | `core.security` (identifiers), `core.company_profile` | security_id |
+| `historical-price-eod/non-split-adjusted` | `ingest prices` | `core.daily_price` | (security_id, trade_date) |
+| `splits`, `dividends` (per symbol); `splits-calendar`, `dividends-calendar` | `ingest actions` | `core.corporate_action` | (security_id, action_type, ex_date) |
+| `symbol-change` | `ingest symbol-changes` | `core.symbol_change`, `core.symbol_xref` | (source, old, new, change_date) |
+| `delisted-companies` | `ingest delisted` | `core.security.delisted_date` | security_id |
+
+**Derived and operator-written:**
+
+| Writer | Target |
+|---|---|
+| `fafnir adjust` | `core.adjustment_factor` |
+| `fafnir db refresh-marts` | `mart.security_latest`, `mart.fundamental_panel`, `mart.security_fundamentals_latest` (`maintenance.MATVIEWS`, in that order) |
+| `dq run` (SQL checks, dorq) | `ops.data_quality_flag`; dorq's shadow file and `ops.load_watermark` |
+| `dq resolve\|accept\|reopen\|recheck`, `dq label` | `ops.data_quality_flag`, `ops.dq_label` |
+| `actions add\|delete\|redate`, `prices delete\|shift\|rescale`, `override revoke\|set-reason` | `core.corporate_action` / `core.daily_price` with `ops.operator_override` |
+| `security merge\|split-history\|venue-transfer\|delist\|relist\|descope` | `core.security` and everything keyed on it; an `operator` run in `ops.ingestion_run` |
+| `track add\|rm` | `ref.tracked_symbol` |
+| `vendor link accept\|reject`, `vendor feed` | `core.security_vendor_xref`, `core.security_vendor_rejection` |
+
+Domains not built (economic series and the rest) are sketched in
 [extending.md](extending.md).
