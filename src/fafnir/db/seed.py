@@ -66,10 +66,16 @@ def _observed(d: dt.date) -> dt.date:
     return d
 
 
+#: The first year NYSE closed for Martin Luther King Jr. Day. The federal holiday
+#: dates from 1986, but the exchange traded through it until 1998: 1,247-2,511 bars
+#: a day sit on each of 1990-1997's, and 2 on 1998-01-19. Migration 0041 adds those
+#: eight sessions to calendars generated before this rule.
+MLK_DAY_FIRST_CLOSED = 1998
+
+
 def us_market_holidays(year: int) -> set[dt.date]:
     holidays = {
         _observed(dt.date(year, 1, 1)),  # New Year's Day
-        _nth_weekday(year, 1, 0, 3),  # MLK Day (3rd Mon Jan)
         _nth_weekday(year, 2, 0, 3),  # Washington's Birthday (3rd Mon Feb)
         _easter(year) - dt.timedelta(days=2),  # Good Friday
         _nth_weekday(year, 5, 0, -1),  # Memorial Day (last Mon May)
@@ -78,6 +84,8 @@ def us_market_holidays(year: int) -> set[dt.date]:
         _nth_weekday(year, 11, 3, 4),  # Thanksgiving (4th Thu Nov)
         _observed(dt.date(year, 12, 25)),  # Christmas
     }
+    if year >= MLK_DAY_FIRST_CLOSED:
+        holidays.add(_nth_weekday(year, 1, 0, 3))  # MLK Day (3rd Mon Jan)
     if year >= 2022:
         holidays.add(_observed(dt.date(year, 6, 19)))  # Juneteenth
     return holidays

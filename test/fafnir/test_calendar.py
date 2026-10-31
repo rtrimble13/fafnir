@@ -6,7 +6,21 @@ import datetime as dt
 import re
 from pathlib import Path
 
-from fafnir.db.seed import AD_HOC_CLOSURES, trading_days, us_market_holidays
+from fafnir.db.seed import (
+    AD_HOC_CLOSURES,
+    MLK_DAY_FIRST_CLOSED,
+    trading_days,
+    us_market_holidays,
+)
+
+MIGRATIONS = Path(__file__).resolve().parents[2] / "sql" / "migrations"
+
+
+def _migration_dates(name: str) -> set[dt.date]:
+    sql = (MIGRATIONS / name).read_text()
+    return {
+        dt.date.fromisoformat(m) for m in re.findall(r"DATE '(\d{4}-\d{2}-\d{2})'", sql)
+    }
 
 
 def test_known_holidays_2023():
@@ -76,13 +90,43 @@ def test_ad_hoc_closures_match_the_migration():
     edited, so the list is deliberately written twice. This is what stops the two
     from drifting apart -- add a closure to one and this fails until it is in both.
     """
-    sql = (
-        Path(__file__).resolve().parents[2]
-        / "sql"
-        / "migrations"
-        / "0022_ad_hoc_market_closures.up.sql"
-    ).read_text()
-    in_migration = {
-        dt.date.fromisoformat(m) for m in re.findall(r"DATE '(\d{4}-\d{2}-\d{2})'", sql)
+    assert _migration_dates("0022_ad_hoc_market_closures.up.sql") == set(
+        AD_HOC_CLOSURES
+    )
+
+
+# ---------------------------------------------------------------------------
+# MLK Day before 1998 (0041)
+# ---------------------------------------------------------------------------
+
+
+def _mlk(year: int) -> dt.date:
+    third_monday = 15 + (0 - dt.date(year, 1, 15).weekday()) % 7
+    return dt.date(year, 1, third_monday)
+
+
+def test_mlk_day_is_a_session_until_nyse_first_closed_for_it():
+    """NYSE traded through MLK Day until 1998: the warehouse holds 1,247-2,511 bars
+    on each of 1990-1997's, and 2 on 1998-01-19."""
+    assert MLK_DAY_FIRST_CLOSED == 1998
+    for year in range(1990, 1998):
+        assert _mlk(year) not in us_market_holidays(year)
+        assert _mlk(year) in set(trading_days(year, year))
+    for year in (1998, 1999, 2026):
+        assert _mlk(year) in us_market_holidays(year)
+        assert _mlk(year) not in set(trading_days(year, year))
+    assert _mlk(1997) == dt.date(1997, 1, 20)
+    assert _mlk(1998) == dt.date(1998, 1, 19)
+
+
+def test_mlk_sessions_match_the_migration():
+    """0041 adds the sessions to calendars already generated; the seed's rule
+    governs new ones. As with 0022, the dates are written out in the migration, so
+    this keeps the two in step."""
+    seeded = {
+        _mlk(year)
+        for year in range(1990, MLK_DAY_FIRST_CLOSED)
+        if _mlk(year) in set(trading_days(year, year))
     }
-    assert in_migration == set(AD_HOC_CLOSURES)
+    assert _migration_dates("0041_mlk_day_before_1998.up.sql") == seeded
+    assert _migration_dates("0041_mlk_day_before_1998.down.sql") == seeded

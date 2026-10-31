@@ -1030,6 +1030,21 @@ class DqRunOutcome:
     flagged: dict[str, int]
     shadow_file: Optional[Path] = None
     backfill: Optional[dict] = None
+    #: Set when the run judged nothing because the night was judged already: the
+    #: run that did (``ingestion_run_id``, ``started_at``). See :func:`run`.
+    judged_by: Optional[dict] = None
+
+
+def judged_night(db: Database, endpoint: str, as_of: dt.date) -> Optional[dict]:
+    """The run that already judged ``as_of`` on ``endpoint``, or None.
+
+    A night counts as judged once a run for it succeeded: the watermark only moves
+    on success, so ``watermark == as_of`` says one did, and :func:`night_run`
+    (nightly or ``--full``) names it.
+    """
+    if read_watermark(db, endpoint) != as_of:
+        return None
+    return night_run(db, endpoint, as_of)
 
 
 def run(
@@ -1039,8 +1054,21 @@ def run(
     *,
     shadow: bool,
     full: bool = False,
+    rerun: bool = False,
 ) -> DqRunOutcome:
     """One dorq pass over the warehouse: the nightly window, or ``full`` history.
+
+    **A nightly run judges a night once.** When the market's latest session is a
+    date a run has already judged -- no new session loaded since, because the load
+    failed (2026-10-31: Sharadar's SFP answered 503), it was a holiday, or `dq run`
+    is run again by hand -- it judges nothing, writes nothing and returns with
+    ``judged_by`` set. Re-judging it would replace that night's shadow file with one
+    that also carries the day's repairs, and the next night's `dq compare` would
+    count "new" against it. Nothing is lost by skipping: the next night's history
+    pass starts from the last run that judged a night (:func:`previous_night_start`),
+    so it takes whatever was rewritten in between. ``rerun`` judges the night again
+    over the span that night's run used, replacing its file: the deliberate re-run
+    after a repair. ``full`` always runs.
 
     In shadow mode nothing is written to the queue; the rows go to the shadow file
     for `fafnir dq compare`. Either way the run is recorded in ops.ingestion_run
@@ -1066,6 +1094,24 @@ def run(
     if window.as_of is None:
         logger.info("dorq: no bars on an open session yet; nothing to check")
         return DqRunOutcome(version="", window=window, detected={}, flagged={})
+    if not full and not rerun:
+        judged = judged_night(db, endpoint, window.as_of)
+        if judged is not None:
+            logger.info(
+                "dorq: %s was judged by run %s; no newer session to judge",
+                window.as_of,
+                judged["ingestion_run_id"],
+            )
+            return DqRunOutcome(
+                version="",
+                window=window,
+                detected={},
+                flagged={},
+                judged_by={
+                    "ingestion_run_id": judged["ingestion_run_id"],
+                    "started_at": judged["started_at"],
+                },
+            )
     run_id = start_run(db, window, shadow, full=full)
     db.commit()
     try:

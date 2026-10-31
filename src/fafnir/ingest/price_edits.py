@@ -163,21 +163,6 @@ def weekday_counts(dates: Iterable[date]) -> list[int]:
     return counts
 
 
-def is_calendar_mlk_gap(d: date) -> bool:
-    """Whether ``d`` is Martin Luther King Jr. Day 1990-1997.
-
-    ref.trading_calendar marks those days closed, but NYSE first closed for the
-    holiday in 1998 -- real bars exist on them (BXMT, ALNT, AIRT, PRG, ...). A refusal
-    naming one of these dates is the calendar's error, not the edit's.
-    """
-    return (
-        d.month == 1
-        and d.weekday() == 0
-        and 15 <= d.day <= 21
-        and 1990 <= d.year <= 1997
-    )
-
-
 # ---------------------------------------------------------------------------
 # Planning
 # ---------------------------------------------------------------------------
@@ -398,17 +383,10 @@ def plan_shift(
 
     closed = sorted(dp.non_session_dates(db, exchange, targets))
     if closed:
-        mlk = [d for d in closed if is_calendar_mlk_gap(d)]
         text = (
             f"{len(closed)} bar(s) would be dated on a day the venue's calendar has no "
             f"session: {_listed([_day(d) for d in closed])}."
         )
-        if mlk:
-            text += (
-                f" {len(mlk)} of them are Martin Luther King Jr. Day 1990-1997, which "
-                "ref.trading_calendar marks closed although NYSE first closed for it "
-                "in 1998 -- those are the calendar's error, not the shift's."
-            )
         if allow_non_session:
             plan.notes.append(text + " Allowed by --allow-non-session.")
         else:

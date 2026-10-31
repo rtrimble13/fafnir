@@ -306,8 +306,8 @@ gaps), then `db refresh-marts`.
 - **The newest bar of an ETF FMP restates** (XNDX, MILK, MSEP, NODE): FMP serves a
   provisional last bar, sometimes at the wrong scale, and restates it the next night.
   Recheck tomorrow; never delete a newest bar on the first night.
-- **Bars on MLK Day 1990–1997.** `ref.trading_calendar` marks them closed; NYSE was
-  open until 1998. They are real bars.
+- **Bars on MLK Day 1990–1997.** NYSE was open until 1998. They are real bars;
+  before migration 0041 the calendar marked them closed (data-semantics.md §16).
 
 ### 2k. Dead Sharadar histories: the moves that end a company's life (#76)
 

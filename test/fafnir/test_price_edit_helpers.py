@@ -128,7 +128,7 @@ def test_rescale_accepts_a_flat_bar_shrunk_to_the_smallest_price():
 
 
 # ---------------------------------------------------------------------------
-# shift_row, weekday_counts, is_calendar_mlk_gap
+# shift_row, weekday_counts
 # ---------------------------------------------------------------------------
 def test_shift_moves_the_date_and_nothing_else():
     old = _row(d="2024-06-02")
@@ -153,21 +153,6 @@ def test_weekday_counts_shows_the_one_day_early_shape():
         0,
         0,
     ]
-
-
-@pytest.mark.parametrize(
-    "d, expected",
-    [
-        (date(1994, 1, 17), True),
-        (date(1990, 1, 15), True),
-        (date(1997, 1, 20), True),
-        (date(1998, 1, 19), False),  # NYSE's first MLK closure: the calendar is right
-        (date(1994, 1, 18), False),
-        (date(1994, 1, 10), False),
-    ],
-)
-def test_the_calendars_mlk_gap_is_recognised(d, expected):
-    assert pe.is_calendar_mlk_gap(d) is expected
 
 
 # ---------------------------------------------------------------------------

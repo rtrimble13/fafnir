@@ -557,6 +557,39 @@ def test_cli_engine_both_runs_sql_and_dorq(db, fake_dorq, tmp_path, monkeypatch)
 
 
 @pytest.mark.integration
+def test_cli_says_a_judged_night_is_skipped_and_still_runs_the_sql_checks(
+    db, fake_dorq, tmp_path, monkeypatch
+):
+    sid = _mk(db, "DQSKP")
+    days = _sessions(db)
+    _walk(db, sid, days[:40])
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(
+        f'[database]\ndsn = "{db.dsn}"\n'
+        f'[dq]\ndorq_path = "{fake_dorq}"\ndorq_shadow_dir = "{tmp_path / "sh"}"\n'
+    )
+    monkeypatch.delenv("FAFNIR_DSN", raising=False)
+    monkeypatch.delenv("FAFNIR_DORQ_PATH", raising=False)
+    runner = CliRunner()
+    args = ["--config", str(rc), "dq", "run", "--engine", "both"]
+    assert runner.invoke(cli.main, args).exit_code == 0
+
+    again = runner.invoke(cli.main, args)
+    assert again.exit_code == 0, again.output
+    assert "DQ flags written:" in again.output
+    assert f"dorq: {days[39].isoformat()} was judged by run" in again.output
+    assert "--rerun" in again.output
+
+    rerun = runner.invoke(cli.main, args + ["--rerun"])
+    assert rerun.exit_code == 0, rerun.output
+    assert "written to the shadow file" in rerun.output
+
+    both = runner.invoke(cli.main, args + ["--rerun", "--full"])
+    assert both.exit_code == 2
+    assert "--full always runs" in both.output
+
+
+@pytest.mark.integration
 def test_status_reports_the_dorq_version(db, fake_dorq, tmp_path, monkeypatch):
     rc = tmp_path / "fafnirrc"
     rc.write_text(
@@ -863,7 +896,7 @@ def test_a_second_run_for_the_same_night_judges_the_same_window(
     assert first.window.since == days[290 - dorq.SINCE_OVERLAP_SESSIONS]
     night = first.shadow_file.read_bytes()
 
-    again = dorq.run(db, settings, "NASDAQ", shadow=True)
+    again = dorq.run(db, settings, "NASDAQ", shadow=True, rerun=True)
     assert again.window == first.window
     assert again.shadow_file == first.shadow_file
     assert again.shadow_file.read_bytes() == night
@@ -882,7 +915,8 @@ def test_a_rerun_of_the_first_night_reports_the_whole_lookback_again(
     _, _, settings = _night(db, fake_dorq, tmp_path)
     first = dorq.run(db, settings, "NASDAQ", shadow=True)
     assert first.window.since is None
-    assert dorq.run(db, settings, "NASDAQ", shadow=True).window == first.window
+    again = dorq.run(db, settings, "NASDAQ", shadow=True, rerun=True)
+    assert again.window == first.window
 
 
 @pytest.mark.integration
@@ -891,7 +925,8 @@ def test_the_queue_run_reproduces_its_own_night(db, fake_dorq, tmp_path):
     dorq.write_watermark(db, dorq.WATERMARK_QUEUE, days[290])
     first = dorq.run(db, settings, "NASDAQ", shadow=False)
     assert first.window.since == days[290 - dorq.SINCE_OVERLAP_SESSIONS]
-    assert dorq.run(db, settings, "NASDAQ", shadow=False).window == first.window
+    again = dorq.run(db, settings, "NASDAQ", shadow=False, rerun=True)
+    assert again.window == first.window
     # The shadow has had no night of its own.
     assert dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW).since is None
 
@@ -912,6 +947,78 @@ def test_a_full_run_does_not_set_a_nightly_reruns_window(db, fake_dorq, tmp_path
     assert dorq.nightly_window(db, "NASDAQ", 260, dorq.WATERMARK_SHADOW) == (
         nightly.window
     )
+
+
+@pytest.mark.integration
+def test_a_night_already_judged_is_not_judged_again(db, fake_dorq, tmp_path):
+    """2026-10-31: Sharadar's SFP delta answered 503, the load stopped with no new
+    session, and fafnir-dq still ran. dorq re-judged 10-29, replaced that night's
+    file with one carrying the day's repairs, and its history pass doubled.
+
+    Without --rerun a night is judged once: no run row, no file written, no
+    watermark moved, no call to dorq. The SQL checks are the CLI's, not this."""
+    _, days, settings = _night(db, fake_dorq, tmp_path)
+    dorq.write_watermark(db, dorq.WATERMARK_SHADOW, days[290])
+    first = dorq.run(db, settings, "NASDAQ", shadow=True)
+    night = first.shadow_file.read_bytes()
+    runs = db.fetchval("SELECT count(*) FROM ops.ingestion_run WHERE source = 'dorq'")
+    calls = (fake_dorq.parent / "calls.txt").read_text().splitlines()
+
+    _emit(fake_dorq, [])  # a re-run would now write an empty file
+    again = dorq.run(db, settings, "NASDAQ", shadow=True)
+
+    run_id = db.fetchval(
+        "SELECT max(ingestion_run_id) FROM ops.ingestion_run WHERE source = 'dorq'"
+    )
+    assert again.judged_by["ingestion_run_id"] == run_id
+    assert again.shadow_file is None and again.detected == {}
+    assert first.shadow_file.read_bytes() == night
+    assert (
+        db.fetchval("SELECT count(*) FROM ops.ingestion_run WHERE source = 'dorq'")
+        == runs
+    )
+    assert dorq.read_watermark(db, dorq.WATERMARK_SHADOW) == days[299]
+    assert (fake_dorq.parent / "calls.txt").read_text().splitlines() == calls
+
+    # --rerun judges it again, over the span that night's run used.
+    rerun = dorq.run(db, settings, "NASDAQ", shadow=True, rerun=True)
+    assert rerun.judged_by is None and rerun.window == first.window
+    assert dorq.read_shadow(first.shadow_file) == []
+
+
+@pytest.mark.integration
+def test_a_skipped_night_leaves_nothing_out_of_the_next_nights_pass(
+    db, fake_dorq, tmp_path, monkeypatch
+):
+    """The skip costs nothing: a security minted after the judged night, while the
+    next run had no session to judge, is in the following night's history pass,
+    which is measured from the last run that judged a night."""
+    old, new, days, settings = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
+    # The judged night is days[299]. Take days[300] away for a moment, as a failed
+    # load would, so the next run has nothing newer.
+    db.execute("DELETE FROM core.daily_price WHERE trade_date = %s", (days[300],))
+    skipped = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert skipped.judged_by is not None
+
+    _walk(db, old, days[:301])
+    _walk(db, new, days[:301], seed=3, bad={days[100]: 3.0})
+    out = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert out.judged_by is None and out.window.as_of == days[300]
+    assert out.backfill["security_ids"] == [new]
+
+
+@pytest.mark.integration
+def test_a_night_only_a_full_run_judged_is_not_judged_again(db, fake_dorq, tmp_path):
+    """A --full run's file stands for its night too: a nightly on the same date,
+    with nothing new loaded, leaves it in place."""
+    _, days, settings = _night(db, fake_dorq, tmp_path)
+    full = dorq.run(db, settings, "NASDAQ", shadow=True, full=True)
+    whole = full.shadow_file.read_bytes()
+    nightly = dorq.run(db, settings, "NASDAQ", shadow=True)
+    assert nightly.judged_by is not None
+    assert full.shadow_file.read_bytes() == whole
+    # --full itself always runs.
+    assert dorq.run(db, settings, "NASDAQ", shadow=True, full=True).judged_by is None
 
 
 @pytest.mark.integration
@@ -1025,7 +1132,7 @@ def test_a_rerun_of_the_night_keeps_the_pass(db, fake_dorq, tmp_path, monkeypatc
     _, new, _, settings = _backfill_world(db, fake_dorq, tmp_path, monkeypatch)
     first = dorq.run(db, settings, "NASDAQ", shadow=True)
     night = first.shadow_file.read_bytes()
-    again = dorq.run(db, settings, "NASDAQ", shadow=True)
+    again = dorq.run(db, settings, "NASDAQ", shadow=True, rerun=True)
     assert again.backfill["security_ids"] == [new]
     assert again.shadow_file.read_bytes() == night
 

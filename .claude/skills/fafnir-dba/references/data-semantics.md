@@ -211,14 +211,17 @@ is smooth and both series are wrong.
 > **Wrong answer:** "the adjusted series is smooth, so the split is real." Check the
 > price levels against what the instrument could have traded at.
 
-## 16. The trading calendar is wrong for MLK Day 1990–1997
+## 16. MLK Day 1990–1997 is a session (migration 0041)
 
-`ref.trading_calendar` marks Martin Luther King Jr. Day closed from 1990, but NYSE
-first closed for it in 1998. Real bars exist on those dates (BXMT, ALNT, AIRT, PRG,
-ASRV, ARWR, UEIC).
+NYSE first closed for Martin Luther King Jr. Day in 1998. Until migration 0041 the
+calendar closed it from 1990, so real bars on those eight Mondays (BXMT, ALNT, AIRT,
+PRG, ASRV, ARWR, UEIC: 14,183 of them) read as non-session, and both price loaders
+dropped them from any history loaded since the set-aside existed. Check
+`meta.schema_migration` for 0041 before reasoning about those dates.
 
-> **Wrong answer:** treating those bars as non-session prints to delete. The
-> loader's non-session set-aside also drops them on any backfill.
+> **Wrong answer:** treating those bars as non-session prints to delete. And after
+> 0041, a `gap` on one of those dates is usually a bar a loader dropped: re-fetch it
+> (`ingest sharadar-prices --backfill` for a Sharadar-fed row), don't accept it.
 
 ## 17. Some ETFs' newest bar is provisional
 
