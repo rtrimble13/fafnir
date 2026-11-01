@@ -103,6 +103,8 @@ duk ca AAPL --exact --json                # splits and dividends as stored
 duk tc NYSE -s 2024-12-20 -e 2024-12-31   # a venue's sessions
 duk fs AAPL --as-of 2015-06-30            # a statement as known on a date
 duk fa AAPL                               # the security's factor row
+duk mc AAPL TSM -s 2024-01-01             # daily market cap, and the shares behind it
+duk ph AAPL --adj --close --mcap -f month # an index's inputs: returns and weights
 duk -S fmp ph AAPL                        # the same series straight from a vendor
 duk -S sharadar ph AAPL
 duk ti sma -i prices.csv -c close -w 20   # pure compute, source-agnostic
@@ -131,14 +133,15 @@ from that window load the same night.
 
 `duk` keeps its full command surface (`ph`, `yc`, `ls`, `rc`, `ti`, `fs`, `fa`),
 reads the warehouse's ticker history, corporate actions and trading calendar
-(`th`, `ca`, `tc`), and adds a global `--source/-S`:
+(`th`, `ca`, `tc`) and daily market cap (`mc`, `ph --mcap`: derived on read, for
+custom index construction), and adds a global `--source/-S`:
 
 - `-S db` (**the default**): reads the fafnir warehouse. Without a DSN configured,
   `duk` says so and names the vendor flags rather than silently reading a vendor.
 - `-S fmp`: reads the FMP API directly (`-S live` is the older spelling and still
   works).
-- `-S sharadar`: reads Sharadar's price tables directly (`ph` only; needs
-  `SHARADAR_API_KEY`).
+- `-S sharadar`: reads Sharadar's price tables directly (`ph`, and DAILY's market
+  cap for `mc` / `ph --mcap`; needs `SHARADAR_API_KEY`).
 
 On a terminal every command prints a bordered, aligned table, with thousands
 separators and a dash for a missing value; in a pipe or a redirect it prints the

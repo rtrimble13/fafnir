@@ -355,6 +355,114 @@ def price_history(
     )
 
 
+#: The most securities one market_cap_history call reads: an index's constituents,
+#: not the universe.
+MAX_MARKET_CAP_SYMBOLS = 1000
+
+
+def market_cap_history(
+    *,
+    dsn: str,
+    symbols: list[str] | str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """Daily market cap for one or more securities -- ``duk mc --exact``'s rows.
+
+    Derived on read (migration 0042, ADR 0019 §5): the raw close x the shares of the
+    latest balance sheet in force that day, in that day's share terms, x SF1's
+    share factor. Numbers are exact decimal strings (:func:`jsonable`). A day with
+    no count in force is left out, and a security with none at all is named in
+    ``missing``. As in :func:`price_history`, ``limit`` without an ``end_date``
+    counts back from the securities' last bar, not from today.
+    """
+    from duk import identifiers
+    from duk.datasource.db import market_cap_rows, resolve_symbols
+
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    wanted = list(dict.fromkeys(_require_symbol(s) for s in (symbols or [])))
+    if not wanted:
+        raise ToolError("symbols is required: one or more tickers or identifiers")
+    if len(wanted) > MAX_MARKET_CAP_SYMBOLS:
+        raise ToolError(
+            f"at most {MAX_MARKET_CAP_SYMBOLS} symbols per call, got {len(wanted)}"
+        )
+    start = _parse_date(start_date, "start_date")
+    end = _parse_date(end_date, "end_date")
+    if start and end and start > end:
+        raise ToolError(f"start_date {start} is after end_date {end}")
+    requested = clamp_limit(limit, DEFAULT_MAX_ROWS) if limit is not None else None
+
+    # Tickers on one connection (a constituent list is hundreds); an identifier
+    # through _resolve_named, which explains an ambiguous or unknown one.
+    tickers = []
+    for s in wanted:
+        try:
+            if identifiers.parse(s).is_ticker:
+                tickers.append(s)
+        except identifiers.IdentifierError as exc:
+            raise ToolError(str(exc)) from None
+    try:
+        by_ticker = resolve_symbols(dsn=dsn, symbols=tickers) if tickers else {}
+    except Exception as exc:  # noqa: BLE001
+        raise connection_error(exc, dsn) from None
+    unknown = [t for t in tickers if by_ticker.get(t) is None]
+    if unknown:
+        raise ToolError(
+            f"no security matches {', '.join(unknown)}. The resolver tries the live "
+            "ticker, then the primary symbol, then a former ticker; use "
+            "resolve_symbol or screen_securities to find one by name."
+        )
+    named: dict[int, str] = {}
+    for s in wanted:
+        name, sid = (s, by_ticker[s]) if s in by_ticker else _resolve_named(dsn, s)
+        named.setdefault(int(sid), name)
+
+    if requested is not None and end is None:
+        anchors = [d for d in (_last_trade_date(dsn, sid) for sid in named) if d]
+        if not anchors:
+            return envelope(
+                [],
+                securities=_named_list(named),
+                missing=list(named.values()),
+                note="the warehouse holds no bars for these securities",
+            )
+        end = max(anchors)
+
+    try:
+        found = market_cap_rows(
+            dsn=dsn,
+            security_ids=list(named),
+            start_date=start.isoformat() if start else None,
+            end_date=end.isoformat() if end else None,
+            limit=requested,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _wrap(exc, dsn) from None
+    rows = [{"symbol": named[int(r["security_id"])], **r} for r in found]
+    held = {int(r["security_id"]) for r in found}
+    return envelope(
+        rows,
+        max_rows=DEFAULT_MAX_ROWS,
+        securities=_named_list(named),
+        missing=[name for sid, name in named.items() if sid not in held],
+        note=(
+            "Market cap = the RAW close x shares_outstanding (the latest balance "
+            "sheet in force that day, filed within two years, in that day's share "
+            "terms) x share_factor (SF1's: an ADR's ratio, a multi-class issuer's "
+            "primary class). In the trading currency; never adjusted. fiscal_date "
+            "and known_from name the balance sheet. A fund, an ETF or a secondary "
+            "share class has none: its issuer's primary class counts every class."
+        ),
+    )
+
+
+def _named_list(named: dict[int, str]) -> list[dict]:
+    return [{"symbol": name, "security_id": sid} for sid, name in named.items()]
+
+
 def screen_securities(
     *,
     dsn: str,

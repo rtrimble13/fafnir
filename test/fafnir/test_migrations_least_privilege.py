@@ -225,6 +225,8 @@ CLIENT_MART_RELATIONS = (
     "mart.v_cash_flow_statement_versions",
     "mart.v_statements_current",
     "mart.v_fundamentals_ttm",
+    # SF1's share factor per income version (0042): the one key of extra mart reads.
+    "mart.v_share_factor_versions",
 )
 
 # The statement functions (0036, #95) and the factor panel's (0037, #100). Not
@@ -238,6 +240,8 @@ STATEMENT_FUNCTIONS = (
     "mart.fn_fundamental_snapshot(current_date)",
     "mart.fn_ratio(1, 2)",
     "mart.fn_growth(2, 1)",
+    # Daily market cap (0042): duk mc, ph --mcap and the MCP tool call it.
+    "mart.fn_daily_market_cap(ARRAY[1]::bigint[], current_date - 30, current_date)",
 )
 
 # What the seam must NOT reach. core.daily_price is the one that matters most: it
@@ -381,7 +385,7 @@ def test_the_statement_functions_are_not_executable_by_public(least_privilege_ds
              WHERE n.nspname = 'mart'
                AND p.proname IN ('fn_statements_as_of', 'fn_fundamentals_ttm',
                                  'fn_fundamental_panel', 'fn_fundamental_snapshot',
-                                 'fn_ratio', 'fn_growth')
+                                 'fn_ratio', 'fn_growth', 'fn_daily_market_cap')
             """)
     assert len(rows) == len(STATEMENT_FUNCTIONS)
     assert all(r["app_can"] and not r["public_can"] for r in rows), rows

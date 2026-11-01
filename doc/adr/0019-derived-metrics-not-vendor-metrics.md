@@ -2,6 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-10-25
+- Amended: 2026-11-01 — [daily market cap, and the share factor](#amendment-2026-11-daily-market-cap-and-the-share-factor)
+  (migration 0042).
 - Implemented by: #87 (`extra`), #95 (TTM), #100 (the factor panel), #101 (industry
   aggregates)
 - Related: [ADR 0001](0001-raw-prices-plus-adjustment-factors.md) (derive on read),
@@ -81,3 +83,67 @@ AAPL's splits since 1990 multiply to 112.
 - **Keep everything in today's share terms, and prices with it.** Rejected: today's terms
   move at every split, so the stored figures and every price beside them would be
   re-expressed again and again. Raw prices are ADR 0001's rule.
+
+## Amendment (2026-11): daily market cap, and the share factor
+
+Market cap is wanted daily, as the weights of custom cap-weighted indexes. Decision 5's
+expression is evaluated on every bar, and one SF1 column is admitted to it.
+
+**Daily, derived on read.** `mart.fn_daily_market_cap(security_ids, start, end)` returns,
+for each raw bar:
+
+- the raw close × `shares_outstanding` of the latest balance sheet in force that day
+  (ended within 730 days), in that day's share terms (decision 3), × the share factor
+  below;
+- the balance sheet the count came from (`fiscal_date`, `known_from`).
+
+Nothing is stored, as ADR 0001 stores no adjusted price. The value on a past day is
+unchanged by anything known later: a restatement is known from the day fafnir observes
+it (ADR 0018), and a later split converts the count on and after its ex-date only. A
+vendor correction or a corrected split changes it, as it should. A materialized table
+was rejected: tens of millions of rows to rebuild whenever a split or a correction
+lands. A computation in duk was rejected too: a third copy of the expression, and
+nothing for SQL or MCP readers. `duk mc`, `duk ph --mcap` and the MCP tool
+`market_cap_history` read the function.
+
+**The share factor is a share-terms conversion, not a vendor metric.** SF1's
+`sharefactor` turns its count into the traded line's:
+
+- an ADR's ratio: TSM's 0.2, five ordinary shares to one ADR;
+- a multi-class issuer's conversion into its primary class: BRK.B's about 1.52.
+
+Sharadar's own `marketcap` is `closeunadj × sharesbas × sharefactor`. Measured on
+2026-10-30, AAPL's DAILY figure is 344.63 × 14,594,180,000 (factor 1). Without the
+factor, TSM's derived cap was five times too high and BRK.B's a third too low. It
+differs from the columns decision 1 excludes:
+
+- it is not measured on a date or a price;
+- the vendor does not recompute it from either;
+- it changes only when the share structure does.
+
+So it is read. It stays in `extra.vendor_metric` (a typed column would change every
+statement's content hash, and so restate every period), and
+`mart.v_share_factor_versions` exposes it on each income version's own timelines.
+
+- **The one key of `extra` that `mart` reads.** It is used where it is a positive
+  number.
+- **Which factor applies.** The same period's income version in force on the day.
+- **Absent is 1.** Where SF1 gives none, the factor is 1: one class, no ADR.
+
+**Coverage, as decision 5 had it.** A cap exists where SF1 holds a count: never for a
+fund, an ETF, or a security Sharadar does not feed. A secondary share class has none of
+its own (ADR 0018 §6). Its issuer's primary class carries a cap counting every class's
+shares, as SF1's does, so an index holding both classes holds the issuer twice. There
+is no float adjustment: SF1 carries no float.
+
+**Consequences.**
+
+- `mart.v_security_attributes` applies the factor (0042). `mart.security_latest` takes
+  it on its next refresh.
+- The factor panel applies it since 0043, to its market cap, EV and every ratio to
+  them. A test holds the panel's month-end cap equal to the daily function's.
+  - **Per-share and issuance measures are in traded units, as the price is.** EPS is
+    net income over weighted shares × the factor. Year-on-year issuance compares
+    count × factor, so a class conversion is not read as issuance.
+  - **`shares_outstanding_as_of` stays SF1's count**, with the factor in a new
+    `share_factor` column.

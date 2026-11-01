@@ -147,9 +147,10 @@ def echo_summary_table(stats, *, title="Summary statistics", precision=4):
     echo_table(rows, title=title, footer=footer, decimals=precision)
 
 
-def bars_footer(count, first, last, *, symbol, adjusted, frequency):
+def bars_footer(count, first, last, *, symbol, adjusted, frequency, market_cap=False):
     """``61 bars · AAPL · raw · day · 2024-01-02 → 2024-03-28``; ``first`` and
-    ``last`` are dates, or None to leave the span out."""
+    ``last`` are dates, or None to leave the span out. Beside adjusted prices, a
+    market cap column is said to be unadjusted: it is a dollar amount."""
     parts = [
         tables.plural(count, "bar"),
         symbol,
@@ -158,10 +159,12 @@ def bars_footer(count, first, last, *, symbol, adjusted, frequency):
     ]
     if first is not None and last is not None:
         parts.append(f"{first.isoformat()} → {last.isoformat()}")
+    if market_cap and adjusted:
+        parts.append("market_cap unadjusted")
     return " · ".join(parts)
 
 
-def bar_footer(frame, *, symbol, adjusted, frequency):
+def bar_footer(frame, *, symbol, adjusted, frequency, market_cap=False):
     """:func:`bars_footer` for a frame with a ``date`` column."""
     dated = "date" in frame.columns and len(frame)
     return bars_footer(
@@ -171,6 +174,7 @@ def bar_footer(frame, *, symbol, adjusted, frequency):
         symbol=symbol,
         adjusted=adjusted,
         frequency=frequency,
+        market_cap=market_cap,
     )
 
 
@@ -459,6 +463,15 @@ def main(ctx, config, source):
 @click.option("--cv", is_flag=True, help="Return Date, Close, Volume fields")
 @click.option("--adj", is_flag=True, help="Retrieve dividend-adjusted price history")
 @click.option(
+    "--mcap",
+    is_flag=True,
+    help=(
+        "Append each bar's market_cap: the raw close x the shares known that day "
+        "(-S db; `duk mc` shows how), or Sharadar's DAILY figure (-S sharadar). "
+        "Never adjusted, even with --adj; the period's last when resampled."
+    ),
+)
+@click.option(
     "--exact",
     is_flag=True,
     help=(
@@ -511,6 +524,7 @@ def ph(
     hlcv,
     cv,
     adj,
+    mcap,
     exact,
     precision,
     output_table,
@@ -525,6 +539,9 @@ def ph(
     SYMBOL: The ticker symbol (e.g., AAPL, MSFT). Case insensitive. A security may
     also be named by identifier -- cik:51143, isin:US4592001014, cusip:459200101 --
     which is resolved to its ticker before anything else happens.
+
+    --mcap appends market_cap to whichever fields are printed: with --adj, the
+    adjusted prices a total return needs and the weights beside them.
     """
     # Get logger from context
     logger = ctx.obj.get("logger", logging.getLogger("duk"))
@@ -564,6 +581,8 @@ def ph(
             raise click.UsageError(
                 "--exact prints every stored digit; --precision does not apply."
             )
+    if mcap and source == "fmp":
+        raise click.UsageError(_FMP_MARKET_CAP_REFUSAL)
     api_key = require_source_credentials(ctx, source)
 
     # An identifier is resolved to ONE security up front, so everything downstream
@@ -617,6 +636,7 @@ def ph(
                 limit=limit,
                 fields=fields,
                 adjusted=adj,
+                market_cap=mcap,
             )
         except Exception as e:
             logger.error(f"Failed to fetch price history: {e}")
@@ -626,6 +646,8 @@ def ph(
             logger.warning(f"No data returned for {symbol}")
             echo_empty(console, f"No data found for {symbol}", quiet=quiet)
             sys.exit(0)
+        if mcap and all(r.get("market_cap") is None for r in rows):
+            _note_no_market_cap(ctx, symbol, security_id)
         logger.info(f"Retrieved {len(rows)} records for {symbol}")
         _print_exact(
             plain_records(rows, exact=True),
@@ -643,6 +665,7 @@ def ph(
                 symbol=symbol,
                 adjusted=adj,
                 frequency="day",
+                market_cap=mcap,
             ),
         )
         return
@@ -660,6 +683,7 @@ def ph(
                 limit=limit,
                 fields=fields,
                 adjusted=adj,
+                market_cap=mcap,
             )
         elif source == "sharadar":
             df = ds_sharadar.price_history(
@@ -672,6 +696,7 @@ def ph(
                 limit=limit,
                 fields=fields,
                 adjusted=adj,
+                market_cap=mcap,
             )
         else:
             df = ds_live.price_history(
@@ -695,10 +720,17 @@ def ph(
         sys.exit(0)
 
     logger.info(f"Retrieved {len(df)} records for {symbol}")
+    if mcap and ("market_cap" not in df.columns or df["market_cap"].isna().all()):
+        _note_no_market_cap(ctx, symbol, security_id)
 
     # Prepare output
     # Reset index to include date as a column in output
     output_df = df.reset_index()
+    if "market_cap" in output_df.columns:
+        # To the cent: a float's tail past it is noise, not information.
+        output_df["market_cap"] = pd.to_numeric(
+            output_df["market_cap"], errors="coerce"
+        ).round(2)
 
     # Display precision is applied at the output boundary only: `df` itself keeps
     # full precision, so the library contract and the db/live parity guarantee are
@@ -758,7 +790,11 @@ def ph(
                 output_df,
                 price_decimals=precision,
                 footer=bar_footer(
-                    output_df, symbol=symbol, adjusted=adj, frequency=frequency
+                    output_df,
+                    symbol=symbol,
+                    adjusted=adj,
+                    frequency=frequency,
+                    market_cap=mcap,
                 ),
             )
         else:
@@ -811,6 +847,433 @@ def _print_exact(
         echo_table(exact_rows, exact=True, footer=footer + " · exact")
     else:
         click.echo(_exact_text(records, file_format).rstrip("\n"))
+
+
+# ---------------------------------------------------------------------------
+# mc: daily market cap (migration 0042, ADR 0019 §5)
+# ---------------------------------------------------------------------------
+
+_FMP_MARKET_CAP_REFUSAL = (
+    "market cap is read from the warehouse (-S db), which derives its own (ADR "
+    "0019), or from Sharadar's DAILY table (-S sharadar) to check it; FMP's is not "
+    "read."
+)
+
+
+def _note_no_market_cap(ctx, symbol, security_id=None):
+    """On stderr: why ``symbol`` has no market cap, and for a secondary share class,
+    which class carries the issuer's. Best effort: a failed lookup never fails the
+    command."""
+    source = ctx.obj.get("source", "db")
+    if source == "sharadar":
+        click.echo(
+            f"Note: Sharadar's DAILY table has no market cap for {symbol}: it covers "
+            "SEP's equities, not ETFs or funds.",
+            err=True,
+        )
+        return
+    issuer = None
+    try:
+        dsn = ctx.obj["config"].dsn
+        if security_id is None:
+            security_id = ds_db.resolve_symbols(dsn=dsn, symbols=[symbol]).get(symbol)
+        if security_id is not None:
+            issuer = ds_db.issuer_class(dsn=dsn, security_id=security_id)
+    except Exception as exc:  # noqa: BLE001 -- a note, never a failure
+        logger = ctx.obj.get("logger", logging.getLogger("duk"))
+        logger.debug(f"Issuer class lookup failed: {exc}")
+    if issuer:
+        click.echo(
+            f"Note: no market cap for {symbol}: SF1 files its issuer's statements "
+            f"under {issuer['symbol']} (CIK {issuer['cik']}), whose market cap counts "
+            f"every class's shares. Read {issuer['symbol']}'s.",
+            err=True,
+        )
+    else:
+        click.echo(
+            f"Note: no market cap for {symbol}: the warehouse derives one only where "
+            "SF1 holds a share count (not for funds, ETFs or securities Sharadar does "
+            "not feed), from the first filing on, while the latest balance sheet "
+            "ended under two years before.",
+            err=True,
+        )
+
+
+def _symbols_from_file(handle):
+    """Tickers or identifiers from ``--symbols-file``: whitespace or commas between
+    them, ``#`` to the end of a line a comment."""
+    out = []
+    for line in handle:
+        for token in line.split("#", 1)[0].replace(",", " ").split():
+            out.append(token)
+    return out
+
+
+def _mc_securities(ctx, arguments):
+    """``[(label, security_id)]`` for `mc`'s arguments in the warehouse: tickers by
+    the ladder in one connection, identifiers one by one (each must name one
+    security). Exits 1 naming every argument that matched nothing; a security
+    named twice (FB and META) is read once, under the first name."""
+    named = [parse_security_argument(argument) for argument in arguments]
+    cfg = ctx.obj["config"]
+    tickers = [i.value for i in named if i.is_ticker]
+    try:
+        by_ticker = (
+            ds_db.resolve_symbols(dsn=cfg.dsn, symbols=tickers) if tickers else {}
+        )
+    except Exception as exc:
+        click.echo(f"Error: Failed to resolve tickers: {exc}", err=True)
+        sys.exit(1)
+    if len(named) == 1 and named[0].is_ticker:
+        hint_reused_ticker(ctx, named[0])
+    out, missing, seen = [], [], set()
+    for identifier in named:
+        if identifier.is_ticker:
+            label, sid = identifier.value, by_ticker.get(identifier.value)
+            if sid is None:
+                missing.append(identifier.value)
+                continue
+        else:
+            label, sid = resolve_security_identifier(ctx, identifier)
+        if sid not in seen:
+            seen.add(sid)
+            out.append((label, int(sid)))
+    if missing:
+        click.echo(
+            f"Error: no security in the warehouse for {', '.join(missing)}.", err=True
+        )
+        sys.exit(1)
+    return out
+
+
+@main.command()
+@click.argument("symbols", metavar="[SYMBOL]...", nargs=-1)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print log output to the console (default: log file only)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress printing to stdout")
+@click.option(
+    "--symbols-file",
+    type=click.File("r"),
+    help="Read more SYMBOLs from a file ('-' for stdin): separated by spaces, commas "
+    "or lines; '#' starts a comment",
+)
+@click.option("-s", "--start-date", help="Start date (YYYY-MM-DD)")
+@click.option("-e", "--end-date", help="End date (YYYY-MM-DD)")
+@click.option(
+    "-n",
+    "--limit",
+    type=int,
+    help="Number of bars per security (periods at --frequency)",
+)
+@click.option(
+    "-f",
+    "--frequency",
+    type=click.Choice(
+        ["day", "week", "month", "quarter", "semi-annual", "annual"],
+        case_sensitive=False,
+    ),
+    default="day",
+    help="Data frequency (default: day): each period's last bar, as `ph` resamples",
+)
+@click.option(
+    "--exact",
+    is_flag=True,
+    help="Print every number as the decimal text the warehouse computes, never "
+    "through a float. Daily, -S db only.",
+)
+@click.option(
+    "-p",
+    "--precision",
+    type=int,
+    default=DEFAULT_DECIMALS,
+    help=f"Decimal places for close_raw (default: {DEFAULT_DECIMALS})",
+)
+@table_option
+@click.option("--csv", "output_csv", is_flag=True, help=CSV_HELP)
+@click.option("--json", "output_json", is_flag=True, help="Output data as JSON")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write to a file (CSV, or JSON with --json). If path is a directory, the "
+    "filename is <symbol>_mcap_<start>_<end>.<ext> (market_cap_... for several)",
+)
+@click.pass_context
+def mc(
+    ctx,
+    symbols,
+    verbose,
+    quiet,
+    symbols_file,
+    start_date,
+    end_date,
+    limit,
+    frequency,
+    exact,
+    precision,
+    output_table,
+    output_csv,
+    output_json,
+    output,
+):
+    """
+    Daily market cap: one security's, or a list's in one read.
+
+    SYMBOL as for `duk ph`: a ticker, an identifier (cik:, isin:, cusip:), sid:,
+    or TICKER@YYYY-MM-DD. Name several, or read them from --symbols-file, for a
+    constituent list: one row per security and day, with its symbol and
+    security_id.
+
+    The warehouse's market cap (-S db) is derived on read (ADR 0019 §5): the raw
+    close x the shares outstanding of the latest balance sheet in force that day
+    (filed within two years), put in that day's share terms with the warehouse's
+    splits, x SF1's share factor (an ADR's ratio; a multi-class issuer's primary
+    class). Each row says where the count came from: fiscal_date and known_from.
+    A day with no count in force is left out. Funds, ETFs and securities Sharadar
+    does not feed have none; a secondary share class (GOOG) has none of its own,
+    because its issuer's (GOOGL's) counts every class.
+
+    -S sharadar reads Sharadar's own figure from its DAILY table, for comparison
+    (date and market_cap only). FMP's is not read.
+    """
+    logger = ctx.obj.get("logger", logging.getLogger("duk"))
+    if verbose:
+        enable_console_logging(logger)
+    source = ctx.obj.get("source", "db")
+    if source == "fmp":
+        raise click.UsageError(_FMP_MARKET_CAP_REFUSAL)
+    arguments = list(symbols) + (
+        _symbols_from_file(symbols_file) if symbols_file else []
+    )
+    arguments = list(dict.fromkeys(arguments))
+    if not arguments:
+        raise click.UsageError("name at least one SYMBOL, or give --symbols-file.")
+    if exact:
+        if source != "db":
+            raise click.UsageError(
+                "--exact prints the warehouse's decimals; a vendor API sends floats. "
+                "Use it with -S db."
+            )
+        if frequency.lower() != "day":
+            raise click.UsageError(
+                f"--exact prints daily bars; resampling to --frequency {frequency} "
+                "is float arithmetic."
+            )
+        if ctx.get_parameter_source("precision") == ParameterSource.COMMANDLINE:
+            raise click.UsageError(
+                "--exact prints every computed digit; --precision does not apply."
+            )
+    console = output_format(ctx, output_table, output_csv, output_json)
+    api_key = require_source_credentials(ctx, source)
+    cfg = ctx.obj["config"]
+
+    if source == "sharadar":
+        securities = []
+        for argument in arguments:
+            identifier = parse_security_argument(argument)
+            if not identifier.is_ticker:
+                resolve_security_identifier(ctx, identifier)  # refuses, and exits
+            securities.append((identifier.value, None))
+    else:
+        securities = _mc_securities(ctx, arguments)
+    several = len(securities) > 1
+    label = securities[0][0] if not several else "market_cap"
+
+    try:
+        if source == "sharadar":
+            frames = []
+            for symbol, _ in securities:
+                one = ds_sharadar.market_cap_history(
+                    api_key=api_key,
+                    base_url=cfg.sharadar_base_url or None,
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=frequency,
+                    limit=limit,
+                )
+                if not one.empty:
+                    one = one.reset_index()
+                    one.insert(1, "symbol", symbol)
+                    frames.append(one)
+            frame = (
+                pd.concat(frames, ignore_index=True)
+                if frames
+                else pd.DataFrame(columns=["date", "symbol", "market_cap"])
+            )
+            if not several:
+                frame = frame.drop(columns=["symbol"])
+            got = set(frame["symbol"]) if several else {label} if len(frame) else set()
+        else:
+            ids = [sid for _, sid in securities]
+            names = {sid: name for name, sid in securities}
+            if exact:
+                rows = ds_db.market_cap_rows(
+                    dsn=cfg.dsn,
+                    security_ids=ids,
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=limit,
+                )
+                got = {names[int(r["security_id"])] for r in rows}
+            else:
+                frame = ds_db.market_cap_history(
+                    dsn=cfg.dsn,
+                    security_ids=ids,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=frequency.lower(),
+                    limit=limit,
+                )
+                got = {names[int(s)] for s in frame["security_id"]}
+    except ds_base.DataSourceError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error(f"Failed to read market cap: {exc}")
+        click.echo(f"Error: Failed to read market cap: {exc}", err=True)
+        sys.exit(1)
+
+    missing = [(name, sid) for name, sid in securities if name not in got]
+    if missing and not quiet:
+        if len(missing) <= 3:
+            for name, sid in missing:
+                _note_no_market_cap(ctx, name, sid)
+        else:
+            click.echo(
+                f"Note: no market cap for {len(missing)} of {len(securities)} "
+                f"securities: {', '.join(n for n, _ in missing)}. Run `duk mc` on "
+                "one of them for why.",
+                err=True,
+            )
+
+    start_text, end_text = start_date or "earliest", end_date or "latest"
+    file_name = f"{label if several else label + '_mcap'}_{start_text}_{end_text}"
+    if source == "db" and exact:
+        view = [
+            {
+                "date": r["date"],
+                **(
+                    {
+                        "symbol": names[int(r["security_id"])],
+                        "security_id": r["security_id"],
+                    }
+                    if several
+                    else {}
+                ),
+                **{c: r[c] for c in ds_db.MARKET_CAP_COLUMNS},
+            }
+            for r in rows
+        ]
+        footer = _mc_footer(
+            len(view),
+            label,
+            len(got),
+            frequency="day",
+            first=view[0]["date"] if view else None,
+            last=view[-1]["date"] if view else None,
+            several=several,
+        )
+        emit_records(
+            view,
+            console=console,
+            output=output,
+            default_name=file_name,
+            quiet=quiet,
+            logger=logger,
+            exact=True,
+            empty_message=f"No market cap for {', '.join(n for n, _ in securities)}",
+            footer=footer + " · exact",
+        )
+        return
+
+    if frame.empty:
+        empty = f"No market cap for {', '.join(n for n, _ in securities)}"
+        logger.warning(empty)
+        echo_empty(console, empty, quiet=quiet)
+        return
+    if source == "db":
+        frame["symbol"] = [names[int(s)] for s in frame["security_id"]]
+        keep = ["date", *(["symbol", "security_id"] if several else [])]
+        frame = frame[[*keep, *ds_db.MARKET_CAP_COLUMNS]].copy()
+        frame["shares_outstanding"] = (
+            frame["shares_outstanding"].round().astype("Int64")
+        )
+        for col in ("fiscal_date", "known_from"):
+            frame[col] = [d.isoformat() if d is not None else None for d in frame[col]]
+    # To the cent: a float's tail past it is noise, not information.
+    frame["market_cap"] = frame["market_cap"].astype(float).round(2)
+    logger.info(f"Retrieved {len(frame)} market caps for {label}")
+    dates = pd.to_datetime(frame["date"])
+    footer = _mc_footer(
+        len(frame),
+        label,
+        len(got),
+        frequency=frequency.lower(),
+        first=dates.min().date(),
+        last=dates.max().date(),
+        several=several,
+        vendor="Sharadar DAILY" if source == "sharadar" else None,
+    )
+    _emit_mc_frame(
+        frame,
+        console=console,
+        output=output,
+        file_name=file_name,
+        quiet=quiet,
+        logger=logger,
+        precision=precision,
+        footer=footer,
+    )
+
+
+def _mc_footer(
+    count, label, securities, *, frequency, first, last, several, vendor=None
+):
+    """``2,515 bars · AAPL · market cap · day · 2016-01-04 → 2025-12-31``."""
+    parts = [tables.plural(count, "bar")]
+    parts.append(
+        tables.plural(securities, "security", "securities") if several else label
+    )
+    parts += [f"market cap{f' ({vendor})' if vendor else ''}", frequency]
+    if first is not None and last is not None:
+        parts.append(f"{first.isoformat()} → {last.isoformat()}")
+    return " · ".join(parts)
+
+
+def _emit_mc_frame(
+    frame, *, console, output, file_name, quiet, logger, precision, footer
+):
+    """`mc`'s frame as a table, CSV or JSON, and to ``output`` when asked: `ph`'s
+    output rules, close_raw at ``precision``."""
+    file_format = "json" if console == "json" else "csv"
+
+    def as_text(fmt):
+        if fmt == "json":
+            return round_price_columns(frame, decimals=precision).to_json(
+                orient="records", date_format="iso"
+            )
+        return format_price_columns(frame, decimals=precision).to_csv(index=False)
+
+    if output:
+        output_path = Path(output)
+        if output_path.is_dir():
+            output_path = output_path / f"{file_name}.{file_format}"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(as_text(file_format), encoding="utf-8")
+        logger.info(f"Data written to {output_path}")
+        if not quiet:
+            click.echo(f"Data written to {output_path}")
+    if quiet:
+        return
+    if console == "table":
+        echo_table(frame, price_decimals=precision, footer=footer)
+    else:
+        click.echo(as_text(console).rstrip("\n"))
 
 
 @main.command()

@@ -70,6 +70,8 @@ COUNT_COLUMNS = frozenset(
         "bar_count",
         "count",
         "n_observations",
+        "shares_outstanding",
+        "shares_outstanding_as_of",
     }
 )
 

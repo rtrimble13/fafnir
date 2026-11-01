@@ -38,9 +38,17 @@ def resolve_source(requested: Optional[str], default_source: Optional[str]) -> s
     return source
 
 
-# Aggregation map shared by live and db frequency resampling.
-_AGG = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-_FREQ = {
+# Aggregation map shared by live and db frequency resampling. A market cap is a
+# level, as of the period's last bar, like the close.
+_AGG = {
+    "open": "first",
+    "high": "max",
+    "low": "min",
+    "close": "last",
+    "volume": "sum",
+    "market_cap": "last",
+}
+RESAMPLE_RULES = {
     "day": None,
     "week": "W",
     "month": "ME",
@@ -70,7 +78,7 @@ def shape_price_dataframe(
     """
     if df.empty:
         return df
-    rule = _FREQ.get(frequency)
+    rule = RESAMPLE_RULES.get(frequency)
     if rule is not None:
         agg = {c: _AGG[c] for c in df.columns if c in _AGG}
         df = df.resample(rule).agg(agg).dropna(how="all")

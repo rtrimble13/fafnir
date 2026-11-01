@@ -192,6 +192,7 @@ ADR 0008) only the first group. A tool the profile lacks does not exist on it
 |---|---|---|
 | `resolve_symbol` | read | a ticker, identifier, `TICKER@date` or name to one security |
 | `price_history` | read | daily OHLCV, raw or adjusted (say which) |
+| `market_cap_history` | read | daily market cap of up to 1,000 securities, with the count, share factor and filing behind each (`duk mc --exact`; never adjusted) |
 | `screen_securities`, `list_sectors`, `list_industries` | read | `mart.security_latest`, `ref.*`; the lists carry `security_count` (actively trading) and, for an industry, the `sector_name` its securities are classified in |
 | `security_profile` | read | everything held on one security |
 | `dq_summary` | read | the open DQ flags of one security, without detail |
