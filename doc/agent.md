@@ -192,11 +192,14 @@ ADR 0008) only the first group. A tool the profile lacks does not exist on it
 |---|---|---|
 | `resolve_symbol` | read | a ticker, identifier, `TICKER@date` or name to one security |
 | `price_history` | read | daily OHLCV, raw or adjusted (say which) |
-| `screen_securities`, `list_sectors`, `list_industries` | read | `mart.security_latest`, `ref.*` |
+| `screen_securities`, `list_sectors`, `list_industries` | read | `mart.security_latest`, `ref.*`; the lists carry `security_count` (actively trading) and, for an industry, the `sector_name` its securities are classified in |
 | `security_profile` | read | everything held on one security |
 | `dq_summary` | read | the open DQ flags of one security, without detail |
 | `statements_as_of` | read | one statement of one security, every period as known on `as_of` (#107) |
 | `factor_row` | read | one security's factor-panel row, latest or at a month-end (#107) |
+| `ticker_history` | read | which security a ticker named and when, or every ticker a security held (`duk th`) |
+| `corporate_actions` | read | one security's splits and cash dividends by ex-date, exact decimals (`duk ca`) |
+| `trading_calendar` | read | which venues have a calendar, or one venue's sessions over a range (`duk tc`) |
 | `dq_queue`, `dq_triage`, `dq_totals` | ops | the DQ queue with detail and history |
 | `ingestion_runs`, `watermarks`, `landing_payload`, `sharadar_files` | ops | the operational record |
 | `schema_state`, `sql_read` | ops | migrations; free-form read-only SQL |

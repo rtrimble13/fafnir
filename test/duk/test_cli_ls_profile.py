@@ -62,6 +62,11 @@ def runner(monkeypatch, tmp_path):
     monkeypatch.setenv("FAFNIR_DSN", "host=/nonexistent dbname=fafnir")
     monkeypatch.setattr(ds_db, "resolve_company", lambda **kw: [dict(CANDIDATE)])
     monkeypatch.setattr(ds_db, "company_summary", lambda **kw: dict(RAW))
+    # The taxonomy a screen's --sector / --industry is canonicalised against.
+    monkeypatch.setattr(ds_db, "sector_names", lambda **kw: ["Energy", "Technology"])
+    monkeypatch.setattr(
+        ds_db, "industry_names", lambda **kw: ["Consumer Electronics", "Software"]
+    )
     # An empty ~/.dukrc, so a developer's real config cannot change the result.
     cfg = tmp_path / "dukrc.toml"
     cfg.write_text("")

@@ -5,9 +5,11 @@ This module provides functions to compute and format summary statistics
 for financial data, including date ranges and column-wise statistics.
 """
 
+from __future__ import annotations
+
 import logging
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 
 def compute_summary_stats(df, date_column="date"):
@@ -146,3 +148,27 @@ def format_summary_stats(stats, precision=4):
     lines.append("=" * 60)
 
     return "\n".join(lines)
+
+
+def summary_stats_rows(stats):
+    """The per-column statistics as rows, one per column, for a table.
+
+    The same numbers :func:`format_summary_stats` prints, laid out so a table can
+    align them; a column with no data keeps its row, with every statistic None.
+    """
+    if not stats:
+        return []
+    rows = []
+    for name, col in (stats.get("column_stats") or {}).items():
+        rows.append(
+            {
+                "column": name,
+                "min": col.get("min"),
+                "p25": col.get("p25"),
+                "median": col.get("median"),
+                "mean": col.get("mean"),
+                "p75": col.get("p75"),
+                "max": col.get("max"),
+            }
+        )
+    return rows

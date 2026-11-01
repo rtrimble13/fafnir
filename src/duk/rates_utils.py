@@ -5,6 +5,8 @@ This module provides functions for converting and processing treasury rate
 data retrieved from APIs.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 from typing import Any, Dict, List, Tuple

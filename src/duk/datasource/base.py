@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-import pandas as pd
+from duk._deferred import pandas as pd
 
 
 class DataSourceError(Exception):

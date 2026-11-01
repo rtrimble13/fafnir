@@ -46,6 +46,10 @@ Fundamentals are point in time. `statements_as_of(as_of=...)` and
 with what is known today, which includes later restatements. A backtest passes
 as_of.
 
+Tickers are reused and renamed. `ticker_history` shows which security a ticker
+named on each day, with its security_id; name that security to any other tool as
+`sid:<security_id>` to be sure which one you mean.
+
 Nothing here writes. Changes to the warehouse go through the `fafnir` CLI.
 """
 
@@ -211,6 +215,77 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
         warehouse itself is unsure about some of those bars.
         """
         return T.dq_summary(dsn=dsn, symbol=symbol)
+
+    @server.tool()
+    @_surfaced
+    def ticker_history(
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """Which security a ticker named, and when.
+
+        A ticker lists every security that traded under it, one row per period
+        (valid_from..valid_to inclusive, null = still open); an identifier
+        (cik:, isin:, cusip:, sid:, TICKER@DATE) lists every ticker that security
+        held. Each row has the security_id and master record. start_date /
+        end_date keep the periods overlapping the range. Nothing is picked where
+        periods overlap.
+        """
+        return T.ticker_history(
+            dsn=dsn,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+
+    @server.tool()
+    @_surfaced
+    def corporate_actions(
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        action_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """One security's splits and cash dividends, one row per event.
+
+        Bounded by ex-date (start_date / end_date, YYYY-MM-DD); action_type is
+        split or dividend. Ratios and amounts are exact decimal strings.
+        """
+        return T.corporate_actions(
+            dsn=dsn,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            action_type=action_type,
+            limit=limit,
+        )
+
+    @server.tool()
+    @_surfaced
+    def trading_calendar(
+        exchange: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """A venue's trading days, or which venues have a calendar.
+
+        Without exchange: every venue with a calendar and its span. With one
+        (e.g. NYSE): its days from start_date to end_date, each open or an
+        ad-hoc closure. A venue with no calendar returns no rows -- never
+        another venue's days.
+        """
+        return T.trading_calendar(
+            dsn=dsn,
+            exchange=exchange,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
 
     @server.tool()
     @_surfaced
