@@ -801,6 +801,20 @@ columns and half the periods restated.
 
 Measure both on the host and record them on #92.
 
+**Measured on the production host** (the reload, 2026-10-27, run 491; recorded on #92):
+- **Time.** The backfill read 3.10M rows of SF1 file 26 (3.22M rows, a 0.62 GB zip) and wrote
+  3.55M statement rows in 25 minutes, against the projection's 40. The file's download took
+  under a minute. A `--backfill --symbols` run for 334 securities linked later (2026-11-01,
+  run 669, 71,005 rows) took 78 seconds.
+- **Size.** On 2026-11-01, at 3.63M versions, the three tables came to 3.2 GB with indexes,
+  at the bottom of the projected range:
+  - **income statement:** 2.0 GB, 1.6 KB a row;
+  - **balance sheet:** 0.62 GB, 0.61 KB a row;
+  - **cash flow statement:** 0.63 GB, 0.53 KB a row.
+- **The panel.** 1.84M rows, invariant 0. A concurrent refresh of it took 34 minutes on
+  2026-11-01 (after 1.8M bars of new dead issuers), past the 15 minutes at which it moves to its
+  own timer ([operations.md](operations.md#fundamentals-in-the-night)).
+
 ## Disk budget with Sharadar
 
 Plan v2 keeps Sharadar's files on disk, under `[sharadar] bulk_dir`, recorded in
