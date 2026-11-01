@@ -21,7 +21,11 @@ from typing import Any, Optional
 
 from duk import identifiers
 from duk._deferred import pandas as pd
-from duk.datasource.base import DataSourceError, shape_price_dataframe
+from duk.datasource.base import (
+    RESAMPLE_RULES,
+    DataSourceError,
+    shape_price_dataframe,
+)
 from duk.date_utils import get_api_date_range
 
 
@@ -254,9 +258,13 @@ def resolve_identifier(*, dsn: str, identifier: identifiers.Identifier) -> list[
 BAR_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
-def _daily_bars(cur, symbol, security_id, start, end, adjusted) -> list[dict]:
+def _daily_bars(
+    cur, symbol, security_id, start, end, adjusted, market_cap=False
+) -> list[dict]:
     """One security's daily bars from ``start`` to ``end`` (None: unbounded), raw or
-    adjusted, oldest first, as psycopg returns them: ``Decimal`` prices."""
+    adjusted, oldest first, as psycopg returns them: ``Decimal`` prices. With
+    ``market_cap`` each bar also carries the day's market cap (None where none can
+    be derived), which no price adjustment touches."""
     sec_id = security_id
     if sec_id is None:
         sec_id = _resolve_security_id(cur, symbol.upper())
@@ -276,7 +284,15 @@ def _daily_bars(cur, symbol, security_id, start, end, adjusted) -> list[dict]:
         f"FROM {relation} WHERE {' AND '.join(clauses)} ORDER BY trade_date ASC",
         params,
     )
-    return [dict(r) for r in cur.fetchall()]
+    rows = [dict(r) for r in cur.fetchall()]
+    if market_cap and rows:
+        caps = {
+            r["date"]: r["market_cap"]
+            for r in _market_caps(cur, [sec_id], rows[0]["date"], rows[-1]["date"])
+        }
+        for r in rows:
+            r["market_cap"] = caps.get(r["date"])
+    return rows
 
 
 def exact_bars(
@@ -289,6 +305,7 @@ def exact_bars(
     limit: Optional[int] = None,
     fields: Optional[list[str]] = None,
     adjusted: bool = False,
+    market_cap: bool = False,
 ) -> list[dict]:
     """Daily bars exactly as stored, as plain rows: `ph --exact`.
 
@@ -308,8 +325,10 @@ def exact_bars(
         "day",
     )
     with _connect(dsn) as conn, conn.cursor() as cur:
-        rows = _daily_bars(cur, symbol, security_id, start, end, adjusted)
+        rows = _daily_bars(cur, symbol, security_id, start, end, adjusted, market_cap)
     keep = [c for c in (fields or ()) if c in BAR_COLUMNS] or list(BAR_COLUMNS)
+    if market_cap:
+        keep.append("market_cap")
     rows = [{"date": r["date"], **{c: r[c] for c in keep}} for r in rows]
     if limit is not None and limit > 0:
         rows = (
@@ -332,8 +351,13 @@ def price_history(
     adjusted: bool = False,
     security_id: Optional[int] = None,
     exact: bool = False,
+    market_cap: bool = False,
 ) -> pd.DataFrame:
     """Return a date-indexed OHLCV DataFrame from fafnir, shaped like the live path.
+
+    With ``market_cap`` the frame gains a ``market_cap`` column (`ph --mcap`): the
+    day's derived cap (:func:`market_cap_rows`), never adjusted, the last of each
+    period when resampled.
 
     With ``exact`` the prices stay the ``Decimal`` values the warehouse stores
     (object columns) instead of becoming floats, for a caller that must not
@@ -371,6 +395,7 @@ def price_history(
             limit=limit,
             fields=fields,
             adjusted=adjusted,
+            market_cap=market_cap,
         )
         if not bars:
             return pd.DataFrame()
@@ -379,7 +404,7 @@ def price_history(
         return df.set_index("date")
 
     with _connect(dsn) as conn, conn.cursor() as cur:
-        rows = _daily_bars(cur, symbol, security_id, start, end, adjusted)
+        rows = _daily_bars(cur, symbol, security_id, start, end, adjusted, market_cap)
 
     if not rows:
         return pd.DataFrame()
@@ -387,9 +412,11 @@ def price_history(
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
     # Prices: exact decimals -> float for downstream numeric ops (matches live).
-    for col in ("open", "high", "low", "close"):
+    for col in ("open", "high", "low", "close", "market_cap"):
         if col in df.columns:
             df[col] = df[col].astype(float)
+    if market_cap and fields and "market_cap" not in fields:
+        fields = [*fields, "market_cap"]
     # Volume stays integer to match the live path's int64 dtype (the adjusted view
     # rounds to whole shares as unconstrained numeric, so coerce Decimal/int ->
     # int64). Adjusted volume can legitimately exceed int64 -- a deep forward-split
@@ -408,6 +435,160 @@ def price_history(
         start_date=start_date,
         end_date=end_date,
     )
+
+
+# ---------------------------------------------------------------------------
+# Daily market cap (`duk mc`, `ph --mcap`; migration 0042, ADR 0019 §5)
+# ---------------------------------------------------------------------------
+
+#: What `mc` reports for each bar, after its date, in this order. ``close_raw`` is
+#: the close as traded, whatever ``ph --adj`` would print: the cap is a dollar
+#: amount, and no adjustment applies to it.
+MARKET_CAP_COLUMNS = (
+    "close_raw",
+    "shares_outstanding",
+    "share_factor",
+    "market_cap",
+    "currency",
+    "fiscal_date",
+    "known_from",
+)
+_MARKET_CAP_NUMBERS = ("close_raw", "shares_outstanding", "share_factor", "market_cap")
+
+_MARKET_CAP_SQL = (
+    "SELECT security_id, trade_date AS date, "
+    + ", ".join(MARKET_CAP_COLUMNS)
+    + " FROM mart.fn_daily_market_cap(%s::bigint[], %s, %s)"
+)
+
+
+def _market_caps(cur, security_ids, start, end) -> list[dict]:
+    """Every bar of ``security_ids`` from ``start`` to ``end`` (None: open), with
+    its cap or None, ordered by security then date: the function's rows. Raises
+    DataSourceError naming migration 0042 on a warehouse that predates it."""
+    try:
+        cur.execute(_MARKET_CAP_SQL, (list(security_ids), start, end))
+    except Exception as exc:  # noqa: BLE001 -- one case is translated
+        if getattr(exc, "sqlstate", None) == "42883":
+            raise DataSourceError(
+                "this warehouse has no mart.fn_daily_market_cap: it arrives with "
+                "fafnir migration 0042 (`fafnir db migrate` on the host)"
+            ) from exc
+        raise
+    return [dict(r) for r in cur.fetchall()]
+
+
+def resolve_symbols(*, dsn: str, symbols: list[str]) -> dict[str, Optional[int]]:
+    """Each ticker's ``security_id`` by the resolution ladder (None: not found), on
+    one connection: a constituent list is hundreds of tickers."""
+    out: dict[str, Optional[int]] = {}
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        for symbol in symbols:
+            out[symbol] = _resolve_security_id(cur, symbol.upper())
+    return out
+
+
+def _limited(rows: list, limit: Optional[int], start_date, end_date) -> list:
+    """`ph`'s ``limit`` rule: the first rows when only a start was given, else the
+    last."""
+    if limit is None or limit <= 0:
+        return rows
+    return (
+        rows[:limit] if start_date is not None and end_date is None else rows[-limit:]
+    )
+
+
+def market_cap_rows(
+    *,
+    dsn: str,
+    security_ids: list[int],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+    frequency: str = "day",
+) -> list[dict]:
+    """The days each security has a market cap, as stored values (`mc --exact`).
+
+    Each row is ``{"security_id", "date", <MARKET_CAP_COLUMNS>}``: ``Decimal``
+    numbers, ``date`` dates, oldest first within each security, the securities in
+    the order given. A bar with no cap (no SF1 count in force: a fund, an ETF, a
+    secondary share class, before the first filing, a stale balance sheet) is left
+    out. ``limit`` applies to each security, as `ph` applies it; ``frequency``
+    only widens the read for it (resampling is :func:`market_cap_history`'s).
+    """
+    if not security_ids:
+        return []
+    start, end = get_api_date_range(
+        _parse_date(start_date, "start date"),
+        _parse_date(end_date, "end date"),
+        limit,
+        frequency,
+    )
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        found = _market_caps(cur, security_ids, start, end)
+    by_security: dict[int, list[dict]] = {int(sid): [] for sid in security_ids}
+    for row in found:
+        if row["market_cap"] is not None:
+            by_security.setdefault(int(row["security_id"]), []).append(row)
+    out: list[dict] = []
+    for sid in dict.fromkeys(int(s) for s in security_ids):
+        out += _limited(by_security.get(sid, []), limit, start_date, end_date)
+    return out
+
+
+def market_cap_history(
+    *,
+    dsn: str,
+    security_ids: list[int],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    frequency: str = "day",
+    limit: Optional[int] = None,
+) -> pd.DataFrame:
+    """:func:`market_cap_rows` as a frame for `mc`: columns ``security_id``,
+    ``date`` and :data:`MARKET_CAP_COLUMNS`, numbers as floats.
+
+    Resampled per security to ``frequency`` as `ph` resamples a close: each period's
+    last bar, labelled with the period's end, so `mc -f month` joins `ph -f month`
+    on the date. ``limit`` then keeps each security's first or last periods by
+    `ph`'s rule.
+    """
+    rows = market_cap_rows(
+        dsn=dsn,
+        security_ids=security_ids,
+        start_date=start_date,
+        end_date=end_date,
+        frequency=frequency,
+    )
+    columns = ["security_id", "date", *MARKET_CAP_COLUMNS]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(rows, columns=columns)
+    for col in _MARKET_CAP_NUMBERS:
+        df[col] = df[col].astype(float)
+    df["date"] = pd.to_datetime(df["date"])
+    rule = RESAMPLE_RULES.get(frequency.lower())
+    pieces = []
+    for sid in dict.fromkeys(int(s) for s in security_ids):
+        one = df[df["security_id"] == sid].set_index("date").sort_index()
+        if one.empty:
+            continue
+        if rule is not None:
+            # A bar's columns belong together: the period's last bar, whole.
+            one = one.resample(rule).last().dropna(subset=["market_cap"])
+            one["security_id"] = sid
+        pieces.append(_limited(one, limit, start_date, end_date).reset_index())
+    if not pieces:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(pieces, ignore_index=True)[columns]
+
+
+def issuer_class(*, dsn: str, security_id: int) -> Optional[dict]:
+    """The issuer's share class that holds the statements, when ``security_id``
+    holds none of its own (a secondary class: GOOG answered by GOOGL), else None.
+    Its market cap counts every class's shares (ADR 0019 §5)."""
+    with _connect(dsn) as conn, conn.cursor() as cur:
+        return _statements_of(cur, security_id)
 
 
 #: Screen filters the warehouse cannot honour. ``mart.security_latest`` carries no

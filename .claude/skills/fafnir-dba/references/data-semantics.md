@@ -34,13 +34,14 @@ the nightly job. Everything `screen_securities` returns comes from it.
 
 ## 3. `market_cap_usd` and `beta`: derived in the screener, a snapshot in the profile
 
-Since #109 (migration 0039) there are two kinds, and neither is history:
+Since #109 (migration 0039) there are two kinds, and neither is history (for that, see
+the daily market cap below):
 
 - **`mart.security_latest` (what `screen_securities` returns) derives them where it
   can.**
   - **Market cap:** the last raw close × SF1's `shares_outstanding` in force that day,
-    put in that day's share terms (ADR 0019 §5, the panel's expression), for USD-traded
-    securities.
+    put in that day's share terms, × SF1's share factor (ADR 0019 §5; the factor since
+    0042), for USD-traded securities.
   - **Beta:** the slope of a year of daily adjusted returns on SPY's, from at least
     120 of them.
   - **Where neither can be derived** (no SF1 shares: funds, ETFs, secondary classes,
@@ -53,11 +54,19 @@ Since #109 (migration 0039) there are two kinds, and neither is history:
   That is FMP's last screener value, frozen since the cutover (2026-10-22) for every
   security Sharadar feeds, because FMP's screener runs only in FMP's night.
 
-> **Wrong answer:** "market cap over time" — a series that does not exist in either.
-> The panel has one at month-ends (`mart.fundamental_panel.market_cap`), or build it
-> from the raw close × shares outstanding in the same share terms (ADR 0019).
-> `core.balance_sheet.shares_outstanding` holds each period's cover count in the
-> terms of its `known_from`, so it is multiplied by the splits after that day first.
+**Market cap over time** is `mart.fn_daily_market_cap(security_ids, start, end)`
+(0042): every raw bar's cap, with the count, the share factor and the balance sheet
+(`fiscal_date`, `known_from`) behind it. The MCP tool `market_cap_history` and `duk mc`
+read it.
+
+> **Wrong answer:** building the series by hand from `core.balance_sheet`. That forgets
+> one of two things. The cover count is in the terms of its `known_from`, so it must be
+> multiplied by the splits since. And SF1's share factor: an ADR's count is of ordinary
+> shares, so TSM's cap without it is five times too high.
+
+> **Wrong answer:** `mart.fundamental_panel.market_cap` for an ADR or a multi-class
+> issuer. The panel predates 0042 and omits the share factor. Where `share_factor` is
+> not 1, read the daily function.
 
 > **Wrong answer:** quoting the profile's market cap or beta for a Sharadar-fed
 > security as current. Read the screener's, and say whether it was derived.
@@ -454,4 +463,6 @@ How to check a row:
   as_of_date` is 0, always.
 - **Its market cap** is `close_raw × shares_outstanding_as_of`, the count put in
   `as_of_date`'s terms with `mart.v_corporate_action`'s splits. A P/E that is 2, 7 or
-  112 times off means a split is missing from the warehouse's list (ADR 0019).
+  112 times off means a split is missing from the warehouse's list (ADR 0019). It omits
+  SF1's share factor (an ADR's ratio), which `mart.fn_daily_market_cap` applies: for a
+  security whose factor is not 1, the two differ by it until the panel is regenerated.

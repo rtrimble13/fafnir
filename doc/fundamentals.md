@@ -138,7 +138,9 @@ screens, never for a backtest, since they know every restatement since.
    statements as known `extra_lag_days` before each date, against the date's own prices.
 6. **Prices and share counts at the date.** The panel's market cap is the raw close at the
    date times a share count put in that date's terms. A count in today's terms against a 1999
-   price would put Apple's market cap 112 times too high.
+   price would put Apple's market cap 112 times too high. For every trading day, and with SF1's
+   share factor (an ADR's ratio, which the panel omits), read `mart.fn_daily_market_cap`
+   (`duk mc`; [duk.md](duk.md#mc-and-ph---mcap--daily-market-cap)).
 7. **Keep the dead in the universe.** The panel holds every security with statements that
    traded in the week to each date, including those that later died. A filter on today's `is_actively_trading`
    or `delisted_date IS NULL` throws them out and biases every return upward.

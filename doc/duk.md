@@ -9,7 +9,7 @@ adds a global `--source/-S` to choose between the warehouse and a vendor's API.
 |---|---|---|
 | `db` (**default**) | fafnir PostgreSQL `mart` | normal use; fast, offline, point-in-time stable, every security the warehouse holds |
 | `fmp` | FMP's API, through the warehouse's client | a symbol not yet in the warehouse; checking a series against FMP; no-DB use. `live` is the older name and still works |
-| `sharadar` | Sharadar's SEP/SFP price tables, through the warehouse's client | checking a series against Sharadar; reading a security before it is loaded. `ph` only |
+| `sharadar` | Sharadar's SEP/SFP price tables and DAILY's market cap, through the warehouse's client | checking a series against Sharadar; reading a security before it is loaded. `ph` and `mc` only |
 
 Both vendor sources request through the clients in `fafnir.sources`
 ([ADR 0017](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md)):
@@ -42,6 +42,7 @@ Each vendor source needs that vendor's key, and nothing else: `-S fmp` reads
 |---|---|---|---|
 | `ph` | ✅ | ✅ | ✅ |
 | `ph cik:` / `isin:` / `cusip:` | ✅ warehouse identifiers | ✅ FMP search | ✖ pass a ticker, or resolve with `-S db` / `-S fmp` |
+| `mc`, `ph --mcap` (market cap) | ✅ derived on read | ✖ FMP's is not read | ✅ DAILY's own figure, to compare |
 | `ls` (list, screen) | ✅ | ✅ | ✖ |
 | `ls SYMBOL` (company summary) | ✅ | ✖ | ✖ |
 | `fs`, `fa` (statements, factors) | ✅ | ✖ db mode only | ✖ db mode only |
@@ -98,7 +99,8 @@ when symbol resolution still read `core`.
 
 | Command | Description | `db` | `fmp` |
 |---|---|---|---|
-| `ph SYMBOL` | price history (OHLCV, raw or `--adj`) | ✅ warehouse | ✅ FMP (and ✅ `sharadar`) |
+| `ph SYMBOL` | price history (OHLCV, raw or `--adj`; `--mcap` adds the market cap) | ✅ warehouse | ✅ FMP (and ✅ `sharadar`) |
+| `mc SYMBOL...` | daily market cap, with the count, factor and filing behind it; several securities in one read | ✅ `mart.fn_daily_market_cap` | ✖ (✅ `sharadar`: DAILY) |
 | `ls` | list/screen securities, sectors, industries | ✅ `mart.security_latest` / `ref.*` | ✅ FMP |
 | `ls SYMBOL\|NAME` | everything the warehouse holds on one company | ✅ `mart.v_security_*` | ✖ db only |
 | `fs SYMBOL` | a financial statement, point in time with `--as-of` | ✅ `mart.v_*_versions` | ✖ db only |
@@ -199,6 +201,11 @@ duk ti sma -i prices.csv -c close -w 20
 # Reconcile a symbol: the same raw series from the warehouse and a vendor should match
 diff <(duk ph AAPL --close --csv) <(duk -S fmp ph AAPL --close --csv)
 diff <(duk ph AAPL --close --csv) <(duk -S sharadar ph AAPL --close --csv)
+
+# An index's inputs: adjusted closes and the day's market cap, monthly
+duk ph AAPL --adj --close --mcap -f month -s 2010-01-01
+# Every constituent's market cap in one read
+duk mc --symbols-file members.txt -s 2010-01-01 -o caps.csv
 ```
 
 ### Price formatting
@@ -443,6 +450,78 @@ warehouse is refused, naming it).
 The MCP read profile has the same three reads as `ticker_history`,
 `corporate_actions` and `trading_calendar` ([agent.md](agent.md#the-tools)),
 over the same `duk.datasource.db` functions, so they return the same rows.
+
+## `mc` and `ph --mcap` — daily market cap
+
+The input to a cap-weighted index: each security's market cap on each day, derived by
+the warehouse when it is read (migration 0042;
+[ADR 0019 §5 and its amendment](adr/0019-derived-metrics-not-vendor-metrics.md#amendment-2026-11-daily-market-cap-and-the-share-factor);
+[data dictionary](data_dictionary.md#daily-market-cap-function-and-view)).
+
+**What it is.** The market cap on a day is the product of:
+- the raw close that day;
+- the shares outstanding of the latest balance sheet in force that day, filed within
+  two years and put in that day's share terms with the warehouse's splits;
+- SF1's share factor: an ADR's ratio (TSM's 0.2), or a multi-class issuer's conversion
+  into its primary class (BRK.B's about 1.52).
+
+The count steps when a 10-Q or 10-K becomes known (`known_from`). Between filings only
+a split moves it, so the cap is continuous across a split while the raw close drops by its ratio.
+Nothing known later reaches an earlier day.
+
+**`duk mc SYMBOL... [--symbols-file FILE] [-s] [-e] [-n] [-f] [--exact]`**
+- One row per day with a cap: `date, close_raw, shares_outstanding, share_factor,
+  market_cap, currency, fiscal_date, known_from`. The last two name the balance sheet
+  the count came from.
+- **Several securities in one read.** Name them (`duk mc AAPL MSFT XOM`), or list them
+  in `--symbols-file` (`-` for stdin; spaces, commas or lines; `#` comments). The rows
+  gain `symbol` and `security_id`, each security's oldest first, in the order named.
+  Tickers resolve on one connection, and the caps come back in one query, so a list of
+  hundreds costs about what one does. A ticker that resolves to nothing stops the
+  command (exit 1, naming every one), rather than leaving a constituent out.
+- SYMBOL is any of `ph`'s forms: a ticker, `cik:`/`isin:`/`cusip:`, `sid:` or
+  `TICKER@YYYY-MM-DD` (the member that traded under a reused ticker on that day).
+  A security named twice (FB and META) is read once.
+- `-f` resamples as `ph` does: each period's last bar, labelled with the period's end,
+  so `mc -f month` and `ph -f month` join on the date. `-n` is per security.
+- `--exact` prints the warehouse's decimals as text (daily, `-S db`), as `ph --exact`
+  does.
+- **No cap**, and a note on stderr saying why, for:
+  - a fund or an ETF;
+  - a security Sharadar does not feed;
+  - days before the first filing, or more than two years after the last balance sheet;
+  - a secondary share class. SF1 files an issuer under its primary class, whose cap
+    counts every class's shares, so the note names that class: `duk mc GOOG` points
+    at GOOGL. An index holding both classes would hold Alphabet twice.
+- There is no float adjustment: SF1 carries no float.
+- On a warehouse that predates migration 0042, `mc` and `ph --mcap` are refused,
+  naming it (`fafnir db migrate` on the host).
+
+**`duk ph SYMBOL --mcap`** appends one column, `market_cap`, to whatever `ph` prints:
+- **Never adjusted.** With `--adj`, the table's footer says `market_cap unadjusted`.
+  Together they are a total-return index's two inputs: `ph --adj --close --mcap` gives
+  the returns and the weights.
+- The field filters keep it (`--close --mcap` is `date, close, market_cap`), and `-f`
+  takes the period's last. With `--exact` it is the stored decimal text.
+- Empty where `mc` would have no row, with the same note.
+
+**Against Sharadar.** `-S sharadar` reads Sharadar's own figure from its DAILY table
+(`marketcap`, in millions to one decimal, so a resolution of $100,000), converted to
+dollars. It is computed as the warehouse's is (`closeunadj × sharesbas × sharefactor`),
+so the two should agree to that resolution. A day where they do not is worth a look: a
+filing the two date differently, or a split one of them lacks.
+
+```bash
+diff <(duk ph AAPL --close --mcap --csv -s 2025-01-01) \
+     <(duk -S sharadar ph AAPL --close --mcap --csv -s 2025-01-01)
+```
+
+`-S sharadar mc` prints `date` and `market_cap` only (DAILY has no count). DAILY covers
+SEP's equities: an ETF has no row. Tickers only, as for `-S sharadar ph`. FMP's market
+cap is not read: `-S fmp` refuses both.
+
+The MCP read profile's `market_cap_history` ([agent.md](agent.md#the-tools)) returns
+`mc --exact`'s rows for up to 1,000 securities, through the same function.
 
 ## `ls QUERY` — one company, everything held
 

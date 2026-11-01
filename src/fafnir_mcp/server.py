@@ -46,6 +46,10 @@ Fundamentals are point in time. `statements_as_of(as_of=...)` and
 with what is known today, which includes later restatements. A backtest passes
 as_of.
 
+Market cap over time is `market_cap_history`: each day's raw close x the shares
+known that day x SF1's share factor, never adjusted. For a cap-weighted index, pair
+it with `price_history(adjusted=true)` for the returns.
+
 Tickers are reused and renamed. `ticker_history` shows which security a ticker
 named on each day, with its security_id; name that security to any other tool as
 `sid:<security_id>` to be sure which one you mean.
@@ -145,6 +149,30 @@ def build_server(*, dsn: str, profile: str = DEFAULT_PROFILE):
             start_date=start_date,
             end_date=end_date,
             adjusted=adjusted,
+            limit=limit,
+        )
+
+    @server.tool()
+    @_surfaced
+    def market_cap_history(
+        symbols: list[str],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """Daily market cap for one or more securities (up to 1,000): the inputs to
+        a cap-weighted index. Dates are ISO (YYYY-MM-DD); limit is per security.
+
+        The raw close x the shares known that day x SF1's share factor, derived on
+        read; exact decimal strings. Never adjusted. For returns, pair it with
+        price_history(adjusted=True). A fund, an ETF or a secondary share class
+        has no cap and is listed in `missing`.
+        """
+        return T.market_cap_history(
+            dsn=dsn,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
             limit=limit,
         )
 

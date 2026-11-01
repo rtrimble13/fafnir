@@ -29,6 +29,8 @@ DSN = "dbname=fafnir user=nobody"  # never connected to; build_server does not d
 READ_TOOLS = {
     "resolve_symbol",
     "price_history",
+    # Daily market cap (0042): an index's weights.
+    "market_cap_history",
     "screen_securities",
     "list_sectors",
     "list_industries",

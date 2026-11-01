@@ -79,6 +79,14 @@ SURFACED = [
     ),
     ("price_history", {"symbol": ""}, "symbol is required"),
     ("price_history", {"symbol": "AAPL", "limit": 0}, "at least 1"),
+    ("market_cap_history", {"symbols": []}, "symbols is required"),
+    ("market_cap_history", {"symbols": ["AAPL"], "limit": 0}, "at least 1"),
+    (
+        "market_cap_history",
+        {"symbols": ["AAPL"], "start_date": "2024-02-01", "end_date": "2024-01-01"},
+        "is after end_date",
+    ),
+    ("market_cap_history", {"symbols": ["cik:12x"]}, "CIK"),
     ("resolve_symbol", {"symbol": "   "}, "symbol is required"),
 ]
 

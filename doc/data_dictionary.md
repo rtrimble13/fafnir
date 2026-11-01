@@ -4,10 +4,11 @@ Every schema, table, view, materialized view and function fafnir stores or serve
 with its **grain**, **source**, **units**, **adjustment status** and **update
 cadence**. This is the contract between the warehouse and everything that reads it.
 
-It describes the schema at migration **0041** (`mlk_day_before_1998`). It was
+It describes the schema at migration **0042** (`daily_market_cap`). It was
 checked against the live catalog at 0040 (`pg_class`, `pg_attribute`,
 `pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
-on 2026-10-31; 0041 adds calendar rows and changes no object. A migration that adds, drops or re-types a column updates this file in
+on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's view, function and
+re-defined view are described from the migration and its tests. A migration that adds, drops or re-types a column updates this file in
 the same pull request: the PR template's first box.
 
 Conventions:
@@ -532,7 +533,7 @@ Every table shares these columns, then its line items, then `content_hash`,
 | `loaded_at` / `superseded_at` | TIMESTAMPTZ | The load timeline. `superseded_at` is set when a vendor correction replaced the row, which keeps its knowledge interval. |
 | `reported_currency` | TEXT | TICKERS' `currency`, per security. |
 | `content_hash` | TEXT CHECK | SHA-256 (64 hex) over the typed values and `filing_date`; share counts at 1,000-share precision, so a split's re-expression is no change. The loader also leaves a row whose share counts moved by no more than a recovery's rounding (1,000 shares, or a millionth). |
-| `extra` | JSONB NOT NULL | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions; `unmapped`: any column SF1 adds later), once per SF1 row, on `core.income_statement`, its numbers exactly as SF1 wrote them. `{}` on the other two tables. **Never read by mart.** Measured at about 965 bytes a row, about 1.35 GB at full scale; `core.income_statement` was 1.96 GB with its indexes on 2026-10-31. |
+| `extra` | JSONB NOT NULL | SF1 fields without a column (`vendor_metric`: the 36 metrics, the date-measured columns, per-share values, `*usd` conversions; `unmapped`: any column SF1 adds later), once per SF1 row, on `core.income_statement`, its numbers exactly as SF1 wrote them. `{}` on the other two tables. **Never read by mart**, but for one key: `vendor_metric.sharefactor`, through `mart.v_share_factor_versions` (0042). Measured at about 965 bytes a row, about 1.35 GB at full scale; `core.income_statement` was 1.96 GB with its indexes on 2026-10-31. |
 | `source` | TEXT NOT NULL CHECK | Always `sharadar` (`ck_*_source`). |
 | `ingestion_run_id` | BIGINT FK | The load. |
 
@@ -819,8 +820,9 @@ per version of a period, per load.
 - **Columns:** `security_id, period_type, fiscal_date, calendar_date, fiscal_year,
   fiscal_period, version_no, known_from, known_to, knowledge_source, filing_date,
   loaded_at, superseded_at, reported_currency`, then the table's line items.
-- **Left out:** `extra` (SF1's vendor metrics are never read through mart: ADR 0019),
-  `vendor_key`, `content_hash`, `source` and `ingestion_run_id`.
+- **Left out:** `extra` (SF1's vendor metrics are never read through mart: ADR 0019;
+  its share factor is, through `mart.v_share_factor_versions`), `vendor_key`,
+  `content_hash`, `source` and `ingestion_run_id`.
 
 **`mart.fn_statements_as_of(as_of DATE)`** (FUNCTION) returns, per
 `(security_id, period_type)`, the latest `fiscal_date` with a version in force at
@@ -941,6 +943,10 @@ clipped or filled.
   `as_of_date`'s terms with the warehouse's splits (`mart.v_corporate_action`), the list
   the raw prices follow. `market_cap` is the raw close times it: never a vendor
   snapshot. EPS and dividends per share are in the same terms.
+- **No share factor yet.** The panel predates 0042 and omits SF1's share factor, which
+  `mart.fn_daily_market_cap` applies. For a security whose factor is not 1 (an ADR, a
+  multi-class issuer's primary class), `market_cap`, `enterprise_value` and the value
+  yields are off by it until the panel is regenerated.
 - **`enterprise_value`** is market cap plus total debt less cash. It omits minority
   interest and preferred stock: SF1 carries no balance for either.
 - **`currency_mismatch`**: the statements are not in the trading currency. Every ratio
@@ -966,6 +972,61 @@ clipped or filled.
   and a third of quarters restated: the full refresh took **45 s** (291,430 rows), and
   one date about 3 s. Production's is recorded on #92, after the backfill (step 9). On
   2026-10-31 the production panel held about 1.83M rows (1.16 GB).
+
+### Daily market cap (FUNCTION and VIEW)
+Added by migration 0042 ([ADR 0019 §5 and its 2026-11 amendment](adr/0019-derived-metrics-not-vendor-metrics.md#amendment-2026-11-daily-market-cap-and-the-share-factor)).
+The input to cap-weighted index construction; `duk mc`, `duk ph --mcap` and the MCP tool
+`market_cap_history` read it.
+
+**`mart.fn_daily_market_cap(security_ids BIGINT[], start_date DATE DEFAULT NULL,
+end_date DATE DEFAULT NULL)`** (FUNCTION). **Grain:** one row per raw bar of each
+security in `[start_date, end_date]` (NULL leaves that end open), ordered by
+`security_id, trade_date`.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `security_id`, `trade_date` | BIGINT, DATE | the bar |
+| `currency` | TEXT | the trading currency, which `market_cap` is in (`USD` where none is held) |
+| `close_raw` | NUMERIC | the close as traded (**raw**) |
+| `shares_outstanding` | NUMERIC | the count in force, in `trade_date`'s share terms, to the whole share |
+| `share_factor` | NUMERIC | SF1's share factor applied (1 where SF1 gives none); NULL with no count |
+| `market_cap` | NUMERIC | `close_raw × shares_outstanding × share_factor`; NULL with no count |
+| `fiscal_date`, `known_from` | DATE | the balance sheet the count came from |
+
+- **The count** is `shares_outstanding` (SF1's `sharesbas`) of the latest balance sheet
+  in force on the day, if it ended within 730 days. Versions and timelines are ADR
+  0018's.
+  - **Steps:** it changes on a filing's `known_from`. Between filings only splits move
+    it: × the warehouse's splits with an ex-date in `(known_from, trade_date]`, the
+    expression of the factor panel and `mart.v_security_attributes`.
+  - **No look-ahead:** a later restatement or filing never reaches an earlier day.
+  - **Excluded:** superseded rows.
+- **The share factor** is the same period's income version's in force on the day
+  (`mart.v_share_factor_versions`). It is an ADR's ratio (TSM 0.2), or a multi-class
+  issuer's conversion to its primary class (BRK.B about 1.52).
+- **No cap** for a fund, an ETF, a security Sharadar does not feed, a secondary share
+  class (its issuer's primary class counts every class), before the first filing, or
+  from the 731st day after the latest balance sheet ended. There is no float
+  adjustment.
+- **Never adjusted.** A dollar amount needs none: across a split the raw close and the
+  count move inversely and the cap is continuous.
+- **How it runs.**
+  - **The segments:** what is in force changes only on a version's `known_from` or
+    `known_to`, a balance sheet's 731st day, or a split's ex-date. Those days cut each
+    security's span into segments. The count, factor and split product are found once
+    per segment, and each bar takes its segment's from a running count.
+  - **Measured** on a synthetic load: 500 securities over 2018–2026 (1.15M bars, 25,500
+    balance-sheet versions) in 4.7 s, one year of them in 0.4 s, and one security's
+    whole history in 20 ms.
+  - **Rights:** plain SQL, `STABLE`, reading only definer-rights mart views. EXECUTE goes
+    to `fafnir_read`, `fafnir_app` and `fafnir_ops`, and is revoked from PUBLIC.
+
+**`mart.v_share_factor_versions`** (VIEW). **Grain:** `core.income_statement`'s, one row
+per version of a period, per load.
+- **Columns:** `security_id, period_type, fiscal_date, version_no, known_from, known_to,
+  knowledge_source, loaded_at, superseded_at, share_factor`.
+- **`share_factor`** is `extra.vendor_metric.sharefactor` where that is a positive
+  number, else NULL. It is the one key of `extra` mart reads (ADR 0019's amendment).
 
 ### `mart.v_industry_fundamentals` — the panel by sector and industry (VIEW)
 Added by migration 0038 (#101; build prompt §5.4). **Grain:** `(group_level, as_of_date,
@@ -1061,10 +1122,11 @@ of `core.security` is written.
 - **Classification:** `sector_name`, `industry_name` and `attributes_source` (`sharadar`,
   or the `core.security.source` that wrote the pair), from the classification view below.
 - **`market_cap_usd`:**
-  - **How it is derived** (ADR 0019 §5, the panel's expression): the last raw close ×
-    `shares_outstanding` of the latest balance sheet in force on that day, ended within
-    730 days, put in that day's share terms with the warehouse's splits. It is derived
-    for USD-traded securities only.
+  - **How it is derived** (ADR 0019 §5, `mart.fn_daily_market_cap`'s expression on the
+    last bar): the last raw close × `shares_outstanding` of the latest balance sheet in
+    force on that day, ended within 730 days, put in that day's share terms with the
+    warehouse's splits, × the period's share factor (0042; 1 where SF1 gives none). It
+    is derived for USD-traded securities only. A test holds it equal to the function.
   - **The record:** `market_cap_source` is `derived`, `market_cap_as_of` the close's date,
     `market_cap_fiscal_date` the balance sheet's period.
   - **Otherwise** (no SF1 shares: funds, ETFs, secondary share classes, names Sharadar

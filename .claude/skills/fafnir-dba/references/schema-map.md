@@ -91,6 +91,8 @@ The last one the nightly applied is in the `prices:nightly` run's `params.throug
 | `mart.v_statements_current`, `mart.v_fundamentals_ttm` | the two functions as of today: screening, **not backtests** | live |
 | `mart.fn_fundamental_panel(dates[], lag)`, `mart.fn_fundamental_snapshot(as_of, lag)` | the factors at any dates, or one: basis TTM or fiscal year as known then, prices that day, one row per security that traded that week (#100) | live |
 | `mart.fundamental_panel` | the same at each month-end from 1998; sector and industry are **today's** | **materialized, lagged** |
+| `mart.fn_daily_market_cap(ids[], start, end)` | every raw bar's market cap: the count in force in the day's terms × SF1's share factor, with the balance sheet behind it (0042) | live — **market cap over time** |
+| `mart.v_share_factor_versions` | SF1's `sharefactor` per income version, the one key of `extra` mart reads (0042) | live |
 | `mart.v_industry_fundamentals` | the panel by sector and by industry per month-end: counts and quartiles; groups under three suppressed (#101) | live over the panel, so **as lagged as it** |
 | `mart.security_fundamentals_latest` | each security's factors as of the last refresh, with symbol and name; screens opt into it by joining on `security_id` (#101) | **materialized, lagged** |
 | `mart.v_security_dq_open` | open flags: counts, keys, dates — **never `detail`** | live |
