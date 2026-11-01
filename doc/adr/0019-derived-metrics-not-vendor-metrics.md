@@ -140,6 +140,10 @@ is no float adjustment: SF1 carries no float.
 
 - `mart.v_security_attributes` applies the factor (0042). `mart.security_latest` takes
   it on its next refresh.
-- The factor panel (0037) does not apply it yet. Its `market_cap` and value yields for a
-  security whose factor is not 1 differ from the daily function until the panel is
-  regenerated. A test pins the difference, so the fix shows up there.
+- The factor panel applies it since 0043, to its market cap, EV and every ratio to
+  them. A test holds the panel's month-end cap equal to the daily function's.
+  - **Per-share and issuance measures are in traded units, as the price is.** EPS is
+    net income over weighted shares × the factor. Year-on-year issuance compares
+    count × factor, so a class conversion is not read as issuance.
+  - **`shares_outstanding_as_of` stays SF1's count**, with the factor in a new
+    `share_factor` column.

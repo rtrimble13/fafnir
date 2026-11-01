@@ -138,8 +138,9 @@ screens, never for a backtest, since they know every restatement since.
    statements as known `extra_lag_days` before each date, against the date's own prices.
 6. **Prices and share counts at the date.** The panel's market cap is the raw close at the
    date times a share count put in that date's terms. A count in today's terms against a 1999
-   price would put Apple's market cap 112 times too high. For every trading day, and with SF1's
-   share factor (an ADR's ratio, which the panel omits), read `mart.fn_daily_market_cap`
+   price would put Apple's market cap 112 times too high. Both carry SF1's share factor
+   (an ADR's ratio, a multi-class issuer's primary class; 0043), and EPS is per traded
+   share. For every trading day, read `mart.fn_daily_market_cap`
    (`duk mc`; [duk.md](duk.md#mc-and-ph---mcap--daily-market-cap)).
 7. **Keep the dead in the universe.** The panel holds every security with statements that
    traded in the week to each date, including those that later died. A filter on today's `is_actively_trading`
@@ -198,7 +199,8 @@ SELECT * FROM mart.fn_fundamental_snapshot('2020-06-15');
 - **Price.** The raw close on the date, or the last one in the week before it.
 - **Share terms.** Share counts, EPS and dividends per share are put in the date's terms with
   the warehouse's own splits, the ones its raw prices follow (ADR 0019). Market cap is the raw
-  close times that count. A 1999 count in today's terms, against 1999's raw price, would put
+  close times that count times SF1's share factor (0043), and EPS and share issuance are per
+  traded share. A 1999 count in today's terms, against 1999's raw price, would put
   Apple's market cap and P/E 112 times too high.
 - **Signs are SF1's.** Capital expenditure, dividends paid and buybacks are negative cash flows,
   so the formulas below negate them.

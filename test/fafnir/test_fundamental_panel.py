@@ -11,6 +11,7 @@ mismatch, the extra lag, and one definition shared by the snapshot and the panel
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -312,6 +313,83 @@ def test_the_factors_from_one_year_and_its_predecessor(db):
     assert 0 <= r["piotroski_f"] <= 9 and r["altman_z"] > 0
     # Three years back is not on file: no CAGR rather than a guess.
     assert r["revenue_cagr_3y"] is None
+
+
+def _factor(db, sid, year, factor):
+    """SF1's sharefactor on a fiscal year's income version, as the loader keeps it
+    (extra.vendor_metric; ADR 0019's amendment, migrations 0042-0043)."""
+    db.execute(
+        "UPDATE core.income_statement SET extra = %s::jsonb"
+        " WHERE security_id = %s AND fiscal_year = %s",
+        (json.dumps({"vendor_metric": {"sharefactor": factor}}), sid, year),
+    )
+
+
+def test_the_share_factor_scales_the_cap_and_every_ratio_to_it(db):
+    """An ADR (TSM's 0.2: five ordinary shares to one ADR): SF1's count is of
+    ordinary shares, the price of ADRs (0043)."""
+    plain, adr = _security(db, "ZZORD"), _security(db, "ZZADR")
+    for sid in (plain, adr):
+        _year(db, sid, 2010, D(2011, 2, 18))
+        _price(db, sid, D(2011, 3, 31), 20)
+    _factor(db, adr, 2010, "0.2")
+    snap = _snapshot(db, D(2011, 3, 31))
+    a, o = snap[adr], snap[plain]
+    assert (o["share_factor"], a["share_factor"]) == (1, Decimal("0.2"))
+    # The count is SF1's in both; the cap is the traded line's.
+    assert a["shares_outstanding_as_of"] == o["shares_outstanding_as_of"] == 100
+    assert (o["market_cap"], a["market_cap"]) == (2000, 400)
+    assert (o["enterprise_value"], a["enterprise_value"]) == (2200, 600)
+    for ratio in ("earnings_yield", "book_to_price", "fcf_yield", "buyback_yield_ttm"):
+        assert a[ratio] == pytest.approx(o[ratio] * 5), ratio
+    assert a["ev_to_ebitda"] == pytest.approx(600 / 230)
+    assert a["altman_z"] < o["altman_z"]
+    # Nothing that does not meet the price moves.
+    for ratio in ("roe", "roa", "gross_margin", "current_ratio", "debt_to_equity"):
+        assert a[ratio] == pytest.approx(o[ratio]), ratio
+
+
+def test_issuance_and_eps_are_counted_in_traded_units(db):
+    """A multi-class issuer's conversion (BRK's A into B): SF1's count of the primary
+    class rises 3% while its factor falls as much. No share was issued, and earnings
+    per traded share did not fall (0043)."""
+    sid = _security(db, "ZZBRK")
+    _year(
+        db,
+        sid,
+        2009,
+        D(2010, 2, 20),
+        shares_outstanding=100,
+        weighted_average_shares=100,
+    )
+    _year(
+        db,
+        sid,
+        2010,
+        D(2011, 2, 18),
+        shares_outstanding=103,
+        weighted_average_shares=103,
+    )
+    _factor(db, sid, 2009, "1.03")
+    _factor(db, sid, 2010, "1")
+    _price(db, sid, D(2011, 3, 31), 20)
+    r = _snapshot(db, D(2011, 3, 31))[sid]
+    assert r["net_share_issuance_1y"] == pytest.approx(0, abs=1e-12)
+    assert r["eps_growth_yoy"] == pytest.approx(0, abs=1e-12)
+    assert r["market_cap"] == 20 * 103
+
+
+def test_no_count_no_factor(db):
+    sid = _security(db, "ZZNOC")
+    _year(db, sid, 2010, D(2011, 2, 18), shares_outstanding=None)
+    _factor(db, sid, 2010, "0.2")
+    _price(db, sid, D(2011, 3, 31), 20)
+    r = _snapshot(db, D(2011, 3, 31))[sid]
+    assert (r["shares_outstanding_as_of"], r["share_factor"], r["market_cap"]) == (
+        None,
+        None,
+        None,
+    )
 
 
 def test_the_denominator_rule(db):

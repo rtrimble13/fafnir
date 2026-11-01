@@ -4,11 +4,11 @@ Every schema, table, view, materialized view and function fafnir stores or serve
 with its **grain**, **source**, **units**, **adjustment status** and **update
 cadence**. This is the contract between the warehouse and everything that reads it.
 
-It describes the schema at migration **0042** (`daily_market_cap`). It was
+It describes the schema at migration **0043** (`panel_share_factor`). It was
 checked against the live catalog at 0040 (`pg_class`, `pg_attribute`,
 `pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
-on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's view, function and
-re-defined view are described from the migration and its tests. A migration that adds, drops or re-types a column updates this file in
+on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's and 0043's objects
+are described from the migrations and their tests. A migration that adds, drops or re-types a column updates this file in
 the same pull request: the PR template's first box.
 
 Conventions:
@@ -938,15 +938,30 @@ clipped or filled.
 | Growth | `revenue_growth_yoy, eps_growth_yoy, revenue_cagr_3y, net_income_growth_yoy` |
 | Investment, issuance | `asset_growth_1y, capex_to_sales, net_share_issuance_1y` |
 | Payout | `dividend_yield_ttm, buyback_yield_ttm, shareholder_yield` |
+| Share factor | `share_factor` (0043, the last column): SF1's, applied; NULL with no count |
 
 - **Share terms** (ADR 0019 §3). `shares_outstanding_as_of` is the basis's count put in
   `as_of_date`'s terms with the warehouse's splits (`mart.v_corporate_action`), the list
   the raw prices follow. `market_cap` is the raw close times it: never a vendor
   snapshot. EPS and dividends per share are in the same terms.
-- **No share factor yet.** The panel predates 0042 and omits SF1's share factor, which
-  `mart.fn_daily_market_cap` applies. For a security whose factor is not 1 (an ADR, a
-  multi-class issuer's primary class), `market_cap`, `enterprise_value` and the value
-  yields are off by it until the panel is regenerated.
+- **The share factor** (0043; [ADR 0019's amendment](adr/0019-derived-metrics-not-vendor-metrics.md#amendment-2026-11-daily-market-cap-and-the-share-factor)).
+  SF1's `sharefactor` turns the count into the traded line's: an ADR's ratio, or a
+  multi-class issuer's primary class.
+  - **Which:** the basis period's income version in force at the knowledge date, read
+    through the panel's own states; 1 where SF1 gave none.
+  - **Where:** `market_cap` is `close_raw × shares_outstanding_as_of × share_factor`, so
+    `enterprise_value` and every ratio to them carry it, Altman Z's market-value term
+    included. `mart.fn_daily_market_cap` gives the same cap on the same day (a test
+    holds them equal).
+  - **Per-share and issuance measures are in traded units, as the price is.** EPS (so
+    `eps_growth_yoy`) is net income to common over weighted shares × the factor.
+    `net_share_issuance_1y` and Piotroski's issuance point compare count × factor, each
+    period with its own, so a class conversion (BRK's A into B) is not issuance. An
+    ADR's factor is constant, so neither moves for one.
+  - **`shares_outstanding_as_of` stays SF1's count**, as in the daily function.
+  - **Cost:** reading the factor costs a second scan of the income versions. On a
+    synthetic load of 500 securities and 93 month-ends, the panel function took about
+    7 s with it and 6 s without.
 - **`enterprise_value`** is market cap plus total debt less cash. It omits minority
   interest and preferred stock: SF1 carries no balance for either.
 - **`currency_mismatch`**: the statements are not in the trading currency. Every ratio

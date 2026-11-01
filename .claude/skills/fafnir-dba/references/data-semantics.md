@@ -64,9 +64,11 @@ read it.
 > multiplied by the splits since. And SF1's share factor: an ADR's count is of ordinary
 > shares, so TSM's cap without it is five times too high.
 
-> **Wrong answer:** `mart.fundamental_panel.market_cap` for an ADR or a multi-class
-> issuer. The panel predates 0042 and omits the share factor. Where `share_factor` is
-> not 1, read the daily function.
+> **Wrong answer:** a panel row from a warehouse before migration 0043, for an ADR or
+> a multi-class issuer. Before 0043 the panel omitted the share factor, and its market
+> cap and value yields were off by it (TSM's five times). A row with a `share_factor`
+> column carries it; after `fafnir db migrate`, it is there once `fafnir db
+> refresh-marts` has run.
 
 > **Wrong answer:** quoting the profile's market cap or beta for a Sharadar-fed
 > security as current. Read the screener's, and say whether it was derived.
@@ -463,6 +465,8 @@ How to check a row:
   as_of_date` is 0, always.
 - **Its market cap** is `close_raw × shares_outstanding_as_of`, the count put in
   `as_of_date`'s terms with `mart.v_corporate_action`'s splits. A P/E that is 2, 7 or
-  112 times off means a split is missing from the warehouse's list (ADR 0019). It omits
-  SF1's share factor (an ADR's ratio), which `mart.fn_daily_market_cap` applies: for a
-  security whose factor is not 1, the two differ by it until the panel is regenerated.
+  112 times off means a split is missing from the warehouse's list (ADR 0019).
+- **Times its share factor** (0043): `market_cap` is `close_raw ×
+  shares_outstanding_as_of × share_factor`, the same cap as `mart.fn_daily_market_cap`
+  on the same day. EPS and issuance are per traded share. So a cap that is 5 times
+  `close_raw × shares_outstanding_as_of` is an ADR's ratio, not an error.

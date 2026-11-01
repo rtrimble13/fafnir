@@ -15,7 +15,7 @@ warehouse's splits, x SF1's share factor for the period:
 - a cross-section in one call is each security's own call, and the span's bounds
   change only which bars come back;
 - mart.v_security_attributes meets it on the last bar, and the factor panel meets
-  it at month-ends (where the factor is 1: the panel omits it, until regenerated).
+  it at month-ends, share factor and all (0043).
 """
 
 from __future__ import annotations
@@ -511,19 +511,16 @@ def test_through_the_loader_the_split_era_and_the_factor(db, tmp_path):
     panel = {
         (r["security_id"], r["as_of_date"]): r
         for r in db.fetchall(
-            "SELECT security_id, as_of_date, price_date, market_cap"
+            "SELECT security_id, as_of_date, price_date, market_cap, share_factor"
             "  FROM mart.fundamental_panel WHERE security_id = ANY(%s)",
             ([apl, adr],),
         )
     }
     for day in (D(1999, 12, 31), D(2000, 7, 31)):
+        # The panel's month-end cap is the daily one, share factor and all (0043).
         assert panel[(apl, day)]["market_cap"] == got[day]["market_cap"]
-        # The panel omits the share factor until it is regenerated (0042's header):
-        # this pins the known gap so the fix shows up here.
-        assert (
-            panel[(adr, day)]["market_cap"] * Decimal("0.2")
-            == adr_rows[day]["market_cap"]
-        )
+        assert panel[(adr, day)]["market_cap"] == adr_rows[day]["market_cap"]
+        assert panel[(adr, day)]["share_factor"] == Decimal("0.2")
 
 
 # ---------------------------------------------------------------------------
