@@ -608,7 +608,10 @@ fafnir dq run --no-statements             # this run without them
    statement's, so the three tables share one header. Each row also carries `close`,
    the raw close on or before its `known_from`, for the share-terms checks (DQ921).
    That close is looked up once per security and `known_from`, since the three
-   statements of a version share one. Beside the stream go three files:
+   statements of a version share one. It reaches back 92 days at most: a security
+   that has not traded for a quarter has no price to sharpen DQ921 with, and the
+   reach keeps each lookup to one or two of `core.daily_price`'s yearly partitions,
+   not every one before the date. Beside the stream go three files:
    - `ref.statement_line_item` (`--items`), as it is;
    - `core.corporate_action` (`--actions`), as the bars run sends it;
    - the security master (`--meta`):
@@ -651,7 +654,19 @@ or has run: on or off, shadow or queue, and the newest run's as-of date, reports
 time.
 
 **Runtime.** The plan's target is the whole statements history in 2 minutes or less
-on the host, end to end (F4). RUNTIME_PLACEHOLDER Measure it on the host with
+on the host, end to end (F4). On a 4-core test machine, with dorq's 6M-row
+benchmark (20,000 securities, twenty years) loaded into the three tables:
+
+| Step | Time |
+|---|---|
+| The `COPY` alone, 2.3 GB of CSV | 50 s |
+| dorq alone, from a file, four threads | 44 s at 1.4 GB |
+| `fafnir dq run --statements-only`, end to end | 70 s |
+
+Postgres's sort of the wide rows dominates the `COPY`. dorq checks while the rows
+stream in, so the two overlap. The benchmark's line items are drawn independently,
+so its identities and cash ties fail on nearly every row. dorq's figure is from a
+run on its defaults, and the end-to-end one ignores DQ904. Measure it on the host with
 `fafnir dq run --statements-only --rerun` (it prints the time) or read
 `finished_at - started_at` on the run's row. If it is over 2 minutes, the plan's
 fallback is to judge only the securities with a row loaded since the previous run.

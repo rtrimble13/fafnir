@@ -65,6 +65,11 @@ DEFAULT_TABLE = "core.income_statement"
 #: it is never auto-resolved (``fafnir_mcp.tools.NEVER_AUTO_RESOLVE``).
 STATEMENT_KEY_CHECK = "dorq_statement_key"
 
+#: How far before a version's ``known_from`` its ``close`` may be: a security
+#: that has not traded for a quarter has no price to sharpen DQ921 with, and the
+#: row goes without one (dorq reads ``close`` as optional).
+CLOSE_REACH_DAYS = 92
+
 #: The statement tables by dorq's statement name, in the order the export reads
 #: them.
 STATEMENT_TABLE = dict(TABLES)
@@ -241,9 +246,12 @@ def statements_copy_statement(
     tables are.
 
     ``close`` is the raw close on or before ``known_from`` (dorq's share-terms
-    checks, DQ921). It is looked up once per security and ``known_from`` -- the
-    three statements of a version share one -- and joined back to each row. COPY
-    takes no bind parameters, so values are composed as literals.
+    checks, DQ921), within :data:`CLOSE_REACH_DAYS` of it. It is looked up once
+    per security and ``known_from`` -- the three statements of a version share one
+    -- and joined back to each row. The reach keeps each lookup to the one or two
+    yearly partitions of ``core.daily_price`` it can fall in; without it every
+    lookup probes every partition before its date. COPY takes no bind parameters,
+    so values are composed as literals.
     """
     names = [str(i["column_name"]) for i in items]
     where = sql.SQL("superseded_at IS NULL")
@@ -293,6 +301,7 @@ def statements_copy_statement(
         "SELECT k.security_id, k.known_from, p.close FROM ({known}) k"
         " LEFT JOIN LATERAL (SELECT d.close FROM core.daily_price d"
         " WHERE d.security_id = k.security_id AND d.trade_date <= k.known_from"
+        " AND d.trade_date > k.known_from - {reach}"
         " ORDER BY d.trade_date DESC LIMIT 1) p ON TRUE)"
         " SELECT {columns} FROM ({rows}) t"
         " JOIN c ON c.security_id = t.security_id AND c.known_from = t.known_from"
@@ -301,6 +310,7 @@ def statements_copy_statement(
         ") TO STDOUT (FORMAT csv, HEADER)"
     ).format(
         known=sql.SQL(" UNION ").join(known),
+        reach=sql.Literal(CLOSE_REACH_DAYS),
         columns=columns,
         rows=sql.SQL(" UNION ALL ").join(rows),
     )

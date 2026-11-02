@@ -430,6 +430,42 @@ def test_the_export_streams_current_versions_with_close_items_and_meta(
     assert meta[str(expected)][-1] == "true"
 
 
+def test_a_close_more_than_a_quarter_before_known_from_is_not_sent(
+    db, fake_dorq, tmp_path
+):
+    sid = _security(db, "STMQ")
+    days = _sessions(db)
+    _prices(db, sid, days[:40])  # trades until early March 2023
+    _put(
+        db,
+        "income",
+        sid,
+        dt.date(2023, 3, 31),
+        label="2023-Q1",
+        known_from=dt.date(2023, 5, 2),
+        revenue=100,
+    )
+    _put(
+        db,
+        "income",
+        sid,
+        dt.date(2023, 6, 30),
+        label="2023-Q2",
+        known_from=dt.date(2023, 8, 1),
+        revenue=100,
+    )
+    dorq_statements.run_statements(
+        db, _settings(fake_dorq, tmp_path), dt.date(2024, 12, 31)
+    )
+    lines = (fake_dorq.parent / "stdin-0.csv").read_text().splitlines()
+    header = lines[0].split(",")
+    closes = [dict(zip(header, ln.split(",")))["close"] for ln in lines[1:]]
+    # 2023-05-02 is within 92 days of the last bar (2023-03-01); 2023-08-01 is not.
+    assert days[39] == dt.date(2023, 3, 1)
+    assert closes[0] != "" and closes[1] == ""
+    assert dorq_statements.CLOSE_REACH_DAYS == 92
+
+
 def test_a_recheck_export_is_scoped_to_its_securities(db, fake_dorq, tmp_path):
     a, _ = _company(db, "STMA")
     b, _ = _company(db, "STMB")
