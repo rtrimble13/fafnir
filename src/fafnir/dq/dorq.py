@@ -58,12 +58,16 @@ DORQ_PREFIX = "dorq_"
 SINCE_OVERLAP_SESSIONS = 5
 
 #: dorq's checks whose judgement spans securities: a failed load across a cohort,
-#: several series moving by one split ratio, a market-wide day. A re-run over the
-#: few securities with open flags cannot reproduce them, so ``dq recheck`` leaves
-#: them alone.
+#: several series moving by one split ratio, a market-wide day, and on the
+#: statements, many series revised on one date (DQ951). A re-run over the few
+#: securities with open flags cannot reproduce them, so ``dq recheck`` leaves them
+#: alone.
 CROSS_SECTIONAL_CHECKS = frozenset(
-    {"dorq_cohort_gap", "dorq_cohort_move", "dorq_market_day"}
+    {"dorq_cohort_gap", "dorq_cohort_move", "dorq_market_day", "dorq_revision_cohort"}
 )
+
+#: DQ951's check: a revision cohort on the statements (dorq 0.13).
+REVISION_COHORT_CHECK = "dorq_revision_cohort"
 
 #: dorq's stale-feed check (DQ304): bars that stop before the as-of date by more
 #: sessions than the series' density explains. dorq cannot tell a delisting from a
@@ -102,10 +106,15 @@ class DorqSettings:
     lookback_sessions: int = 260
     shadow_dir: str = "var/dorq-shadow"
     backfill_max: int = 500
+    #: The statements run's config (``[dq] dorq_statements_config``); empty runs it
+    #: ``--isolated``. See :mod:`fafnir.dq.dorq_statements`.
+    statements_config: str = ""
 
-    def base_args(self) -> list[str]:
+    def base_args(self, config: Optional[str] = None) -> list[str]:
+        """``dorq check`` with ``config`` (the bars run's by default)."""
+        config = self.config if config is None else config
         args = [self.path, "check"]
-        args += ["--config", self.config] if self.config else ["--isolated"]
+        args += ["--config", config] if config else ["--isolated"]
         if self.threads:
             args += ["--threads", str(self.threads)]
         return args
@@ -120,6 +129,7 @@ def settings_from(cfg) -> DorqSettings:
         lookback_sessions=cfg.dorq_lookback_sessions,
         shadow_dir=cfg.dorq_shadow_dir,
         backfill_max=cfg.dorq_backfill_max,
+        statements_config=cfg.dorq_statements_config,
     )
 
 
@@ -311,7 +321,7 @@ def full_window(db: Database, exchange_code: str) -> Window:
 # ---------------------------------------------------------------------------
 
 
-def _write_csv(path: Path, header: Sequence[str], rows: Iterable[Sequence]) -> int:
+def write_csv(path: Path, header: Sequence[str], rows: Iterable[Sequence]) -> int:
     count = 0
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh, lineterminator="\n")
@@ -326,6 +336,46 @@ def _scope(security_ids: Optional[Sequence[int]], alias: str) -> tuple[str, list
     if security_ids is None:
         return "", []
     return f" AND {alias}.security_id = ANY(%s)", [list(security_ids)]
+
+
+def write_actions(
+    db: Database, path: Path, security_ids: Optional[Sequence[int]] = None
+) -> int:
+    """``core.corporate_action``'s splits and dividends as stored, in the shape of
+    dorq's ``--actions`` file: the bars run's and the statements run's alike."""
+    where, params = _scope(security_ids, "a")
+    actions = db.fetchall(
+        f"""
+        SELECT a.security_id, a.ex_date, a.action_type, a.split_numerator,
+               a.split_denominator, a.dividend_amount
+          FROM core.corporate_action a
+         WHERE a.action_type IN ('split', 'dividend'){where}
+         ORDER BY a.security_id, a.ex_date, a.action_type
+        """,
+        params,
+    )
+    return write_csv(
+        path,
+        (
+            "security_id",
+            "ex_date",
+            "action_type",
+            "split_numerator",
+            "split_denominator",
+            "dividend_amount",
+        ),
+        (
+            (
+                r["security_id"],
+                r["ex_date"],
+                r["action_type"],
+                r["split_numerator"],
+                r["split_denominator"],
+                r["dividend_amount"],
+            )
+            for r in actions
+        ),
+    )
 
 
 def export_context(
@@ -356,45 +406,13 @@ def export_context(
         """,
         (exchange_code,),
     )
-    _write_csv(
+    write_csv(
         paths["calendar"],
         ("exchange_code", "trade_date", "is_open"),
         ((r["exchange_code"], r["trade_date"], r["is_open"]) for r in cal),
     )
 
-    where, params = _scope(security_ids, "a")
-    actions = db.fetchall(
-        f"""
-        SELECT a.security_id, a.ex_date, a.action_type, a.split_numerator,
-               a.split_denominator, a.dividend_amount
-          FROM core.corporate_action a
-         WHERE a.action_type IN ('split', 'dividend'){where}
-         ORDER BY a.security_id, a.ex_date, a.action_type
-        """,
-        params,
-    )
-    _write_csv(
-        paths["actions"],
-        (
-            "security_id",
-            "ex_date",
-            "action_type",
-            "split_numerator",
-            "split_denominator",
-            "dividend_amount",
-        ),
-        (
-            (
-                r["security_id"],
-                r["ex_date"],
-                r["action_type"],
-                r["split_numerator"],
-                r["split_denominator"],
-                r["dividend_amount"],
-            )
-            for r in actions
-        ),
-    )
+    write_actions(db, paths["actions"], security_ids)
 
     where, params = _scope(security_ids, "s")
     meta = db.fetchall(
@@ -407,7 +425,7 @@ def export_context(
         """,
         [list(NAV_LAGGING_ASSET_TYPES), *params],
     )
-    _write_csv(
+    write_csv(
         paths["meta"],
         ("security_id", "asset_type", "nav_priced", "exchange"),
         (
@@ -523,30 +541,18 @@ def run_dorq(
             args += ["--as-of", window.as_of.isoformat()]
         if window.since is not None:
             args += ["--since", window.since.isoformat()]
-        out_path = workdir / "out.jsonl"
-        err_path = workdir / "err.txt"
-        logger.info("dorq: %s", " ".join(args))
-        with out_path.open("wb") as out, err_path.open("wb") as err:
-            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=out, stderr=err)
-            sent = _stream_bars(db, proc, window.bars_from, security_ids)
-            status = proc.wait()
-        if status != 0:
-            tail = err_path.read_text(errors="replace").strip()[-2000:]
-            raise DorqError(f"dorq {version} exited {status}: {tail or 'no message'}")
-        records = [
-            json.loads(line)
-            for line in out_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        records, sent = invoke(
+            db,
+            args,
+            bars_copy_statement(window.bars_from, security_ids),
+            workdir,
+            version,
+        )
     logger.info(
         "dorq %s: %d violations from %.1f MB of bars", version, len(records), sent / 1e6
     )
     # Read before the filter: the hash is dorq's, whatever fafnir then leaves out.
-    config_hash = (
-        ((records[0].get("detail") or {}).get("dorq") or {}).get("config_hash")
-        if records
-        else None
-    )
+    config_hash = config_hash_of(records)
     records, dropped = drop_not_trading(db, records)
     return RunResult(
         version=version,
@@ -556,6 +562,48 @@ def run_dorq(
         config_hash=config_hash,
         dropped=dropped,
     )
+
+
+def invoke(
+    db: Database,
+    args: Sequence[str],
+    copy_statement: sql.Composed,
+    workdir: Path,
+    version: str,
+) -> tuple[list[dict], int]:
+    """Run ``args`` with ``copy_statement``'s rows on its stdin; return dorq's rows
+    and the bytes sent. Raises :class:`DorqError` when dorq exits non-zero, with
+    the tail of its message.
+
+    dorq's stdout goes to a file in ``workdir`` rather than a pipe -- reading a
+    pipe while writing another invites a deadlock -- and is parsed once dorq has
+    exited.
+    """
+    out_path = workdir / "out.jsonl"
+    err_path = workdir / "err.txt"
+    logger.info("dorq: %s", " ".join(args))
+    with out_path.open("wb") as out, err_path.open("wb") as err:
+        proc = subprocess.Popen(
+            list(args), stdin=subprocess.PIPE, stdout=out, stderr=err
+        )
+        sent = stream_copy(db, proc, copy_statement)
+        status = proc.wait()
+    if status != 0:
+        tail = err_path.read_text(errors="replace").strip()[-2000:]
+        raise DorqError(f"dorq {version} exited {status}: {tail or 'no message'}")
+    records = [
+        json.loads(line)
+        for line in out_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return records, sent
+
+
+def config_hash_of(records: Sequence[dict]) -> Optional[str]:
+    """The hash dorq stamped on its reports (None when it reported nothing)."""
+    if not records:
+        return None
+    return ((records[0].get("detail") or {}).get("dorq") or {}).get("config_hash")
 
 
 def drop_not_trading(
@@ -600,13 +648,11 @@ def drop_not_trading(
     return kept, {STALE_FEED_CHECK: left_out}
 
 
-def _stream_bars(
-    db: Database,
-    proc: subprocess.Popen,
-    bars_from: Optional[dt.date],
-    security_ids: Optional[Sequence[int]],
+def stream_copy(
+    db: Database, proc: subprocess.Popen, copy_statement: sql.Composed
 ) -> int:
-    """Copy the bars into dorq's stdin; return the bytes sent.
+    """Copy ``copy_statement``'s rows (the bars, or the statements) into dorq's
+    stdin; return the bytes sent.
 
     COPY hands rows over one at a time, so they are gathered into blocks before
     each write: one system call per row would cost more than dorq's whole run on
@@ -620,7 +666,7 @@ def _stream_bars(
     block = bytearray()
     try:
         with db.conn.cursor() as cur:
-            with cur.copy(bars_copy_statement(bars_from, security_ids)) as copy:
+            with cur.copy(copy_statement) as copy:
                 for chunk in copy:
                     block += chunk
                     if len(block) >= block_size:
@@ -752,6 +798,13 @@ def condition_record_key(record: dict) -> dict:
         return key
     inner = (record.get("detail") or {}).get("detail")
     inner = inner if isinstance(inner, dict) else {}
+    if record.get("check_name") == REVISION_COHORT_CHECK and "cohort" not in key:
+        # DQ951 keys a cohort on its date alone, and a date can have two: the
+        # series revised that day (info), and those carrying one finding in rows
+        # loaded that day (warn, with the finding's ``codes``). Their members
+        # change as they are re-judged, so the kind tells them apart.
+        key["cohort"] = "findings" if inner.get("codes") else "revisions"
+        return key
     if "ratio" in key or "members" in key:
         return key
     if inner.get("ratio") not in (None, ""):
@@ -963,11 +1016,21 @@ def read_shadow(path: Path) -> list[dict]:
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def start_run(db: Database, window: Window, shadow: bool, full: bool = False) -> int:
+def start_run(
+    db: Database,
+    window: Window,
+    shadow: bool,
+    full: bool = False,
+    *,
+    endpoint: Optional[str] = None,
+    params: Optional[dict] = None,
+) -> int:
     """An ``ops.ingestion_run`` row for the run: lineage for every flag it writes.
 
     Opened before dorq runs, so a run that fails still has a row. The version is
     known only once dorq has answered, so :func:`finish_run` fills it in.
+    ``endpoint`` is the bars run's (``dq-shadow`` or ``dq-run``) unless given;
+    ``params`` are added to those it opens with.
     """
     return int(
         db.fetchval(
@@ -979,13 +1042,14 @@ def start_run(db: Database, window: Window, shadow: bool, full: bool = False) ->
             """,
             (
                 WATERMARK_SOURCE,
-                WATERMARK_SHADOW if shadow else WATERMARK_QUEUE,
+                endpoint or (WATERMARK_SHADOW if shadow else WATERMARK_QUEUE),
                 json.dumps(
                     {
                         "dorq_version": None,
                         "since": window.since.isoformat() if window.since else None,
                         "shadow": shadow,
                         "full": full,
+                        **(params or {}),
                     }
                 ),
                 window.bars_from,

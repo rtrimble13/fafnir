@@ -38,6 +38,15 @@ incremental and idempotent — a missed day is caught up on the next run.
    the first's shadow file. One `dq-shadow` row in `ops.ingestion_run` a night,
    started after `fafnir-daily` ended, is the healthy shape.
 
+   With `[dq] dorq_statements = true` the same `dq run` then runs dorq on the
+   statements: their whole history, as of the night's session, into
+   `<dorq_shadow_dir>/statements/<as-of>.jsonl` while `dorq_statements_shadow`
+   holds (doc/dorq.md, *Statements*). That is a second dorq row a night, endpoint
+   `dq-statements-shadow`, with `params.reports` and its own watermark; `dq.log`
+   says `dorq statements <version> (as of <date>, <seconds> s)`. It judges a night
+   once, as the bars do, and its failure is a `dq run` failure, not the load's.
+   `fafnir status` shows its newest run under the `dorq` line.
+
    It runs after a failed load too. dorq then finds no session newer than the night
    it last judged, says so in `dq.log` and writes no run row, no file and no
    watermark. **No `dq-shadow` row after a failed daily is expected, not a second

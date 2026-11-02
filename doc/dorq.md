@@ -6,7 +6,8 @@ error**. It weighs a bad print, a price at the wrong scale, an unreported split,
 history at the wrong date, a feed outage and a real move against each other, and
 reports the probability of an error, the evidence, and the repair it suggests.
 [ADR 0013](adr/0013-dorq-dq-engine.md) records why it runs beside the SQL checks
-rather than instead of them.
+rather than instead of them. From dorq 0.13 it judges the financial statements too,
+in a run of their own ([Statements](#statements)).
 
 ## Install
 
@@ -37,6 +38,9 @@ move the link. To roll back, move it back.
 Or build it from source with the `release` preset (dorq's README). Either way the
 binary is `/opt/dorq/bin/dorq`, which is `[dq] dorq_path`'s default.
 
+The statements run ([Statements](#statements)) needs dorq 0.13.0 or later: the
+first release with every check that succeeds a SQL fundamentals check.
+
 ## Configure
 
 In `~/.fafnirrc` (all optional):
@@ -51,6 +55,7 @@ dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"   # absolute on a host: see belo
 dorq_lookback_sessions = 260              # bars per security on a nightly run
 dorq_threads = 0           # 0: one per core; the output does not depend on it
 dorq_backfill_max = 500    # most securities a night's backfill judges (see Window)
+dorq_statements = false    # dorq on the statements too: see Statements
 ```
 
 `dorq_shadow_dir` defaults to `var/dorq-shadow`. Like `log_dir`'s default, it is
@@ -550,4 +555,165 @@ in tiers. Three are never auto-resolved:
 `fafnir dq recheck` re-runs dorq over the full history of the securities with open
 dorq flags, and closes each one dorq no longer emits. It skips the never-resolve
 three and the cross-sectional `dorq_cohort_gap` and `dorq_cohort_move`. When the
-binary has changed since a flag was written, the resolution note says so.
+binary has changed since a flag was written, the resolution note says so. A flag on
+a statement table is re-run on the statements ([Recheck](#recheck)).
+
+## Statements
+
+dorq 0.13 reads financial statements as a third kind of input, beside bars. Its
+DQ9xx checks judge identities, values over time, share counts, the knowledge
+timeline, coverage and freshness (dorq's `doc/statements.md`). fafnir runs it on
+`core.income_statement`, `core.balance_sheet` and `core.cash_flow_statement` in a
+run of its own, after the bars. **The bars run is the same with it or without it:**
+the same export, window, history pass, shadow file and run record.
+
+It succeeds thirteen of the fourteen SQL fundamentals checks (the dorq fundamentals
+plan, §3). Until the statements' own shadow period has met its cutover criteria (the
+plan's §6; DR-0914), its rows go to a shadow directory of their own, and the SQL
+checks keep the queue.
+
+### Configure
+
+```toml
+[dq]
+engine = "both"
+dorq_statements = true            # off by default
+dorq_statements_config = "/etc/fafnir/dorq-statements.toml"
+dorq_statements_shadow = true     # <dorq_shadow_dir>/statements/, not the queue
+```
+
+```toml
+# /etc/fafnir/dorq-statements.toml
+include = ["/opt/dorq/share/dorq/priors/fafnir-statements.toml"]
+```
+
+`fafnir-statements.toml` ships with dorq. It holds SF1's identities, the SQL checks'
+tolerances (an identity within 0.5% or 1M, the change in cash within 2%, or 10% from
+2018), the items that are never negative or never absent, and `[fafnir] table_name`.
+With `dorq_statements_config` empty, dorq runs `--isolated`, on its defaults: no
+identities, so DQ903 judges none.
+
+### What a run does
+
+```bash
+fafnir dq run --engine both               # SQL, dorq on the bars, then the statements
+fafnir dq run --statements-only           # dorq on the statements alone
+fafnir dq run --statements-only --rerun   # judge the night again, after a repair
+fafnir dq run --no-statements             # this run without them
+```
+
+1. **Export.** One `COPY` streams every current version (`superseded_at IS NULL`) of
+   the three tables into dorq's stdin. It is ordered by security, statement, period
+   type, fiscal date and version. Each row carries every line item, empty for another
+   statement's, so the three tables share one header. Each row also carries `close`,
+   the raw close on or before its `known_from`, for the share-terms checks (DQ921).
+   That close is looked up once per security and `known_from`, since the three
+   statements of a version share one. Beside the stream go three files:
+   - `ref.statement_line_item` (`--items`), as it is;
+   - `core.corporate_action` (`--actions`), as the bars run sends it;
+   - the security master (`--meta`):
+
+     | Field | From |
+     |---|---|
+     | `currency` | `core.security.currency`: DQ944 compares the reporting currency with it |
+     | `first_trade_date`, `last_trade_date` | the first and last bar in `core.daily_price` |
+     | `active`, `delisted_date` | `is_actively_trading`, `delisted_date` |
+     | `sector`, `industry` | `core.v_security_classification`, as readers see it; dorq's profiles can match on `sector` |
+     | `statements_expected` | the open Sharadar link names a fundamentals master row with a `first_quarter`, the rule `fundamentals_coverage` uses |
+2. **Window.** The whole history, every night, as of the market's latest session
+   (`--as-of`). DQ942 judges staleness against that date. There is no `--since`: the
+   night's file is dorq's standing view of the statements, as the SQL checks' open
+   flags are theirs. **A night is judged once**, as for bars. A second run for a
+   session a statements run already judged says which run judged it and does
+   nothing; `--rerun` judges it again and replaces its file.
+3. **Run.** `dorq check --kind statements --format fafnir --exit-zero --show-info`.
+   Info is shown because some of the SQL checks this run succeeds write info flags:
+   a gap, a currency, a coverage hole.
+4. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`.
+   That is a directory of its own, because `dq compare` takes the last `*.jsonl` in
+   the shadow directory's top level as the newest night of bars. Otherwise the bars'
+   ingest writes them, with the same open and accepted guards. Each row's
+   `table_name` is its statement's table. A finding on no one statement goes under
+   `core.income_statement`, as the SQL checks file theirs: DQ943 (statements missing)
+   and DQ951's cohorts. A date can hold two DQ951 cohorts: the series revised that
+   day, and those carrying one finding in rows loaded that day. dorq keys both on the
+   date, so fafnir's condition key adds which it is (`cohort`: `revisions` or
+   `findings`).
+5. **Record.** `ops.ingestion_run`, `source = 'dorq'`, endpoint `dq-statements-shadow`
+   (or `dq-statements` into the queue), with its own watermark. The bars run's
+   window, history pass and `dq compare` never read these rows. `params` holds
+   `kind: statements`, `full: true`, `dorq_version`, `dorq_config_hash`, `bytes` (the
+   statements sent) and `reports`. A failed run leaves `status = 'failed'` and the
+   watermark where it was.
+
+`fafnir status` prints a `statements` line under the `dorq` line once the run is on
+or has run: on or off, shadow or queue, and the newest run's as-of date, reports and
+time.
+
+**Runtime.** The plan's target is the whole statements history in 2 minutes or less
+on the host, end to end (F4). RUNTIME_PLACEHOLDER Measure it on the host with
+`fafnir dq run --statements-only --rerun` (it prints the time) or read
+`finished_at - started_at` on the run's row. If it is over 2 minutes, the plan's
+fallback is to judge only the securities with a row loaded since the previous run.
+It is not built: DQ942 has to judge every trading security each night, because a
+filing becomes overdue with time, not with a row.
+
+### The statements shadow period
+
+```bash
+fafnir dq compare --statements                    # the newest statements night
+fafnir dq compare --statements --labels-from-db   # with precision
+fafnir dq compare --statements /var/lib/fafnir/dorq-shadow/statements/2026-11-0{2,3}.jsonl
+fafnir dq compare --statements --json
+```
+
+- **Overlap.** These are the SQL flags open when the night's run started, for each
+  of the thirteen checks dorq succeeds. For each, the comparison counts how many a
+  successor report also covers. A report covers a flag when it is on the same
+  security and of a successor code, and agrees with whatever the flag's key names,
+  as below:
+
+  | SQL check | dorq | Agrees on |
+  |---|---|---|
+  | `fundamentals_version_chain` | DQ901 | statement, period |
+  | `fundamentals_negative_impossible` | DQ902 | statement, period |
+  | `balance_sheet_identity` | DQ903 | the balance sheet, period, identity `balance_sheet` |
+  | `cash_flow_tie` | DQ903 | the cash flow, period, identity `cash_flow` |
+  | `cash_balance_tie` | DQ904 | period, tie `cash` |
+  | `fundamentals_suspicious_zero` | DQ915 | statement, period |
+  | `fundamentals_ytd_suspect` | DQ916 | statement, fiscal year |
+  | `fundamentals_implausible_filing_lag` | DQ931 | period |
+  | `fundamentals_gap` | DQ941 | a fiscal date in the gap's span |
+  | `fundamentals_ttm_incomplete` | DQ941 | that fiscal year or the one before |
+  | `fundamentals_stale` | DQ942 | the security |
+  | `fundamentals_coverage` | DQ943 | the security |
+  | `fundamentals_currency_mismatch` | DQ944 | the reporting currency |
+
+  A period is the period type and fiscal date. Per dorq code: its reports, those at
+  warn and above, those an open SQL flag covers, and those no SQL check made.
+- **Standing.** dorq's conditions at warn and above against the SQL checks' open
+  flags at warn and above. The bar is 30% or less.
+- **New per night.** The conditions in this night's file absent from the previous
+  statements night's, against the SQL flags of the thirteen written between the two
+  runs' starts. The bar is 70% fewer.
+- **Precision.** With labels, it is reported at warn and above, at error, and per
+  code. Matching is dorq-eval's for a statements label: the same security, the
+  statement, period type, version and item agreeing where both name one, and the
+  fiscal dates overlapping within the slack (`--slack`, three days). Only labels about
+  statements judge statement reports, and they judge no bars report. A label is
+  about statements when it names a statement scope or a DQ9xx code. The warehouse's
+  own statement labels come with DR-0913. Until then, `--labels FILE` takes a file of
+  them.
+
+### Recheck
+
+`fafnir dq recheck` re-runs each open `dorq_*` flag by the run that wrote it. A flag
+on a statement table is re-run on the whole statements history of its securities,
+as of the market's latest session; any other flag is re-run on the bars. A bars
+re-run never closes a statement flag, and a statements re-run never closes a bars
+flag. A statements re-run sends the metadata of those securities alone, so it does
+not take every other security for one with no statements (DQ943). It skips
+`dorq_statement_key` (DQ901), which is never auto-resolved: as with
+`fundamentals_version_chain`, the repair is made on the host. It also skips
+`dorq_revision_cohort` (DQ951), a cohort that a subset of securities cannot
+reproduce.

@@ -59,7 +59,11 @@ once the daily has finished; the cron example chains it in the same entry. It is
 the night's only `dq run`: a DQ failure does not mark the load failed, and its
 queue summary goes to its own log. dorq judges a night once: a second run with no new
 session (after a failed load, on a holiday, or by hand) says so and writes nothing,
-and `dq run --rerun` re-judges on purpose ([dorq.md](dorq.md)).
+and `dq run --rerun` re-judges on purpose ([dorq.md](dorq.md)). With `[dq]
+dorq_statements`, the same `dq run` then has dorq judge the statements' whole
+history, into `<dorq_shadow_dir>/statements/` until their cutover
+([dorq.md](dorq.md#statements)). It is a second `ops.ingestion_run` row a night
+(`dq-statements-shadow`), and it too judges a night once.
 
 The first four steps are **universe maintenance**, and their order is load-bearing:
 
@@ -808,7 +812,9 @@ registration — the whole procedure, with the audit and revocation queries, is
 `fafnir dq run` writes flags; `fafnir dq list` and `fafnir dq resolve` are how they
 get worked. With `[dq] engine = "both"`, dorq runs after the SQL checks and, until
 the shadow period ends, writes to `[dq] dorq_shadow_dir` rather than the queue; read
-each night with `fafnir dq compare` ([dorq.md](dorq.md)). The two take the **same** selection options, so the workflow is to
+each night with `fafnir dq compare` ([dorq.md](dorq.md)). Its statements run, once
+`[dq] dorq_statements` is on, has a shadow period of its own: read it with `fafnir
+dq compare --statements` ([dorq.md](dorq.md#the-statements-shadow-period)). The two take the **same** selection options, so the workflow is to
 narrow with `list` until the page is the problem you mean, then re-run the same
 options under `resolve`.
 

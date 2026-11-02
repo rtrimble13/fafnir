@@ -980,9 +980,14 @@ def dq_queue(
 #:                                   resolve.
 #: * ``dorq_split_double_applied``-- the bars apply a split twice. Every adjusted
 #:                                   price before it is off by the ratio.
+#: * ``dorq_statement_key``       -- a statement period whose versions do not
+#:                                   chain (DQ901): a write went around the
+#:                                   loader, and the repair is made on the host,
+#:                                   as ``fundamentals_version_chain``'s is.
 #:
 #: The first three are the skill's standing rule 5 verbatim; the price_ pair are
-#: the playbooks' "report, do not resolve"; the dorq_ three are dorq plan §7.6.
+#: the playbooks' "report, do not resolve"; the bars' dorq_ three are dorq plan
+#: §7.6, and ``dorq_statement_key`` its fundamentals plan §5.6.
 #: ``test_never_auto_matches_the_skill``
 #: parses SKILL.md and asserts the two lists agree, so this cannot drift into
 #: being a second, quieter policy.
@@ -997,6 +1002,7 @@ NEVER_AUTO_RESOLVE = frozenset(
         "dorq_scale_shift",
         "dorq_split_without_jump",
         "dorq_split_double_applied",
+        "dorq_statement_key",
     }
 )
 

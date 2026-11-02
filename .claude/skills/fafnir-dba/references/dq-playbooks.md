@@ -1695,6 +1695,51 @@ repair: point-in-time reads over the break see two versions, or none.
 
 ---
 
+## The `dorq_*` statements family — dorq's judgement of a statement
+
+dorq 0.13 judges the three statement tables too (DQ9xx, dorq's
+`doc/statements.md`). `fafnir dq run` runs it after the bars when
+`[dq] dorq_statements = true`, over every current version, every night. It writes
+the queue **only with `[dq] dorq_statements_shadow = false`**. Until the statements
+cutover (DR-0914), the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`, and
+`fafnir dq compare --statements` reads them. A statement flag's `table_name` is its
+statement's table, and its `record_key` names the statement, period type, fiscal date
+and version (and the item, identity or tie when the condition is per item). Read
+`detail` as for bars: `p_error`, `hypotheses`, `evidence`, `suggested_action`.
+
+| Check | Code | Succeeds | What to do | Close with |
+|---|---|---|---|---|
+| `dorq_statement_key` | DQ901 | `fundamentals_version_chain` | a repair on the host: the intervals must chain | **Never** — see below |
+| `dorq_impossible_value` | DQ902 | `fundamentals_negative_impossible` | check the filing; the vendor's correction | `dq recheck` once SF1 corrects it |
+| `dorq_identity_break` | DQ903 | `balance_sheet_identity`, `cash_flow_tie` | a structural gap (NCI, temporary equity) is info by itself; one period alone is the vendor's | `dq recheck`, or **accept** with the filing named |
+| `dorq_period_tie` | DQ904 | `cash_balance_tie` | restricted cash, or four quarters against the year | as DQ903 |
+| `dorq_bad_value`, `dorq_unit_error`, `dorq_sign_error` | DQ911–913 | | the filing's figure against the stored one | `dq recheck` once SF1 corrects it; **accept** a figure the filing states |
+| `dorq_copied_period`, `dorq_absent_as_zero`, `dorq_cumulative_quarters` | DQ914–916 | `fundamentals_suspicious_zero`, `fundamentals_ytd_suspect` | as DQ911 | as DQ911 |
+| `dorq_large_change` | DQ919 | | info: a change that is probably real (an acquisition, a write-down) | judgement |
+| `dorq_share_terms_step`, `dorq_share_count_mismatch` | DQ921–922 | | a split missing from `core.corporate_action` (`actions add --split`), or counts in the wrong terms | the repair, then `dq recheck` |
+| `dorq_filing_date_implausible` | DQ931 | `fundamentals_implausible_filing_lag` | the filing's date on EDGAR | `dq recheck`, else **accept** |
+| `dorq_restatement_implausible` | DQ932 | judging `fundamentals_restatement` | which version is the error | `dq recheck` once SF1 corrects it |
+| `dorq_period_gap` | DQ941 | `fundamentals_gap`, `fundamentals_ttm_incomplete` | is the period on EDGAR? a change of fiscal year is info | `dq recheck` once the period loads; **accept** a period never filed |
+| `dorq_statements_stale` | DQ942 | `fundamentals_stale` | is the issuer delinquent (an NT filing), or the feed behind? | **`dq recheck`** once a newer period loads |
+| `dorq_statements_missing` | DQ943 | `fundamentals_coverage` | SF1 lists statements the warehouse lacks | **`dq recheck`** once they load |
+| `dorq_reporting_currency` | DQ944 | `fundamentals_currency_mismatch` | info: price ratios need the exchange rate | judgement |
+| `dorq_revision_cohort` | DQ951 | | info or warn: a vendor batch or a load fault across many series; its members' DQ903 and DQ932 reports drop to info | judgement; `dq recheck` never closes it |
+
+`dq recheck` re-runs dorq over the statements history of the securities with open
+statement flags, as of the market's latest session, and closes each one the run no
+longer emits. It skips `dorq_statement_key` and the cross-sectional
+`dorq_revision_cohort`.
+
+### `dorq_statement_key` — a period's versions do not chain
+
+`error`, deterministic: two rows for one version, versions whose `known_to` is not the
+next `known_from`, a `known_from` before the period ends, or a filed version known
+from another day than its filing. As `fundamentals_version_chain`: the loader keeps
+the chain, so a break means a write went around it. Repair it on the host, then
+resolve. Never resolve without the repair.
+
+---
+
 ## After the cutover
 
 From the day Sharadar became primary (#125; operations.md › *Cutover to Sharadar as
