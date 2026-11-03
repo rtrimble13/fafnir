@@ -864,6 +864,177 @@ def test_a_broken_version_chain(db):
     ]
 
 
+def _set(db, statement, sid, fiscal_date, period_type="quarter", **values):
+    """Change a period's current rows in place: what a vendor's correction leaves
+    the check to read."""
+    sets = ", ".join(f"{c} = %s" for c in values)
+    db.execute(
+        f"UPDATE {fm.TABLES[statement]} SET {sets}"
+        " WHERE security_id = %s AND fiscal_date = %s AND period_type = %s"
+        " AND superseded_at IS NULL",
+        [*values.values(), sid, fiscal_date, period_type],
+    )
+
+
+_QUARTERS = ((1, (3, 31)), (2, (6, 30)), (3, (9, 30)), (4, (12, 31)))
+
+
+def _make_condition(db, check, sid):
+    """The condition ``check`` flags, on ``sid``."""
+    if check == "fundamentals_gap":  # traded through 2005-2008 with no period
+        for year in (2005, 2008):
+            _put(
+                db,
+                "income",
+                sid,
+                D(year, 12, 31),
+                label=f"{year}-FY",
+                known_from=D(year + 1, 3, 1),
+            )
+        _price(db, sid, D(2007, 6, 1))
+    elif check == "fundamentals_currency_mismatch":
+        _put(
+            db,
+            "income",
+            sid,
+            D(2010, 3, 31),
+            label="2010-Q1",
+            known_from=D(2010, 5, 1),
+            currency="EUR",
+        )
+    elif check == "fundamentals_suspicious_zero":
+        for n, (m, d) in _QUARTERS[:3]:
+            _put(
+                db,
+                "income",
+                sid,
+                D(2010, m, d),
+                label=f"2010-Q{n}",
+                known_from=D(2010, m, d) + timedelta(days=40),
+                revenue=0 if n == 2 else 100,
+                net_income=10,
+            )
+    elif check == "fundamentals_implausible_filing_lag":
+        _put(
+            db, "income", sid, D(2010, 3, 31), label="2010-Q1", known_from=D(2010, 4, 2)
+        )
+    elif check == "fundamentals_ytd_suspect":  # 100, 200, 300, 400 against 400
+        for n, (m, d) in _QUARTERS:
+            _put(
+                db,
+                "income",
+                sid,
+                D(2010, m, d),
+                label=f"2010-Q{n}",
+                known_from=D(2010, m, d) + timedelta(days=40),
+                revenue=100 * n,
+            )
+        _put(
+            db,
+            "income",
+            sid,
+            D(2010, 12, 31),
+            label="2010-FY",
+            known_from=D(2011, 2, 9),
+            revenue=400,
+        )
+    else:  # fundamentals_version_chain: version 1 closes a month before 2 opens
+        end = D(2010, 3, 31)
+        _put(
+            db,
+            "income",
+            sid,
+            end,
+            label="2010-Q1",
+            known_from=D(2010, 5, 1),
+            known_to=D(2010, 9, 1),
+        )
+        _put(
+            db,
+            "income",
+            sid,
+            end,
+            label="2010-Q1",
+            known_from=D(2010, 10, 1),
+            version=2,
+        )
+
+
+def _put_right(db, check, sid):
+    """What closes ``check``'s condition on ``sid``: a filing, a vendor's fix, or the
+    host's repair."""
+    if check == "fundamentals_gap":  # the missing years filed
+        for year in (2006, 2007):
+            _put(
+                db,
+                "income",
+                sid,
+                D(year, 12, 31),
+                label=f"{year}-FY",
+                known_from=D(year + 1, 3, 1),
+            )
+    elif check == "fundamentals_currency_mismatch":
+        _set(db, "income", sid, D(2010, 3, 31), reported_currency="USD")
+    elif check == "fundamentals_suspicious_zero":
+        _set(db, "income", sid, D(2010, 6, 30), revenue=110)
+    elif check == "fundamentals_implausible_filing_lag":  # SF1 corrected the date
+        _set(
+            db,
+            "income",
+            sid,
+            D(2010, 3, 31),
+            known_from=D(2010, 5, 10),
+            filing_date=D(2010, 5, 10),
+        )
+    elif check == "fundamentals_ytd_suspect":  # discrete quarters now
+        for _, (m, d) in _QUARTERS[1:]:
+            _set(db, "income", sid, D(2010, m, d), revenue=100)
+    else:  # the repair on the host: version 1 closes where version 2 opens
+        db.execute(
+            "UPDATE core.income_statement SET known_to = %s"
+            " WHERE security_id = %s AND version_no = 1",
+            (D(2010, 10, 1), sid),
+        )
+
+
+SIX = (
+    "fundamentals_gap",
+    "fundamentals_currency_mismatch",
+    "fundamentals_suspicious_zero",
+    "fundamentals_implausible_filing_lag",
+    "fundamentals_ytd_suspect",
+    "fundamentals_version_chain",
+)
+
+
+def test_recheck_closes_the_six_judgement_checks_once_their_condition_is_gone(db):
+    """DR-0914: every SQL fundamentals check the statements cutover retires has a
+    recheck rule, so its open flags close by recheck, not by a bulk resolve. Each of
+    the six gets two securities: one put right, one whose condition still holds."""
+    assert set(SIX) <= set(checks.FUNDAMENTALS_DETECTORS)
+    assert set(SIX) <= set(rc.RECHECKABLE)
+    put_right = {}
+    for n, check in enumerate(SIX):
+        held, fixed = _security(db, f"ZZHELD{n}"), _security(db, f"ZZFIXED{n}")
+        _make_condition(db, check, held)
+        _make_condition(db, check, fixed)
+        assert checks.FUNDAMENTALS_CHECKS[check](db) == 2, check
+        put_right[check] = fixed
+    # Nothing has changed: recheck closes nothing.
+    assert [r.stale for r in rc.recheck(db, checks=list(SIX))] == [0] * len(SIX)
+    for check, sid in put_right.items():
+        _put_right(db, check, sid)
+    results = {r.check_name: r for r in rc.recheck(db, checks=list(SIX))}
+    for check, sid in put_right.items():
+        fixed_flag = db.fetchval(
+            "SELECT dq_flag_id FROM ops.data_quality_flag"
+            " WHERE check_name = %s AND security_id = %s AND resolved_at IS NULL",
+            (check, sid),
+        )
+        assert results[check].stale_flag_ids == [fixed_flag], check
+        assert results[check].open_flags == 2, check
+
+
 # ---------------------------------------------------------------------------
 # fafnir status
 # ---------------------------------------------------------------------------
