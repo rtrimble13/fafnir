@@ -807,7 +807,7 @@ Measure both on the host and record them on #92.
   under a minute. A `--backfill --symbols` run for 334 securities linked later (2026-11-01,
   run 669, 71,005 rows) took 78 seconds.
 - **Size.** On 2026-11-01, at 3.63M versions, the three tables came to 3.2 GB with indexes,
-  at the bottom of the projected range:
+  just under the projected 3.3–5.8 GB:
   - **income statement:** 2.0 GB, 1.6 KB a row;
   - **balance sheet:** 0.62 GB, 0.61 KB a row;
   - **cash flow statement:** 0.63 GB, 0.53 KB a row.
