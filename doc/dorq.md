@@ -490,6 +490,28 @@ fafnir dq accept 893223 --per-flag --label data_error --kind feed_gap -m "..."
 | `wrong_instrument` | data_error | expect DQ202\|DQ205 |
 | `bad_print` | data_error | expect DQ201 |
 | `cohort_fact` | market_fact | DQ601, on `*` with `members` |
+| `unit_error` | data_error | expect DQ912 (statements) |
+| `sign_error` | data_error | expect DQ913 (statements) |
+| `misdated_filing` | data_error | expect DQ931 (statements) |
+| `structural_gap` | market_fact | DQ903 (statements): an identity's gap that is the company's structure |
+| `fiscal_year_change` | market_fact | DQ941 (statements) |
+| `real_zero` | market_fact | DQ915 (statements): the filing has the zero |
+
+A label about statements names its period by `--fiscal-date` (or `--first` and
+`--last`, fiscal dates), and `--statement`, `--period-type`, `--version-no` and
+`--item` as far as the fault has them. Each one left out covers every value, as in
+dorq's label format:
+
+```bash
+fafnir dq label add --security-id 752016 --fiscal-date 2024-06-30 \
+    --statement income --period-type quarter --item revenue \
+    --kind unit_error --verified -m "10-Q p.4: 412.3M; SF1 had 412,300M"
+```
+
+A statement kind takes them, and a bars kind refuses them. `dq label list` adds a
+`SCOPE` column when a label has one, and `dq label import` reads the four fields.
+`dq accept|resolve --label` on a statement flag states its label on the flag's
+statement, period, version and item.
 
 Another kind is free text and needs `--class`. `dq accept|resolve --label CLASS
 [--kind K] [--expect X] [--codes X]` states one per closed flag, on its security and
@@ -503,6 +525,55 @@ agent may add, revoke or import after showing the dry run and getting a yes, as 
 What makes a good label: checked on the bars or an outside source, and the note
 says which; one decision, never a bulk class; a repair's label expires at the
 repair; a scope removal is not an error.
+
+### Statements
+
+The warehouse never edits a statement value, so its statement labels come from what
+does change one, and from how a statement flag was closed (DR-0913):
+
+| From | Label |
+|---|---|
+| SF1 corrected a value by a power of ten | `data_error`, DQ912 (`corrected_unit`) |
+| by a sign | `data_error`, DQ913 (`corrected_sign`) |
+| from a zero | `data_error`, DQ915 (`corrected_zero`) |
+| beyond tolerance otherwise | `data_error`, any of DQ902, DQ903, DQ904, DQ911 to DQ916, DQ921, DQ922, DQ932 (`corrected_value`) |
+| SF1 corrected a filing date | `data_error`, DQ931 (`corrected_filing_date`) |
+| a statement flag accepted, SQL or `dorq_*` | `market_fact` on its successor's code (`<check>_accepted`): the filing shows it |
+| a statement flag resolved after SF1 corrected its period | `data_error` on its code: added to the correction's label, or `<check>_vendor_fixed` where the correction moved nothing beyond tolerance |
+| a row of `ops.dq_label` with a statement scope | as stated |
+
+- **What a correction is.** SF1 corrects a first-reported row, and the loader
+  supersedes it and loads the corrected one, with the same version
+  (`fundamentals_vendor_correction`). Per version, the row as first loaded is
+  compared with the row now current. A move beyond the SQL checks' tolerance
+  (0.5% of the larger value, and 1M of the currency) is a label. So is a move by a
+  power of ten, a sign or from a zero, at any size. Each kind of move is one label:
+  on its item when it moved alone, and on the row when several items moved alike (a
+  row stored in thousands). A cent's correction is no label.
+- **The scope.** Every statement label names its statement, period type, version
+  and item where it has one, with `first` and `last` its fiscal dates (dorq's
+  doc/labels.md, *Labels about statements*). An SQL flag's label takes its
+  successor's code (the table in [The statements shadow
+  period](#the-statements-shadow-period)) and the period, fiscal year or span its
+  key names.
+- **When it applies.** A correction's label applies until the correction loaded:
+  from then on dorq reads the corrected row. An acceptance always applies.
+  `verified` follows the closure (`--per-flag` or `--by-rule`), and a correction is
+  not marked: nobody checked it, though the vendor stated it. `--verified-only` and
+  `dq compare`'s time scoping read them as they read bar labels.
+- **Rows as they stood.** `--restore-statements FILE` writes the superseded rows the
+  labels describe, in the shape of the statements export (its columns, `close`
+  included, in its order). Each replaces the current row of its version. dorq 0.13's
+  `--restore` restores bars only; a statements restore is dorq's DR-0911.
+- **Kept apart from bars.** A label is about statements when it names a statement
+  scope or a DQ9xx code. It judges statement reports only (`dq compare
+  --statements`), and a stated statements label never replaces a derived bars label
+  on the same dates.
+
+```bash
+fafnir dq export-labels --out labels.jsonl --restore-statements statements-before.csv
+dorq-eval --labels labels.jsonl --results night.jsonl   # a statements night, as jsonl
+```
 
 ## Calibrate
 

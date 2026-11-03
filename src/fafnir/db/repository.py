@@ -6647,6 +6647,10 @@ _LABEL_COLUMNS = (
     "decided_by",
     "decided_at",
     "applies_until",
+    "statement",
+    "period_type",
+    "version_no",
+    "item",
 )
 
 
@@ -6654,7 +6658,8 @@ def insert_dq_labels(db: Database, rows: Sequence[dict]) -> list[int]:
     """Write stated labels; return their ids in order.
 
     Each row carries the columns of ops.dq_label. ``decided_at`` defaults to now;
-    ``members`` and ``applies_until`` to NULL.
+    ``members``, ``applies_until`` and the statement scope (``statement``,
+    ``period_type``, ``version_no``, ``item``, migration 0044) to NULL.
     """
     import json
 
@@ -6677,15 +6682,19 @@ def insert_dq_labels(db: Database, rows: Sequence[dict]) -> list[int]:
         """
         INSERT INTO ops.dq_label
             (security_id, members, first_date, last_date, class, kind, expect,
-             codes, note, verified, source, decided_by, decided_at, applies_until)
+             codes, note, verified, source, decided_by, decided_at, applies_until,
+             statement, period_type, version_no, item)
         SELECT x.security_id, x.members, x.first_date, x.last_date, x.class, x.kind,
                NULLIF(x.expect, ''), NULLIF(x.codes, ''), x.note, x.verified,
-               x.source, x.decided_by, COALESCE(x.decided_at, now()), x.applies_until
+               x.source, x.decided_by, COALESCE(x.decided_at, now()), x.applies_until,
+               NULLIF(x.statement, ''), NULLIF(x.period_type, ''), x.version_no,
+               NULLIF(x.item, '')
           FROM jsonb_to_recordset(%s::jsonb) AS x(
                  security_id bigint, members bigint[], first_date date,
                  last_date date, class text, kind text, expect text, codes text,
                  note text, verified boolean, source text, decided_by text,
-                 decided_at timestamptz, applies_until timestamptz, n bigint)
+                 decided_at timestamptz, applies_until timestamptz, statement text,
+                 period_type text, version_no integer, item text, n bigint)
          ORDER BY x.n
         RETURNING label_id
         """,
@@ -6729,7 +6738,8 @@ def list_dq_labels(
         SELECT l.label_id, l.security_id, s.primary_symbol, l.members, l.first_date,
                l.last_date, l.class, l.kind, l.expect, l.codes, l.note, l.verified,
                l.source, l.decided_by, l.decided_at, l.applies_until, l.revoked_at,
-               l.revoked_by, l.revoked_note
+               l.revoked_by, l.revoked_note, l.statement, l.period_type,
+               l.version_no, l.item
           FROM ops.dq_label l
           LEFT JOIN core.security s ON s.security_id = l.security_id
          WHERE {' AND '.join(clauses)}
@@ -6777,13 +6787,23 @@ def revoke_flag_labels(
 
 def flags_for_labels(db: Database, flag_ids: Sequence[int]) -> list[dict]:
     """What a label stated with a flag's closure needs: its security, the date it
-    is about (and a dorq report's end date), its check and dorq code."""
+    is about (and a dorq report's end date), its check and dorq code. A flag on a
+    statement (DR-0913) is about its fiscal date, and carries its statement, period
+    type, version and item."""
     if not flag_ids:
         return []
     return db.fetchall(
         f"""
-        SELECT f.dq_flag_id, f.security_id, f.check_name,
-               {_FLAG_DATE_SQL} AS d,
+        SELECT f.dq_flag_id, f.security_id, f.check_name, f.table_name,
+               COALESCE({_FLAG_DATE_SQL},
+                        CASE WHEN f.record_key->>'fiscal_date'
+                                  ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                             THEN (f.record_key->>'fiscal_date')::date END) AS d,
+               f.record_key->>'statement' AS statement,
+               f.record_key->>'period_type' AS period_type,
+               CASE WHEN f.record_key->>'version_no' ~ '^[0-9]+$'
+                    THEN (f.record_key->>'version_no')::int END AS version_no,
+               f.record_key->>'item' AS item,
                CASE WHEN f.detail->>'end_date' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
                     THEN (f.detail->>'end_date')::date END AS end_date,
                f.detail->>'code' AS code,

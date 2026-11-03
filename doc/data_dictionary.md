@@ -1602,23 +1602,29 @@ What someone checked and found true about a stretch of one series, or a cohort, 
 measuring dorq (doc/dorq.md, "Labels"). Written by `fafnir dq label add|import` and
 `dq accept|resolve --label`; revoked by `dq label revoke` (and by `dq reopen`, for a
 label stated with that flag's closure). Merged into `dq export-labels`, where a row
-here wins over a derived label on the same security, overlapping dates and class.
-Changes no data and no flag (migration 0028). Active means `revoked_at IS NULL`.
+here wins over a derived label on the same security, overlapping dates and class,
+and of the same kind: a label about statements never replaces one about bars.
+Changes no data and no flag (migrations 0028, 0044). Active means `revoked_at IS
+NULL`.
 
 | Column | Type | Notes |
 |---|---|---|
 | `label_id` | BIGINT IDENTITY PK | |
 | `security_id` | BIGINT | NULL for a cross-sectional label (dorq's series `*`). No FK, as `operator_override`. |
 | `members` | BIGINT[] | A cohort label's securities: it covers only the cross-sectional rows naming one of them. |
-| `first_date` / `last_date` | DATE | The span. |
+| `first_date` / `last_date` | DATE | The span. For a label about statements, fiscal dates. |
 | `class` | TEXT CHECK | `data_error`, `context_gap` or `market_fact`. |
-| `kind` | TEXT | `feed_gap`, `odd_lots_only`, `distribution`, `dividend_units`, `wrong_instrument`, `bad_print`, `cohort_fact`, or free text. |
+| `kind` | TEXT | `feed_gap`, `odd_lots_only`, `distribution`, `dividend_units`, `wrong_instrument`, `bad_print`, `cohort_fact`; for statements `unit_error`, `sign_error`, `misdated_filing`, `structural_gap`, `fiscal_year_change`, `real_zero`; or free text. |
 | `expect` / `codes` | TEXT | A fault's expected codes (`DQ202\|DQ205`); a market fact's code prefix (default `DQ2`). |
 | `note`, `verified` | TEXT, BOOLEAN | What was checked; whether on the bars or an outside source. |
 | `source` | TEXT | Free text: `dq_flag:893223`, `hand-2026-10-15`, `cli`. |
 | `decided_by` / `decided_at` | TEXT / TIMESTAMPTZ | |
 | `applies_until` | TIMESTAMPTZ | When a repair changed what dorq reads; a shadow night that ran after it is not judged by the label. NULL: always applies. |
 | `revoked_at` / `revoked_by` / `revoked_note` | | |
+| `statement` | TEXT CHECK | A label about statements: `income`, `balance_sheet` or `cash_flow`. NULL: every statement, or a label about bars (0044). |
+| `period_type` | TEXT CHECK | `quarter` or `annual`. NULL: either. |
+| `version_no` | INTEGER CHECK | The version, 1 or more. NULL: any. |
+| `item` | TEXT | The line item, a statement table's column. NULL: any. |
 
 ---
 

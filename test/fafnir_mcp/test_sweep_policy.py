@@ -129,3 +129,34 @@ def test_every_never_check_has_a_playbook(check):
     assert (
         f"## `{check}`" in text or f"`{check}`" in text
     ), f"{check} is on the never-resolve list with no playbook entry"
+
+
+def _statement_tiers() -> dict[str, set[str]]:
+    """The sweep policy's statement tiers: tier name -> the checks it names."""
+    text = SWEEP_POLICY.read_text()
+    start = text.index("| Statement tier |")
+    rows = []
+    for line in text[start:].splitlines()[2:]:
+        if not line.startswith("|"):
+            break
+        rows.append(line)
+    return {
+        row.split("|")[1].strip(): _backticked_checks(row.split("|")[2]) for row in rows
+    }
+
+
+def test_every_statement_check_has_a_tier_and_a_playbook():
+    """Each of dorq's statement checks is in a statement tier and has its own
+    playbook entry; the Never tier is NEVER_AUTO_RESOLVE's statement checks."""
+    from fafnir.dq.dorq_statements import STATEMENT_CHECKS
+
+    tiers = _statement_tiers()
+    placed = set().union(*tiers.values())
+    checks = set(STATEMENT_CHECKS.values())
+    assert (
+        placed == checks
+    ), f"not placed: {sorted(checks - placed)}; unknown: {sorted(placed - checks)}"
+    assert tiers["Never"] == checks & set(NEVER_AUTO_RESOLVE) == {"dorq_statement_key"}
+    text = PLAYBOOKS.read_text()
+    missing = [c for c in sorted(checks) if f"### `{c}`" not in text]
+    assert not missing, f"no playbook entry: {missing}"

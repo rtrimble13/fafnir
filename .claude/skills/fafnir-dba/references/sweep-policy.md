@@ -25,6 +25,25 @@ preconditions.
 A `stale` flag on a name `fafnir source vendor-gaps` lists is **report only**: the
 security trades and the vendor stopped serving it (see the `stale` playbook).
 
+### The statements' `dorq_*` checks
+
+The `dorq_*` checks on the statements (`table_name` a statement table, from
+`[dq] dorq_statements`) are placed here, not by the severity rule above. The
+warehouse never edits a statement value. A statement flag's repair is SF1's
+correction, and `dq recheck` closes the flag once the corrected row loads.
+
+| Statement tier | Checks | What a sweep may do |
+|---|---|---|
+| Never | `dorq_statement_key` | Report only: the repair is made on the host (the playbook). |
+| Vendor-fix | `dorq_impossible_value`, `dorq_unit_error`, `dorq_sign_error`, `dorq_bad_value`, `dorq_copied_period`, `dorq_cumulative_quarters`, `dorq_share_count_mismatch`, `dorq_restatement_implausible`, `dorq_period_tie`, `dorq_identity_break` (one period alone), `dorq_statements_missing` | Never a `dq resolve`. Report them to the vendor with the filing that contradicts the value, and leave them for `dq recheck`. |
+| Repair-first | `dorq_share_terms_step` (`missing_split`: the repair is `actions add --split`) | Propose the repair. Resolve only by `dq recheck` after it. |
+| Filing-checked | `dorq_absent_as_zero`, `dorq_filing_date_implausible`, `dorq_period_gap`, `dorq_statements_stale`, `dorq_identity_break` (`structural`) | May be proposed for **accept**, one by one, when the filing (EDGAR) shows the stored figure, date or absence. The note names the form and its date. Never `--by-rule`. |
+| Info | `dorq_large_change`, `dorq_reporting_currency`, `dorq_revision_cohort` | Report only, or accept with the filing that explains it. A cohort's cause is fixed once, not per member. |
+
+An accepted statement flag is a filing fact that dorq is calibrated on
+(doc/dorq.md, *Labels*). An acceptance the filing does not support teaches dorq
+the error.
+
 `sparse_coverage` is not yet placed in a tier, except on a dead Sharadar history
 ([below](#dead-sharadar-histories-76)). Elsewhere, treat it as **report only**:
 nothing about it has been repaired, so closing one frees its slot and the next
