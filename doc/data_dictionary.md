@@ -1495,22 +1495,22 @@ A check marked † had written no row by 2026-10-31.
 | `vendor_history_overlap` | `vendor overlap` | `core.daily_price` | `kind`, `vendor`, `vendor_key` |
 | `sharadar_split_ratio_mismatch` | `ingest sharadar-prices` | `core.daily_price` | `vendor`, `vendor_key` |
 | `fundamentals_duplicate_period`, `fundamentals_filing_before_period`, `fundamentals_missing_period_label`†, `fundamentals_value_out_of_range`† | `ingest fundamentals` (a quarantined SF1 row) | `landing.sharadar_file` | `ticker`, `dimension`, `reportperiod` |
-| `fundamentals_restatement`, `fundamentals_vendor_correction` | `ingest fundamentals`, once per security and run | NULL | `ingestion_run_id` |
+| `fundamentals_restatement`, `fundamentals_vendor_correction` | `ingest fundamentals`, once per security and run, `info` (a nightly restatement was `warn` until DR-0914) | NULL | `ingestion_run_id` |
 | `fundamentals_estimated_knowledge_date` | `ingest fundamentals` | NULL | `vendor`, `vendor_key` |
 | `fundamentals_unlinked` | `ingest fundamentals` (no security for the permaticker; `security_id` NULL) | `core.security_vendor_xref` | `vendor`, `vendor_key` |
-| `balance_sheet_identity`, `cash_flow_tie` | `dq run` | `core.balance_sheet`, `core.cash_flow_statement` | `period_type`, `fiscal_date`; the rows of 2026-10-28 also carry `version_no` |
-| `cash_balance_tie` | `dq run` | `core.cash_flow_statement`; or `core.balance_sheet`, keyed with `item` too | `period_type`, `fiscal_date` (+ `item`) |
-| `fundamentals_negative_impossible` | `dq run` | `core.income_statement` | `statement`, `period_type`, `fiscal_date`, `version_no` |
-| `fundamentals_suspicious_zero` | `dq run` | the statement's table | `statement`, `period_type`, `fiscal_date` |
-| `fundamentals_implausible_filing_lag` | `dq run` | `core.income_statement` | `period_type`, `fiscal_date`, `version_no` |
-| `fundamentals_gap` | `dq run` | `core.income_statement` | `from`, `to` |
-| `fundamentals_stale` | `dq run` | `core.income_statement` | `latest_fiscal_date` |
-| `fundamentals_ttm_incomplete` | `dq run` | `core.income_statement` | `fiscal_year` |
-| `fundamentals_ytd_suspect` | `dq run` | the statement's table | `fiscal_year`, `item` |
-| `fundamentals_currency_mismatch` | `dq run` | `core.income_statement` | `reported_currency` |
-| `fundamentals_coverage`† | `dq run` | `core.income_statement` | `{}` |
-| `fundamentals_unmapped_fields`† | `dq run` (no security) | `core.income_statement` | `field` |
-| `fundamentals_version_chain`† | `dq run` | the statement's table | the period |
+| `balance_sheet_identity`, `cash_flow_tie` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.balance_sheet`, `core.cash_flow_statement` | `period_type`, `fiscal_date`; the rows of 2026-10-28 also carry `version_no` |
+| `cash_balance_tie` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.cash_flow_statement`; or `core.balance_sheet`, keyed with `item` too | `period_type`, `fiscal_date` (+ `item`) |
+| `fundamentals_negative_impossible` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `statement`, `period_type`, `fiscal_date`, `version_no` |
+| `fundamentals_suspicious_zero` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | the statement's table | `statement`, `period_type`, `fiscal_date` |
+| `fundamentals_implausible_filing_lag` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `period_type`, `fiscal_date`, `version_no` |
+| `fundamentals_gap` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `from`, `to` |
+| `fundamentals_stale` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `latest_fiscal_date` |
+| `fundamentals_ttm_incomplete` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `fiscal_year` |
+| `fundamentals_ytd_suspect` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | the statement's table | `fiscal_year`, `item` |
+| `fundamentals_currency_mismatch` | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `reported_currency` |
+| `fundamentals_coverage`† | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | `core.income_statement` | `{}` |
+| `fundamentals_unmapped_fields`† | `ingest fundamentals` (no security; `dq run` until DR-0914) | `core.income_statement` | `field` |
+| `fundamentals_version_chain`† | `dq run` until the statements cutover (DR-0914); closed since by `dq recheck` | the statement's table | the period |
 | `dorq_*` (`dorq_bad_print`, `dorq_scale_shift`, `dorq_stale_feed`, `dorq_cohort_gap`, `dorq_cohort_move`, …)† | `dq run --engine dorq --no-shadow` | `core.daily_price` | `trade_date`; a cohort row also `ratio`, with `security_id` NULL |
 
 dorq has run in shadow mode throughout (`[dq] dorq_shadow = true`), so its findings

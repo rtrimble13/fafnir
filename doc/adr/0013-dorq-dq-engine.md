@@ -20,6 +20,17 @@
   statement flag on the statements and a bars flag on the bars. It skips the
   cross-sectional `dorq_revision_cohort`, and `dorq_statement_key` joins the
   never-resolve dorq checks. The bars run is unchanged.
+- Status note (DR-0914): **the statements cutover.** The statements' shadow period
+  met the dorq fundamentals plan's §6 on a full-history run verified on EDGAR
+  (fafnir#221 records the figures and the go), so dorq's statement checks keep the
+  queue (`[dq] dorq_statements_shadow = false`) and the thirteen SQL checks they
+  succeed are retired from `run_all` (`checks.RETIRED_FUNDAMENTALS_CHECKS`; their keys
+  stay at 0 for one release). Their open flags close by `dq recheck`, when the
+  condition is gone or when a dorq successor flag carries it
+  (`recheck.recheck_successors`), never by a bulk resolve.
+  `fundamentals_unmapped_fields` moved into the loader, and a nightly restatement is
+  `info`, DQ932's to judge. `fafnir dq sample` drew the verified sample
+  ([dorq.md](../dorq.md#the-statements-cutover)).
 
 ## Context
 

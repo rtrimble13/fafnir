@@ -639,9 +639,10 @@ run of its own, after the bars. **The bars run is the same with it or without it
 the same export, window, history pass, shadow file and run record.
 
 It succeeds thirteen of the fourteen SQL fundamentals checks (the dorq fundamentals
-plan, §3). Until the statements' own shadow period has met its cutover criteria (the
-plan's §6; DR-0914), its rows go to a shadow directory of their own, and the SQL
-checks keep the queue.
+plan, §3). Its own shadow period met the cutover criteria (the plan's §6), and the
+statements cutover (DR-0914) retired those thirteen: dorq's rows reach the queue with
+`[dq] dorq_statements_shadow = false`, and `dq run` says so on any run where they
+would not ([The statements cutover](#the-statements-cutover)).
 
 ### Configure
 
@@ -821,10 +822,22 @@ statements night is one. The operator's steps:
    night), dorq-eval on the same labels (recall, and the calibration error), and the
    night's run time in `fafnir status`. Post the aggregates on fafnir#221.
 4. **Go:** set `[dq] dorq_statements_shadow = false`.
-5. **The cutover release** retires the thirteen from `FUNDAMENTALS_CHECKS`, keeping
-   `run_all`'s keys at 0 for a release, and closes their open flags by `dq recheck`:
-   every one of the thirteen has a recheck rule (`fundamentals_coverage` its own, the
-   rest their check's query), so a flag closes only when its condition is gone.
+5. **The cutover release** (this one) retires the thirteen from `run_all`
+   (`checks.RETIRED_FUNDAMENTALS_CHECKS`), keeping their keys and
+   `fundamentals_unmapped_fields`' at 0 for a release. Once dorq's first statements
+   night has written the queue, `fafnir dq recheck --dry-run`, then `fafnir dq
+   recheck`, closes their open flags on two grounds, each with its own note:
+   - the condition is gone (every one of the thirteen has a rule:
+     `fundamentals_coverage` its own, the rest their check's query);
+   - dorq carries it: a dorq successor flag, open or accepted, on the same security
+     and of a successor code that agrees with the flag's key, by the table under
+     *The statements shadow period*. They are listed as "carried by dorq".
+
+   A flag neither closes is a condition the SQL check saw and dorq does not: judge it
+   on the filing. The same release moves `fundamentals_unmapped_fields` into the
+   loader (`ingest fundamentals` flags a column the map does not know, once by
+   name), and writes a nightly `fundamentals_restatement` at `info`: whether a
+   restatement is plausible is DQ932's judgement now.
 
 ### Recheck
 

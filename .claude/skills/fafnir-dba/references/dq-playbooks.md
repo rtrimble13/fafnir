@@ -1489,10 +1489,17 @@ work those one by one, and do not filter them in fafnir.
 
 ## The fundamentals flags — statements from SF1
 
-Two writers. **The loader** (`fafnir ingest fundamentals`, #90) writes what it sees
-row by row: quarantines and the version events. **`fafnir dq run`** (#102) writes the
-set-based checks over the three statement tables. Every one is once per open
-condition. A statement condition's `record_key` names the period
+Two writers, until the statements cutover. **The loader** (`fafnir ingest
+fundamentals`, #90) writes what it sees row by row: quarantines, the version events
+and, since the cutover, `fundamentals_unmapped_fields`. **`fafnir dq run`** (#102)
+wrote the set-based checks over the three statement tables. **Since the statements
+cutover (DR-0914) dorq judges the statements** (the `dorq_*` statements family
+below), and `dq run` writes none of the thirteen: their playbooks stay for the flags
+still open. `dq recheck` closes those on two grounds, each with its own note: the
+check's own query no longer selects the flag, or a dorq successor flag, open or
+accepted, carries it ("carried by dorq"). A flag neither closes is a condition the
+SQL check saw and dorq does not: judge it on the filing, as its playbook says. Every
+one is once per open condition. A statement condition's `record_key` names the period
 (`period_type`, `fiscal_date`), plus the `version_no` where the check reads every
 current version, and the `statement` where the check reads more than one table. So
 a restated version that still fails is a new condition, and one that passes leaves
@@ -1506,7 +1513,7 @@ version that balances, a period that filed, or a recalibration of the check.
 
 | Check | From | Severity | Closes by |
 |---|---|---|---|
-| `fundamentals_restatement` | loader | `warn` nightly, `info` backfill | judgement: operations.md › *What a restatement flag means* |
+| `fundamentals_restatement` | loader | `info` (a nightly's was `warn` until DR-0914) | judgement: operations.md › *What a restatement flag means* |
 | `fundamentals_vendor_correction` | loader | `info` | judgement |
 | `fundamentals_estimated_knowledge_date` | loader | `info` | judgement |
 | `fundamentals_unlinked`, `fundamentals_missing_period_label`, `fundamentals_filing_before_period`, `fundamentals_value_out_of_range`, `fundamentals_duplicate_period` | loader quarantine | as the loader sets | the row was not stored: fix the link or wait for the vendor. A `fundamentals_duplicate_period` on a first-reported (`AR*`) row from before the later-filing fix is not a vendor fault: see doc/backfill.md › *A backfill from before the later-filing fix* |
@@ -1516,7 +1523,7 @@ version that balances, a period that filed, or a recalibration of the check.
 | `fundamentals_stale` | `dq run` | `warn` | **`dq recheck`** |
 | `fundamentals_coverage` | `dq run` | `info` | **`dq recheck`** |
 | `fundamentals_currency_mismatch` | `dq run` | `info` | **`dq recheck`**, else judgement |
-| `fundamentals_unmapped_fields` | `dq run` | `info` | a map change and a migration |
+| `fundamentals_unmapped_fields` | loader (`dq run` until DR-0914) | `info` | a map change and a migration |
 | `fundamentals_ttm_incomplete` | `dq run` | `info` | **`dq recheck`**, else judgement |
 | `fundamentals_negative_impossible` | `dq run` | `error`; `info` for a financial company's revenue | **`dq recheck`**, else judgement |
 | `fundamentals_suspicious_zero` | `dq run` | `info` | **`dq recheck`**, else judgement |
@@ -1543,11 +1550,11 @@ filing shows), or **resolve** one the vendor has since fixed, naming the run.
 ### `fundamentals_restatement` — a restated row differs from the version in force
 
 The loader made a new knowledge version, known from the day it loaded it
-(`observed`). One flag per security and run, listing the largest moves. A backfill
-dates all of SF1's restated history to its own day, so those are `info`; from the
-nightly, a restatement is news, so `warn`. What it means, and what to check, is in
-operations.md › *What a restatement flag means*. Resolve once read: the version is
-the record.
+(`observed`). One flag per security and run, listing the largest moves, at `info`:
+whether a restatement is plausible is dorq's DQ932's judgement since the statements
+cutover (`dorq_restatement_implausible` below). Before it, the nightly's were `warn`.
+What it means, and what to check, is in operations.md › *What a restatement flag
+means*. Resolve once read: the version is the record.
 
 ### `fundamentals_vendor_correction` — SF1 changed a first-reported row
 
@@ -1637,8 +1644,9 @@ currency. The panel's price ratios are NULL for it, by design (ADR 0019). Accept
 
 ### `fundamentals_unmapped_fields` — a column SF1 added that the map does not know
 
-One flag per column name, for no security, counting rows and securities. **The
-taxonomy's growth signal.** The values are kept in `extra.unmapped`. Deciding whether
+One flag per column name, for no security, counting the rows and securities of the
+load that first saw it. The loader writes it (`dq run` did until the statements
+cutover). **The taxonomy's growth signal.** The values are kept in `extra.unmapped`. Deciding whether
 it is a statement line item is a map change (`fundamentals_map.py`) and a migration
 to type it; until then, accept, naming the decision.
 
@@ -1704,9 +1712,10 @@ point-in-time reads over the break see two versions, or none.
 dorq 0.13 judges the three statement tables too (DQ9xx, dorq's
 `doc/statements.md`). `fafnir dq run` runs it after the bars when
 `[dq] dorq_statements = true`, over every current version, every night. It writes
-the queue **only with `[dq] dorq_statements_shadow = false`**. Until the statements
-cutover (DR-0914), the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`, and
-`fafnir dq compare --statements` reads them. `fafnir dq sample` draws from a night the
+the queue **only with `[dq] dorq_statements_shadow = false`**, which the statements
+cutover (DR-0914) set; before it, the rows went to
+`<dorq_shadow_dir>/statements/<as-of>.jsonl`, and `fafnir dq compare --statements`
+read them. `fafnir dq sample` draws from a night the
 stratified sample the cutover verifies on EDGAR, each row with its `dq label add
 --verified` commands (doc/dorq.md › *The statements cutover*). A statement flag's
 `table_name` is its

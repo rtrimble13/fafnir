@@ -1292,21 +1292,29 @@ own row becomes `next = relist`. Both were done on 2026-10-24.
 
 ### The fundamentals flags
 
-`fafnir dq run` runs fourteen checks over the SF1 statements (#102), after the price
-and security checks. `run_all` keeps its five keys and adds one per check; with no
-statement tables (a database mid-migration) the new ones report 0 and run nothing.
-The loader writes its own flags as it loads (#90). Every one has a playbook in
-`.claude/skills/fafnir-dba/references/dq-playbooks.md` (*The fundamentals flags*).
-`fafnir dq recheck` closes a flag of every one of them but
-`fundamentals_unmapped_fields` once the check's own query no longer selects it: the
-security has filed since, its statements have loaded, the vendor fixed a row, the
-period's versions chain again after a repair on the host, or the check was
-recalibrated. The six judgement checks (`fundamentals_gap`,
-`fundamentals_currency_mismatch`, `fundamentals_suspicious_zero`,
-`fundamentals_implausible_filing_lag`, `fundamentals_ytd_suspect` and
-`fundamentals_version_chain`) gained their rule for the statements cutover
-(DR-0914), which closes the thirteen checks' open flags by recheck. Coverage by
-sector is in the `dq run` log.
+**Since the statements cutover (DR-0914), dorq judges the statements**
+([dorq.md](dorq.md#the-statements-cutover)): its `dorq_*` statement flags reach the
+queue with `[dq] dorq_statements = true` and `dorq_statements_shadow = false`, and
+`dq run` says so on every run where they would not. The thirteen SQL checks `fafnir dq
+run` ran over the SF1 statements (#102) are retired. `run_all` keeps their keys, and
+`fundamentals_unmapped_fields`', at 0 for one release. The loader writes its own
+flags as it loads (#90), `fundamentals_unmapped_fields` among them since the cutover.
+Every one has a playbook in `.claude/skills/fafnir-dba/references/dq-playbooks.md`
+(*The fundamentals flags*).
+
+`fafnir dq recheck` closes the retired checks' open flags on two grounds, each with its
+own note:
+- **The condition is gone.** The check's own query no longer selects it: the security
+  has filed since, its statements have loaded, the vendor fixed a row, the period's
+  versions chain again after a repair on the host, or the check was recalibrated.
+- **dorq carries it.** A dorq successor flag, open or accepted, on the same security
+  and of a successor code that agrees with the flag's key (the rule `dq compare
+  --statements` matched by): the queue keeps one record of the condition, dorq's.
+
+A flag neither closes is a condition the SQL check saw and dorq does not: judge it on
+the filing, as its playbook says. After deploying the cutover, run `fafnir dq recheck
+--dry-run` and then `fafnir dq recheck`, once dorq's statements night has written the
+queue.
 
 **Recalibrated on production data (2026-10-28).** The first run over SF1 wrote about
 308,000 flags, most of them what SF1 cannot express: noncontrolling and minority
@@ -1327,9 +1335,11 @@ from the version in force, so the loader added a version
   is the same day. A read as of an earlier date still sees the figures as first
   reported, which is what a backtest should see.
 - **One flag per security and run,** listing the periods and the fields that moved
-  most, old against new. From the nightly it is `warn`: something was restated this
-  week. From a backfill it is `info`: the backfill dates all of SF1's restated
-  history to its own day, and most of it is a later filing's reclassified comparatives.
+  most, old against new, at `info`. Whether a restatement is plausible is dorq's DQ932's
+  judgement since the statements cutover (DR-0914); before it, the nightly's were
+  `warn`. From a backfill it was always `info`: the backfill dates all of SF1's
+  restated history to its own day, and most of it is a later filing's reclassified
+  comparatives.
 - **Nothing to repair.** The version is the record. Read the moves; an implausible one
   (a factor of 1,000, a sign) is a vendor error to check against EDGAR and report. Its
   fix arrives as a correction. Then resolve, saying what you read.
