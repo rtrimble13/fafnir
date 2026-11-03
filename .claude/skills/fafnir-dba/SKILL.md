@@ -31,10 +31,11 @@ These are not style guidance. Each one is a way this system gets damaged.
    and stop. `security merge --across-vendors` is not a force: it is the guard for
    one company held by two vendors after a rename (identity from the vendor, the
    fed row's bars kept), with blockers of its own.
-5. **Nine checks are never yours to auto-resolve**: `price_scale_collapse`,
+5. **Ten checks are never yours to auto-resolve**: `price_scale_collapse`,
    `corporate_action_drift`, `symbol_change_conflict`, `price_price_out_of_range`,
    `price_subresolution_price`, `security_duplicate_identity`, and dorq's
-   `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied`.
+   `dorq_scale_shift`, `dorq_split_without_jump`, `dorq_split_double_applied` and,
+   on the statements, `dorq_statement_key`.
    Each is a measurement, an unrepresentable value, or needs a different command
    entirely — see the playbooks. This list is also
    `NEVER_AUTO_RESOLVE` in `src/fafnir_mcp/tools.py`, and `dq_triage` returns

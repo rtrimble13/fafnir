@@ -7,6 +7,19 @@
   `fafnir dq run --engine/--shadow`, `fafnir dq compare`, `fafnir dq export-labels`
 - Related: [doc/dorq.md](../dorq.md); the dorq development plan, §7 (integration)
   and §8 (cutover criteria), in [rtrimble13/dorq](https://github.com/rtrimble13/dorq)
+- Status note (2026-11-02, DR-0912): **the statements.** dorq 0.13 reads financial
+  statements as a third kind (DQ9xx), and the same decision covers them as a run of
+  their own: `src/fafnir/dq/dorq_statements.py`, `fafnir dq run --statements`,
+  `fafnir dq compare --statements` ([dorq.md](../dorq.md#statements)). The
+  differences are these. It is off until an operator sets `[dq] dorq_statements`. It
+  reads the whole history every night, as the SQL fundamentals checks do. It has its
+  own shadow (`<dorq_shadow_dir>/statements/`, `[dq] dorq_statements_shadow`), its
+  own `ops.ingestion_run` endpoints and watermarks (`dq-statements`,
+  `dq-statements-shadow`), and its own cutover: DR-0914 retires the thirteen SQL
+  checks it succeeds (the dorq fundamentals plan, §3 and §6). `dq recheck` re-runs a
+  statement flag on the statements and a bars flag on the bars. It skips the
+  cross-sectional `dorq_revision_cohort`, and `dorq_statement_key` joins the
+  never-resolve dorq checks. The bars run is unchanged.
 
 ## Context
 

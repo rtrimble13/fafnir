@@ -138,6 +138,14 @@ log_dir = "var/fafnir/log"
 # its window is new (minted since the last run) or was rewritten by an operator
 # command. Above this many it skips that pass with a warning; use --full.
 # dorq_backfill_max = 500
+# dorq on the statements (doc/dorq.md#statements): with an engine that includes
+# dorq, `dq run` also judges the three statement tables' whole history, after the
+# bars, into <dorq_shadow_dir>/statements/ until the statements' own shadow period
+# meets its cutover criteria. Off by default.
+# dorq_statements = true
+# dorq_statements_config = "/etc/fafnir/dorq-statements.toml"   # includes
+#     /opt/dorq/share/dorq/priors/fafnir-statements.toml; empty: dorq's defaults
+# dorq_statements_shadow = true
 
 # --- duk (read CLI) settings -------------------------------------------------
 # duk reuses [api].fmp_key (-S fmp), [api].sharadar_key (-S sharadar) and

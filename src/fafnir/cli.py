@@ -25,6 +25,7 @@ Examples
 from __future__ import annotations
 
 import datetime as dt
+import time
 from typing import Optional
 
 import click
@@ -6822,8 +6823,29 @@ def _dq_engine(cfg, engine: Optional[str]) -> str:
     help="dorq judges the latest night again although a run already judged it, "
     "over the span that run used, replacing its shadow file (after a repair).",
 )
+@click.option(
+    "--statements/--no-statements",
+    default=None,
+    help="dorq also judges the statements' whole history, when the engine "
+    "includes dorq  [default: [dq] dorq_statements, else no]",
+)
+@click.option(
+    "--statements-only",
+    is_flag=True,
+    help="dorq on the statements alone: no SQL checks, no bars.",
+)
 @click.pass_context
-def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full, rerun):
+def dq_run(
+    ctx,
+    exchange,
+    outlier_threshold,
+    engine,
+    shadow,
+    full,
+    rerun,
+    statements,
+    statements_only,
+):
     """Run the data-quality checks; write flags to ops.data_quality_flag.
 
     \b
@@ -6831,6 +6853,7 @@ def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full, rerun):
       fafnir dq run --engine both            # SQL checks, and dorq in shadow
       fafnir dq run --engine dorq --full     # dorq over the whole history
       fafnir dq run --engine dorq --rerun    # dorq on a night it already judged
+      fafnir dq run --statements-only        # dorq on the statements alone
 
     The SQL engine is the gap / outlier / freshness / identity / classification
     checks. dorq (doc/dorq.md) judges every bar of the lookback for a data error
@@ -6838,76 +6861,151 @@ def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full, rerun):
     `fafnir dq compare` reads, leaving the queue alone. Shadow is the default
     until the cutover criteria are met (dorq plan §7.4, §8).
 
+    With [dq] dorq_statements (or --statements), dorq also judges the three
+    statement tables' whole history, after the bars, into
+    <dorq_shadow_dir>/statements/ while [dq] dorq_statements_shadow holds (the
+    default). The bars run is the same with it or without it.
+
     dorq judges a night once. When no session has loaded since its last run (a
     failed load, a holiday, a second run by hand) it says which run judged the
-    night and does nothing; the SQL checks run regardless. --rerun overrides that.
+    night and does nothing; the SQL checks run regardless. --rerun overrides that,
+    for the bars and the statements alike.
     """
     if rerun and full:
         raise click.UsageError("--rerun is for the nightly window; --full always runs.")
-    from fafnir.dq import checks
-    from fafnir.dq import dorq as dorq_engine
-
+    if statements_only and (full or statements is False):
+        raise click.UsageError(
+            "--statements-only judges the statements' whole history; it takes no "
+            "--full or --no-statements."
+        )
     cfg = ctx.obj["config"]
+    if statements_only:
+        engine, statements = "dorq", True
     engine = _dq_engine(cfg, engine)
     if shadow is None:
         shadow = cfg.dorq_shadow
+    if statements is None:
+        statements = cfg.dorq_statements
     with Database(cfg.dsn) as database:
-        if engine in ("sql", "both"):
-            result = checks.run_all(
-                database, exchange_code=exchange, outlier_threshold=outlier_threshold
+        if not statements_only:
+            _dq_run_bars(
+                database, cfg, exchange, outlier_threshold, engine, shadow, full, rerun
             )
-            # Durable before dorq runs: a dorq failure must not cost the SQL flags.
-            database.commit()
-            click.echo(f"DQ flags written: {result}")
-        if engine in ("dorq", "both"):
-            settings = dorq_engine.settings_from(cfg)
-            try:
-                out = dorq_engine.run(
-                    database, settings, exchange, shadow=shadow, full=full, rerun=rerun
-                )
-            except dorq_engine.DorqError as exc:
-                raise click.ClickException(str(exc)) from exc
-            database.commit()
-            if out.judged_by:
-                j = out.judged_by
-                at = j["started_at"].astimezone(dt.timezone.utc)
-                click.echo(
-                    f"dorq: {out.window.as_of} was judged by run {j['ingestion_run_id']}"
-                    f" ({at:%Y-%m-%d %H:%M} UTC) and no newer session has loaded;"
-                    " nothing to judge. --rerun to judge it again."
-                )
-                return
-            w = out.window
-            span = (
-                f"{w.bars_from or 'start'}..{w.as_of}"
-                + (f", reporting from {w.since}" if w.since else "")
-                if w.as_of
-                else "no bars"
+        if statements and engine in ("dorq", "both"):
+            _dq_run_statements(database, cfg, exchange, rerun)
+        elif statements:
+            click.echo(
+                "dorq statements: not run, the engine is sql (--engine both, or"
+                " --statements-only)"
             )
-            detected = sum(out.detected.values())
-            if shadow:
-                click.echo(
-                    f"dorq {out.version} ({span}): {_plural(detected, 'violation')}"
-                    f" written to the shadow file {out.shadow_file}"
+
+
+def _dq_run_bars(
+    database, cfg, exchange, outlier_threshold, engine, shadow, full, rerun
+):
+    """`dq run`'s SQL checks and dorq's bars run, as they were before the
+    statements run joined them."""
+    from fafnir.dq import checks
+    from fafnir.dq import dorq as dorq_engine
+
+    if engine in ("sql", "both"):
+        result = checks.run_all(
+            database, exchange_code=exchange, outlier_threshold=outlier_threshold
+        )
+        # Durable before dorq runs: a dorq failure must not cost the SQL flags.
+        database.commit()
+        click.echo(f"DQ flags written: {result}")
+    if engine in ("dorq", "both"):
+        settings = dorq_engine.settings_from(cfg)
+        try:
+            out = dorq_engine.run(
+                database, settings, exchange, shadow=shadow, full=full, rerun=rerun
+            )
+        except dorq_engine.DorqError as exc:
+            raise click.ClickException(str(exc)) from exc
+        database.commit()
+        if out.judged_by:
+            j = out.judged_by
+            at = j["started_at"].astimezone(dt.timezone.utc)
+            click.echo(
+                f"dorq: {out.window.as_of} was judged by run {j['ingestion_run_id']}"
+                f" ({at:%Y-%m-%d %H:%M} UTC) and no newer session has loaded;"
+                " nothing to judge. --rerun to judge it again."
+            )
+            return
+        w = out.window
+        span = (
+            f"{w.bars_from or 'start'}..{w.as_of}"
+            + (f", reporting from {w.since}" if w.since else "")
+            if w.as_of
+            else "no bars"
+        )
+        detected = sum(out.detected.values())
+        if shadow:
+            click.echo(
+                f"dorq {out.version} ({span}): {_plural(detected, 'violation')}"
+                f" written to the shadow file {out.shadow_file}"
+            )
+        else:
+            click.echo(
+                f"dorq {out.version} ({span}): {_plural(detected, 'violation')},"
+                f" DQ flags written: {out.flagged}"
+            )
+        b = out.backfill
+        if b and b["securities"]:
+            n = b["securities"]
+            whose = f"{n} {'security' if n == 1 else 'securities'}"
+            click.echo(
+                f"  backfill: {whose} with history before {b['before']} new or"
+                " rewritten -- "
+                + (
+                    f"not judged, {b['skipped']}; use --full"
+                    if b.get("skipped")
+                    else f"{_plural(b['reports'], 'violation')}, included above"
                 )
-            else:
-                click.echo(
-                    f"dorq {out.version} ({span}): {_plural(detected, 'violation')},"
-                    f" DQ flags written: {out.flagged}"
-                )
-            b = out.backfill
-            if b and b["securities"]:
-                n = b["securities"]
-                whose = f"{n} {'security' if n == 1 else 'securities'}"
-                click.echo(
-                    f"  backfill: {whose} with history before {b['before']} new or"
-                    " rewritten -- "
-                    + (
-                        f"not judged, {b['skipped']}; use --full"
-                        if b.get("skipped")
-                        else f"{_plural(b['reports'], 'violation')}, included above"
-                    )
-                )
+            )
+
+
+def _dq_run_statements(database, cfg, exchange, rerun):
+    """dorq's statements run (:mod:`fafnir.dq.dorq_statements`), and its line."""
+    from fafnir.dq import dorq as dorq_engine
+    from fafnir.dq import dorq_statements
+
+    settings = dorq_engine.settings_from(cfg)
+    shadow = cfg.dorq_statements_shadow
+    started = time.monotonic()
+    try:
+        out = dorq_statements.run(
+            database, settings, exchange, shadow=shadow, rerun=rerun
+        )
+    except dorq_engine.DorqError as exc:
+        raise click.ClickException(f"dorq statements: {exc}") from exc
+    database.commit()
+    if out.judged_by:
+        j = out.judged_by
+        at = j["started_at"].astimezone(dt.timezone.utc)
+        click.echo(
+            f"dorq statements: {out.window.as_of} was judged by run"
+            f" {j['ingestion_run_id']} ({at:%Y-%m-%d %H:%M} UTC); nothing to judge."
+            " --rerun to judge it again."
+        )
+        return
+    if not out.version:
+        click.echo("dorq statements: nothing to judge (no statements or no session)")
+        return
+    detected = sum(out.detected.values())
+    took = f"{time.monotonic() - started:.1f} s"
+    if shadow:
+        click.echo(
+            f"dorq statements {out.version} (as of {out.window.as_of}, {took}):"
+            f" {_plural(detected, 'violation')} written to the shadow file"
+            f" {out.shadow_file}"
+        )
+    else:
+        click.echo(
+            f"dorq statements {out.version} (as of {out.window.as_of}, {took}):"
+            f" {_plural(detected, 'violation')}, DQ flags written: {out.flagged}"
+        )
 
 
 @dq.command("compare")
@@ -6946,6 +7044,12 @@ def dq_run(ctx, exchange, outlier_threshold, engine, shadow, full, rerun):
     help="Also run dorq-eval on the same night and labels, and say where it "
     "disagrees  [default: dorq-eval beside [dq] dorq_path, when there is one]",
 )
+@click.option(
+    "--statements",
+    is_flag=True,
+    help="Statements nights (<dorq_shadow_dir>/statements/) against the SQL "
+    "fundamentals checks dorq succeeds, not bars.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.pass_context
 def dq_compare(
@@ -6957,6 +7061,7 @@ def dq_compare(
     verified_only,
     slack,
     dorq_eval,
+    statements,
     as_json,
 ):
     """Compare shadow nights of dorq with the SQL checks and the labels.
@@ -6978,11 +7083,20 @@ def dq_compare(
     and at error, judged only by the labels that applied when the night's run
     started. Several files add a summary over their distinct conditions. Reads
     only.
+
+    --statements compares statements nights instead: of the thirteen SQL
+    fundamentals checks dorq succeeds, the flags open when the night's run
+    started and how many a successor report covers (same security, and the
+    statement, period, fiscal year or span the flag names); the standing count at
+    warn and above (the bar is 30% of the SQL checks' or less); new flags per
+    night; and, with labels about statements, precision.
     """
     import sys
     from pathlib import Path
 
     from fafnir.dq import compare as cmp
+    from fafnir.dq import compare_statements as cst
+    from fafnir.dq import dorq as dorq_engine
 
     cfg = ctx.obj["config"]
     if labels and labels_from_db:
@@ -6992,16 +7106,33 @@ def dq_compare(
             "--labels-ignore-time and --verified-only qualify --labels / "
             "--labels-from-db."
         )
+    if statements and dorq_eval:
+        raise click.ClickException(
+            "--dorq-eval compares bars nights, not --statements."
+        )
     paths = [Path(p) for p in shadow_files]
+    where = cfg.dorq_shadow_dir
+    if statements:
+        settings = dorq_engine.settings_from(cfg)
+        where = str(Path(cfg.dorq_shadow_dir) / "statements")
     if not paths:
-        newest = cmp.latest_shadow_file(cfg.dorq_shadow_dir)
+        newest = (
+            cst.latest_shadow_file(settings)
+            if statements
+            else cmp.latest_shadow_file(cfg.dorq_shadow_dir)
+        )
         paths = [newest] if newest is not None else []
     if not paths or not all(p.is_file() for p in paths):
         missing = [str(p) for p in paths if not p.is_file()]
+        run_hint = (
+            "`fafnir dq run --statements-only` ([dq] dorq_statements_shadow is the "
+            "default)"
+            if statements
+            else "`fafnir dq run --engine both` (shadow is the default)"
+        )
         raise click.ClickException(
             (f"No such shadow file: {', '.join(missing)}." if missing else "")
-            or f"No shadow file in {cfg.dorq_shadow_dir}. Run "
-            "`fafnir dq run --engine both` (shadow is the default) first."
+            or f"No shadow file in {where}. Run {run_hint} first."
         )
     try:
         if labels == "-":
@@ -7010,6 +7141,32 @@ def dq_compare(
             label_rows = cmp.read_labels(Path(labels)) if labels else None
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    if statements:
+        with Database(cfg.dsn) as database:
+            if labels_from_db:
+                label_rows = cmp.labels_from_db(database)
+            nights = [
+                cst.compare(
+                    database,
+                    path,
+                    labels=label_rows,
+                    slack_days=slack,
+                    labels_ignore_time=labels_ignore_time,
+                    verified_only=verified_only,
+                )
+                for path in paths
+            ]
+        if as_json:
+            _dq_json(
+                nights[0].as_dict()
+                if len(nights) == 1
+                else {"nights": [n.as_dict() for n in nights]}
+            )
+            return
+        click.echo(
+            ("\n\n" + "=" * 78 + "\n\n").join(map(cst.format_comparison, nights))
+        )
+        return
     if dorq_eval is None:
         beside = Path(cfg.dorq_path).with_name("dorq-eval")
         dorq_eval = str(beside) if beside.is_file() else None
@@ -8611,6 +8768,7 @@ def status(ctx):
             database, "sharadar", order=("stocks", "funds", "fundamentals", "insiders")
         )
         fundamentals = repo.fundamentals_status(database)
+        statements_run = _last_statements_run(database)
     click.echo(f"Primary    : {_primary_line(ctx.obj['config'])}")
     click.echo(
         f"Securities : {counts.get('securities', 0)} "
@@ -8632,6 +8790,9 @@ def status(ctx):
     dorq_line = _dorq_status(ctx.obj["config"])
     if dorq_line:
         click.echo(dorq_line)
+        statements_line = _dorq_statements_status(ctx.obj["config"], statements_run)
+        if statements_line:
+            click.echo(statements_line)
     if pending_renames:
         click.echo(f"Renames    : {pending_renames} unapplied (need review)")
         for row in rename_sample:
@@ -8643,6 +8804,39 @@ def status(ctx):
         click.echo(line)
     for line in _fundamentals_status_lines(fundamentals):
         click.echo(line)
+
+
+def _last_statements_run(database) -> Optional[dict]:
+    """The newest dorq statements run, or None (none yet, or a database
+    mid-migration)."""
+    from fafnir.dq import dorq_statements
+
+    return dorq_statements.last_run(database)
+
+
+def _dorq_statements_status(cfg, run: Optional[dict]) -> Optional[str]:
+    """The `status` line for dorq's statements run, under the dorq line: whether
+    it is on, where it writes, and its newest run. None when it is off and has
+    never run, so a host that does not use it prints what it always did."""
+    on = cfg.dorq_statements
+    if not on and run is None:
+        return None
+    line = "             statements " + (
+        f"on ({'shadow' if cfg.dorq_statements_shadow else 'queue'})" if on else "off"
+    )
+    if run is None:
+        return line + "; no run yet"
+    params = run["params"] or {}
+    line += f"; last as of {run['as_of']}"
+    if run["status"] != "success":
+        return line + f", {run['status']} (run {run['ingestion_run_id']})"
+    reports = params.get("reports")
+    if reports is not None:
+        line += f", {_plural(int(reports), 'report')}"
+    if run["finished_at"] and run["started_at"]:
+        took = (run["finished_at"] - run["started_at"]).total_seconds()
+        line += f" in {took:.0f} s"
+    return line + f" (run {run['ingestion_run_id']})"
 
 
 def _fundamentals_status_lines(st: dict) -> list[str]:

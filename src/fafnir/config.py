@@ -26,7 +26,8 @@ Config sections
 ``[dq]``
     engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir,
     dorq_lookback_sessions, dorq_threads, dorq_backfill_max -- see
-    :mod:`fafnir.dq.dorq`
+    :mod:`fafnir.dq.dorq`; dorq_statements, dorq_statements_config,
+    dorq_statements_shadow -- see :mod:`fafnir.dq.dorq_statements`
 
 Environment overrides
 ---------------------
@@ -429,6 +430,27 @@ class FafnirConfig:
         that is new or was rewritten before its window. Above it the pass is skipped
         with a warning: that many is a universe rebuild, which wants ``--full``."""
         return max(0, int(self._get("dq", "dorq_backfill_max", 500)))
+
+    # -- dq: dorq on the statements (dorq plan DR-0912; doc/dorq.md) --------
+    @property
+    def dorq_statements(self) -> bool:
+        """Whether `fafnir dq run` also runs dorq on the three statement tables,
+        when its engine includes dorq. False by default: the statements run is
+        turned on by an operator, as dorq itself was."""
+        return bool(self._get("dq", "dorq_statements", False))
+
+    @property
+    def dorq_statements_config(self) -> str:
+        """dorq's config for the statements run (one that includes dorq's
+        ``priors/fafnir-statements.toml``). Empty runs dorq ``--isolated``."""
+        return str(self._get("dq", "dorq_statements_config", "") or "")
+
+    @property
+    def dorq_statements_shadow(self) -> bool:
+        """Whether the statements run's flags go to ``<dorq_shadow_dir>/statements``
+        instead of the queue. True by default, and apart from ``dorq_shadow``: the
+        statements have a shadow period and a cutover of their own (DR-0914)."""
+        return bool(self._get("dq", "dorq_statements_shadow", True))
 
     def is_loaded(self) -> bool:
         return bool(self._data)

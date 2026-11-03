@@ -202,10 +202,31 @@ class Label:
     applies_until: Optional[dt.datetime] = None
     verified: Optional[bool] = None
     members: tuple[int, ...] = ()
+    # A statements label's scope (dorq's doc/labels.md): each unset covers every
+    # value, and with any of them ``first`` and ``last`` are fiscal dates.
+    statement: Optional[str] = None
+    period_type: Optional[str] = None
+    version_no: Optional[int] = None
+    item: Optional[str] = None
 
     @property
     def is_fault(self) -> bool:
         return self.label_class != "market_fact"
+
+    @property
+    def is_statements(self) -> bool:
+        """Whether the label is about statements: it names a statement scope, or
+        expects (or excuses) a DQ9xx code. Such a label judges only statement
+        reports, and a bars label only bars reports."""
+        scoped = any(
+            v is not None
+            for v in (self.statement, self.period_type, self.version_no, self.item)
+        )
+        return (
+            scoped
+            or any(c.startswith("DQ9") for c in self.expect)
+            or self.codes.startswith("DQ9")
+        )
 
     def applies_at(self, started_at: Optional[dt.datetime]) -> bool:
         """Whether the label is about what a run starting at ``started_at`` read.
@@ -238,6 +259,12 @@ def parse_labels(fh: IO[str], name: str = "labels") -> list[Label]:
         expect = tuple(c for c in str(obj.get("expect") or "").split("|") if c)
         codes = str(obj.get("codes") or ("DQ2" if cls == "market_fact" else ""))
         verified = obj.get("verified")
+        try:
+            version_no = (
+                int(obj["version_no"]) if obj.get("version_no") is not None else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} line {n}: version_no is not a number") from exc
         out.append(
             Label(
                 series,
@@ -251,9 +278,30 @@ def parse_labels(fh: IO[str], name: str = "labels") -> list[Label]:
                 applies_until=_stamp(obj.get("applies_until")),
                 verified=verified if isinstance(verified, bool) else None,
                 members=_ids(obj.get("members")),
+                statement=statement_name(obj.get("statement")),
+                period_type=str(obj["period_type"]) if obj.get("period_type") else None,
+                version_no=version_no,
+                item=str(obj["item"]) if obj.get("item") else None,
             )
         )
     return out
+
+
+#: fafnir's statement tables by dorq's statement name.
+_STATEMENT_OF_TABLE = {
+    "core.income_statement": "income",
+    "core.balance_sheet": "balance_sheet",
+    "core.cash_flow_statement": "cash_flow",
+}
+
+
+def statement_name(value) -> Optional[str]:
+    """dorq's statement name (``income``, ``balance_sheet``, ``cash_flow``) for a
+    name or one of fafnir's table names; None for none."""
+    if value in (None, ""):
+        return None
+    text = str(value)
+    return _STATEMENT_OF_TABLE.get(text, text)
 
 
 def read_labels(path: Path) -> list[Label]:
@@ -744,12 +792,17 @@ def compare(
     out.conditions = len(out.keys)
     index = None
     if labels is not None:
-        used = applicable(
-            labels,
-            state_at,
-            ignore_time=labels_ignore_time,
-            verified_only=verified_only,
-        )
+        used = [
+            lab
+            for lab in applicable(
+                labels,
+                state_at,
+                ignore_time=labels_ignore_time,
+                verified_only=verified_only,
+            )
+            # A statements label judges statement reports (compare_statements).
+            if not lab.is_statements
+        ]
         out.labels_used = len(used)
         out.labels_time_scoped = not labels_ignore_time and state_at is not None
         out.labels_verified_only = verified_only

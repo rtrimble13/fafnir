@@ -461,9 +461,16 @@ def recheck(
 #
 # Two kinds are never closed this way. The NEVER_AUTO_RESOLVE dorq checks name a
 # repair that a resolve would skip (an era at the wrong scale, a split on file
-# that is wrong). The cross-sectional ones (a failed load across a cohort, a
-# family split) are judged across securities, and a re-run over the few with open
-# flags cannot reproduce the cohort they were found in.
+# that is wrong, a version chain broken around the loader). The cross-sectional
+# ones (a failed load across a cohort, a family split, a revision cohort) are
+# judged across securities, and a re-run over the few with open flags cannot
+# reproduce the cohort they were found in.
+#
+# A flag on a statement table (DR-0912) is re-run as the statements run makes it:
+# the whole statements history of its securities, as of the market's latest
+# session (:func:`fafnir.dq.dorq_statements.run_statements`). Every other is re-run
+# on the bars. A flag is judged only by a run of its own kind, so a bars re-run
+# never closes a statement flag it could not have emitted.
 
 
 def dorq_recheck_excluded() -> frozenset[str]:
@@ -503,6 +510,7 @@ def recheck_dorq(
     a check this may not close.
     """
     from fafnir.dq import dorq as dorq_engine
+    from fafnir.dq import dorq_statements
 
     excluded = dorq_recheck_excluded()
     wanted = list(checks) if checks else open_dorq_checks(db)
@@ -519,7 +527,7 @@ def recheck_dorq(
         return []
     flags = db.fetchall(
         """
-        SELECT dq_flag_id, check_name, security_id, record_key,
+        SELECT dq_flag_id, check_name, security_id, table_name, record_key,
                detail->'dorq'->>'version' AS version
           FROM ops.data_quality_flag
          WHERE check_name = ANY(%s) AND resolved_at IS NULL
@@ -530,23 +538,49 @@ def recheck_dorq(
     )
     if not flags:
         return [RecheckResult(name, 0, [], "") for name in sorted(wanted)]
-    securities = sorted({int(f["security_id"]) for f in flags})
-    run = dorq_engine.run_dorq(
-        db,
-        settings,
-        exchange_code,
-        dorq_engine.full_window(db, exchange_code),
-        security_ids=securities,
-    )
-    emitted = {
-        (
-            r["check_name"],
-            int(r["security_id"]),
-            dorq_engine.record_key_json(r["record_key"]),
+
+    def ids(kind: list[dict]) -> list[int]:
+        return sorted({int(f["security_id"]) for f in kind})
+
+    def keys(records: list[dict]) -> set[tuple]:
+        return {
+            (
+                r["check_name"],
+                int(r["security_id"]),
+                dorq_engine.record_key_json(r["record_key"]),
+            )
+            for r in records
+            if r.get("security_id") is not None
+        }
+
+    on_statements = [
+        f for f in flags if dorq_statements.is_statement_flag(f["table_name"])
+    ]
+    on_bars = [
+        f for f in flags if not dorq_statements.is_statement_flag(f["table_name"])
+    ]
+    run = None
+    emitted: set[tuple] = set()
+    if on_bars:
+        run = dorq_engine.run_dorq(
+            db,
+            settings,
+            exchange_code,
+            dorq_engine.full_window(db, exchange_code),
+            security_ids=ids(on_bars),
         )
-        for r in run.records
-        if r.get("security_id") is not None
-    }
+        emitted |= keys(run.records)
+    statements_run = None
+    if on_statements:
+        statements_run = dorq_statements.run_statements(
+            db,
+            settings,
+            dorq_engine.market_latest(db, exchange_code),
+            security_ids=ids(on_statements),
+        )
+        emitted |= keys(statements_run.records)
+    version = (run or statements_run).version
+    statement_flags = {f["dq_flag_id"] for f in on_statements}
     out: list[RecheckResult] = []
     for name in sorted(wanted):
         mine = [f for f in flags if f["check_name"] == name]
@@ -560,21 +594,22 @@ def recheck_dorq(
             )
             not in emitted
         ]
+        history = (
+            "statements history"
+            if mine and all(f["dq_flag_id"] in statement_flags for f in mine)
+            else "full history"
+        )
         reason = (
-            f"re-running dorq {run.version} over the security's full history no longer "
+            f"re-running dorq {version} over the security's {history} no longer "
             "reports it"
         )
-        if run.dropped.get(name):
+        if run is not None and run.dropped.get(name):
             reason += (
                 ", or reports it on a security no longer actively trading, which "
                 "fafnir leaves out"
             )
         older = sorted(
-            {
-                f["version"]
-                for f in stale
-                if f["version"] and f["version"] != run.version
-            }
+            {f["version"] for f in stale if f["version"] and f["version"] != version}
         )
         if older:
             reason += (
