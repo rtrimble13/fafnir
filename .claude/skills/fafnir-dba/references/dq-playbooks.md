@@ -58,7 +58,7 @@ and they are not interchangeable:
 | Check | Written by | Written through | A resolve is re-written by | `dq accept` suppresses? | `dq recheck`? |
 |---|---|---|---|---|---|
 | `gap`, `sparse_coverage`, `outlier`, `stale`, `security_duplicate_identity`, `security_missing_classification` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes — except `security_duplicate_identity` |
-| `balance_sheet_identity`, `cash_flow_tie`, `cash_balance_tie`, `fundamentals_stale`, `fundamentals_coverage`, `fundamentals_ttm_incomplete`, `fundamentals_negative_impossible` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes: the check's own query, run again (a flag at another severity, or keyed per version, closes) |
+| `balance_sheet_identity`, `cash_flow_tie`, `cash_balance_tie`, `fundamentals_gap`, `fundamentals_stale`, `fundamentals_currency_mismatch`, `fundamentals_coverage`, `fundamentals_ttm_incomplete`, `fundamentals_negative_impossible`, `fundamentals_suspicious_zero`, `fundamentals_implausible_filing_lag`, `fundamentals_ytd_suspect`, `fundamentals_version_chain` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes: the check's own query, run again (a flag at another severity, or keyed per version, closes) |
 | `dividend_no_prior_close`, `dividend_exceeds_price`, `adjustment_factor_extreme`, `adjustment_failed` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security | yes | `dividend_no_prior_close` only |
 | `price_scale_collapse` | price loader | `add_dq_flag_once` | a re-read of that bar | yes | no |
 | `price_restatement_conflict` | nightly price load (not `--from`) | `add_dq_flag_once` | a nightly re-read of that date while the vendor still restates it beyond the guard. An explicit `ingest prices --from` re-fetch of the date **resolves it itself** | yes | no |
@@ -1512,17 +1512,17 @@ version that balances, a period that filed, or a recalibration of the check.
 | `fundamentals_unlinked`, `fundamentals_missing_period_label`, `fundamentals_filing_before_period`, `fundamentals_value_out_of_range`, `fundamentals_duplicate_period` | loader quarantine | as the loader sets | the row was not stored: fix the link or wait for the vendor. A `fundamentals_duplicate_period` on a first-reported (`AR*`) row from before the later-filing fix is not a vendor fault: see doc/backfill.md › *A backfill from before the later-filing fix* |
 | `balance_sheet_identity` | `dq run` | `error`; `info` for temporary equity | **`dq recheck`**, else judgement: operations.md › *Investigating a balance-sheet-identity failure* |
 | `cash_flow_tie`, `cash_balance_tie` | `dq run` | `warn` | **`dq recheck`**, else judgement |
-| `fundamentals_gap` | `dq run` | `info` | judgement |
+| `fundamentals_gap` | `dq run` | `info` | **`dq recheck`** once the period loads, else judgement |
 | `fundamentals_stale` | `dq run` | `warn` | **`dq recheck`** |
 | `fundamentals_coverage` | `dq run` | `info` | **`dq recheck`** |
-| `fundamentals_currency_mismatch` | `dq run` | `info` | judgement |
+| `fundamentals_currency_mismatch` | `dq run` | `info` | **`dq recheck`**, else judgement |
 | `fundamentals_unmapped_fields` | `dq run` | `info` | a map change and a migration |
 | `fundamentals_ttm_incomplete` | `dq run` | `info` | **`dq recheck`**, else judgement |
 | `fundamentals_negative_impossible` | `dq run` | `error`; `info` for a financial company's revenue | **`dq recheck`**, else judgement |
-| `fundamentals_suspicious_zero` | `dq run` | `info` | judgement |
-| `fundamentals_implausible_filing_lag` | `dq run` | `warn` | judgement |
-| `fundamentals_ytd_suspect` | `dq run` | `warn` | judgement |
-| `fundamentals_version_chain` | `dq run` | `error` | a repair, then resolve |
+| `fundamentals_suspicious_zero` | `dq run` | `info` | **`dq recheck`**, else judgement |
+| `fundamentals_implausible_filing_lag` | `dq run` | `warn` | **`dq recheck`**, else judgement |
+| `fundamentals_ytd_suspect` | `dq run` | `warn` | **`dq recheck`**, else judgement |
+| `fundamentals_version_chain` | `dq run` | `error` | a repair, then **`dq recheck`** |
 
 **Read the versions before anything else.** Every statement question starts here:
 
@@ -1608,7 +1608,8 @@ reclassification from an error.
 Between two periods in force, or before the first (counting from 1998). `info`: SF1's
 coverage of the security has a hole. Compare the vendor master's `first_quarter` and
 `last_quarter` (`core.vendor_security`, `vendor_table = 'fundamentals'`). A hole SF1
-also has is accepted; one it does not is a load to re-run for that security.
+also has is accepted; one it does not is a load to re-run for that security. Once
+the missing periods load, `dq recheck` closes it.
 
 ### `fundamentals_stale` — an active security's latest period is older than its cycle allows
 
@@ -1664,20 +1665,22 @@ Revenue, net income, weighted shares, total assets, liabilities, parent equity, 
 shares outstanding or operating cash flow is 0 in force, and the periods either side
 report it. SF1 writes 0 for an absent value (#83 item 6), so this is usually "not
 reported in that filing" rather than zero. The panel reads 0 as a value. Check the
-filing; accept a real zero, report a missing one.
+filing; accept a real zero, report a missing one. Once SF1 fills it in, `dq recheck`
+closes it.
 
 ### `fundamentals_implausible_filing_lag` — known within 5 days of its period end
 
 A filed version whose filing date is under five days after the period ended: likely
 the period end itself recorded as the filing date, which would let a backtest know the
 figures too early. Check EDGAR's filing date. A wrong one is reported to Sharadar and
-arrives as a correction that moves `known_from`.
+arrives as a correction that moves `known_from`; `dq recheck` then closes the flag.
 
 ### `fundamentals_ytd_suspect` — four quarters sum to more than 1.5 years
 
 Revenue, or operating cash flow, in the quarters in force against the fiscal year: the
 quarters were stored year to date, not discretely, and every TTM over them is wrong.
-SF1's quarters are discrete (#83), so this should be rare; report it.
+SF1's quarters are discrete (#83), so this should be rare; report it. Once SF1
+corrects the quarters, `dq recheck` closes it.
 
 A fiscal year with two annual periods in force is not judged. A change of year end can
 label the transition period with the year it shares, and the quarters cannot then be
@@ -1690,8 +1693,9 @@ price checks included (2026-10-27, 10 such keys on production).
 `error`: each `known_to` must equal the next version's `known_from`, and only the last
 is open (ADR 0018). The loader keeps this, so a break means a write went around it: a
 manual edit, or a failed transaction that committed half. Repair it on the host
-(close or reopen the interval so it chains), then resolve. Never resolve without the
-repair: point-in-time reads over the break see two versions, or none.
+(close or reopen the interval so it chains), then `dq recheck`: it closes the flag
+once the versions chain, and only then. Never resolve without the repair:
+point-in-time reads over the break see two versions, or none.
 
 ---
 
@@ -1702,7 +1706,10 @@ dorq 0.13 judges the three statement tables too (DQ9xx, dorq's
 `[dq] dorq_statements = true`, over every current version, every night. It writes
 the queue **only with `[dq] dorq_statements_shadow = false`**. Until the statements
 cutover (DR-0914), the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`, and
-`fafnir dq compare --statements` reads them. A statement flag's `table_name` is its
+`fafnir dq compare --statements` reads them. `fafnir dq sample` draws from a night the
+stratified sample the cutover verifies on EDGAR, each row with its `dq label add
+--verified` commands (doc/dorq.md › *The statements cutover*). A statement flag's
+`table_name` is its
 statement's table, and its `record_key` names the statement, period type, fiscal date
 and version (and the item, identity or tie when the condition is per item). Read
 `detail` as for bars: `p_error`, `hypotheses`, `evidence`, `suggested_action`.

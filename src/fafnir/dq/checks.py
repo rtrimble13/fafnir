@@ -1073,13 +1073,11 @@ def check_cash_balance_tie(db: Database) -> int:
     )
 
 
-def check_fundamentals_gap(db: Database) -> int:
+def detect_fundamentals_gap() -> str:
     """A security that traded through more than ``GAP_DAYS`` without a period end in
-    force, between two of its periods or before its first (``info``)."""
-    return _write_flags(
-        db,
-        "fundamentals_gap",
-        f"""
+    force, between two of its periods or before its first (``info``). A period that
+    has filed since closes it, as do bars that no longer reach into the stretch."""
+    return f"""
         WITH p AS (
             SELECT security_id, fiscal_date,
                    lag(fiscal_date) OVER (PARTITION BY security_id
@@ -1111,7 +1109,15 @@ def check_fundamentals_gap(db: Database) -> int:
                'info' AS severity,
                jsonb_build_object('days', g.to_d - g.from_d) AS detail
           FROM (SELECT * FROM inner_gaps UNION ALL SELECT * FROM leading_gaps) g
-        """,
+        """
+
+
+def check_fundamentals_gap(db: Database) -> int:
+    """:func:`detect_fundamentals_gap`, written once per open condition."""
+    return _write_flags(
+        db,
+        "fundamentals_gap",
+        detect_fundamentals_gap(),
         what="stretches traded without a statement",
     )
 
@@ -1178,13 +1184,10 @@ def check_fundamentals_stale(db: Database) -> int:
     )
 
 
-def check_fundamentals_currency_mismatch(db: Database) -> int:
+def detect_fundamentals_currency_mismatch() -> str:
     """Statements in force reported in a currency other than the security's trading
     currency (``info``): the panel's price ratios are NULL for them."""
-    return _write_flags(
-        db,
-        "fundamentals_currency_mismatch",
-        f"""
+    return f"""
         SELECT t.security_id, 'core.income_statement' AS table_name,
                jsonb_build_object('reported_currency', t.reported_currency)
                    AS record_key,
@@ -1196,7 +1199,16 @@ def check_fundamentals_currency_mismatch(db: Database) -> int:
          WHERE t.{IN_FORCE} AND t.reported_currency IS NOT NULL
            AND t.reported_currency <> coalesce(s.currency, 'USD')
          GROUP BY t.security_id, t.reported_currency, s.currency
-        """,
+        """
+
+
+def check_fundamentals_currency_mismatch(db: Database) -> int:
+    """:func:`detect_fundamentals_currency_mismatch`, written once per open
+    condition."""
+    return _write_flags(
+        db,
+        "fundamentals_currency_mismatch",
+        detect_fundamentals_currency_mismatch(),
         what="securities reporting in another currency",
     )
 
@@ -1383,7 +1395,7 @@ def check_fundamentals_coverage(db: Database) -> int:
     )
 
 
-def check_fundamentals_suspicious_zero(db: Database) -> int:
+def detect_fundamentals_suspicious_zero() -> str:
     """A zero, in force, between two in-force neighbours that report the item: SF1's
     zero for an absent value where the company does report it (``info``)."""
     parts = []
@@ -1409,22 +1421,25 @@ def check_fundamentals_suspicious_zero(db: Database) -> int:
                 WINDOW w AS (PARTITION BY security_id, period_type
                              ORDER BY fiscal_date)) t
          WHERE {hits}""")
+    return "\n        UNION ALL".join(parts)
+
+
+def check_fundamentals_suspicious_zero(db: Database) -> int:
+    """:func:`detect_fundamentals_suspicious_zero`, written once per open
+    condition."""
     return _write_flags(
         db,
         "fundamentals_suspicious_zero",
-        "\n        UNION ALL".join(parts),
+        detect_fundamentals_suspicious_zero(),
         what="periods with a suspicious zero",
     )
 
 
-def check_fundamentals_implausible_filing_lag(db: Database) -> int:
+def detect_fundamentals_implausible_filing_lag() -> str:
     """A filed version known less than ``FILING_LAG_MIN_DAYS`` after its period
     ended (``warn``): a filing date that is probably the period's. Read on the income
     statement, which every SF1 row carries."""
-    return _write_flags(
-        db,
-        "fundamentals_implausible_filing_lag",
-        f"""
+    return f"""
         SELECT t.security_id, 'core.income_statement' AS table_name,
                {_VERSION_KEY} AS record_key, 'warn' AS severity,
                jsonb_build_object('known_from', t.known_from::text,
@@ -1432,12 +1447,21 @@ def check_fundamentals_implausible_filing_lag(db: Database) -> int:
           FROM core.income_statement t
          WHERE t.{CURRENT} AND t.knowledge_source = 'filed'
            AND t.known_from - t.fiscal_date < {FILING_LAG_MIN_DAYS}
-        """,
+        """
+
+
+def check_fundamentals_implausible_filing_lag(db: Database) -> int:
+    """:func:`detect_fundamentals_implausible_filing_lag`, written once per open
+    condition."""
+    return _write_flags(
+        db,
+        "fundamentals_implausible_filing_lag",
+        detect_fundamentals_implausible_filing_lag(),
         what="filings implausibly close to their period end",
     )
 
 
-def check_fundamentals_ytd_suspect(db: Database) -> int:
+def detect_fundamentals_ytd_suspect() -> str:
     """A fiscal year whose four quarters in force sum to more than ``YTD_RATIO``
     times the year: quarters reported year to date, not discretely (``warn``).
     Revenue, and operating cash flow, which 10-Qs report year to date.
@@ -1467,18 +1491,24 @@ def check_fundamentals_ytd_suspect(db: Database) -> int:
                 HAVING count(*) = 1) a
             ON a.security_id = q.security_id AND a.fiscal_year = q.fiscal_year
          WHERE q.n = 4 AND a.v <> 0 AND abs(q.s) > {YTD_RATIO} * abs(a.v)""")
+    return "\n        UNION ALL".join(parts)
+
+
+def check_fundamentals_ytd_suspect(db: Database) -> int:
+    """:func:`detect_fundamentals_ytd_suspect`, written once per open condition."""
     return _write_flags(
         db,
         "fundamentals_ytd_suspect",
-        "\n        UNION ALL".join(parts),
+        detect_fundamentals_ytd_suspect(),
         what="years whose quarters look year to date",
     )
 
 
-def check_fundamentals_version_chain(db: Database) -> int:
+def detect_fundamentals_version_chain() -> str:
     """A period whose current versions do not chain: each ``known_to`` the next
     ``known_from``, only the last open (ADR 0018; ``error``). The loader keeps this;
-    a break means a write went around it."""
+    a break means a write went around it, and only the repair on the host closes
+    it."""
     parts = []
     for table in STATEMENT_TABLES:
         parts.append(f"""
@@ -1501,10 +1531,16 @@ def check_fundamentals_version_chain(db: Database) -> int:
          GROUP BY security_id, period_type, fiscal_date
         HAVING bool_or(CASE WHEN next_from IS NULL THEN known_to IS NOT NULL
                             ELSE known_to IS DISTINCT FROM next_from END)""")
+    return "\n        UNION ALL".join(parts)
+
+
+def check_fundamentals_version_chain(db: Database) -> int:
+    """:func:`detect_fundamentals_version_chain`, written once per open
+    condition."""
     return _write_flags(
         db,
         "fundamentals_version_chain",
-        "\n        UNION ALL".join(parts),
+        detect_fundamentals_version_chain(),
         what="periods whose versions do not chain",
     )
 
@@ -1512,14 +1548,24 @@ def check_fundamentals_version_chain(db: Database) -> int:
 #: The fundamentals checks whose condition is a function of the statements as they
 #: stand, each with the query that detects it. ``dq recheck`` closes a flag of theirs
 #: that the query no longer selects: a vendor's fix, a restated version that
-#: balances, a period that filed, or a recalibration of the check itself.
+#: balances, a period that filed, the host's repair of a version chain, or a
+#: recalibration of the check itself. Every SQL fundamentals check but
+#: ``fundamentals_unmapped_fields`` (a map change) and ``fundamentals_coverage`` (a
+#: rule of its own) is here, so the statements cutover can close their flags by
+#: recheck (DR-0914).
 FUNDAMENTALS_DETECTORS = {
     "balance_sheet_identity": detect_balance_sheet_identity,
     "cash_flow_tie": detect_cash_flow_tie,
     "cash_balance_tie": detect_cash_balance_tie,
+    "fundamentals_gap": detect_fundamentals_gap,
     "fundamentals_stale": detect_fundamentals_stale,
+    "fundamentals_currency_mismatch": detect_fundamentals_currency_mismatch,
     "fundamentals_ttm_incomplete": detect_fundamentals_ttm_incomplete,
     "fundamentals_negative_impossible": detect_fundamentals_negative_impossible,
+    "fundamentals_suspicious_zero": detect_fundamentals_suspicious_zero,
+    "fundamentals_implausible_filing_lag": detect_fundamentals_implausible_filing_lag,
+    "fundamentals_ytd_suspect": detect_fundamentals_ytd_suspect,
+    "fundamentals_version_chain": detect_fundamentals_version_chain,
 }
 
 #: The fundamentals checks, in the order ``run_all`` runs them: its keys.

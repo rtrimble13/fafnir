@@ -787,9 +787,44 @@ fafnir dq compare --statements --json
   statement, period type, version and item agreeing where both name one, and the
   fiscal dates overlapping within the slack (`--slack`, three days). Only labels about
   statements judge statement reports, and they judge no bars report. A label is
-  about statements when it names a statement scope or a DQ9xx code. The warehouse's
-  own statement labels come with DR-0913. Until then, `--labels FILE` takes a file of
-  them.
+  about statements when it names a statement scope or a DQ9xx code.
+  `--labels-from-db` reads the warehouse's own (DR-0913).
+
+### The statements cutover
+
+dorq's statement checks take over from the thirteen SQL checks only on evidence, as
+ADR 0013 requires for bars (DR-0914, fafnir#221). SF1's nightly delta is about 1,100
+rows, too few to judge by, so the judgement is made on a full-history run: every
+statements night is one. The operator's steps:
+
+1. **Shadow 20 nights** with `[dq] dorq_statements = true`. A dorq release restarts
+   the count only if it changes a statement check's output.
+2. **Draw the sample** from one night, and verify each row on EDGAR:
+
+   ```bash
+   fafnir dq sample --out sample.csv                 # the newest statements night
+   fafnir dq sample <dorq_shadow_dir>/statements/2026-11-20.jsonl --seed 7 --out s.csv
+   ```
+
+   The sample is the night's distinct conditions at warn and above, one security
+   each: at least `--per-code` of every code (10, or all a code has), then the rest
+   of `--size` (200) in an order the seed fixes. The same night and seed give the
+   same sample, and a larger `--size` keeps a smaller one's rows. A DQ951 cohort row
+   is left out: a cohort is verified as a load, not on a filing. Each row has the
+   report's scope and message, the company's 10-K and 10-Q list on EDGAR (from
+   `core.security.cik`), and two commands: `confirm` states the report right (a
+   `data_error` expecting its code) and `refute` states it wrong (a `market_fact`
+   on its code). Both carry `--verified`; finish the note with what the filing
+   shows, and add `--yes`.
+3. **Judge** against dorq plan §6 with `dq compare --statements --labels-from-db
+   --verified-only` (precision on the sample, the standing count, new flags per
+   night), dorq-eval on the same labels (recall, and the calibration error), and the
+   night's run time in `fafnir status`. Post the aggregates on fafnir#221.
+4. **Go:** set `[dq] dorq_statements_shadow = false`.
+5. **The cutover release** retires the thirteen from `FUNDAMENTALS_CHECKS`, keeping
+   `run_all`'s keys at 0 for a release, and closes their open flags by `dq recheck`:
+   every one of the thirteen has a recheck rule (`fundamentals_coverage` its own, the
+   rest their check's query), so a flag closes only when its condition is gone.
 
 ### Recheck
 

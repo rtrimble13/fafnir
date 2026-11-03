@@ -358,6 +358,43 @@ RECHECKABLE: dict[str, _Rule] = {
         "negative revenue, which the check now judges info (the next run writes it "
         "again at that severity)",
     ),
+    "fundamentals_gap": _Rule(
+        _redetect_sql("fundamentals_gap"),
+        (),
+        "a period in force now ends within the stretch, or the security's bars no "
+        "longer reach into it as the check reads them",
+    ),
+    "fundamentals_currency_mismatch": _Rule(
+        _redetect_sql("fundamentals_currency_mismatch"),
+        (),
+        "no statement in force is reported in that currency now, or it is the "
+        "security's trading currency",
+    ),
+    "fundamentals_suspicious_zero": _Rule(
+        _redetect_sql("fundamentals_suspicious_zero"),
+        (),
+        "no item of the period in force reads zero between two neighbours that "
+        "report it (a vendor fix, or a neighbour that no longer reports it)",
+    ),
+    "fundamentals_implausible_filing_lag": _Rule(
+        _redetect_sql("fundamentals_implausible_filing_lag"),
+        (),
+        "the version is known long enough after its period ended now (a vendor's "
+        "correction of the filing date), or it is no longer a current filed version",
+    ),
+    "fundamentals_ytd_suspect": _Rule(
+        _redetect_sql("fundamentals_ytd_suspect"),
+        (),
+        "the year's four quarters in force no longer sum to more than the ratio "
+        "times the year (a vendor fix), or the year has two annual periods in "
+        "force, which the check does not judge",
+    ),
+    "fundamentals_version_chain": _Rule(
+        _redetect_sql("fundamentals_version_chain"),
+        (),
+        "the period's current versions chain now: each known_to the next "
+        "known_from, only the last open (the repair on the host)",
+    ),
     "fundamentals_coverage": _Rule(
         _FUNDAMENTALS_COVERAGE_SQL,
         (),

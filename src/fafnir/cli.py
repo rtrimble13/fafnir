@@ -7209,6 +7209,86 @@ def dq_compare(
         click.echo(cmp.format_summary(summary))
 
 
+@dq.command("sample")
+@click.argument("shadow_file", required=False, type=click.Path(dir_okay=False))
+@click.option(
+    "--size",
+    default=200,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Conditions in all (more when the codes' minimum needs them).",
+)
+@click.option(
+    "--per-code",
+    default=10,
+    show_default=True,
+    type=click.IntRange(min=0),
+    help="At least this many of every code, or all a code has.",
+)
+@click.option(
+    "--seed",
+    default=1,
+    show_default=True,
+    type=int,
+    help="The same night and seed give the same sample.",
+)
+@click.option(
+    "--out",
+    "out_path",
+    default="-",
+    show_default=True,
+    type=click.Path(dir_okay=False, allow_dash=True),
+    help="The CSV; `-` is stdout.",
+)
+@click.pass_context
+def dq_sample(ctx, shadow_file, size, per_code, seed, out_path):
+    """A stratified sample of a statements night, to verify on EDGAR (DR-0914).
+
+    \b
+      fafnir dq sample --out sample.csv          # the newest statements night
+      fafnir dq sample <dorq_shadow_dir>/statements/2026-11-20.jsonl --seed 7
+
+    The night's distinct conditions at warn and above, about one security each:
+    --per-code of every code (or all it has), then the rest of --size in an order
+    fixed by --seed. Each row has the report's scope and message, the company's
+    filings on EDGAR, and the two `dq label add --verified` commands that state its
+    verdict: `confirm` (a data error, with the code) or `refute` (a market fact on
+    the code). Then `dq compare --statements --labels-from-db --verified-only`
+    measures precision on the sample. Reads only.
+    """
+    import sys
+    from pathlib import Path
+
+    from fafnir.dq import compare_statements as cst
+    from fafnir.dq import dorq as dorq_engine
+    from fafnir.dq import sample as smp
+
+    cfg = ctx.obj["config"]
+    if shadow_file:
+        path: Optional[Path] = Path(shadow_file)
+    else:
+        path = cst.latest_shadow_file(dorq_engine.settings_from(cfg))
+    if path is None or not path.is_file():
+        where = Path(cfg.dorq_shadow_dir) / "statements"
+        raise click.ClickException(
+            f"No such shadow file: {path}."
+            if path is not None
+            else f"No shadow file in {where}. Run `fafnir dq run --statements-only` "
+            "first."
+        )
+    drawn = smp.draw(
+        dorq_engine.read_shadow(path), size=size, per_code=per_code, seed=seed
+    )
+    with Database(cfg.dsn) as database:
+        sample_rows = smp.rows(database, drawn)
+    if out_path == "-":
+        smp.write_csv(sys.stdout, sample_rows)
+    else:
+        with open(out_path, "w", encoding="utf-8", newline="") as fh:
+            smp.write_csv(fh, sample_rows)
+    click.echo(smp.summary(drawn, str(path)), err=True)
+
+
 @dq.command("export-labels")
 @click.option(
     "--out",

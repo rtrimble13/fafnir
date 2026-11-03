@@ -1297,11 +1297,16 @@ and security checks. `run_all` keeps its five keys and adds one per check; with 
 statement tables (a database mid-migration) the new ones report 0 and run nothing.
 The loader writes its own flags as it loads (#90). Every one has a playbook in
 `.claude/skills/fafnir-dba/references/dq-playbooks.md` (*The fundamentals flags*).
-`fafnir dq recheck` closes a flag of `fundamentals_stale`, `fundamentals_coverage`,
-`balance_sheet_identity`, the two cash ties, `fundamentals_ttm_incomplete` and
-`fundamentals_negative_impossible` once the check's own query no longer selects it:
-the security has filed since, its statements have loaded, the vendor fixed a row, or
-the check was recalibrated. Coverage by sector is in the `dq run` log.
+`fafnir dq recheck` closes a flag of every one of them but
+`fundamentals_unmapped_fields` once the check's own query no longer selects it: the
+security has filed since, its statements have loaded, the vendor fixed a row, the
+period's versions chain again after a repair on the host, or the check was
+recalibrated. The six judgement checks (`fundamentals_gap`,
+`fundamentals_currency_mismatch`, `fundamentals_suspicious_zero`,
+`fundamentals_implausible_filing_lag`, `fundamentals_ytd_suspect` and
+`fundamentals_version_chain`) gained their rule for the statements cutover
+(DR-0914), which closes the thirteen checks' open flags by recheck. Coverage by
+sector is in the `dq run` log.
 
 **Recalibrated on production data (2026-10-28).** The first run over SF1 wrote about
 308,000 flags, most of them what SF1 cannot express: noncontrolling and minority
