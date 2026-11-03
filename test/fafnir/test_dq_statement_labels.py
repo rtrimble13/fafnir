@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from test.fafnir import test_dq_dorq_statements as base
 
 import pytest
 from click.testing import CliRunner
@@ -22,14 +23,10 @@ from fafnir.dq import compare as cmp
 from fafnir.dq import compare_statements as cst
 from fafnir.dq import dorq_statements
 from fafnir.dq import labels as lb
-from test.fafnir.test_dq_dorq_statements import (
-    T0,
-    _put,
-    _quarters,
-    _security,
-    _sessions,
-)
-from test.fafnir.test_dq_dorq_statements import _prices as _bars
+
+# The statements fixtures' helpers (synthetic rows, prices, sessions).
+T0, _put, _quarters = base.T0, base._put, base._quarters
+_security, _sessions, _bars = base._security, base._sessions, base._prices
 
 REAL_DORQ = os.environ.get("FAFNIR_TEST_DORQ", "")
 EVAL = os.environ.get("FAFNIR_TEST_DORQ_EVAL", "")
