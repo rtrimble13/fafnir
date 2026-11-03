@@ -61,6 +61,32 @@ SHADOW_SUBDIR = "statements"
 #: ``core.daily_price``.
 DEFAULT_TABLE = "core.income_statement"
 
+#: dorq 0.13's statement checks, by code: the ``check_name`` each writes. The
+#: fafnir-dba skill places each in a sweep tier and gives each a playbook entry
+#: (``test_every_statement_check_has_a_tier_and_a_playbook``).
+STATEMENT_CHECKS = {
+    "DQ901": "dorq_statement_key",
+    "DQ902": "dorq_impossible_value",
+    "DQ903": "dorq_identity_break",
+    "DQ904": "dorq_period_tie",
+    "DQ911": "dorq_bad_value",
+    "DQ912": "dorq_unit_error",
+    "DQ913": "dorq_sign_error",
+    "DQ914": "dorq_copied_period",
+    "DQ915": "dorq_absent_as_zero",
+    "DQ916": "dorq_cumulative_quarters",
+    "DQ919": "dorq_large_change",
+    "DQ921": "dorq_share_terms_step",
+    "DQ922": "dorq_share_count_mismatch",
+    "DQ931": "dorq_filing_date_implausible",
+    "DQ932": "dorq_restatement_implausible",
+    "DQ941": "dorq_period_gap",
+    "DQ942": "dorq_statements_stale",
+    "DQ943": "dorq_statements_missing",
+    "DQ944": "dorq_reporting_currency",
+    "DQ951": "dorq_revision_cohort",
+}
+
 #: DQ901: a version chain that does not chain. Its repair is made on the host, so
 #: it is never auto-resolved (``fafnir_mcp.tools.NEVER_AUTO_RESOLVE``).
 STATEMENT_KEY_CHECK = "dorq_statement_key"

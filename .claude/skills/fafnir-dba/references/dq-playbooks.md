@@ -1730,6 +1730,159 @@ statement flags, as of the market's latest session, and closes each one the run 
 longer emits. It skips `dorq_statement_key` and the cross-sectional
 `dorq_revision_cohort`.
 
+**The warehouse never edits a statement value.** Every statement flag ends one of
+three ways, and each is a label `dq export-labels` writes for dorq (doc/dorq.md,
+*Labels*):
+
+- **The filing shows it: accept.** `fafnir dq accept <id> --per-flag -m "<form,
+  date, what it states>"`. An accepted statement flag is a filing fact (a
+  `market_fact` on its code): dorq was wrong to report it. Name the filing in the
+  note. An acceptance without one is a guess, and calibration will learn it.
+- **SF1 corrected it: `dq recheck`.** Once the vendor's corrected row loads, the
+  re-run no longer reports it and recheck closes it. The superseded row keeps the
+  value as it stood, so the correction is itself a `data_error` label, with the
+  flag's code added to it.
+- **Neither yet: leave it open.** Report it to Sharadar, with the filing that
+  contradicts the stored value. Never `dq resolve` a statement flag by hand: nothing
+  fafnir can do changes the value, so the next run writes it again, and the
+  closure would say nothing true.
+
+Read every one with the versions query below (`mart.v_income_statement_versions`)
+and the filing on EDGAR. `detail.p_error` and `detail.hypotheses` read as for bars.
+
+### `dorq_impossible_value` (DQ902) — a negative where none can be, or a part above its total
+
+`error`, deterministic. `detail.item` and `detail.value`; for a bound, `bound` and
+`bound_value` (cash above total assets). A financial company's negative revenue
+(net of trading losses) is real: **accept** with the filing. Anything else is the
+vendor's: leave it open for SF1's correction. Succeeds
+`fundamentals_negative_impossible`.
+
+### `dorq_identity_break` (DQ903) — an identity fails beyond tolerance
+
+`detail.identity` and `equation`, `gap` (left minus right) and the terms. Read
+`hypotheses`. A **structural** gap (`structural`: the same gap, at a stable share,
+period after period, such as temporary equity or redeemable NCI) is the company's
+structure and arrives at info. Accept it, or state it with `dq label add --kind
+structural_gap`. A gap in one period alone that equals one term, a term at a power
+of ten or twice a term (`field_error`) is the vendor's. A gap in one version only
+(`reclassification`) is a restatement. Succeeds `balance_sheet_identity` and
+`cash_flow_tie`.
+
+### `dorq_period_tie` (DQ904) — a tie across periods fails
+
+`detail.tie`. `cash`: the change in cash against the cash flow's net change, with
+`gap`, `tolerance` and `previous_fiscal_date`. From 2018 the cash flow includes
+restricted cash, which SF1's balance leaves out, and dorq allows 10%. `year`: a
+fiscal year's four quarters against its annual figure. Check the filing's cash flow
+statement. Succeeds `cash_balance_tie`.
+
+### `dorq_bad_value` (DQ911) — one value off an otherwise smooth series
+
+`detail.value`, `expected` and the spread, with the later periods that revert it.
+Compare the 10-Q or 10-K's figure. If it is the filing's, **accept** it (a real
+one-off the next periods happened to revert). If not, it is the vendor's.
+
+### `dorq_unit_error` (DQ912) — a value, a row or an era at a power of ten
+
+`detail.value`, `expected`, `repaired` and `power` (stored = repaired × 10^power).
+The key's `item` names one value. `scope: row` or `era` names a whole row or a run
+of periods. The filing settles it in one look: thousands stored as units, or the
+reverse. State a confirmed one with `--kind unit_error` if SF1 is slow to fix it.
+
+### `dorq_sign_error` (DQ913) — a sign flipped against the item's convention
+
+`detail.value` and the item's sign convention (`ref.statement_line_item`). The cash
+flow signs cash as it moves: capex is negative. A sign SF1 flipped is the vendor's
+(`--kind sign_error`). A real reversal (a gain booked as a negative expense) is
+the filing's: accept it.
+
+### `dorq_copied_period` (DQ914) — a period identical to the one before
+
+`detail.items` (the repeats) and how many. Flows repeated exactly are the tell: a
+company's revenue is never the same to the dollar twice. Vendor's.
+
+### `dorq_absent_as_zero` (DQ915) — a zero where the company reports the item
+
+`detail.expected`, and the periods either side that report it. SF1 writes 0 for an
+item a filing does not carry. If the filing really has a zero (no R&D that
+quarter), accept it or state `--kind real_zero`. Succeeds
+`fundamentals_suspicious_zero`.
+
+### `dorq_cumulative_quarters` (DQ916) — quarters stored year to date
+
+The detail names the flows that fit a year to date (Q2 = H1, Q3 = 9M) or an annual
+figure stored as a quarter. 10-Qs report cash flows year to date, and SF1 should
+difference them. Vendor's. Succeeds `fundamentals_ytd_suspect`.
+
+### `dorq_large_change` (DQ919) — a change that is probably real
+
+`info`. An acquisition, a write-down, a spin-off: `detail.value` against the
+series. It is kept for review, the successor of a threshold that would have
+flagged it. Accept it when the filing explains the change.
+
+### `dorq_share_terms_step` (DQ921) — share counts step by a split ratio
+
+`detail.item`, the step's `ratio` and the hypotheses. `missing_split` is a split
+missing from `core.corporate_action`: the repair is `actions add --split N:D` (§2d),
+then `dq recheck`. `wrong_terms` is counts recovered in the wrong share terms, which
+is the loader's or the vendor's. Check the split on the issuer's 8-K.
+
+### `dorq_share_count_mismatch` (DQ922) — weighted-average and outstanding shares disagree
+
+`detail.item`, `value`, `other`, `other_value` and `ratio`: a clean split ratio or
+a power of ten. One of the two is in the wrong terms or units. Vendor's.
+
+### `dorq_filing_date_implausible` (DQ931) — a filing date against the issuer's own lags
+
+`detail.lag_days` against `usual_lag_days` (`usual_lag_sd`), and `form`. Too early
+(the period's end recorded as its filing date) is a look-ahead: the version was not
+knowable then. An amendment's date taken for the original's is too late. Check
+EDGAR's filing index (`--kind misdated_filing` once confirmed). A late filer is real:
+accept it with the NT 10-Q. Succeeds `fundamentals_implausible_filing_lag`.
+
+### `dorq_restatement_implausible` (DQ932) — a restatement by a power of ten, a sign or a swap
+
+`detail.pattern` (`power`, `sign`, `swap`, `total_only`, `offset`),
+`items_changed`, `power` and `old_version`. The report is on the version dorq
+judges to be the error: the new one, or the old one the restatement corrects. A
+reclassification (`offset`) is real. Read both versions with the versions query.
+
+### `dorq_period_gap` (DQ941) — a period missing while the security traded
+
+`detail.hypothesis`. `missing_period` (warn) is a quarter or year not loaded. Look
+for the 10-Q on EDGAR, and if it is there, SF1 lacks it. `mislabel` is a quarter
+labelled as the next. `fiscal_year_change` (info) is the company's: accept it, or
+state `--kind fiscal_year_change`. `not_yet_filed` (info) clears itself. Succeeds
+`fundamentals_gap` and `fundamentals_ttm_incomplete`.
+
+### `dorq_statements_stale` (DQ942) — no newer period by its usual lag
+
+`detail.latest_fiscal_date`, `next_period_end`, `due`, `as_of` and `days_overdue`.
+An issuer delinquent on EDGAR (no 10-Q, or an NT filing) is a fact: accept it with
+the filing. A filing on EDGAR that SF1 lacks is the vendor's. `dq recheck` closes
+it once a newer period loads. Succeeds `fundamentals_stale`.
+
+### `dorq_statements_missing` (DQ943) — expected statements, none loaded
+
+`detail.from` and `to`, the span the security traded. SF1's master lists statements
+for it (`first_quarter`). Check `ingest fundamentals` reached the key. If SF1 has
+none and never will, accept it. Succeeds `fundamentals_coverage`.
+
+### `dorq_reporting_currency` (DQ944) — statements in another currency
+
+`info`. `detail.reported_currency` and `trading_currency`. An ADR or a foreign
+filer: the figures are right in their own currency, and the panel's price ratios
+are NULL for them. Accept it. Succeeds `fundamentals_currency_mismatch`.
+
+### `dorq_revision_cohort` (DQ951) — many series revised, or one finding, on one date
+
+`detail.members` (the series), and `codes` for a findings cohort. A cohort of
+revisions (info) is a vendor batch. A cohort carrying one finding (warn) is a load
+fault: one cause, not many events. Its members' DQ903 and DQ932 reports drop to info
+and name the cohort's date (`cohort_date`). Fix the cause once (a bad load is
+re-ingested), not each member. `dq recheck` never closes it, so judge it by hand.
+
 ### `dorq_statement_key` — a period's versions do not chain
 
 `error`, deterministic: two rows for one version, versions whose `known_to` is not the

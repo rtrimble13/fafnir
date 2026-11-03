@@ -7231,13 +7231,22 @@ def dq_compare(
     "in the shape of dorq's --actions file.",
 )
 @click.option(
+    "--restore-statements",
+    "statements_path",
+    type=click.Path(dir_okay=False),
+    help="Also write the statement rows SF1 corrected, as they stood, in the shape "
+    "of the statements dorq reads.",
+)
+@click.option(
     "--verified-only",
     is_flag=True,
     help="Only labels marked verified: flags closed --per-flag, and stated labels "
     "added --verified.",
 )
 @click.pass_context
-def dq_export_labels(ctx, out_path, restore_path, actions_path, verified_only):
+def dq_export_labels(
+    ctx, out_path, restore_path, actions_path, statements_path, verified_only
+):
     """Write the warehouse's repairs, judged flags and stated labels for dorq.
 
     \b
@@ -7253,19 +7262,32 @@ def dq_export_labels(ctx, out_path, restore_path, actions_path, verified_only):
     decided_at and applies_until: a repair's label stops applying when the repair
     was made. See fafnir.dq.labels for what each becomes and what is left out.
     Reads only.
+
+    The statements' labels come from SF1's corrections (the superseded rows keep
+    the values as they stood, which --restore-statements writes) and from closed
+    statement flags: accepted is a filing fact, resolved after SF1 corrected the
+    period a data error.
     """
     from pathlib import Path
 
+    from fafnir.dq import checks
     from fafnir.dq import labels as lb
 
     with Database(ctx.obj["config"].dsn) as database:
         export = lb.build(database, verified_only=verified_only)
+        items = None
+        if statements_path and checks.statements_exist(database):
+            from fafnir.dq.dorq_statements import line_items
+
+            items = [str(i["column_name"]) for i in line_items(database)]
     to_stdout = out_path == "-"
     lb.write(
         export,
         Path(out_path) if not to_stdout else "-",
         Path(restore_path) if restore_path else None,
         Path(actions_path) if actions_path else None,
+        Path(statements_path) if statements_path else None,
+        items,
     )
     # With the labels on stdout, the summary goes to stderr so a pipe reads JSONL.
     kinds = ", ".join(f"{k} {n}" for k, n in export.by_kind().items()) or "none"
@@ -7278,6 +7300,12 @@ def dq_export_labels(ctx, out_path, restore_path, actions_path, verified_only):
         click.echo(
             f"Wrote {_plural(len(export.restore), 'bar')} as they stood to "
             f"{restore_path}.",
+            err=to_stdout,
+        )
+    if statements_path:
+        click.echo(
+            f"Wrote {_plural(len(export.restore_statements), 'statement row')} as "
+            f"they stood to {statements_path}.",
             err=to_stdout,
         )
     if actions_path:
@@ -7317,37 +7345,72 @@ def _label_members(value: Optional[str]) -> Optional[list[int]]:
         ) from exc
 
 
+def _label_scope(r) -> str:
+    """A statements label's scope, as a statement finding names its period."""
+    parts = [r.get("statement"), r.get("period_type")]
+    if r.get("version_no"):
+        parts.append(f"v{r['version_no']}")
+    parts.append(r.get("item"))
+    return " ".join(str(p) for p in parts if p)
+
+
 def _echo_labels(rows) -> None:
-    _echo_table(
-        ["ID", "SERIES", "FIRST", "LAST", "CLASS", "KIND", "CODES", "V", "SOURCE"],
+    rows = list(rows)
+    scoped = any(_label_scope(r) for r in rows)
+    headers = ["ID", "SERIES", "FIRST", "LAST", "CLASS", "KIND", "CODES", "V", "SOURCE"]
+    table = [
         [
-            [
-                str(r["label_id"]),
-                (
-                    (r.get("primary_symbol") or str(r["security_id"]))
-                    if r["security_id"] is not None
-                    else "*" + (f"({len(r['members'])})" if r.get("members") else "")
-                ),
-                str(r["first_date"]),
-                str(r["last_date"]),
-                r["class"],
-                r["kind"],
-                r["expect"] or r["codes"] or "",
-                "y" if r["verified"] else "",
-                r["source"],
-            ]
-            for r in rows
-        ],
-        right=(0,),
-    )
+            str(r["label_id"]),
+            (
+                (r.get("primary_symbol") or str(r["security_id"]))
+                if r["security_id"] is not None
+                else "*" + (f"({len(r['members'])})" if r.get("members") else "")
+            ),
+            str(r["first_date"]),
+            str(r["last_date"]),
+            r["class"],
+            r["kind"],
+            r["expect"] or r["codes"] or "",
+            "y" if r["verified"] else "",
+            r["source"],
+        ]
+        for r in rows
+    ]
+    if scoped:
+        # Only with a statements label: the bars' table is as it was.
+        headers.insert(4, "SCOPE")
+        for row, r in zip(table, rows):
+            row.insert(4, _label_scope(r))
+    _echo_table(headers, table, right=(0,))
 
 
 @dq_label.command("add")
 @click.option("--security-id", type=int, help="The security the label is about.")
 @click.option("--cohort", is_flag=True, help="A cross-sectional label: give --members.")
 @click.option("--members", help="With --cohort: the security ids, comma-separated.")
-@click.option("--first", "first_date", required=True, metavar="YYYY-MM-DD")
+@click.option("--first", "first_date", metavar="YYYY-MM-DD", help="Or --fiscal-date.")
 @click.option("--last", "last_date", metavar="YYYY-MM-DD", help="Default: --first.")
+@click.option(
+    "--fiscal-date",
+    metavar="YYYY-MM-DD",
+    help="A statements label about one period: its fiscal date (--first and --last).",
+)
+@click.option(
+    "--statement",
+    type=click.Choice(["income", "balance_sheet", "cash_flow"]),
+    help="A statements label's statement  [default: every one]",
+)
+@click.option(
+    "--period-type",
+    type=click.Choice(["quarter", "annual"]),
+    help="A statements label's period type  [default: either]",
+)
+@click.option(
+    "--version-no", type=click.IntRange(min=1), help="Its version  [default: any]"
+)
+@click.option(
+    "--item", help="Its line item, a statement table's column  [default: any]"
+)
 @click.option(
     "--class",
     "label_class",
@@ -7358,7 +7421,8 @@ def _echo_labels(rows) -> None:
     "--kind",
     required=True,
     help="feed_gap, odd_lots_only, distribution, dividend_units, wrong_instrument, "
-    "bad_print, cohort_fact -- or any other word, with --class.",
+    "bad_print, cohort_fact; for statements unit_error, sign_error, misdated_filing, "
+    "structural_gap, fiscal_year_change, real_zero -- or any other word, with --class.",
 )
 @click.option("--expect", help="A fault's expected codes, e.g. DQ202|DQ205.")
 @click.option("--codes", help="A market fact's code prefix, e.g. DQ705.")
@@ -7385,6 +7449,11 @@ def dq_label_add(
     members,
     first_date,
     last_date,
+    fiscal_date,
+    statement,
+    period_type,
+    version_no,
+    item,
     label_class,
     kind,
     expect,
@@ -7404,15 +7473,26 @@ def dq_label_add(
           --kind feed_gap --verified -m "trades 10-05..10-13 on stockanalysis; FMP none"
       fafnir dq label add --cohort --members 3560,5286,19195 --first 2026-10-06 \\
           --kind cohort_fact --verified -m "each checked: three real 2:1-sized moves"
+      fafnir dq label add --security-id 752016 --fiscal-date 2024-06-30 \\
+          --statement income --period-type quarter --item revenue \\
+          --kind unit_error --verified -m "10-Q: 412.3M; SF1 had 412,300M"
 
     A known kind fills in its class and codes: a `distribution` is two labels (a
-    false DQ705 and a false price report).
+    false DQ705 and a false price report). A label about statements names its
+    period by its fiscal date, and its statement, period type, version and item as
+    far as the fault has them; each left out covers every one.
     """
     from fafnir.db import repository as repo
     from fafnir.dq import labels as lb
 
     if cohort == (security_id is not None):
         raise click.ClickException("Give --security-id, or --cohort with --members.")
+    if fiscal_date and (first_date or last_date):
+        raise click.ClickException("--fiscal-date, or --first and --last: not both.")
+    if fiscal_date:
+        first_date = last_date = fiscal_date
+    if not first_date:
+        raise click.ClickException("Give --first (or --fiscal-date).")
     member_ids = _label_members(members)
     if member_ids and not cohort:
         raise click.ClickException("--members goes with --cohort.")
@@ -7436,6 +7516,10 @@ def dq_label_add(
             source=source or "cli",
             decided_by=decided_by,
             applies_until=until,
+            statement=statement,
+            period_type=period_type,
+            version_no=version_no,
+            item=item,
         )
     except lb.LabelRefused as exc:
         raise click.ClickException(str(exc)) from exc
@@ -7607,6 +7691,7 @@ def dq_label_import(ctx, path, verified, source, decided_by, dry_run, yes):
                     "source": p["source"] or source or name,
                     "decided_by": decided_by,
                     "applies_until": _parse_stamp(until),
+                    **{f: p.get(f) for f in lb.SCOPE_FIELDS},
                 }
             )
     except (lb.LabelRefused, ValueError) as exc:
