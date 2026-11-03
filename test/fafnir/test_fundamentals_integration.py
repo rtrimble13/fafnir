@@ -312,7 +312,8 @@ def test_load_twice_is_identical_and_a_mutation_restates(db, tmp_path):
         " WHERE check_name = %s AND security_id = %s",
         (fu.RESTATEMENT, aapl),
     )
-    assert flag["severity"] == "warn"
+    # info since the statements cutover (DR-0914): DQ932 judges a restatement.
+    assert flag["severity"] == "info"
     assert flag["detail"]["largest"][0]["moved"] == {
         "net_income": ["57411000000.00", "57400000000.00"],
         "net_income_common": ["57411000000.00", "57400000000.00"],
