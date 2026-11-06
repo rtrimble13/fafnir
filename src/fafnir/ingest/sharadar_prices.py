@@ -47,6 +47,22 @@ of tickers, not 45M rows, and a run killed part-way keeps every security it
 finished. Every ``PROGRESS_SECONDS`` the counts so far and the ticker reached are
 written to the open run (``params.progress``).
 
+**A key is read by the ticker its file names it by** (#238; SF1's backfill reads its
+file the same way, :func:`tickers_as_of_file`). SEP and SFP rows carry
+no permaticker, only the ticker of the day the file was fetched, and Sharadar files a
+key's history under its current ticker. Tonight's TICKERS can say otherwise: a key
+renamed since the file holds its rows under its old ticker, and its new one may be
+another issuer's there. A full file fetched since #238 names the TICKERS file fetched
+with it (``filters.tickers_file_id``), and each key is read by the ticker that file
+gives it (``ticker_as_of_file`` counts the ones that differ from tonight's;
+``not_in_file`` the keys it lacks). An older full file names none: a key a ticker
+change since its fetch (less ``RENAME_SLACK_DAYS``) touches, its own or another's to
+or from its ticker, is skipped (``ticker_changed_since_file``), and the warning names
+the ``sharadar-bulk --force`` that pairs a new one. Two keys on one ticker read
+neither (``ticker_shared``). The nightly's deltas are fetched the night they are read,
+so only a security with no bars yet, which reads the older deltas too, is guarded: one
+a ticker change since the oldest touches reads tonight's alone.
+
 In the bulk modes a date the security already holds, whoever supplied it, is not
 read again, so a re-run writes nothing new; the vendor's later revisions of its own
 history come with the nightly. The watermark is ``(sharadar, SEP|SFP, security_id)``, for
@@ -59,7 +75,7 @@ from __future__ import annotations
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional, Sequence
@@ -100,6 +116,10 @@ QUANTUM = Decimal("0.0000005")
 VOLUME_TOLERANCE = Decimal("0.01")
 #: How often a scan writes its progress to the open run, in seconds.
 PROGRESS_SECONDS = 60
+#: How long before a file was fetched a ticker change may be dated and still be
+#: missing from it: ACTIONS records some events days late, and the vendor's files can
+#: lag the change (as ``sharadar_universe.LOOKBACK_DAYS``) (#238).
+RENAME_SLACK_DAYS = 30
 
 
 class PricesError(RuntimeError):
@@ -347,6 +367,115 @@ def _load_run(
     _write(db, t, table, clean, run=run, result=result)
 
 
+def file_tickers(
+    db: Database, bulk_dir: str | Path, entry: dict
+) -> Optional[dict[str, str]]:
+    """``vendor_key -> ticker`` as a full SEP, SFP or SF1 file names its rows (#238).
+
+    Their rows carry no permaticker, only the ticker of the day the file was
+    fetched, and Sharadar files a key's history under its current ticker. So the
+    map is the TICKERS file the full file was fetched with (``filters.
+    tickers_file_id``, :func:`fafnir.ingest.sharadar_bulk.download_tables`), its
+    rows of the same table. None when the full file names none (one fetched before
+    #238) or that TICKERS file is no longer on disk."""
+    tickers_id = (entry.get("filters") or {}).get("tickers_file_id")
+    if tickers_id is None:
+        return None
+    out: dict[str, str] = {}
+    try:
+        for r in ledger.rows(db, int(tickers_id), bulk_dir):
+            if sf.canonical_table(r["table"]) == entry["vendor_table"]:
+                out[str(r["permaticker"])] = r["ticker"]
+    except sf.SharadarFileError as exc:
+        logger.warning(
+            "file %s's TICKERS file %s cannot be read (%s): its renamed keys are "
+            "skipped",
+            entry["file_id"],
+            tickers_id,
+            exc,
+        )
+        return None
+    return out
+
+
+def renamed_since(db: Database, tickers: dict[str, str], since: date) -> set[str]:
+    """The keys of ``tickers`` (``key -> ticker``, as tonight's TICKERS has them) a
+    ticker change dated on or after ``since`` touches: one of the key's own, or
+    another key's to or from the same ticker (#238). A file fetched before such a
+    change may name this key's rows by another ticker, or another key's by this
+    one."""
+    events = repo.vendor_renames_since(db, VENDOR, since)
+    keys = {e["vendor_key"] for e in events}
+    named = {x for e in events for x in (e["ticker"], e["contra_ticker"]) if x}
+    return {key for key, ticker in tickers.items() if key in keys or ticker in named}
+
+
+def _since(entry: dict) -> date:
+    """The first date a ticker change may be missing from ``entry``'s file."""
+    return entry["fetched_at"].date() - timedelta(days=RENAME_SLACK_DAYS)
+
+
+def tickers_as_of_file(
+    db: Database,
+    bulk_dir: str | Path,
+    entry: Optional[dict],
+    tonight: dict[str, str],
+    counts: Counter,
+) -> dict[str, str]:
+    """``key -> ticker``: what to read each of ``tonight``'s keys (``key -> ticker``,
+    as tonight's TICKERS has them) by in ``entry``, a full file of one table (#238).
+
+    SEP, SFP and SF1 rows carry no permaticker, only the ticker of the day the file
+    was fetched, and Sharadar files a key's history under its current ticker. So:
+
+    - **A paired file** (:func:`file_tickers`): the ticker its TICKERS file gives
+      the key. ``ticker_as_of_file`` counts those that differ from tonight's, and
+      ``not_in_file`` the keys it lacks, which the file does not hold.
+    - **An unpaired one**: tonight's, unless a ticker change since the file's fetch
+      touches the key (:func:`renamed_since`). That key is skipped
+      (``ticker_changed_since_file``): its rows could be under another ticker, and
+      this one another issuer's. Fetching the file again pairs it.
+
+    With no ``entry`` (a delta, fetched the night of tonight's TICKERS), tonight's.
+    Two keys on one ticker read neither (``ticker_shared``): the file's rows under
+    it are one issuer's, and which is not known."""
+    as_of = file_tickers(db, bulk_dir, entry) if entry is not None else None
+    renamed: set[str] = set()
+    if entry is not None and as_of is None:
+        renamed = renamed_since(db, tonight, _since(entry))
+        if renamed:
+            logger.warning(
+                "%d %s key(s) renamed since file %s was fetched (%s) are skipped: "
+                "the file may name their rows by another ticker. Fetch it again "
+                "(`fafnir source sharadar-bulk --tables %s --force`) to read them.",
+                len(renamed),
+                entry["vendor_table"],
+                entry["file_id"],
+                entry["fetched_at"].date(),
+                entry["vendor_table"],
+            )
+    holders: dict[str, list[str]] = defaultdict(list)
+    for key, ticker in tonight.items():
+        if as_of is not None:
+            if key not in as_of:
+                counts["not_in_file"] += 1
+                continue
+            if as_of[key] != ticker:
+                counts["ticker_as_of_file"] += 1
+            ticker = as_of[key]
+        elif key in renamed:
+            counts["ticker_changed_since_file"] += 1
+            continue
+        holders[ticker].append(key)
+    out = {}
+    for ticker, keys in holders.items():
+        if len(keys) > 1:
+            counts["ticker_shared"] += len(keys)
+            continue
+        out[keys[0]] = ticker
+    return out
+
+
 def prepare(
     db: Database,
     bulk_dir: str | Path,
@@ -359,24 +488,26 @@ def prepare(
     and ticker hold each one's prices (``{table: {ticker: _Target}}``), the current
     file of each table needed (``{table: file_id}``; none without ``fulls``), and
     every target by key, its ACTIONS splits read. A key with no priced row is
-    counted ``no_priced_row``."""
+    counted ``no_priced_row``.
+
+    With ``fulls``, a key's ticker is the one the full file names it by, not
+    tonight's (:func:`tickers_as_of_file`, #238)."""
     where = repo.vendor_tickers(db, VENDOR, [t["vendor_key"] for t in targets])
-    by_file: dict[str, dict[str, _Target]] = {table: {} for table in TABLES}
+    by_table: dict[str, list[tuple[str, dict]]] = {table: [] for table in TABLES}
     for t in targets:
         if t["vendor_key"] not in where:
             counts["no_priced_row"] += 1
             continue
         table, ticker = where[t["vendor_key"]]
-        by_file[table][ticker] = _Target(
-            t["security_id"],
-            t["primary_symbol"],
-            t["vendor_key"],
-            t["is_feed"],
-            t["valid_from"],
-        )
+        by_table[table].append((ticker, t))
+    by_file: dict[str, dict[str, _Target]] = {table: {} for table in TABLES}
     files = {}
-    for table in TABLES if fulls else ():
-        if by_file[table]:
+    for table in TABLES:
+        rows = by_table[table]
+        if not rows:
+            continue
+        entry = None
+        if fulls:
             entry = repo.current_sharadar_full(db, table)
             if entry is None:
                 raise PricesError(
@@ -384,6 +515,19 @@ def prepare(
                     f"`fafnir source sharadar-bulk --tables {table}` first"
                 )
             files[table] = entry["file_id"]
+        by_key = {t["vendor_key"]: t for _, t in rows}
+        tonight = {t["vendor_key"]: ticker for ticker, t in rows}
+        for key, ticker in tickers_as_of_file(
+            db, bulk_dir, entry, tonight, counts
+        ).items():
+            t = by_key[key]
+            by_file[table][ticker] = _Target(
+                t["security_id"],
+                t["primary_symbol"],
+                key,
+                t["is_feed"],
+                t["valid_from"],
+            )
 
     # The splits that turn the vendor's adjusted bars back into raw ones.
     actions = repo.current_sharadar_full(db, "actions")
@@ -768,11 +912,28 @@ def nightly(
     def rows_of(table: str) -> dict[str, dict[date, dict]]:
         tickers = by_file[table]
         new = [k for k, t in tickers.items() if t.security_id in fresh]
+        every = repo.sharadar_deltas_after(db, table, 0) if new else []
+        # A delta fetched before tonight names its rows by the tickers of its own
+        # night: a fresh key a ticker change since touches reads only the pending
+        # deltas, not another issuer's rows under its ticker (#238).
+        applied = {f["file_id"] for f in pending[table]}
+        older = [f for f in every if f["file_id"] not in applied]
+        moved = (
+            renamed_since(
+                db,
+                {tickers[k].vendor_key: k for k in new},
+                min(_since(f) for f in older),
+            )
+            if older
+            else set()
+        )
+        if moved:
+            result.counts["ticker_changed_since_file"] += len(moved)
+        new = [k for k in new if tickers[k].vendor_key not in moved]
         merged = merged_rows(
             db, bulk_dir, pending[table], [k for k in tickers if k not in new]
         )
         if new:
-            every = repo.sharadar_deltas_after(db, table, 0)
             merged.update(merged_rows(db, bulk_dir, every, new))
         return merged
 

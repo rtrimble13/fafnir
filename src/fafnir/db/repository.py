@@ -7087,6 +7087,21 @@ def sharadar_file(db: Database, file_id: int) -> Optional[dict]:
     )
 
 
+def pair_sharadar_tickers(db: Database, file_id: int, tickers_file_id: int) -> None:
+    """Record the TICKERS file a full SEP, SFP or SF1 file was fetched with, as its
+    ``filters.tickers_file_id`` (#238). Their rows carry the ticker of the day the
+    file was fetched: the readers map a key to that ticker through this TICKERS
+    file, and `sharadar-prune` keeps it while the full file is kept."""
+    db.execute(
+        """
+        UPDATE landing.sharadar_file
+           SET filters = filters || jsonb_build_object('tickers_file_id', %s::bigint)
+         WHERE file_id = %s
+        """,
+        (tickers_file_id, file_id),
+    )
+
+
 # ---------------------------------------------------------------------------
 # core.vendor_security / core.vendor_security_event -- a vendor's own view (#58)
 # ---------------------------------------------------------------------------
@@ -7743,6 +7758,21 @@ def vendor_events(
          ORDER BY vendor_key, event_date, action
         """,
         (vendor, list(keys), list(actions)),
+    )
+
+
+def vendor_renames_since(db: Database, vendor: str, since: date) -> list[dict]:
+    """The vendor's ticker changes (``tickerchangefrom``, ``tickerchangeto``) dated
+    on or after ``since``: the key, the ticker the event is filed under, and the
+    other party's ticker (#238)."""
+    return db.fetchall(
+        """
+        SELECT vendor_key, ticker, contra_ticker
+          FROM core.vendor_security_event
+         WHERE vendor = %s AND action IN ('tickerchangefrom', 'tickerchangeto')
+           AND event_date >= %s
+        """,
+        (vendor, since),
     )
 
 

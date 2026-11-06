@@ -570,15 +570,21 @@ the files (#55, #58, #75). For each table:
     and read as text.
 - **Record it.** It counts the rows and records the file, then marks the table's
   older full files `superseded`.
+- **Pair it with TICKERS** (#238). SEP, SFP and SF1 rows carry only the ticker of
+  the day. So a run that fetches any of them fetches TICKERS first, forced, and the
+  file records it (`filters.tickers_file_id`). The readers then map each security to
+  the ticker the file names it by, whatever TICKERS says tonight
+  ([ingestion.md › Which ticker a key is read by](ingestion.md#bars-from-sharadar-and-why-raw-is-recovered-75)).
+  A table the run skips keeps its pairing.
 
 Its behaviour across runs:
 - **One run row per table.** `ops.ingestion_run` gets `source = sharadar`,
   `endpoint = bulk:<table>`, with the bytes downloaded and, in `params`, the rows,
   file and header findings.
 - **Resumable.** A table the ledger already holds is skipped (no request), so a run
-  that stopped part-way picks up at the first table it had not finished. One
-  table's failure does not undo the others; the command exits non-zero naming the
-  failures.
+  that stopped part-way picks up at the first table it had not finished. TICKERS is
+  fetched again with a price table the run fetches. One table's failure does not
+  undo the others; the command exits non-zero naming the failures.
 - **Idempotent.** With `--force`, content identical to a file on record is that
   file again: no second row, no second copy on disk.
 
@@ -712,7 +718,7 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
 |---|---|---|
 | 1. Dump | `scripts/backup_dump.sh` | Record the path on #92 before anything writes |
 | 2. Deploy | `git pull && fafnir --version && fafnir db migrate` | Applies 0035–0037; add `pip install` if `pyproject.toml` changed ([releasing.md](releasing.md#deploying-it)) |
-| 3. A current file | `fafnir source sharadar-bulk --tables SF1 --force` | The ledger's SF1 file is from 2026-10-19: refresh it, so the deltas take over from a current one. About 0.6 GB |
+| 3. A current file | `fafnir source sharadar-bulk --tables SF1 --force` | The ledger's SF1 file is from 2026-10-19: refresh it, so the deltas take over from a current one, and so it is paired with TICKERS (#238). About 0.6 GB |
 | 4. The probe | `fafnir source probe-fundamentals` | Its verdicts against the 2026-10-24 table; `--json` stays on the host |
 | 5. Dry run | `time fafnir ingest fundamentals --backfill --dry-run` | Reads everything and writes nothing. Its `<table>:inserted` and `<table>:restated` counts are the rows the run will write |
 | 6. The backfill | `time fafnir ingest fundamentals --backfill` | One run, committed per vendor key, so a stopped run resumes where it stood: re-run the same command |

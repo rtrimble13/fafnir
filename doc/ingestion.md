@@ -278,6 +278,7 @@ step 7, decides from the ledger what each file is still for:
 | A delta its nightly has not applied (after its `through`, or after the current full before the first nightly): SEP's and SFP's by the price nightly, SF1's by the fundamentals nightly, which also counts the deltas before a whole backfill's file (#106) | always |
 | An applied delta | for 45 days, the universe step's 30-day window and a margin: a new listing reads it. SF1's are kept as long, for triage |
 | A superseded full file | for `[sharadar] keep_days` (7), and the newest of each table whatever its age |
+| The TICKERS file a kept SEP, SFP or SF1 full file was fetched with (`filters.tickers_file_id`, #238) | as long as that full file: its readers map tickers through it |
 | `.*.part`, `.sharadar-sort-*` (a killed download or sort) | 24 hours |
 | A `<sha256>.<ext>` file the ledger never recorded (a header that failed the check) | 14 days, for inspection |
 | Anything else | never touched; reported |
@@ -340,7 +341,12 @@ fafnir ingest fundamentals                         # the SF1 deltas since the la
 - **What it reads.** First-reported rows (ARQ, ARY) and restated rows (MRQ, MRY), for
   every security with a Sharadar link, dead issuers included. SF1's trailing rows
   (ART, MRT) are not read. `--backfill` groups the full file by ticker on disk
-  first, so allow about four times the zip's size free under `bulk_dir`. Without it,
+  first, so allow about four times the zip's size free under `bulk_dir`. It reads a
+  key by the ticker the file files it under, as the price backfill does
+  ([Which ticker a key is read by](#bars-from-sharadar-and-why-raw-is-recovered-75),
+  #238): an SF1 file fetched before #238 skips the keys renamed since, counted
+  `ticker_changed_since_file`, until `sharadar-bulk --tables SF1 --force` fetches a
+  paired one. Without it,
   the run reads the SF1 delta files recorded since the last nightly run
   (`sharadar/fundamentals:nightly`). Its `params.through` names the last file
   applied, so a failed night is read again the next. Step 2 of `ingest sharadar`
@@ -543,6 +549,26 @@ Bulk TICKERS writes its `table` column in legacy codes (`SEP`, `SFP`, `SF1`, `SF
 
 In the two bulk modes a date the security already holds, whoever supplied it, is
 never read, so a re-run writes nothing new.
+
+**Which ticker a key is read by** (#238). SEP, SFP and SF1 rows carry no permaticker,
+only the ticker of the day the file was fetched, and Sharadar files a security's history
+under its current ticker. Once a key is renamed after the file was fetched, tonight's
+TICKERS and the file disagree. The key's rows are under its old ticker, and its new
+ticker can be another issuer's in the file. On 2026-11-03, key 124449 became `NORD`,
+and the full SEP file's `NORD` rows were Nord Anglia's (key 166256, now `NORD1`). So
+the bulk modes, `vendor correct` and the fundamentals backfill
+([Statements from SF1](#statements-from-sf1-90)) read a key by the ticker its file
+names it by:
+
+| The full file | A key is read by | Counted |
+|---|---|---|
+| Names the TICKERS file fetched with it (`filters.tickers_file_id`: every full SEP, SFP and SF1 `sharadar-bulk` fetches since #238) | the ticker that TICKERS file gives it | `ticker_as_of_file`: those whose ticker differs from tonight's. `not_in_file`: the keys that TICKERS file lacks, which the file does not hold |
+| Names none (fetched before #238, or its TICKERS file failed or is gone from disk) | tonight's ticker, unless a ticker change dated since the file's fetch, less 30 days, touches the key: its own, or another key's to or from its ticker | `ticker_changed_since_file`: skipped, with a warning naming the `sharadar-bulk --tables <table> --force` that pairs a new file |
+
+Two keys on one ticker read neither (`ticker_shared`). The nightly reads deltas
+fetched the same night as TICKERS, so it agrees, except for a security with no bars
+yet, which reads every delta on disk: one a ticker change since the oldest touches
+reads tonight's deltas alone, counted `ticker_changed_since_file`.
 
 **Why raw is recovered.** No observed raw source exists for a dead issuer's history:
 SEP's `open/high/low/close/volume` are split-adjusted, and only `closeunadj` is raw.
@@ -841,7 +867,11 @@ that disagrees with Sharadar's is corrected. `fafnir vendor correct` reads, for 
 FMP-minted security linked to Sharadar, fed or not, the vendor's bars, recovers them
 raw as above, and compares them with the bars FMP supplied on the dates both hold,
 from the link's `valid_from`. The vendor's own bars on a fed row are the nightly's
-to revise, and never compared.
+to revise, and never compared. A security's bars are read by the ticker the full
+file names it by, as the bulk modes read them
+([Which ticker a key is read by](#bars-from-sharadar-and-why-raw-is-recovered-75)):
+read by tonight's ticker, a renamed key's comparison was with another issuer's bars,
+and it replaced FMP's good ones (#238).
 
 **Fed or not.** Up to v3.0.3 a fed row was left out. The cutover (2026-10-22) fed
 every linked security, so from then on the command found none: ADS, whose FMP history
