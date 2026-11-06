@@ -208,7 +208,9 @@ def load(
     for a in repo.action_dates(db, [t["security_id"] for t in targets]):
         if a["source"] != VENDOR:
             foreign[(a["security_id"], a["action_type"])].append(a["ex_date"])
-    suppressed = repo.suppressed_action_keys(db)
+    # As for the bars: a key a history split moved off another vendor's row is set
+    # aside only for that vendor.
+    suppressed = repo.suppressed_action_keys(db, vendor=VENDOR)
     for key, target in by_key.items():
         for p in planned_for(
             target["security_id"], actions.get(key, {}), result.skipped

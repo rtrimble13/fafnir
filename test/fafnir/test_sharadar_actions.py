@@ -292,6 +292,50 @@ def test_gap_fill_adds_only_what_fmp_lacks_inside_the_link(db, tmp_path):
 
 
 @integration
+def test_an_action_a_history_split_moved_off_fmp_is_not_held_against_sharadar(
+    db, tmp_path
+):
+    # The split moved another issuer's FMP dividend off this row; Sharadar's own
+    # dividend for the key is the source issuer's. An operator's delete still holds.
+    fed = _sec(db, "ZZS", Y(2010, 1, 4), Y(2012, 12, 31))
+    _vendor(db, "900013", "ZZS")
+    _link(db, fed, "900013", Y(2010, 1, 4), feed=True)
+    db.execute(
+        "INSERT INTO ops.operator_override (security_id, target, action_type, "
+        "key_date, operation, note, created_by, detail) VALUES "
+        "(%s, 'corporate_action', 'dividend', '2011-06-10', 'delete', "
+        "'another issuer', 't', %s::jsonb)",
+        (
+            fed,
+            '{"row": {"dividend_amount": "9", "source": "fmp"}, '
+            '"split": {"kind": "moved", "source_security_id": 1, '
+            '"destination_security_id": 2}}',
+        ),
+    )
+    db.execute(
+        "INSERT INTO ops.operator_override (security_id, target, action_type, "
+        "key_date, operation, note, created_by) VALUES "
+        "(%s, 'corporate_action', 'dividend', '2012-03-09', 'delete', 'bad', 't')",
+        (fed,),
+    )
+    _actions_file(
+        db,
+        tmp_path,
+        [
+            ("2011-06-10", "dividend", "ZZS", "1"),  # the split moved FMP's: loaded
+            ("2012-03-09", "dividend", "ZZS", "1"),  # the operator deleted: not
+        ],
+    )
+    plan = sa.load(
+        db, tmp_path, backfill=True, gap_fill=False, dry_run=True, as_of=Y(2026, 1, 2)
+    )
+    assert [(p.action_type, p.ex_date) for p in plan.planned] == [
+        ("dividend", Y(2011, 6, 10))
+    ]
+    assert plan.skipped == {"suppressed": 1}
+
+
+@integration
 def test_a_fed_security_another_vendor_minted_takes_only_its_link_span(db, tmp_path):
     # The cutover fed every linked security; its history before the link is FMP's.
     fed = _sec(db, "ZZF", Y(2008, 1, 2), Y(2012, 12, 31))

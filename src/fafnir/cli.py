@@ -3521,12 +3521,15 @@ def security_split_history(
     OHLC or the split is refused.
 
     Every moved key stays suppressed on the source by an active 'delete' override,
-    so the next load of the ticker's full history does not put it back. DQ flags
-    about a moved date follow it. Adjustment factors of both securities are
+    so the next load of the ticker's full history does not put it back. The
+    suppression is for the vendor whose rows moved: a vendor linked to the source
+    by its own key (Sharadar) still loads the source issuer's row for that key.
+    DQ flags about a moved date follow it. Adjustment factors of both securities are
     recomputed in the same transaction.
 
     --undo reverses exactly what the split moved, read from those overrides, and
-    deletes a minted destination left empty.
+    deletes a minted destination left empty. It refuses while the source holds a
+    row of its own on a moved key.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
