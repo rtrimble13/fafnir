@@ -1665,7 +1665,7 @@ data. A restore of the database brings the ledger back without the files (see
 | `file_id` | BIGINT IDENTITY PK | |
 | `vendor_table` | TEXT CHECK | Sharadar's modern name: `stocks` (not `SEP`), `funds` (SFP), `fundamentals` (SF1), `tickers`, `actions`, `daily`, `metrics`, `descriptions`, `events`, `sp500`, `insiders`, `holdings`, `holdings_investor`, `holdings_ticker`. Only the first five have been fetched. |
 | `kind` | TEXT CHECK | `full` (a bulk file, `years=5\|10\|full`) or `delta` (a slice: a date, a `lastupdated` window). |
-| `filters` | JSONB | What was asked for, as sent. A full `stocks` or `funds` file fetched since #238 also carries `tickers_file_id`: the TICKERS file fetched with it, by which its readers map each permaticker to the ticker the file names its rows by. |
+| `filters` | JSONB | What was asked for, as sent. A full `stocks`, `funds` or `fundamentals` file fetched since #238 also carries `tickers_file_id`: the TICKERS file fetched with it, by which its readers map each permaticker to the ticker the file names its rows by. |
 | `path` | TEXT CHECK | Relative to `bulk_dir`: `<sha256><suffix>`. Never absolute, never `..`. |
 | `member` | TEXT | The CSV inside a zip; NULL for a plain or gzipped CSV. |
 | `sha256` | TEXT UNIQUE | The file's content hash: a file already held is not recorded twice. |
