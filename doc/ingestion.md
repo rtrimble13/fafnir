@@ -392,8 +392,10 @@ fafnir ingest fundamentals                         # the SF1 deltas since the la
   restated row, as a restatement. Rows that differ only in `lastupdated` are one row.
 - **Flags.** Restatements are flagged `fundamentals_restatement` and corrections
   `fundamentals_vendor_correction`, once per security and run, with the largest moves.
-  A restatement is `warn` from the nightly and `info` from a backfill, which observes
-  the whole of SF1's restated history in one day. `fundamentals_estimated_knowledge_date`
+  A restatement is `info`: whether it is plausible is dorq's DQ932's judgement since
+  the statements cutover (DR-0914; the nightly's were `warn` before it). A column SF1
+  adds that the map does not know is flagged `fundamentals_unmapped_fields`, once by
+  name, for no security (`dq run`'s check before the cutover). `fundamentals_estimated_knowledge_date`
   (`info`) stands once per security.
 - **Unit of work.** A vendor key's writes are committed together. The run's
   `params` record the counts, the versions by decade and `knowledge_source` (§7),

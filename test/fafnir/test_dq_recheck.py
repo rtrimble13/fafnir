@@ -60,7 +60,7 @@ def test_the_fundamentals_negations_run_the_checks_own_queries():
     not a copy that could keep closing flags by the old rule."""
     for name, detect in checks.FUNDAMENTALS_DETECTORS.items():
         assert detect() in rc.RECHECKABLE[name].sql, name
-        assert name in checks.FUNDAMENTALS_CHECKS, name
+        assert name in checks.RETIRED_FUNDAMENTALS_CHECKS, name
 
 
 def test_an_unknown_check_is_refused_by_name():

@@ -62,8 +62,10 @@ per-share values and ``*usd`` conversions go to the income row's ``extra``
 A vendor key is the unit of work: its periods and versions are written and committed
 before the next. The watermark is ``(sharadar, SF1:<dimension>, security_id)``, the
 latest ``reportperiod`` applied. Restatements and corrections are flagged once per
-security and run (``warn`` from the nightly; ``info`` from a backfill, which observes
-the whole of SF1's restated history in a day).
+security and run, at ``info``: whether a restatement is plausible is dorq's DQ932's
+judgement since the statements cutover (DR-0914; the nightly's were ``warn``). A
+column SF1 adds that the map does not know is flagged once by name
+(``fundamentals_unmapped_fields``, moved here from ``dq run`` by DR-0914).
 """
 
 from __future__ import annotations
@@ -124,6 +126,7 @@ UNLINKED = "fundamentals_unlinked"
 RESTATEMENT = "fundamentals_restatement"
 CORRECTION = "fundamentals_vendor_correction"
 ESTIMATED_FLAG = "fundamentals_estimated_knowledge_date"
+UNMAPPED = "fundamentals_unmapped_fields"
 
 #: SF1's columns that place a row rather than describe the company.
 ROW_KEYS = (
@@ -795,6 +798,11 @@ class FundamentalsResult:
     #: Versions inserted, by the decade of their period and knowledge source (§7).
     by_decade: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
     unmapped: set[str] = field(default_factory=set)
+    #: Per unmapped column: the rows that carried it, and their securities.
+    unmapped_rows: Counter = field(default_factory=Counter)
+    unmapped_securities: dict[str, set] = field(
+        default_factory=lambda: defaultdict(set)
+    )
     files: list[int] = field(default_factory=list)
     through: Optional[int] = None
     #: The nightly before any backfill: nothing read, no run (:func:`backfilled`).
@@ -1072,6 +1080,7 @@ def load(
             )
         if run is None:
             return
+        _flag_unmapped(db, run, result)
         run.rows_inserted = result.written
         run.params.pop("progress", None)
         run.params.update(_summary(result))
@@ -1213,6 +1222,10 @@ def _load_key(
             continue
         if parsed.unmapped:
             result.unmapped |= set(parsed.unmapped)
+            for name in parsed.unmapped:
+                result.unmapped_rows[name] += 1
+                if sid is not None:
+                    result.unmapped_securities[name].add(sid)
         if (parsed.filing_date or parsed.fiscal_date) > as_of:
             counts["future"] += 1
             continue
@@ -1319,6 +1332,26 @@ def _entry(e: Event) -> dict:
     return entry
 
 
+def _flag_unmapped(db: Database, run: RunLog, result: FundamentalsResult) -> None:
+    """One standing flag per SF1 column the map does not know, for no security
+    (``info``): the taxonomy's growth signal, its values kept in ``extra.unmapped``.
+    Keyed by the column's name, as ``dq run``'s check keyed it before DR-0914, so a
+    column already flagged, open or accepted, is not flagged again."""
+    for name in sorted(result.unmapped):
+        repo.add_dq_flag_once(
+            db,
+            check_name=UNMAPPED,
+            severity="info",
+            table_name="core.income_statement",
+            record_key={"field": name},
+            detail={
+                "rows": result.unmapped_rows[name],
+                "securities": len(result.unmapped_securities.get(name, ())),
+            },
+            ingestion_run_id=run.run_id,
+        )
+
+
 def _flag(
     db: Database,
     security_id: int,
@@ -1331,7 +1364,7 @@ def _flag(
     """One flag per security and run for its restatements, one for its corrections,
     and one (standing) for its estimated knowledge dates."""
     for check, kinds, severity in (
-        (RESTATEMENT, ("restated",), "info" if backfill else "warn"),
+        (RESTATEMENT, ("restated",), "info"),
         (CORRECTION, ("corrected", "refused"), "info"),
     ):
         hits = [e for e in events if e.kind in kinds]

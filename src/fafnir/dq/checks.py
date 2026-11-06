@@ -1213,28 +1213,6 @@ def check_fundamentals_currency_mismatch(db: Database) -> int:
     )
 
 
-def check_fundamentals_unmapped_fields(db: Database) -> int:
-    """SF1 columns the map does not know, landed in ``extra.unmapped``: one flag per
-    column name, for no security (``info``). The taxonomy's growth signal."""
-    return _write_flags(
-        db,
-        "fundamentals_unmapped_fields",
-        f"""
-        SELECT NULL::bigint AS security_id, 'core.income_statement' AS table_name,
-               jsonb_build_object('field', k.key) AS record_key,
-               'info' AS severity,
-               jsonb_build_object('rows', count(*),
-                                  'securities', count(DISTINCT t.security_id))
-                   AS detail
-          FROM core.income_statement t
-          CROSS JOIN LATERAL jsonb_object_keys(t.extra -> 'unmapped') AS k(key)
-         WHERE t.{CURRENT} AND jsonb_typeof(t.extra -> 'unmapped') = 'object'
-         GROUP BY k.key
-        """,
-        what="unmapped SF1 columns",
-    )
-
-
 def _contiguous(a: str, b: str, da: str, db_: str) -> str:
     lo, hi = QUARTER_GAP
     return f"({a} - {b} = 1 AND {da} - {db_} BETWEEN {lo} AND {hi})"
@@ -1568,15 +1546,20 @@ FUNDAMENTALS_DETECTORS = {
     "fundamentals_version_chain": detect_fundamentals_version_chain,
 }
 
-#: The fundamentals checks, in the order ``run_all`` runs them: its keys.
-FUNDAMENTALS_CHECKS = {
+#: The SQL fundamentals checks the statements cutover retired (DR-0914): dorq's
+#: statement checks succeed them (``compare_statements.SUCCESSORS``), judged on a
+#: full-history run verified on EDGAR (doc/dorq.md › *The statements cutover*).
+#: ``run_all`` no longer runs them. Their detectors stay, so ``dq recheck`` closes
+#: the flags they wrote as each condition clears, and so does a dorq successor flag
+#: that carries the condition (:func:`fafnir.dq.recheck.recheck_successors`). The
+#: writers stay with ``run_all``'s keys, for one release.
+RETIRED_FUNDAMENTALS_CHECKS = {
     "balance_sheet_identity": check_balance_sheet_identity,
     "cash_flow_tie": check_cash_flow_tie,
     "cash_balance_tie": check_cash_balance_tie,
     "fundamentals_gap": check_fundamentals_gap,
     "fundamentals_stale": check_fundamentals_stale,
     "fundamentals_currency_mismatch": check_fundamentals_currency_mismatch,
-    "fundamentals_unmapped_fields": check_fundamentals_unmapped_fields,
     "fundamentals_ttm_incomplete": check_fundamentals_ttm_incomplete,
     "fundamentals_negative_impossible": check_fundamentals_negative_impossible,
     "fundamentals_coverage": check_fundamentals_coverage,
@@ -1585,6 +1568,31 @@ FUNDAMENTALS_CHECKS = {
     "fundamentals_ytd_suspect": check_fundamentals_ytd_suspect,
     "fundamentals_version_chain": check_fundamentals_version_chain,
 }
+
+#: The fundamentals checks ``run_all`` runs, in order: its keys after the five. None
+#: since the statements cutover: dorq judges the statements, and
+#: ``fundamentals_unmapped_fields`` moved into the loader (DR-0914).
+FUNDAMENTALS_CHECKS: dict = {}
+
+#: ``run_all``'s keys for the checks the cutover retired or moved, in the order it
+#: reported them, kept at 0 for one release so a caller reading them by name does
+#: not break (#102). Drop them in the release after DR-0914's.
+RETIRED_KEYS = (
+    "balance_sheet_identity",
+    "cash_flow_tie",
+    "cash_balance_tie",
+    "fundamentals_gap",
+    "fundamentals_stale",
+    "fundamentals_currency_mismatch",
+    "fundamentals_unmapped_fields",
+    "fundamentals_ttm_incomplete",
+    "fundamentals_negative_impossible",
+    "fundamentals_coverage",
+    "fundamentals_suspicious_zero",
+    "fundamentals_implausible_filing_lag",
+    "fundamentals_ytd_suspect",
+    "fundamentals_version_chain",
+)
 
 
 def run_all(
@@ -1603,7 +1611,9 @@ def run_all(
     The price and security checks' five keys come first and never change (#102);
     the fundamentals checks' keys follow, one per check. They are 0 without
     ``include_fundamentals`` or without the statement tables (a database
-    mid-migration), and then nothing runs against them.
+    mid-migration), and then nothing runs against them. The SQL fundamentals checks
+    the statements cutover retired keep their keys, at 0, for one release
+    (:data:`RETIRED_KEYS`).
     """
     out = {
         "gaps": check_gaps(db, exchange_code),
@@ -1615,6 +1625,8 @@ def run_all(
     run = include_fundamentals and statements_exist(db)
     if include_fundamentals and not run:
         logger.info("fundamentals checks skipped: no statement tables")
+    for key in RETIRED_KEYS:
+        out[key] = 0
     for key, check in FUNDAMENTALS_CHECKS.items():
         out[key] = check(db) if run else 0
     return out
