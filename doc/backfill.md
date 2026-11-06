@@ -570,15 +570,21 @@ the files (#55, #58, #75). For each table:
     and read as text.
 - **Record it.** It counts the rows and records the file, then marks the table's
   older full files `superseded`.
+- **Pair a price file with TICKERS** (#238). SEP and SFP rows carry only the ticker
+  of the day. So a run that fetches either fetches TICKERS first, forced, and the
+  price file records it (`filters.tickers_file_id`). The readers then map each
+  security to the ticker the file names it by, whatever TICKERS says tonight
+  ([ingestion.md › Which ticker a key is read by](ingestion.md#bars-from-sharadar-and-why-raw-is-recovered-75)).
+  A price table the run skips keeps its pairing.
 
 Its behaviour across runs:
 - **One run row per table.** `ops.ingestion_run` gets `source = sharadar`,
   `endpoint = bulk:<table>`, with the bytes downloaded and, in `params`, the rows,
   file and header findings.
 - **Resumable.** A table the ledger already holds is skipped (no request), so a run
-  that stopped part-way picks up at the first table it had not finished. One
-  table's failure does not undo the others; the command exits non-zero naming the
-  failures.
+  that stopped part-way picks up at the first table it had not finished. TICKERS is
+  fetched again with a price table the run fetches. One table's failure does not
+  undo the others; the command exits non-zero naming the failures.
 - **Idempotent.** With `--force`, content identical to a file on record is that
   file again: no second row, no second copy on disk.
 

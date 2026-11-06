@@ -16,6 +16,10 @@ For each table asked for:
 4. **Record it** in ``landing.sharadar_file`` with its row count, then mark the
    table's older full files superseded. The same content downloaded twice is one
    file, not two.
+5. **Pair a price file** (#238). A full SEP or SFP file is fetched with TICKERS,
+   forced, just before it, and records that file as ``filters.tickers_file_id``:
+   its rows carry only the ticker of the day, and the readers map each security to
+   it through that file (:func:`fafnir.ingest.sharadar_prices.file_tickers`).
 
 Each table is its own ``ops.ingestion_run`` (``source = sharadar``, ``endpoint =
 bulk:<table>``), with the bytes downloaded and, in ``params``, the rows, file and

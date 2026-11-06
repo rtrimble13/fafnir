@@ -47,6 +47,21 @@ of tickers, not 45M rows, and a run killed part-way keeps every security it
 finished. Every ``PROGRESS_SECONDS`` the counts so far and the ticker reached are
 written to the open run (``params.progress``).
 
+**A key is read by the ticker its file names it by** (#238). SEP and SFP rows carry
+no permaticker, only the ticker of the day the file was fetched, and Sharadar files a
+key's history under its current ticker. Tonight's TICKERS can say otherwise: a key
+renamed since the file holds its rows under its old ticker, and its new one may be
+another issuer's there. A full file fetched since #238 names the TICKERS file fetched
+with it (``filters.tickers_file_id``), and each key is read by the ticker that file
+gives it (``ticker_as_of_file`` counts the ones that differ from tonight's;
+``not_in_file`` the keys it lacks). An older full file names none: a key a ticker
+change since its fetch (less ``RENAME_SLACK_DAYS``) touches, its own or another's to
+or from its ticker, is skipped (``ticker_changed_since_file``), and the warning names
+the ``sharadar-bulk --force`` that pairs a new one. Two keys on one ticker read
+neither (``ticker_shared``). The nightly's deltas are fetched the night they are read,
+so only a security with no bars yet, which reads the older deltas too, is guarded: one
+a ticker change since the oldest touches reads tonight's alone.
+
 In the bulk modes a date the security already holds, whoever supplied it, is not
 read again, so a re-run writes nothing new; the vendor's later revisions of its own
 history come with the nightly. The watermark is ``(sharadar, SEP|SFP, security_id)``, for
