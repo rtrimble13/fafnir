@@ -7092,7 +7092,9 @@ def dq_compare(
     started and how many a successor report covers (same security, and the
     statement, period, fiscal year or span the flag names); the standing count at
     warn and above (the bar is 30% of the SQL checks' or less); new flags per
-    night; and, with labels about statements, precision.
+    night; and, with labels about statements, precision, and both engines'
+    recall on the confirmed errors (dorq's reports, and the SQL checks' flags
+    open or closed by the night's start).
     """
     import sys
     from pathlib import Path

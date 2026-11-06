@@ -789,6 +789,22 @@ fafnir dq compare --statements --json
   statements judge statement reports, and they judge no bars report. A label is
   about statements when it names a statement scope or a DQ9xx code.
   `--labels-from-db` reads the warehouse's own (DR-0913).
+- **Recall, both engines'.** With labels, the confirmed errors are the `data_error`
+  statements labels on one security that apply at the night: the EDGAR sample's
+  confirmations of dorq's reports, and the corrections and closures of the SQL
+  checks' flags. They pool both engines' confirmations, so neither one's recall is
+  1 by construction. On each, the comparison asks:
+  - **dorq:** is a report at warn and above on it, matched as precision matches?
+  - **The SQL checks:** is a flag of the thirteen at warn and above on it, open or
+    closed, detected by the night's start? A flag is placed as `dq export-labels`
+    places it: its successor's code, and the period, fiscal year or span its key
+    names.
+
+  `found` needs a code the label expects (an SQL flag's is its successor's); `any`
+  takes any code. The bar is dorq's recall at least the SQL checks'. A table by the
+  label's kind shows where the confirmations came from. A correction's label stops
+  applying once the correction loaded, so read recall on an early statements night
+  against the labels since: its confirmed errors are the conditions it read.
 
 ### The statements cutover
 
@@ -816,10 +832,13 @@ statements night is one. The operator's steps:
    `data_error` expecting its code) and `refute` states it wrong (a `market_fact`
    on its code). Both carry `--verified`; finish the note with what the filing
    shows, and add `--yes`.
-3. **Judge** against dorq plan §6 with `dq compare --statements --labels-from-db
-   --verified-only` (precision on the sample, the standing count, new flags per
-   night), dorq-eval on the same labels (recall, and the calibration error), and the
-   night's run time in `fafnir status`. Post the aggregates on fafnir#221.
+3. **Judge** against dorq plan §6 and post the aggregates on fafnir#221:
+   - `dq compare --statements --labels-from-db --verified-only`: precision on the
+     sample, the standing count, new flags per night;
+   - `dq compare --statements --labels-from-db` on the first shadow night: precision
+     on every correction label, and both engines' recall on the confirmed errors;
+   - dorq-eval on the exported labels: the calibration error;
+   - `fafnir status`: the night's run time.
 4. **Go:** set `[dq] dorq_statements_shadow = false`.
 5. **The cutover release** retires the thirteen from `FUNDAMENTALS_CHECKS`, keeping
    `run_all`'s keys at 0 for a release, and closes their open flags by `dq recheck`:

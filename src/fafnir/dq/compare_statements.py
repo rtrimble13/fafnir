@@ -24,6 +24,16 @@ measures what the plan's cutover criteria (§6) ask of it:
     version and item agreeing where both name one, and its fiscal dates
     overlapping the report's within the slack. Only labels about statements
     judge (:attr:`fafnir.dq.compare.Label.is_statements`).
+  * **Recall, both engines'.** With labels, of the confirmed errors (the
+    ``data_error`` statements labels on one security that apply at the night),
+    how many dorq found, a report at warn and above as precision matches it, and
+    how many the thirteen SQL checks found: a flag of theirs at warn and above,
+    open or closed, detected by the night's start, placed as `dq export-labels`
+    places it (:func:`fafnir.dq.labels.place_statement_flags`). The set pools both
+    engines' confirmations, the EDGAR sample of dorq's reports and the closures and
+    corrections of the SQL checks' flags, so neither engine's recall is 1 by
+    construction. ``found`` needs a code the label expects (an SQL flag: its
+    successor's); ``any`` takes any code. The bar: dorq's at least the SQL checks'.
 
 Reads only.
 """
@@ -51,6 +61,45 @@ from fafnir.dq.compare import (
 #: The bar for the standing count at warn and above: dorq's at most this share of
 #: the SQL checks' (plan §6).
 STANDING_BAR = 0.30
+
+
+@dataclass
+class Recall:
+    """Confirmed errors, and how many each engine found: with a code the label
+    expects (``dorq``, ``sql``), or with any code (``dorq_any``, ``sql_any``)."""
+
+    labels: int = 0
+    dorq: int = 0
+    dorq_any: int = 0
+    sql: int = 0
+    sql_any: int = 0
+
+    def add(self, dorq: bool, dorq_any: bool, sql: bool, sql_any: bool) -> None:
+        self.labels += 1
+        self.dorq += dorq
+        self.dorq_any += dorq_any
+        self.sql += sql
+        self.sql_any += sql_any
+
+    def _of(self, n: int) -> Optional[float]:
+        return n / self.labels if self.labels else None
+
+    def as_dict(self) -> dict:
+        return {
+            "labels": self.labels,
+            "dorq": {
+                "found": self.dorq,
+                "any": self.dorq_any,
+                "recall": self._of(self.dorq),
+                "recall_any": self._of(self.dorq_any),
+            },
+            "sql": {
+                "found": self.sql,
+                "any": self.sql_any,
+                "recall": self._of(self.sql),
+                "recall_any": self._of(self.sql_any),
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -279,6 +328,9 @@ class StatementsComparison:
     precision_warn: Precision = field(default_factory=Precision)
     precision_error: Precision = field(default_factory=Precision)
     precision_by_code: dict[str, Precision] = field(default_factory=dict)
+    recall: Recall = field(default_factory=Recall)
+    #: by the label's kind: where the confirmation came from
+    recall_by_kind: dict[str, Recall] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         warn = self.precision_warn
@@ -311,6 +363,14 @@ class StatementsComparison:
                     "labels": self.labels_used,
                     "time_scoped": self.labels_time_scoped,
                     "verified_only": self.labels_verified_only,
+                }
+                if self.labelled
+                else None
+            ),
+            "recall": (
+                {
+                    **self.recall.as_dict(),
+                    "by_kind": {k: v.as_dict() for k, v in self.recall_by_kind.items()},
                 }
                 if self.labelled
                 else None
@@ -352,6 +412,83 @@ def _written_between(
             (list(SUCCESSORS), after, until),
         )
     )
+
+
+def _sql_flags_found(
+    db: Database, state_at: Optional[dt.datetime], securities: Sequence[int]
+) -> list[dict]:
+    """Every flag of the thirteen at warn and above on ``securities`` detected by
+    ``state_at`` (now when None), open or closed: what the SQL checks found."""
+    if not securities:
+        return []
+    return db.fetchall(
+        """
+        SELECT dq_flag_id, check_name, security_id, table_name, record_key, detail,
+               COALESCE(accepted_at, resolved_at, %(t)s, now()) AS decided_at
+          FROM ops.data_quality_flag
+         WHERE check_name = ANY(%(checks)s) AND security_id = ANY(%(sids)s)
+           AND severity IN ('warn', 'error')
+           AND detected_at <= coalesce(%(t)s, now())
+         ORDER BY dq_flag_id
+        """,
+        {"t": state_at, "checks": list(SUCCESSORS), "sids": list(securities)},
+    )
+
+
+def _flag_finds(placed: tuple, lab: Label, slack: int) -> tuple[bool, bool]:
+    """Whether a placed SQL flag (:func:`fafnir.dq.labels.place_statement_flags`)
+    found confirmed error ``lab``: with a code it expects, and at all. It agrees
+    with the label's scope where both name one, and its dates overlap the label's
+    within the slack, as a report must."""
+    code, scope, first, last = placed
+    if not (
+        _same(lab.statement, scope.get("statement"))
+        and _same(lab.period_type, scope.get("period_type"))
+        and _same(lab.version_no, scope.get("version_no"))
+        and _same(lab.item, scope.get("item"))
+    ):
+        return False, False
+    pad = dt.timedelta(days=slack)
+    if not (first <= lab.last + pad and lab.first <= last + pad):
+        return False, False
+    return (not lab.expect or code in lab.expect), True
+
+
+def _recall(
+    db: Database,
+    out: "StatementsComparison",
+    used: Sequence[Label],
+    by_security: dict[int, list[StatementReport]],
+    slack: int,
+) -> None:
+    """Both engines' recall on the confirmed errors among ``used``."""
+    from fafnir.dq import labels as lb
+
+    errors = [
+        lab for lab in used if lab.label_class == "data_error" and lab.series.isdigit()
+    ]
+    sids = sorted({int(lab.series) for lab in errors})
+    placed: dict[int, list[tuple]] = {}
+    for flag, where in lb.place_statement_flags(
+        db, _sql_flags_found(db, out.state_at, sids)
+    ):
+        placed.setdefault(int(flag["security_id"]), []).append(where)
+    for lab in errors:
+        sid = int(lab.series)
+        dorq = dorq_any = False
+        for r in by_security.get(sid, ()):
+            if r.severity in _SEVERE and _label_overlaps(r, lab, slack):
+                dorq_any = True
+                dorq = dorq or not lab.expect or r.code in lab.expect
+        sql = sql_any = False
+        for where in placed.get(sid, ()):
+            strict, overlaps = _flag_finds(where, lab, slack)
+            sql, sql_any = sql or strict, sql_any or overlaps
+        out.recall.add(dorq, dorq_any, sql, sql_any)
+        out.recall_by_kind.setdefault(lab.kind or "?", Recall()).add(
+            dorq, dorq_any, sql, sql_any
+        )
+    out.recall_by_kind = dict(sorted(out.recall_by_kind.items()))
 
 
 def latest_shadow_file(settings: engine.DorqSettings) -> Optional[Path]:
@@ -470,6 +607,8 @@ def compare(
                 out.precision_error.add(outcome)
     out.by_code = dict(sorted(out.by_code.items()))
     out.precision_by_code = dict(sorted(out.precision_by_code.items()))
+    if index is not None:
+        _recall(db, out, index, by_security, slack_days)
 
     sql_severe = sum(e["severe"] for e in out.by_sql_check.values())
     out.standing = {
@@ -588,4 +727,23 @@ def format_comparison(c: StatementsComparison) -> str:
         lines.append(_precision_line("error", c.precision_error, fmt))
         for code, p in c.precision_by_code.items():
             lines.append(_precision_line(code, p, fmt))
+        rc = c.recall
+        lines.append("")
+        lines.append(
+            f"Recall at warn+ ({rc.labels} confirmed errors: the data_error labels on "
+            "one security, both engines' confirmations)"
+        )
+        for name, found, any_ in (
+            ("dorq", rc.dorq, rc.dorq_any),
+            ("SQL checks", rc.sql, rc.sql_any),
+        ):
+            lines.append(
+                f"  {name:<14} found {_ratio(found, rc.labels):<16}"
+                f" with any code {_ratio(any_, rc.labels)}"
+            )
+        lines.append("  the bar: dorq's recall at least the SQL checks'")
+        if c.recall_by_kind:
+            lines.append("  by label kind                     labels   dorq    SQL")
+            for kind, k in c.recall_by_kind.items():
+                lines.append(f"    {kind:<32} {k.labels:>6} {k.dorq:>6} {k.sql:>6}")
     return "\n".join(lines)
