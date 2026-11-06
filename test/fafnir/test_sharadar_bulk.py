@@ -233,6 +233,20 @@ def test_a_price_file_records_the_tickers_file_fetched_with_it(db, tmp_path):
     assert alone.outcome == "unchanged" and _pairing(db, sep.file_id) == t2.file_id
 
 
+def test_an_sf1_file_is_paired_too(db, tmp_path):
+    header = ",".join(bulk.expected_columns("fundamentals"))
+    client = _FakeBulk({"SF1": _zip("SF1.csv", header + "\n")})
+    t, sf1 = bulk.download_tables(db, client, ["SF1"], tmp_path)
+    assert (t.table, sf1.table, sf1.outcome) == ("tickers", "fundamentals", "recorded")
+    assert _pairing(db, sf1.file_id) == t.file_id
+    # ACTIONS alone pairs nothing, and fetches no TICKERS.
+    client.files["actions"] = _zip(
+        "actions.csv", "date,action,ticker,name,value,contraticker,contraname\n"
+    )
+    [actions] = bulk.download_tables(db, client, ["actions"], tmp_path)
+    assert actions.outcome == "recorded" and _pairing(db, actions.file_id) is None
+
+
 def test_a_price_file_whose_tickers_failed_is_left_unpaired(db, tmp_path, caplog):
     client = _FakeBulk(
         {"tickers": SourceError("HTTP 503"), "SEP": _zip("SEP.csv", STOCKS)}

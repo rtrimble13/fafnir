@@ -1,8 +1,8 @@
 """
-A Sharadar full price file is read by the tickers it was fetched with, not
-tonight's (#238; the tests need FAFNIR_TEST_DSN).
+A Sharadar full SEP, SFP or SF1 file is read by the tickers it was fetched with,
+not tonight's (#238; the tests need FAFNIR_TEST_DSN).
 
-SEP and SFP rows carry no permaticker, only the ticker of the day the file was
+SEP, SFP and SF1 rows carry no permaticker, only the ticker of the day the file was
 fetched, and Sharadar files a key's history under its current ticker. Here two
 keys pass a ticker between the full file and tonight's TICKERS, as on 2026-11-03:
 key 900201 is ZZOLD in the file and ZZNEW tonight, and key 900202, ZZNEW's holder
@@ -15,10 +15,12 @@ from __future__ import annotations
 import hashlib
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from test.fafnir import test_fundamentals_ingest as fi
 
 import pytest
 
 from fafnir.db import repository as repo
+from fafnir.ingest import fundamentals as fu
 from fafnir.ingest import sharadar_prices as sp
 from fafnir.ingest import sharadar_prune as pr
 from fafnir.ingest import vendor_correct as vc
@@ -70,11 +72,12 @@ def _file(db, bulk, table, body, *, kind="full"):
 
 
 def _tickers(db, bulk, listing):
-    """A TICKERS file listing ``{key: ticker}`` in SEP."""
+    """A TICKERS file listing ``{key: ticker}`` in SEP and SF1."""
     body = TICKERS + "".join(
-        f"SEP,{key},{ticker},{ticker} CO,NYSE,N,Domestic Common Stock,,,,,,,,,,,,"
-        "USD,,2026-01-02,,,,,,,\n"
+        f"{table},{key},{ticker},{ticker} CO,NYSE,N,Domestic Common Stock,,,,,,,,,,"
+        ",,USD,,2026-01-02,,,,,,,\n"
         for key, ticker in listing.items()
+        for table in ("SEP", "SF1")
     )
     return _file(db, bulk, "tickers", body)
 
@@ -316,6 +319,69 @@ def test_a_fresh_key_renamed_since_reads_only_tonights_deltas(db, tmp_path):
     result = sp.nightly(db, tmp_path, as_of=Y(2026, 10, 21))
     assert result.counts["ticker_changed_since_file"] == 1
     assert _bars(db, fresh) == {Y(2026, 10, 20): (D("8"), "sharadar")}
+
+
+# ---------------------------------------------------------------------------
+# The fundamentals backfill (SF1)
+# ---------------------------------------------------------------------------
+
+
+def _sf1_swap(db, bulk, *, paired=True):
+    """The SF1 file and tonight's master, as :func:`_swap`: 900201's statements are
+    under ZZOLD (revenue 1000), 900202's under ZZNEW (revenue 9000), 900203's under
+    ZZC (revenue 3000). The securities, by key."""
+    sids = {
+        key: fi._security(db, symbol, key)
+        for key, symbol in (
+            ("900201", "ZZNEW"),
+            ("900202", "ZZNEW1"),
+            ("900203", "ZZC"),
+        )
+    }
+    tickers = _tickers(
+        db, bulk, {"900201": "ZZOLD", "900202": "ZZNEW", "900203": "ZZC"}
+    )
+    _rename(db, "900201", "ZZOLD", "ZZNEW")
+    _rename(db, "900202", "ZZNEW", "ZZNEW1")
+
+    def year(ticker, revenue):
+        return fi._row(
+            "ARY", "2019-12-31", "2020-02-20", "2019-FY", ticker=ticker, revenue=revenue
+        )
+
+    sf1 = _file(
+        db,
+        bulk,
+        "fundamentals",
+        fi._sf1(year("ZZOLD", 1000), year("ZZNEW", 9000), year("ZZC", 3000)),
+    )
+    if paired:
+        repo.pair_sharadar_tickers(db, sf1["file_id"], tickers["file_id"])
+    _file(db, bulk, "actions", ACTIONS)
+    return sids
+
+
+def _revenue(db, sid):
+    return [r["revenue"] for r in fi._rows(db, sid=sid)]
+
+
+def test_the_sf1_backfill_loads_each_keys_own_statements(db, tmp_path):
+    sids = _sf1_swap(db, tmp_path)
+    result = fu.load(db, tmp_path, backfill=True, as_of=fi.BACKFILL_DAY)
+    assert result.counts["ticker_as_of_file"] == 2
+    # Read by tonight's tickers, 900201 would load 900202's 9000.
+    assert _revenue(db, sids["900201"]) == [D("1000")]
+    assert _revenue(db, sids["900202"]) == [D("9000")]
+    assert _revenue(db, sids["900203"]) == [D("3000")]
+
+
+def test_an_unpaired_sf1_file_skips_the_keys_renamed_since(db, tmp_path, caplog):
+    sids = _sf1_swap(db, tmp_path, paired=False)
+    result = fu.load(db, tmp_path, backfill=True, as_of=fi.BACKFILL_DAY)
+    assert result.counts["ticker_changed_since_file"] == 2
+    assert "--tables fundamentals --force" in caplog.text
+    assert _revenue(db, sids["900201"]) == [] and _revenue(db, sids["900202"]) == []
+    assert _revenue(db, sids["900203"]) == [D("3000")]
 
 
 # ---------------------------------------------------------------------------
