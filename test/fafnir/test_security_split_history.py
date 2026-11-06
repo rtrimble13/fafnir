@@ -1146,3 +1146,96 @@ def test_undo_keeps_the_row_a_vendor_identity_is_linked_to(two_issuers):
         )
         == dest
     )
+
+
+# ---------------------------------------------------------------------------
+# The suppression is the moved vendor's (GPUS, 2026-11-06)
+# ---------------------------------------------------------------------------
+
+
+def _old_dates():
+    return frozenset(dt.date.fromisoformat(d) for d in OLD)
+
+
+def test_a_split_suppresses_only_the_vendor_whose_rows_it_moved(two_issuers):
+    # The split says FMP's BID history held Sotheby's on those dates. A vendor linked
+    # to the source by its own key serves the source issuer's bar for them, which is
+    # the bar the split left missing; FMP's reload would put Sotheby's back.
+    db, sid = two_issuers
+    assert _split_off("--yes").exit_code == 0
+
+    assert _old_dates() <= repo.suppressed_price_dates(db, sid)
+    assert _old_dates() <= repo.suppressed_price_dates(db, sid, vendor="fmp")
+    assert not _old_dates() & repo.suppressed_price_dates(db, sid, vendor="sharadar")
+    key = (sid, "dividend", dt.date(2024, 1, 4))
+    assert key in repo.suppressed_action_keys(db, sid)
+    assert key in repo.suppressed_action_keys(db, sid, vendor="fmp")
+    assert key not in repo.suppressed_action_keys(db, sid, vendor="sharadar")
+    assert key not in repo.suppressed_action_keys(db, vendor="sharadar")
+
+
+def test_an_operators_own_delete_still_suppresses_every_vendor(two_issuers):
+    db, sid = two_issuers
+    out = _run(
+        "prices",
+        "delete",
+        "--symbol",
+        "BID",
+        "--date",
+        "2024-06-04",
+        "-m",
+        "bad print",
+        "--by",
+        "claude",
+        "--yes",
+    )
+    assert out.exit_code == 0, out.output
+    assert _split_off("--yes").exit_code == 0
+
+    for vendor in (None, "fmp", "sharadar"):
+        assert dt.date(2024, 6, 4) in repo.suppressed_price_dates(
+            db, sid, vendor=vendor
+        )
+
+
+def test_undo_refuses_while_the_source_holds_its_own_bar_on_a_moved_date(two_issuers):
+    # Sharadar has since written the source issuer's bar on 2024-01-03. The undo
+    # would put Sotheby's bar back ON CONFLICT DO NOTHING and then delete it from the
+    # destination, keeping neither.
+    db, sid = two_issuers
+    assert _split_off("--yes").exit_code == 0
+    dest = _dest(db, sid)
+    db.execute(
+        "INSERT INTO core.daily_price (security_id, trade_date, open, high, low, "
+        "close, volume, source) VALUES (%s, '2024-01-03', 12, 12, 12, 12, 500, "
+        "'sharadar')",
+        (sid,),
+    )
+    active = db.fetchval(
+        "SELECT count(*) FROM ops.operator_override WHERE revoked_at IS NULL"
+    )
+
+    out = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--into-security-id",
+        str(dest),
+        "--undo",
+        "-m",
+        "wrong boundary",
+        "--yes",
+    )
+
+    assert out.exit_code != 0
+    assert "now holds its own row on 1 of the keys the split moved" in out.output
+    assert "2024-01-03..2024-01-03" in out.output
+    assert _bars(db, dest) == {k: float(v) for k, v in OLD.items()}
+    assert _bars(db, sid)["2024-01-03"] == 12.0
+    assert (
+        db.fetchval(
+            "SELECT count(*) FROM ops.operator_override WHERE revoked_at IS NULL"
+        )
+        == active
+    )

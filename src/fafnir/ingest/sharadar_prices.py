@@ -275,8 +275,10 @@ def _gate(
         bars, _session_calendar(db, profile.get("exchange_code"), bars)
     )
     result.counts["non_session"] += off
+    # Sharadar's own bars on a date a history split moved another vendor's bar off
+    # (the moved issuer's) are this security's issuer's: only FMP's stay set aside.
     bars, removed = _drop_suppressed(
-        bars, repo.suppressed_price_dates(db, t.security_id)
+        bars, repo.suppressed_price_dates(db, t.security_id, vendor=VENDOR)
     )
     result.counts["suppressed"] += removed
 

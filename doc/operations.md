@@ -996,6 +996,14 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   is never fed: every loader universe excludes `source = operator`, and an explicit
   `ingest prices --symbols` that resolves to one loads nothing. Moved actions are
   stored on the destination as operator rows.
+- **The suppression is the moved vendor's.** It sets aside rows from the vendor
+  whose rows the split moved (the override's `detail.row.source`, FMP so far), not
+  every vendor. A vendor linked to the source by its own key serves the source
+  issuer's row for a moved date, which is exactly the row the split left missing:
+  `ingest sharadar-prices --backfill` and `--gap-fill`, and `ingest sharadar-actions`,
+  load it. FMP's loaders still read every key. The NILE split of 2026-09-17 is the
+  case: Blue Nile's 2004–2017 bars moved off the row Sharadar feeds as GPUS
+  (formerly DPW, Ault), which then could not take its own bars for those years.
 - **`--restore-deleted`** also moves bars in the range that `prices delete` had
   already removed (their rows are in the overrides). Those deletes stay in force.
 - **Refused:** a range holding every bar the source has (that is `security merge`
@@ -1007,7 +1015,10 @@ fafnir security split-history --security-id 6598 --into-security-id 900123 \
   same destination, it undoes the most recent, so run it again for the one before. It
   is the only way back — `override revoke` on one of the split's own overrides is
   refused, because lifting one key's suppression while the destination keeps its copy
-  would leave that session on both securities after the next load. Then run `fafnir dq recheck --check outlier --check gap --check
+  would leave that session on both securities after the next load. It also refuses
+  while the source holds a row of its own on a moved key (another vendor's, loaded
+  since): putting the moved row back there would fail and its copy on the
+  destination would still be removed. Delete those rows from the source first. Then run `fafnir dq recheck --check outlier --check gap --check
   sparse_coverage` and `fafnir db refresh-marts`, as after any split.
 
 **The vendor-assisted path (#68).** When Sharadar knows the dead issuer, mint it from

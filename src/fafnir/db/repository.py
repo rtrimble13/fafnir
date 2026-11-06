@@ -3505,14 +3505,33 @@ def list_corporate_actions(
     )
 
 
+# A history split's key (`security split-history`: on the source, a key whose row
+# moved to the destination, or one the destination already held), moved off the
+# source from a vendor other than %s. The COALESCE keeps a row with no detail, no
+# split marker or no moved row's source in the suppressed set: only a split that
+# names the vendor whose row it moved is scoped.
+_SPLIT_OF_ANOTHER_VENDOR = """
+    COALESCE(
+        detail->'split'->>'kind' IN ('moved', 'duplicate')
+        AND detail->'row'->>'source' IS NOT NULL
+        AND detail->'row'->>'source' <> %s,
+        false
+    )
+"""
+
+
 def suppressed_action_keys(
-    db: Database, security_id: Optional[int] = None
+    db: Database, security_id: Optional[int] = None, *, vendor: Optional[str] = None
 ) -> set[tuple[int, str, date]]:
     """``(security_id, action_type, ex_date)`` for every action an operator deleted.
 
     The loaders set a vendor row at one of these keys aside instead of upserting it.
     The table holds a handful of rows, so the calendar sweep reads it whole once and
     the per-symbol path reads one security's slice.
+
+    ``vendor`` is the vendor about to write. A key a history split moved is then set
+    aside only for the vendor whose row the split moved (see
+    :func:`suppressed_price_dates`). Without it every deleted key counts.
     """
     sql = """
         SELECT security_id, action_type, key_date
@@ -3524,13 +3543,18 @@ def suppressed_action_keys(
     if security_id is not None:
         sql += " AND security_id = %s"
         params.append(security_id)
+    if vendor is not None:
+        sql += f" AND NOT {_SPLIT_OF_ANOTHER_VENDOR}"
+        params.append(vendor)
     return {
         (int(r["security_id"]), r["action_type"], r["key_date"])
         for r in db.fetchall(sql, params)
     }
 
 
-def suppressed_price_dates(db: Database, security_id: int) -> frozenset[date]:
+def suppressed_price_dates(
+    db: Database, security_id: int, *, vendor: Optional[str] = None
+) -> frozenset[date]:
     """Trade dates of this security's bars an operator edited. The price loader sets
     a vendor bar on one of these dates aside instead of upserting it.
 
@@ -3539,17 +3563,28 @@ def suppressed_price_dates(db: Database, security_id: int) -> frozenset[date]:
     the vendor still serves its own copy of that date -- the wrong-scale original, or
     whatever it has on the date a bar was moved to -- and upserting it would silently
     undo the correction.
+
+    ``vendor`` is the vendor about to write. A date a history split moved
+    (`security split-history`: a 'delete' whose ``detail.split`` is moved or
+    duplicate) is then set aside only for the vendor whose row the split moved,
+    ``detail.row.source``. The split says that vendor's history for this ticker held
+    another issuer on those dates; a vendor linked to the source by its own key
+    serves the source issuer's bar for the date instead, which is the bar the split
+    left missing. The FMP loaders read every key: FMP is the vendor such a split
+    moved, and its full-history reload of the ticker would put the other issuer
+    back. The NILE split of 2026-09-17 moved Blue Nile's 2004-2017 bars off the row
+    Sharadar feeds as GPUS, which then could not take its own bars for those years.
+    Without ``vendor`` every edited date counts.
     """
-    return frozenset(
-        r["key_date"]
-        for r in db.fetchall(
-            """
-            SELECT DISTINCT key_date FROM ops.operator_override
-             WHERE target = 'daily_price' AND revoked_at IS NULL AND security_id = %s
-            """,
-            (security_id,),
-        )
-    )
+    sql = """
+        SELECT DISTINCT key_date FROM ops.operator_override
+         WHERE target = 'daily_price' AND revoked_at IS NULL AND security_id = %s
+    """
+    params: list[Any] = [security_id]
+    if vendor is not None:
+        sql += f" AND NOT {_SPLIT_OF_ANOTHER_VENDOR}"
+        params.append(vendor)
+    return frozenset(r["key_date"] for r in db.fetchall(sql, params))
 
 
 def _active_override(
@@ -5491,6 +5526,38 @@ def undo_history_split(
     if not rows:
         raise OverrideRefused(
             f"No active split from security {source_id} to {destination_id}."
+        )
+    # A moved key the source has since taken a row on: another vendor's, which the
+    # split's suppression lets through (suppressed_price_dates). The undo writes the
+    # moved row back ON CONFLICT DO NOTHING and then removes the destination's copy,
+    # so it would keep neither. Refused before anything changes, naming the keys.
+    occupied = [
+        o["key_date"]
+        for o in rows
+        if int(o["security_id"]) == source_id
+        and o["operation"] == "delete"
+        and o["detail"]["split"]["kind"] == "moved"
+        and (
+            db.fetchval(
+                "SELECT 1 FROM core.daily_price "
+                "WHERE security_id = %s AND trade_date = %s",
+                (source_id, o["key_date"]),
+            )
+            if o["target"] == "daily_price"
+            else db.fetchval(
+                "SELECT 1 FROM core.corporate_action "
+                "WHERE security_id = %s AND action_type = %s AND ex_date = %s",
+                (source_id, o["action_type"], o["key_date"]),
+            )
+        )
+    ]
+    if occupied:
+        raise OverrideRefused(
+            f"Security {source_id} now holds its own row on {len(occupied)} of the "
+            f"keys the split moved ({min(occupied)}..{max(occupied)}), written by "
+            "another vendor after the split. Undoing would drop the moved rows from "
+            "both securities. Delete those rows from the source first "
+            "(`fafnir prices delete` / `fafnir actions delete`), then undo."
         )
 
     def _revoke(oid: int) -> None:

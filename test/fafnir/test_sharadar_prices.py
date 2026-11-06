@@ -334,6 +334,49 @@ def test_gap_fill_adds_only_the_dates_fmp_lacks_from_the_link(db, tmp_path):
     assert repo.get_watermark(db, "sharadar", "SEP", fmp) is None  # FMP feeds it
 
 
+@integration
+def test_backfill_takes_its_own_bar_on_a_date_a_history_split_moved(db, tmp_path):
+    # GPUS, 2026-11-06: a split moved another issuer's FMP bars off the row
+    # Sharadar feeds (Blue Nile off NILE). Sharadar's bar for such a date is the
+    # source issuer's own and is loaded; a date an operator deleted is still not.
+    fed = _security(db, "ZZG", source="fmp")
+    _vendor(db, "900004", "ZZG")
+    _link(db, fed, "900004", Y(2010, 1, 4), feed=True)
+    db.execute(
+        "INSERT INTO ops.operator_override (security_id, target, key_date, "
+        "operation, note, created_by, detail) VALUES (%s, 'daily_price', "
+        "'2010-01-06', 'delete', 'another issuer', 't', %s::jsonb)",
+        (
+            fed,
+            '{"row": {"close": "3", "source": "fmp"}, '
+            '"split": {"kind": "moved", "source_security_id": 1, '
+            '"destination_security_id": 2}}',
+        ),
+    )
+    db.execute(
+        "INSERT INTO ops.operator_override (security_id, target, key_date, "
+        "operation, note, created_by) VALUES (%s, 'daily_price', '2010-01-07', "
+        "'delete', 'bad print', 't')",
+        (fed,),
+    )
+    _file(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES
+        + _bar("ZZG", "2010-01-05", "21", "21")
+        + _bar("ZZG", "2010-01-06", "22", "22")  # the split moved FMP's: loaded
+        + _bar("ZZG", "2010-01-07", "23", "23"),  # the operator deleted: not
+    )
+    _file(db, tmp_path, "actions", ACTIONS)
+    result = sp.load(db, tmp_path, backfill=True, gap_fill=False, as_of=Y(2026, 1, 2))
+    assert result.counts["suppressed"] == 1
+    bars = _bars(db, fed)
+    assert set(bars) == {Y(2010, 1, 5), Y(2010, 1, 6)}
+    assert bars[Y(2010, 1, 6)]["source"] == "sharadar"
+    assert bars[Y(2010, 1, 6)]["close"] == D("22")
+
+
 def _date_major(db, tmp_path):
     """Two dead issuers whose rows the file interleaves by date, as SEP does."""
     sids = []
