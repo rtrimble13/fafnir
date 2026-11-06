@@ -78,7 +78,7 @@ from fafnir.ingest.daily_price import (
     _validate_bar,
 )
 from fafnir.ingest.runlog import RunLog
-from fafnir.ingest.sharadar_master import SECURITY_TABLES, master_row
+from fafnir.ingest.sharadar_master import SECURITY_TABLES
 from fafnir.logging_config import get_logger
 from fafnir.sources import sharadar_files as sf
 
@@ -357,8 +357,8 @@ def file_tickers(
     A SEP or SFP row carries no permaticker, only the ticker of the day the file was
     fetched, and Sharadar files a key's history under its current ticker. So the
     map is the TICKERS file the price file was fetched with (``filters.
-    tickers_file_id``, :func:`fafnir.ingest.sharadar_bulk.download_tables`), read as
-    `ingest sharadar-master` reads it. None when the price file names none (one
+    tickers_file_id``, :func:`fafnir.ingest.sharadar_bulk.download_tables`). None
+    when the price file names none (one
     fetched before #238) or that TICKERS file is no longer on disk."""
     tickers_id = (entry.get("filters") or {}).get("tickers_file_id")
     if tickers_id is None:
@@ -366,9 +366,8 @@ def file_tickers(
     out: dict[str, str] = {}
     try:
         for r in ledger.rows(db, int(tickers_id), bulk_dir):
-            row = master_row(r)
-            if row is not None and row["vendor_table"] == entry["vendor_table"]:
-                out[row["vendor_key"]] = row["ticker"]
+            if sf.canonical_table(r["table"]) == entry["vendor_table"]:
+                out[str(r["permaticker"])] = r["ticker"]
     except sf.SharadarFileError as exc:
         logger.warning(
             "file %s's TICKERS file %s cannot be read (%s): its renamed keys are "
@@ -879,7 +878,11 @@ def nightly(
         applied = {f["file_id"] for f in pending[table]}
         older = [f for f in every if f["file_id"] not in applied]
         moved = (
-            renamed_since(db, {k: tickers[k].vendor_key for k in new}, _since(older[0]))
+            renamed_since(
+                db,
+                {k: tickers[k].vendor_key for k in new},
+                min(_since(f) for f in older),
+            )
             if older
             else set()
         )
