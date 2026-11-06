@@ -7021,10 +7021,10 @@ def sharadar_file(db: Database, file_id: int) -> Optional[dict]:
 
 
 def pair_sharadar_tickers(db: Database, file_id: int, tickers_file_id: int) -> None:
-    """Record the TICKERS file a full price file was fetched with, as its
-    ``filters.tickers_file_id`` (#238). A price file's rows carry the ticker of the
-    day it was fetched: the readers map a key to that ticker through this TICKERS
-    file, and `sharadar-prune` keeps it while the price file is kept."""
+    """Record the TICKERS file a full SEP, SFP or SF1 file was fetched with, as its
+    ``filters.tickers_file_id`` (#238). Their rows carry the ticker of the day the
+    file was fetched: the readers map a key to that ticker through this TICKERS
+    file, and `sharadar-prune` keeps it while the full file is kept."""
     db.execute(
         """
         UPDATE landing.sharadar_file

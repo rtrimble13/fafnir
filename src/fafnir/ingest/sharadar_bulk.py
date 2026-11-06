@@ -16,10 +16,11 @@ For each table asked for:
 4. **Record it** in ``landing.sharadar_file`` with its row count, then mark the
    table's older full files superseded. The same content downloaded twice is one
    file, not two.
-5. **Pair a price file** (#238). A full SEP or SFP file is fetched with TICKERS,
-   forced, just before it, and records that file as ``filters.tickers_file_id``:
-   its rows carry only the ticker of the day, and the readers map each security to
-   it through that file (:func:`fafnir.ingest.sharadar_prices.file_tickers`).
+5. **Pair it with TICKERS** (#238). A full SEP, SFP or SF1 file is fetched with
+   TICKERS, forced, just before it, and records that file as
+   ``filters.tickers_file_id``: its rows carry only the ticker of the day, and the
+   readers map each security to it through that file
+   (:func:`fafnir.ingest.sharadar_prices.tickers_as_of_file`).
 
 Each table is its own ``ops.ingestion_run`` (``source = sharadar``, ``endpoint =
 bulk:<table>``), with the bytes downloaded and, in ``params``, the rows, file and
@@ -66,9 +67,9 @@ logger = get_logger("ingest.sharadar_bulk")
 #: What the initial population downloads (plan v2, P1). Legacy codes are
 #: accepted and recorded under the modern name.
 DEFAULT_TABLES = ("tickers", "actions", "SEP", "SFP", "SF1")
-#: The price tables a full file of is read by ticker, so it is fetched with TICKERS
-#: and records which (#238).
-PAIRED_TABLES = ("stocks", "funds")
+#: The tables whose rows carry only a ticker, so a full file of one is fetched with
+#: TICKERS and records which (#238): SEP, SFP and SF1.
+PAIRED_TABLES = ("stocks", "funds", "fundamentals")
 #: What the nightly fetches as deltas, by ``lastupdated``: the price tables (#98)
 #: and SF1 (#106).
 DELTA_TABLES = ("SEP", "SFP", "SF1")
@@ -225,12 +226,12 @@ def download_tables(
     """:func:`download_table` for each table, in order; one table's failure does
     not stop the rest.
 
-    A full file of a price table (:data:`PAIRED_TABLES`) is fetched with TICKERS,
+    A full file of SEP, SFP or SF1 (:data:`PAIRED_TABLES`) is fetched with TICKERS,
     whole and forced, just before it (#238). Its rows carry only the ticker of the
     day, and a ticker can pass to another issuer later: the full file records that
     TICKERS file (:func:`repository.pair_sharadar_tickers`), so its readers know
-    which security each ticker named. A price table this run skips (a current full
-    file, and no ``force``) keeps the pairing it has."""
+    which security each ticker named. A table this run skips (a current full file,
+    and no ``force``) keeps the pairing it has."""
     if str(years) not in BULK_YEARS:
         raise ValueError(f"years must be one of {BULK_YEARS}, not {years!r}")
     fetching = [
