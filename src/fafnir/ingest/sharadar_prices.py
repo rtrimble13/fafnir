@@ -396,7 +396,7 @@ def file_tickers(
 
 
 def renamed_since(db: Database, tickers: dict[str, str], since: date) -> set[str]:
-    """The keys of ``tickers`` (``ticker -> key``, as tonight's TICKERS has them) a
+    """The keys of ``tickers`` (``key -> ticker``, as tonight's TICKERS has them) a
     ticker change dated on or after ``since`` touches: one of the key's own, or
     another key's to or from the same ticker (#238). A file fetched before such a
     change may name this key's rows by another ticker, or another key's by this
@@ -404,7 +404,7 @@ def renamed_since(db: Database, tickers: dict[str, str], since: date) -> set[str
     events = repo.vendor_renames_since(db, VENDOR, since)
     keys = {e["vendor_key"] for e in events}
     named = {x for e in events for x in (e["ticker"], e["contra_ticker"]) if x}
-    return {key for ticker, key in tickers.items() if key in keys or ticker in named}
+    return {key for key, ticker in tickers.items() if key in keys or ticker in named}
 
 
 def _since(entry: dict) -> date:
@@ -460,7 +460,7 @@ def prepare(
             as_of = file_tickers(db, bulk_dir, entry)
             if as_of is None:
                 renamed = renamed_since(
-                    db, {ticker: t["vendor_key"] for ticker, t in rows}, _since(entry)
+                    db, {t["vendor_key"]: ticker for ticker, t in rows}, _since(entry)
                 )
                 if renamed:
                     logger.warning(
@@ -895,7 +895,7 @@ def nightly(
         moved = (
             renamed_since(
                 db,
-                {k: tickers[k].vendor_key for k in new},
+                {tickers[k].vendor_key: k for k in new},
                 min(_since(f) for f in older),
             )
             if older
