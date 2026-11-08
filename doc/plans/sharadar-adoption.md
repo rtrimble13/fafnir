@@ -537,7 +537,28 @@ These pass to ordinary operations, outside this plan:
     working agreements and the costs; the risks' outcomes; *Issue dispositions (at the close)*; the
     *Retrospective*.
   - **The docs audit:** every page in [index.md](../index.md) read for FMP-as-primary wording and for Tiingo,
-    FRED, BLS or BEA as planned. **[audit: the pages changed]**
+    FRED, BLS or BEA as planned, each finding checked against the code before it was changed.
+    - **No Tiingo, FRED, BLS or BEA wording was left as planned.** #124 and #130 had done that.
+    - **Changed,** where a page described FMP mode as the night, or Sharadar's work as to come:
+      - `architecture.md`: Sharadar's raw bars; the discovered universe from TICKERS;
+      - `data_dictionary.md`: `core.security`'s source and `updated_at`, the FMP endpoint table, the
+        universe;
+      - `extending.md`: the fundamentals shipped;
+      - `install_hetzner.md`: Sharadar's hosts and key, and the cutover after the install;
+      - `backfill.md`: the fundamentals backfill ran; survivorship;
+      - `ingestion.md`, `operations.md`: `--allow-secondary` on the fund and re-fetch commands, the
+        Sharadar mode of the delisting checks, and the cutover runbook done on 2026-10-22;
+      - `etc/fafnirrc` (comments): `SHARADAR_API_KEY`, the production setting;
+      - the fafnir-dba skill: the Sharadar pre-flight ping, Sharadar mode as the current one, precedence.
+    - **No finding:** README, `duk.md`, `agent.md`, `fundamentals.md`, `dorq.md`, `releasing.md`,
+      `nightly_report.md`, and the ADRs' status notes.
+    - **The data dictionary is complete** for every table and view from migration 0025 to 0044. Its
+      inventory gained `mart.v_share_factor_versions` and `mart.fn_daily_market_cap`, and its header
+      moved to 0044.
+    - **Left for #128:** the FMP plan's name ("Professional"), the 300 requests a minute and the 50 GB a
+      month, which the reduced tier may change.
+    - **Left for its own change:** the skill's re-fetch steps for a bad bar, which name FMP's `ingest
+      prices`. That changes playbook logic.
   - **ADR 0017:** a status note; **[#128: Accepted, or still proposed]**.
   - **Measured:** nothing; docs only. `check_doc_links.py` passes.
 
