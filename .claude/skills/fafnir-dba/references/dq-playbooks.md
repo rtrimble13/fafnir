@@ -120,9 +120,13 @@ only, and peers on the same venue traded (so the calendar is wrong for this
 security, not the load).
 
 **Escalate / repair when** many securities share the date — that is a missed load,
-not a market fact. Re-ingest the window first:
-`sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --symbols <SYM> --from <date> --to <date>`,
-then re-check. Resolving two hundred gap flags individually is the wrong answer to
+not a market fact. Re-ingest the window first, from the vendor that feeds them
+([Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows)). For FMP-fed
+securities:
+`sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --allow-secondary --symbols <SYM> --from <date> --to <date>`.
+For Sharadar-fed ones, a missed night is read again by the next, and an older date
+is filled by `ingest sharadar-prices --backfill --symbols <SYM>`, dry run first.
+Then re-check. Resolving two hundred gap flags individually is the wrong answer to
 one missed night.
 
 **Close with `dq recheck --check gap`** after any repair: the bar now exists, so
@@ -155,8 +159,12 @@ SELECT count(*) AS bars, count(*) FILTER (WHERE volume = 0) AS zero_volume,
   FROM core.daily_price WHERE security_id = <id>;
 ```
 
-A re-ingest of one thin window settles it: `ingest prices --symbols <SYM> --from
-<d> --to <d>` returning ~0 `rows_inserted` means the bars are not there to fetch.
+A re-ingest of one thin window settles it. On an FMP-fed security, `ingest prices
+--allow-secondary --symbols <SYM> --from <d> --to <d>` returning ~0 `rows_inserted`
+means the bars are not there to fetch. On a Sharadar-fed one, `ingest
+sharadar-prices --backfill --symbols <SYM> --dry-run` with 0 `bars to write` says
+the same of the vendor's file
+([Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows)).
 
 **Do not** resolve it as "backfilled" and do not bulk re-ingest the cohort on the
 strength of the flag alone. Nothing has been repaired: the condition is still true
@@ -177,7 +185,7 @@ the bound the query walks every partition and times out.
   block of missing history. These are permanent and true; a resolve returns on the
   next `dq run`.
 - **`accept`** — a dead Sharadar history (`source = 'sharadar'`, delisted): its bars
-  are final, and the re-ingest above does not apply (FMP never feeds it). In bulk,
+  are final, and FMP's re-ingest above does not apply (FMP never feeds it). In bulk,
   by rule: see `sweep-policy.md`, "Dead Sharadar histories".
 - **Leave open** — an **active** security with a gap of more than 180 days ending
   in the last 18 months, *especially* when the price level jumps across the gap.
@@ -272,12 +280,20 @@ explanation. The queries and thresholds for each are in
   misses edges, so a leftover open flag is often **the other half of a pair already
   accepted** — find the partner in any state before treating it as new, and look at
   the window: most are two or three scales alternating day by day, not a clean block.
-- **An isolated bad bar** can be re-fetched: the loader overwrites bars on
-  re-ingest. **Probe first** (`source probe-prices --symbol <SYM> --date <d>`, read
-  the whole output): when FMP has corrected it, re-fetch with `ingest prices
+- **An isolated bad bar** can be re-fetched only from the vendor that feeds the
+  security: read which first
+  ([Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows)). On an
+  **FMP-fed** security, FMP's loader overwrites a bar on an explicit re-fetch.
+  **Probe first** (`source probe-prices --symbol <SYM> --date <d>`, read the whole
+  output): when FMP has corrected it, re-fetch with `ingest prices --allow-secondary
   --symbols <SYM> --from <d> --to <d>` and keep the session (GEVX, 251,705 → 20.57).
-  When the vendor re-serves the same bad value, `fafnir prices delete --symbol <SYM>
-  --date <d>` removes it and keeps it out; the session then reads as a gap, to
+  On a **Sharadar-fed** one, an FMP bar from before the cutover is replaced by
+  `vendor correct --symbols <SYM>` (the dry run yours, the run the operator's). A
+  bar of Sharadar's own has no re-fetch: the nightly rewrites it only when the
+  vendor revises it, and what Sharadar serves now is the operator's
+  `duk -S sharadar ph` read.
+  When the feeding vendor serves the same bad value, `fafnir prices delete --symbol
+  <SYM> --date <d>` removes it and keeps it out; the session then reads as a gap, to
   accept. Scan the security's whole history for other bars far from their
   neighbours first, so one delete batch takes them all (RUSS: 11 zero-volume bars at
   ~5×, none after 2011).
@@ -304,7 +320,10 @@ explanation. The queries and thresholds for each are in
 Every one of these is `--dry-run` first, `--note` always, and recorded in
 `ops.operator_override` (`fafnir override list`). A deleted bar survives only in its
 override's `detail.row`: `override revoke` lifts the suppression but **does not write
-the row back** — the next load, or an explicit `ingest prices`, does. A bar *edited* by
+the row back**. On an FMP-fed security the next load, or an explicit `ingest prices
+--allow-secondary --from`, does. On a Sharadar-fed one the nightly reads only the
+vendor's deltas, so nothing does until `ingest sharadar-prices --backfill --symbols
+<SYM>` reads the date from the current full file. A bar *edited* by
 `prices shift|rescale` is the exception: revoking any override of that edit removes
 the operator's bars and writes the vendor's back exactly as they stood, because the
 edit replaced them rather than judging them worthless. Deletes need migration 0025
@@ -583,11 +602,20 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices --symbol <SYM> -
 
 **Repair.** Stored side right: nothing to change; the vendor's wrong re-read is held
 off every night. Incoming side right: re-fetch the date explicitly, which overwrites,
-prints what it restated, and resolves this flag itself:
+prints what it restated, and resolves this flag itself. Since the cutover the flag
+comes only from FMP's secondary load, on an FMP-fed security, so the re-fetch takes
+`--allow-secondary`:
 
 ```bash
-sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --symbols <SYM> --from <d> --to <d>
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --allow-secondary --symbols <SYM> --from <d> --to <d>
 ```
+
+A flag from before the cutover on a security Sharadar now feeds has no FMP re-fetch:
+the loader skips the security, and FMP no longer re-reads the date. The stored bar
+is FMP's, and `vendor correct` compares it with Sharadar's
+([Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows)). `vendor correct`
+does not resolve this flag; since nothing re-reads the date, nothing writes it again
+either.
 
 Read the restated table it prints: ZBAO's re-fetch put the prices right and returned
 volume x50 in the same breath. If neither side is right, `prices delete` the bar.
@@ -610,11 +638,16 @@ volume consistent with the vendor's adjusted bar. It was not stored. `detail` na
 the split, the factor and which volume shape it matched.
 
 **Repair-first.** Probe the date (`source probe-prices`): the split-adjusted feed
-should equal the incoming bar. Then re-fetch once the vendor serves the raw bar, or
-let the watermark budget release it and fill the gap by hand-checked re-fetch. If
-the split on file is itself wrong (misdated, a phantom), fix the action (`actions
-delete|redate`) and re-fetch. **Close with:** the re-fetch that stores the raw bar,
-then resolve with the evidence. Never accept: it is a bar the warehouse does not hold.
+should equal the incoming bar. Then re-fetch (`ingest prices --allow-secondary
+--symbols <SYM> --from <d> --to <d>`: only FMP's loader writes this flag, so the
+security is FMP-fed) once the vendor serves the raw bar, or let the watermark budget
+release it and fill the gap by hand-checked re-fetch. If the split on file is itself
+wrong (misdated, a phantom), fix the action (`actions delete|redate`) and re-fetch.
+A flag from before the cutover on a security Sharadar now feeds is a date that
+security lacks, which FMP will not fill:
+[Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows). **Close with:** the
+re-fetch that stores the raw bar, then resolve with the evidence. Never accept: it
+is a bar the warehouse does not hold.
 
 ---
 
@@ -1378,13 +1411,13 @@ by hand (`references/outlier-classification.md`, sections in brackets):
 | `dorq_split_without_jump`, `dorq_split_double_applied` | an action or bar repair | **Never** — see below |
 | `dorq_split_ratio_mismatch`, `dorq_dividend_implausible` | correct the action on file | the repair, then `dq recheck` |
 | `dorq_bad_context_row` | correct or delete the action on file (`actions delete`, then `actions add`). A skipped split can also surface as `dorq_unreported_split`: fix the row first | the repair, then `dq recheck` |
-| `dorq_missing_run`, `dorq_cohort_gap` | `ingest prices --symbols … --from … --to …` | the repair, then `dq recheck` |
-| `dorq_frequency_gap` | a thin series dorq reads as weekly or monthly, missing whole periods: re-fetch them with `ingest prices`. If the vendor has no bar, the security did not trade | the repair, then `dq recheck`; **accept** a period with no trading |
+| `dorq_missing_run`, `dorq_cohort_gap` | `ingest prices --allow-secondary --symbols … --from … --to …` on an FMP-fed security; on a Sharadar-fed one, [the backfill](#re-fetching-a-bar-what-each-feed-allows) | the repair, then `dq recheck` |
+| `dorq_frequency_gap` | a thin series dorq reads as weekly or monthly, missing whole periods: re-fetch them from the feeding vendor ([per feed](#re-fetching-a-bar-what-each-feed-allows)). If the vendor has no bar, the security did not trade | the repair, then `dq recheck`; **accept** a period with no trading |
 | `dorq_stale_feed` | as `stale`. fafnir leaves out stale-feed reports on securities not actively trading, by `stale`'s own rule, so every one here is on a security still trading | as `stale`. `dq recheck` closes it once the security stops trading |
 | `dorq_repeated_price` | as `stale` | as `stale` |
-| `dorq_zero_range_with_volume` | re-fetch the bar. Check first for a cash takeover pinning the price (below) | the repair, then `dq recheck`; **accept** a deal-price pin |
-| `dorq_move_on_zero_volume` | probe the vendor (§3), then re-fetch the bar; `prices delete` if it re-serves an indicative quote | the repair, then `dq recheck` |
-| `dorq_volume_scale_shift` | `prices rescale --factor 1 --volume-factor V` over the era (§2i), or re-fetch it | the repair, then `dq recheck` |
+| `dorq_zero_range_with_volume` | re-fetch the bar ([per feed](#re-fetching-a-bar-what-each-feed-allows)). Check first for a cash takeover pinning the price (below) | the repair, then `dq recheck`; **accept** a deal-price pin |
+| `dorq_move_on_zero_volume` | probe the vendor (§3), then re-fetch the bar ([per feed](#re-fetching-a-bar-what-each-feed-allows)); `prices delete` if it re-serves an indicative quote | the repair, then `dq recheck` |
+| `dorq_volume_scale_shift` | `prices rescale --factor 1 --volume-factor V` over the era (§2i), or re-fetch it ([per feed](#re-fetching-a-bar-what-each-feed-allows)) | the repair, then `dq recheck` |
 | `dorq_non_session_bar` | `prices delete --non-session`, after the weekday check under `outlier`: a history dated a day early wants `prices shift` (§2i) | the repair, then `dq recheck` |
 | `dorq_precision_shift` | an era of computed, back-adjusted prices in the raw feed (WZRD, SMUP): `prices rescale` it to as-traded once an outside source confirms the scale (§2i) | the repair, then `dq recheck` |
 
@@ -1476,7 +1509,9 @@ Check `delisted_date` and the last sessions' closes. A delisting within days of
 the bar, with the closes before it at or near one price, is the pin. **Accept**
 it, and name the deal in the note.
 
-Otherwise re-fetch the bar (`ingest prices --symbols <SYM> --from <d> --to <d>`).
+Otherwise re-fetch the bar: `ingest prices --allow-secondary --symbols <SYM> --from
+<d> --to <d>` on an FMP-fed security, and on a Sharadar-fed one what
+[Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows) allows.
 If the vendor serves the same flat bar on a price small enough for its range to
 round away, it is `price_scale_collapse`'s case: report it, and do not resolve.
 
@@ -1930,3 +1965,96 @@ primary*), the queue changes shape. Judge it by these, not by the FMP-era habits
   `(old_symbol, new_symbol)` record key, so Sharadar's step closes it when it
   applies that rename (#93). One whose rename Sharadar never files stays open:
   work it through its own entry.
+
+### Re-fetching a bar: what each feed allows
+
+The re-fetches in the entries above were written for FMP's night. In Sharadar mode
+`ingest prices` is refused without `--allow-secondary`, and with it loads only what
+FMP still feeds. Before any re-fetch, read who feeds the security and whose the bar
+is (a null `bar_source` is a date the security lacks):
+
+```sql
+SELECT s.source AS minted_by, x.vendor AS feed, x.valid_from, p.source AS bar_source
+  FROM core.security s
+  LEFT JOIN core.security_vendor_xref x
+    ON x.security_id = s.security_id AND x.is_feed AND x.valid_to IS NULL
+  LEFT JOIN core.daily_price p
+    ON p.security_id = s.security_id AND p.trade_date = '<d>'
+ WHERE s.security_id = <id>;
+```
+
+**FMP-fed: `feed` null, `minted_by = 'fmp'`** (`repo.fmp_fed`: the funds and the
+unlinked names). Probe, then re-fetch as the secondary vendor:
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices --symbol <SYM> --date <d>
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest prices --allow-secondary --symbols <SYM> --from <d> --to <d>
+```
+
+`--allow-secondary` is the mode the night itself runs FMP in, not a way round the
+guard. The loader still writes only what FMP feeds, and with `--from` it does what
+the entries above say: it overwrites, prints what it restated, and resolves
+`price_restatement_conflict` on its dates; it has no `--dry-run`. On any other
+security it writes nothing, so it never turns a refused step into a repair
+(automations.md, "FMP as secondary").
+
+**Sharadar-fed: `feed = 'sharadar'`.** FMP's loader skips it even with the flag
+(`which FMP does not feed; not loading prices into it`), and a `--from` run then
+fails with `FMP returned no bars`. What repairs a wrong bar depends on whose it is:
+
+- **`bar_source = 'fmp'`**: FMP's history from before the link or the cutover, which
+  the nightly keeps (`kept:fmp`). `vendor correct` replaces FMP's bars where
+  Sharadar's current full file differs. It reads the file on disk, so the dry run
+  is yours:
+
+  ```bash
+  sudo -u fafnir /opt/fafnir/.venv/bin/fafnir vendor correct --symbols <SYM> --dry-run
+  ```
+
+  It is not a one-bar re-fetch. It compares every FMP bar from `valid_from` on,
+  replaces each that differs by more than max($0.01, 1 bp), and keeps FMP's volume
+  unless `--volume sharadar`. Read `differ` against the bars you meant, then propose
+  the operator's run, as under
+  [`vendor_history_disagrees`](#vendor_history_disagrees--a-linked-securitys-history-to-correct).
+  A bar before `valid_from`, or on a date Sharadar's file lacks or agrees with,
+  stays as it is.
+- **`bar_source = 'sharadar'`: nothing re-fetches one bar.** `ingest sharadar-prices
+  --backfill` reads only the dates a security does not hold (`held_or_outside` in
+  its counts), so a fresh full SEP or SFP file and a backfill write nothing over it.
+  `vendor correct` compares FMP's bars only. The one writer is the nightly, on its
+  own: it rewrites Sharadar's bar when a delta carries the vendor's revision of it
+  (`revised` in the `prices:nightly` counts). A wrong Sharadar bar still stored is
+  one the vendor still serves, or one it changed without restamping. What Sharadar
+  serves now is the operator's read: its key is only in `/etc/fafnir/fafnir.env`,
+  which your sudo rule does not load.
+
+  ```bash
+  sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; duk -S sharadar ph <TICKER> -s <d> -e <d>'
+  ```
+
+  `<TICKER>` is the vendor's, from `core.vendor_security`. The same bar: the repair
+  is the entry's own (`prices delete`, `prices shift|rescale`) or its accept.
+  Another bar: report it and leave the flag open. Re-reading the date is the
+  operator's call: `prices delete`, then `override revoke`, leaves it unheld, and
+  `ingest sharadar-prices --backfill --symbols <SYM>` then reads it from the
+  current full file. That file must postdate the vendor's fix (`sharadar_files`);
+  a fresh one is the operator's `source sharadar-bulk --tables SEP --force` (`SFP`
+  for a fund), and the backfill's caveat below applies.
+
+**A date a Sharadar-fed security lacks** is for a backfill to fill. A missed night
+is read again by the next (automations.md, "No bars tonight"). The backfill reads
+only the current full file:
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest sharadar-prices --backfill --symbols <SYM> --dry-run
+```
+
+It reads the whole file, so run it in the background. `bars to write` counts every
+date the file holds that the security lacks. On a security Sharadar minted, run it
+for real. On one FMP minted, it is not bounded by `valid_from` (the nightly is):
+a count beyond the dates you meant includes dates before the link, which can be
+another issuer's era (#68). Do not run that; report it. `--gap-fill` reads only
+linked securities Sharadar does not feed, which since the cutover is normally none.
+
+**An operator-minted security** (`minted_by = 'operator'`, from `security
+split-history`) has no feed, and nothing re-fetches it.
