@@ -103,6 +103,11 @@ sudo -n -l
 # Read-only; confirms the DB config resolves.
 sudo -u fafnir /opt/fafnir/.venv/bin/fafnir dq list | head -3
 
+# 2 requests; fails fast if the Sharadar key is absent or served as the free tier.
+# The key is only in /etc/fafnir/fafnir.env, which this sudo rule does not load,
+# so a failure here can mean "not in this shell", not "not on the host".
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source ping --require-paid
+
 # 3 requests; fails fast if the FMP key is absent.
 sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
     --symbol AAPL --date 1990-01-02
@@ -113,10 +118,21 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
   (`etc/agent/sudoers.example`). That refusal reads like a policy block and is not
   one: never report a task as blocked on it. Every example in these files uses the
   full path for the same reason.
-- **If the FMP key is absent, every repair needing a fresh vendor fetch is
-  blocked** — re-ingests, backfills, re-fetching a bad bar. The probe costs 3
-  requests and fails fast. Say so in the *first* report, not when a repair fails
-  halfway through a plan.
+- **A vendor's key blocks only the repairs that call that vendor's API.** FMP's
+  (the probe above) is needed only for the securities FMP still feeds
+  (`repo.fmp_fed`: the funds and the unlinked names): their re-ingests and bar
+  re-fetches (`source probe-prices`, `ingest prices --allow-secondary`, `ingest
+  actions --allow-secondary`). Without it those are blocked, and nothing on a
+  Sharadar-fed security is. Sharadar's repairs read the files already under
+  `[sharadar] bulk_dir` and need no key: `ingest sharadar-prices --backfill`,
+  `ingest sharadar-actions --backfill`, `vendor correct`. They are only as current
+  as the ledger's full file (`sharadar_files`). Sharadar's key is for its API alone
+  (`duk -S sharadar …`, `source sharadar-bulk|delta`), and since your sudo rule
+  does not load it, those reads are the operator's, run with the env file loaded
+  (`sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; fafnir …'`,
+  as `doc/operations.md` does). Each probe costs 2 or 3 requests and fails fast.
+  Say what is blocked in the *first* report, not when a repair fails halfway
+  through a plan.
 - **Know which version is deployed** before concluding a defect is unfixed. A fix
   that is merged is not a fix that is running — `/opt/fafnir` is upgraded by a
   `git pull` somebody has to do.
@@ -170,7 +186,7 @@ a revoke that in fact left the security with none.
 | A price series | `price_history` (say raw or adjusted) |
 | A statement as known on a date | `statements_as_of` (pass `as_of` for anything historical) |
 | A security's factors, now or at a month-end | `factor_row` |
-| Live names the vendor stopped serving | `fafnir source vendor-gaps` (reads only) |
+| Live names FMP stopped serving (FMP-fed only) | `fafnir source vendor-gaps` (reads only) |
 | dorq against the SQL checks and the labels | `fafnir dq compare --labels-from-db` (reads only) |
 | Timers, journal, disk, backups | `scripts/monitor.sh` (changes nothing) |
 | To change something | the `fafnir` CLI, under `sudo -u fafnir` |

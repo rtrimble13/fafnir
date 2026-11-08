@@ -52,6 +52,7 @@ dorq_path = "/opt/dorq/bin/dorq"          # or FAFNIR_DORQ_PATH
 dorq_config = "/etc/fafnir/dorq.toml"     # dorq's settings; empty: dorq's defaults
 dorq_shadow = true         # dorq's flags to dorq_shadow_dir, not the queue
 dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"   # absolute on a host: see below
+dorq_work_dir = ""         # a run's working files; empty: dorq-work beside the shadow dir
 dorq_lookback_sessions = 260              # bars per security on a nightly run
 dorq_threads = 0           # 0: one per core; the output does not depend on it
 dorq_backfill_max = 500    # most securities a night's backfill judges (see Window)
@@ -66,6 +67,16 @@ then look somewhere else and find nothing. On a host, set an absolute path the
 service user can write, such as one under its home (`/var/lib/fafnir` in
 [install_hetzner.md](install_hetzner.md)). Not one under `/home`: the units run
 with `ProtectHome=read-only`.
+
+`dorq_work_dir` is where a run keeps its working files: the calendar, actions,
+meta and items files beside dorq's input, and dorq's output before fafnir reads it.
+Each run has a directory of its own there, removed when the run ends. The next run
+prunes a directory that a killed run left, once it is 6 hours old. Empty, the
+default, is `dorq-work` beside `dorq_shadow_dir`, so `/var/lib/fafnir/dorq-work` on
+the host. It is on disk on purpose. Under a unit's `PrivateTmp` on a host whose
+`/tmp` is a tmpfs, a file in the system temporary directory is memory. That was how
+the first statements night on the host ran out of it (see
+[Memory](#memory-on-the-host)).
 
 `dorq_config` is dorq's own TOML. dorq ships fafnir's starting configuration at
 `/opt/dorq/share/dorq/priors/fafnir.toml`. Point at it from a file of your own,
@@ -704,7 +715,9 @@ fafnir dq run --no-statements             # this run without them
 3. **Run.** `dorq check --kind statements --format fafnir --exit-zero --show-info`.
    Info is shown because some of the SQL checks this run succeeds write info flags:
    a gap, a currency, a coverage hole.
-4. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`.
+4. **Write.** The rows stream from dorq's output file, one at a time, to where
+   they go. The night is never held in memory (see [Memory](#memory-on-the-host)).
+   In shadow mode the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`.
    That is a directory of its own, because `dq compare` takes the last `*.jsonl` in
    the shadow directory's top level as the newest night of bars. Otherwise the bars'
    ingest writes them, with the same open and accepted guards. Each row's
@@ -716,10 +729,17 @@ fafnir dq run --no-statements             # this run without them
    `findings`).
 5. **Record.** `ops.ingestion_run`, `source = 'dorq'`, endpoint `dq-statements-shadow`
    (or `dq-statements` into the queue), with its own watermark. The bars run's
-   window, history pass and `dq compare` never read these rows. `params` holds
-   `kind: statements`, `full: true`, `dorq_version`, `dorq_config_hash`, `bytes` (the
-   statements sent) and `reports`. A failed run leaves `status = 'failed'` and the
-   watermark where it was.
+   window, history pass and `dq compare` never read these rows. `params` holds:
+   - `kind: statements`, `full: true`, `dorq_version`, `dorq_config_hash`;
+   - `reports`;
+   - `bytes` and `bytes_out`: the statements sent and dorq's output;
+   - `dorq_max_rss_mb`: dorq's peak resident memory, as the kernel accounts for
+     the child;
+   - `fafnir_max_rss_mb`: this process's peak so far.
+
+   A failed run leaves `status = 'failed'` and the watermark where it was.
+   A run the kernel killed leaves `status = 'started'` and no `finished_at`. Every
+   reader of these rows takes only a `success`, so it is harmless.
 
 `fafnir status` prints a `statements` line under the `dorq` line once the run is on
 or has run: on or off, shadow or queue, and the newest run's as-of date, reports and
@@ -739,11 +759,50 @@ Postgres's sort of the wide rows dominates the `COPY`. dorq checks while the row
 stream in, so the two overlap. The benchmark's line items are drawn independently,
 so its identities and cash ties fail on nearly every row. dorq's figure is from a
 run on its defaults, and the end-to-end one ignores DQ904. Measure it on the host with
-`fafnir dq run --statements-only --rerun` (it prints the time) or read
-`finished_at - started_at` on the run's row. If it is over 2 minutes, the plan's
+`fafnir dq run --statements-only --rerun`. It prints the time and dorq's peak memory:
+`(as of <date>, <seconds> s, dorq peak <MB> MB)`. Or read `finished_at - started_at`
+and `params.dorq_max_rss_mb` on the run's row. If it is over 2 minutes, the plan's
 fallback is to judge only the securities with a row loaded since the previous run.
 It is not built: DQ942 has to judge every trading security each night, because a
 filing becomes overdue with time, not with a row.
+
+#### Memory on the host
+
+The first statements night on the host (2026-11-07, run 787) was killed by the
+kernel's OOM killer 12 minutes in (#219). The `fafnir-dq` unit peaked at 3.1 GB on
+a 3.8 GB host where Postgres holds 2 GB of shared buffers. The run then held
+dorq's reports three times over:
+- in dorq, which holds its results until every series is in while DQ951 is on (as
+  a bars run does for DQ303): about 1.7 KB a report, and with `--show-info` the info
+  reports too;
+- in dorq's output file, in the unit's private `/tmp`, a tmpfs, so in memory;
+- in fafnir, which read that file whole into a list: about 6.5 times its size.
+
+Since #219's fix, only dorq's copy remains:
+- the output file is on disk, in [`dorq_work_dir`](#configure);
+- the night streams from it to the shadow file or the queue's `COPY`, at a few
+  hundred KB whatever the night's size;
+- the run row and the CLI line record dorq's own peak, which is the figure to
+  watch.
+
+dorq's figure grows with the reports a night holds. What makes it small is the
+reports themselves: a statements history that judges clean.
+
+**Cap the unit,** so a run that outgrows the host is killed inside its own cgroup,
+never Postgres. A drop-in, with a limit that leaves Postgres its shared buffers
+and the night's load its share:
+
+```bash
+sudo systemctl edit fafnir-dq.service
+# [Service]
+# MemoryMax=1200M
+```
+
+`systemctl show fafnir-dq.service -p MemoryPeak -p Result` says what the last night
+used, and whether it was killed (`Result=oom-kill`). A night killed at the cap fails
+the `dq run`, not the load. It leaves the statements' watermark where it was, so
+the next night judges again. Turn `[dq] dorq_statements` off until dorq's peak
+fits.
 
 ### The statements shadow period
 

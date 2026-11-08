@@ -365,23 +365,44 @@ What does not apply, or applies differently:
   history may also be the warehouse's only copy of the company. Do not delete a
   segment of it as someone else's history.
 - **§3's probe is Sharadar's, not FMP's.** FMP never feeds these rows. Before
-  deleting a print that reverts (§2f), read what Sharadar serves now with
-  `duk -S sharadar ph <TICKER> -s <d> -e <d>`, using the vendor's ticker from
-  `core.vendor_security`. A re-run of the backfill does not re-read a date the
-  security already holds.
+  deleting a print that reverts (§2f), have the operator read what Sharadar serves
+  now: `duk -S sharadar ph <TICKER> -s <d> -e <d>`, under `/etc/fafnir/fafnir.env`
+  as in §3, with the vendor's ticker from `core.vendor_security`. A re-run of the
+  backfill does not re-read a date the security already holds, and nothing else
+  re-fetches it.
 - **Nothing reverts on its own.** No load will restate a dead history, so a flag
   §2j would leave open "to recheck tomorrow" stays as it is. Decide it, or leave
   it open with the reason.
 
 ## 3. Before any delete: probe the vendor
 
-`source probe-prices --symbol S --date D` (3 requests) shows what FMP serves *now*.
-Read the full output — `bar compared:` confirms the date it matched, and
-`unadjusted close` is the value. If FMP has corrected the bar, **re-fetch** with
-`ingest prices --symbols S --from D1 --to D2` instead of deleting: GEVX came back
-from 251,705 to 20.57 that way, keeping seven sessions a delete would have lost.
-A volume mismatch with a matching close (ENTL) means the vendor is mid-correction
-or mixing instruments — hold.
+Probe the vendor that feeds the security, and re-fetch only from it. Who that is,
+and whose the stored bar is, decides the command; the query is in dq-playbooks.md,
+[Re-fetching a bar](dq-playbooks.md#re-fetching-a-bar-what-each-feed-allows).
+
+- **FMP-fed** (`repo.fmp_fed`: the funds and the unlinked names).
+  `source probe-prices --symbol S --date D` (3 requests) shows what FMP serves
+  *now*. Read the full output — `bar compared:` confirms the date it matched, and
+  `unadjusted close` is the value. If FMP has corrected the bar, **re-fetch** with
+  `ingest prices --allow-secondary --symbols S --from D1 --to D2` instead of
+  deleting: GEVX came back from 251,705 to 20.57 that way, keeping seven sessions a
+  delete would have lost. A volume mismatch with a matching close (ENTL) means the
+  vendor is mid-correction or mixing instruments — hold.
+- **Sharadar-fed, a bar FMP stored** before the cutover (`source = 'fmp'`). FMP's
+  loader no longer writes the security. `vendor correct --symbols S --dry-run` says
+  whether Sharadar's current file differs; the operator runs it, and it replaces
+  every differing FMP bar on the security, not only D.
+- **Sharadar-fed, Sharadar's own bar.** Nothing re-fetches it: the backfill skips a
+  date the security holds, and only the nightly rewrites the bar, when the vendor
+  revises it. The probe is the operator's, since Sharadar's key is only in
+  `/etc/fafnir/fafnir.env`, which your sudo rule does not load:
+
+  ```bash
+  sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; duk -S sharadar ph T -s D -e D'
+  ```
+
+  with the vendor's ticker T. The same bar: delete or accept by §2. Another bar:
+  report it and leave the flag open; dq-playbooks.md has the operator's re-read.
 
 ## 4. Say what each batch will leave behind
 

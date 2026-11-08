@@ -19,6 +19,8 @@ export FAFNIR_DSN="host=localhost dbname=fafnir user=fafnir_ingest"
 export PGPASSWORD=...                # ingest role password; FAFNIR_DB_PASSWORD is
                                      # ignored when FAFNIR_DSN is set (see backfill.md §3)
 export FMP_API_KEY=...
+export SHARADAR_API_KEY=...          # the primary vendor; read from the environment only
+                                     # (/etc/fafnir/fafnir.env on a host), never ~/.fafnirrc
 export FAFNIR_SQL_DIR=/opt/fafnir/sql
 
 scripts/setup_db.sh
@@ -28,6 +30,9 @@ scripts/setup_db.sh
 
 # 3. Initial historical backfill (resumable).
 scripts/initial_backfill.sh 2010-01-01
+
+# 4. Sharadar on top: backfill.md › "Sharadar initial population", then the
+#    cutover below (primary_price_vendor = "sharadar").
 ```
 
 ## Daily upkeep
@@ -63,7 +68,10 @@ and `dq run --rerun` re-judges on purpose ([dorq.md](dorq.md)). With `[dq]
 dorq_statements`, the same `dq run` then has dorq judge the statements' whole
 history, into `<dorq_shadow_dir>/statements/` until their cutover
 ([dorq.md](dorq.md#statements)). It is a second `ops.ingestion_run` row a night
-(`dq-statements-shadow`), and it too judges a night once.
+(`dq-statements-shadow`), and it too judges a night once. Its run row and `dq.log`
+line carry dorq's peak memory. On a small host, cap the unit with a `MemoryMax=`
+drop-in, so that a night outgrowing it is killed inside its own cgroup and not beside
+Postgres ([dorq.md](dorq.md#memory-on-the-host)).
 
 The first four steps are **universe maintenance**, and their order is load-bearing:
 
@@ -276,9 +284,9 @@ the wrong vendor or by none. Both nights and the rollback between them are teste
 ```bash
 fafnir source probe-fund VFIAX        # FIRST -- confirm the NAV series is raw
 fafnir track add VFIAX --note "core US equity sleeve"
-fafnir ingest tracked                 # mints it (the nightly job also does this)
-fafnir ingest prices --symbols VFIAX  # no watermark yet -> full history
-fafnir ingest actions --symbols VFIAX && fafnir adjust --symbol VFIAX
+fafnir ingest tracked --allow-secondary                 # mints it (the nightly job also does this)
+fafnir ingest prices --symbols VFIAX --allow-secondary  # no watermark yet -> full history
+fafnir ingest actions --symbols VFIAX --allow-secondary && fafnir adjust --symbol VFIAX
 fafnir track list                     # what is declared, and whether it is loaded
 ```
 
@@ -427,7 +435,9 @@ flag is only the notification.
 
 ## Cutover to Sharadar as primary
 
-The one-time switch of the nightly to Sharadar (#125). It runs on a Monday, so a week
+The one-time switch of the nightly to Sharadar (#125). **Done on production** on
+Thursday 2026-10-22 on v2.0.0, and it held for five sessions (#125, #126); the runbook
+stays for a new host or a return after a rollback. Run it on a Monday, so a week
 of weeknights follows to watch it. Its core is the two steps under
 [Primary vendor switch and rollback](#primary-vendor-switch-and-rollback); this
 section adds the checks, verification and communication around them. Run `fafnir`
@@ -491,7 +501,7 @@ set +a; fafnir …'`, and the queries in `psql` as the ops role.
 
 ### Verification after the first night
 
-Set the cutover's trading day once, in `psql`: `\set cutover '2027-01-11'`, using
+Set the cutover's trading day once, in `psql`: `\set cutover '2026-10-22'`, using
 the actual date.
 
 1. **The night ran.** `scripts/monitor.sh sharadar runs timers` is clean.
@@ -692,7 +702,8 @@ Things to watch:
 - **Freshness** — `fafnir status` latest date should track the last trading day.
   Stale securities raise `stale` DQ flags.
 - **Quarantine spikes** — a jump in `ops.data_quality_flag` (warn/error) on a load
-  signals a source change or bad data. Investigate the `landing.fmp_raw` payload.
+  signals a source change or bad data. Investigate the `landing.fmp_raw` payload;
+  Sharadar's are the files `landing.sharadar_file` ledgers under `[sharadar] bulk_dir`.
   A load where *every* bar quarantines as `price_missing_or_nonnumeric_ohlc` points
   at FMP renaming the OHLC fields; the loader accepts `open…close` and
   `adjOpen…adjClose`, so a third spelling would need adding to `_OHLC_ALIASES`.
@@ -914,7 +925,10 @@ fafnir override revoke 14 -m "FMP corrected it"               # undo one
   such cost.
 - **Revoking a delete does not write the row back** — run
   `fafnir ingest actions --symbols SYM` or `fafnir ingest prices --symbols SYM --from
-  D --to D` to fetch the vendor's current version. A re-date is two overrides;
+  D --to D` to fetch the vendor's current version, with `--allow-secondary` in
+  Sharadar mode. For a security Sharadar feeds, run `fafnir ingest sharadar-actions
+  --backfill --symbols SYM` or `fafnir ingest sharadar-prices --backfill --symbols
+  SYM`, which read the ledger's current full file. A re-date is two overrides;
   revoke both.
 
 #### Bars at the wrong date or the wrong scale
@@ -1073,7 +1087,7 @@ called each security inactive on the NYSE, and both froze them. FMP's price feed
 went on serving their bars. [ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)
 records the design.
 
-**What the nightly does now.**
+**What the nightly does now.** In FMP mode:
 
 - **The delisting sweep** asks the price feed before stamping a recent delisting.
   If the vendor has bars *after* the date, the security is left trading and
@@ -1084,6 +1098,12 @@ records the design.
   whatever the vendor's `isActivelyTrading` says. When the universe load turns a
   row inactive while its last bar is within 5 sessions, it raises
   `security_inactive_but_trading` (info): often the first sign of a move.
+
+In Sharadar mode, `ingest sharadar-universe` declines a `delisted` event that the
+security's own bars contradict, flagging `security_delisting_contradicted`, and raises
+`security_inactive_but_trading` (warn) on a fed security held inactive while it
+trades, with `detail.next = venue_transfer` when the vendor lists the same ticker on
+another venue ([A fed security held inactive](#a-fed-security-held-inactive)).
 
 **Deciding a `security_delisting_contradicted` flag.** The bars cannot tell a move
 between listed venues from a move to OTC, so the flag waits for you. Until you
@@ -1628,10 +1648,11 @@ $F db refresh-marts                                   # 4. drop them from the ma
 
 ## Recovery
 
-- **Interrupted backfill** — just re-run `scripts/initial_backfill.sh`; watermarks
-  resume per symbol.
+- **Interrupted backfill** — just re-run `scripts/initial_backfill.sh` (FMP mode; it
+  refuses in Sharadar mode); watermarks resume per symbol.
 - **Suspected bad load** — the raw payload is in `landing.fmp_raw` (by endpoint +
-  symbol + `fetched_at`); re-pull the window to upsert corrected values.
+  symbol + `fetched_at`); Sharadar's are the files `landing.sharadar_file` ledgers
+  under `[sharadar] bulk_dir`. Re-pull the window to upsert corrected values.
 - **Suspected bad *feed*** — `fafnir source probe-prices` checks that FMP's
   unadjusted endpoint really is unadjusted (3 requests, writes nothing). See
   [backfill.md](backfill.md#confirming-the-price-feed).

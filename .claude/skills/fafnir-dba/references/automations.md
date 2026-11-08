@@ -7,7 +7,9 @@ incremental and idempotent — a missed day is caught up on the next run.
 
 1. **The daily load**, `fafnir-daily` (`scripts/daily_update.sh`, `daily.log`).
    It runs one of two nights, by `[general] primary_price_vendor` (#111); the log's
-   first line names it (`primary vendor: fmp`). FMP mode:
+   first line names it (`primary vendor: sharadar`), and `fafnir status` prints
+   `Primary    : sharadar (FMP secondary on)`. Sharadar mode has run since the
+   cutover (2026-10-22); FMP mode is the rollback, and the code default:
 
    ```
    ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
@@ -44,10 +46,21 @@ incremental and idempotent — a missed day is caught up on the next run.
    holds (doc/dorq.md, *Statements*), and into the queue once the statements cutover
    (DR-0914) has set it false: then the endpoint is `dq-statements`, and the SQL
    fundamentals checks no longer run. That is a second dorq row a night, endpoint
-   `dq-statements-shadow` in shadow, with `params.reports` and its own watermark; `dq.log`
-   says `dorq statements <version> (as of <date>, <seconds> s)`. It judges a night
-   once, as the bars do, and its failure is a `dq run` failure, not the load's.
-   `fafnir status` shows its newest run under the `dorq` line.
+   `dq-statements-shadow` in shadow, with its own watermark. Its params carry:
+   - `reports`;
+   - `bytes_out`, dorq's output;
+   - `dorq_max_rss_mb`, dorq's peak memory.
+
+   `dq.log` says `dorq statements <version> (as of <date>, <seconds> s, dorq peak
+   <MB> MB)`. It judges a night once, as the bars do, and its failure is a `dq run`
+   failure, not the load's. `fafnir status` shows its newest run under the `dorq`
+   line.
+
+   **A row left `started`, with no `finished_at`, is a run the kernel killed.** The
+   first host night (2026-11-07, run 787) was OOM-killed this way, before #219's fix.
+   Read `systemctl show fafnir-dq.service -p Result -p MemoryPeak` (`oom-kill`), not
+   the journal. The run's working directory under `dorq_work_dir` is pruned by a
+   later run, once it is 6 hours old.
 
    It runs after a failed load too. dorq then finds no session newer than the night
    it last judged, says so in `dq.log` and writes no run row, no file and no
@@ -244,9 +257,11 @@ SELECT date_trunc('month', started_at) AS m, source, sum(bytes_downloaded)
 ```
 
 **Requests** — the actual constraint on the nightly window, and dominated by one
-step. `ingest actions` *ships* in `symbol` mode: a full split and dividend history
-for every active security, every night — ~16,000 requests and about an hour to
-capture a few hundred changed rows. The alternative (`actions_mode = "auto"`,
+step. In FMP mode `ingest actions` *ships* in `symbol` mode: a full split and dividend
+history for every active security, every night — ~16,000 requests and about an hour
+to capture a few hundred changed rows. In Sharadar mode it runs as the secondary
+(`--allow-secondary`), over what FMP still feeds: about 4,000 funds and unlinked
+names (`repo.fmp_fed`). The alternative (`actions_mode = "auto"`,
 ADR 0007) costs ~2 requests plus a first-load for anything newly minted and a 1/30
 reconciliation slice.
 

@@ -316,9 +316,9 @@ after FMP's night.
   - `fmp_only`, a bar FMP holds and Sharadar did not serve, on a date the files hold
     in whole.
 - **Reading it.** The night's own trade date is the row to read; the differences are
-  what the issue asks to have explained. No real nightly has advanced `through` yet,
-  so each dry run covers every delta since the full file, and the earlier dates
-  repeat. A standalone check is `fafnir ingest sharadar-prices --nightly --dry-run
+  what the issue asks to have explained. Before the cutover no real nightly advances
+  `through`, so each dry run covers every delta since the full file, and the earlier
+  dates repeat. A standalone check is `fafnir ingest sharadar-prices --nightly --dry-run
   --as-if-fed`.
 
 **Rollback.** `fafnir vendor feed --vendor fmp --all-linked` gives FMP back the
@@ -545,12 +545,17 @@ Bulk TICKERS writes its `table` column in legacy codes (`SEP`, `SFP`, `SF1`, `SF
 
 | Mode | For | What it writes |
 |---|---|---|
-| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71) | the whole history |
-| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: the dates the security does not hold, from the link's `valid_from` |
+| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98, #125) | a dead issuer's whole history; for one another vendor minted, the dates it does not hold from the link's `valid_from` |
+| `--gap-fill` | the FMP securities linked to Sharadar that it does not feed: since the cutover, normally only those a rollback (`vendor feed --vendor fmp`) gave back | fill-only: the dates the security does not hold, from the link's `valid_from` |
 | `--nightly` | the securities Sharadar feeds | the delta files since the last nightly (*Sharadar as primary: prices and actions*) |
 
 In the two bulk modes a date the security already holds, whoever supplied it, is
-never read, so a re-run writes nothing new.
+never read, so a re-run writes nothing new. A security another vendor minted is
+read from its link's `valid_from`, fed or not: before it, its row may hold another
+issuer's era (#68). Only a security Sharadar minted is read whole, and its link
+starts at its first price. Up to v3.1.6 a fed row was not bounded, so since the
+cutover a backfill of a linked FMP security wrote the vendor's bars on the dates
+before the link that the row lacked.
 
 **Which ticker a key is read by** (#238). SEP, SFP and SF1 rows carry no permaticker,
 only the ticker of the day the file was fetched, and Sharadar files a security's history
@@ -793,10 +798,11 @@ show|accept|reject`
 accepted link is `manual`, and like every link it is never moved by the engine. A
 rejected pair is never proposed again.
 
-**The nightly run.** `daily_update.sh` runs `--new` after the price step, not
+**The nightly run.** In FMP mode, `daily_update.sh` runs `--new` after the price step, not
 straight after the security master as #62 first had it. The decision compares the
 security's own bars, and a security minted tonight has none until its history is
-pulled. Before the first full run, `--new` says so and does nothing.
+pulled. Before the first full run, `--new` says so and does nothing. Sharadar mode
+does not run it.
 
 ### Dead issuers minted from Sharadar (#71)
 
@@ -1226,9 +1232,9 @@ the difference — prices, actions, factors, marts and `duk` all key off
 ```bash
 fafnir source probe-fund VFIAX          # FIRST: is the NAV series raw? (3 requests)
 fafnir track add VFIAX --note "core US equity sleeve"
-fafnir ingest tracked                   # mints it; also runs nightly
-fafnir ingest prices --symbols VFIAX    # no watermark yet -> full history
-fafnir ingest actions --symbols VFIAX && fafnir adjust
+fafnir ingest tracked --allow-secondary                 # mints it; also runs nightly
+fafnir ingest prices --symbols VFIAX --allow-secondary  # no watermark yet -> full history
+fafnir ingest actions --symbols VFIAX --allow-secondary && fafnir adjust
 duk ph VFIAX --adj -S db
 ```
 

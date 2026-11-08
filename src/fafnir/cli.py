@@ -644,12 +644,14 @@ def ingest_delisted(ctx, full, allow_secondary):
 @click.option(
     "--backfill",
     is_flag=True,
-    help="The whole history of the securities Sharadar feeds (minted).",
+    help="The securities Sharadar feeds: those it minted whole, the rest from the "
+    "link's start.",
 )
 @click.option(
     "--gap-fill",
     is_flag=True,
-    help="Fill-only for the FMP securities linked to Sharadar: dates FMP never served.",
+    help="Fill-only for the FMP securities linked to Sharadar that it does not feed: "
+    "dates FMP never served.",
 )
 @click.option(
     "--nightly",
@@ -681,9 +683,12 @@ def ingest_sharadar_prices(
       fafnir ingest sharadar-prices --nightly --dry-run --as-if-fed
 
     Reads the ledger's current stocks and funds files under [sharadar] bulk_dir.
-    --backfill loads the whole history of the securities Sharadar feeds (the
-    minted dead issuers); --gap-fill adds, fill-only, the dates an FMP security
-    linked to Sharadar does not hold, from the link's start. Raw prices are
+    --backfill loads the securities Sharadar feeds: the whole history of the dead
+    issuers it minted, and for the FMP securities the cutover fed it, the dates
+    they do not hold from the link's start (before it, the row may hold another
+    issuer's era). --gap-fill adds the same for an FMP security linked to Sharadar
+    that it does not feed (since the cutover, one a rollback gave back to FMP).
+    Neither reads a date the security holds. Raw prices are
     recovered from closeunadj with the ACTIONS split product (the vendor's ratio
     where they disagree, flagged sharadar_split_ratio_mismatch). Non-session and
     operator-edited dates are set aside, and bad bars quarantined, as for FMP.
@@ -4973,10 +4978,16 @@ def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
       fafnir override revoke 14 -m "FMP now dates the split correctly"
 
     Revoking a delete lifts the suppression; it does not write the removed row back.
-    The next load brings back whatever the vendor serves for that key -- or run
-    `fafnir ingest actions --symbols SYM`, or `fafnir ingest prices --symbols SYM
-    --from D --to D`, to fetch it now. Revoking an add removes the operator's row.
-    A re-date is two overrides; revoke both.
+    A later load that re-reads the key brings back whatever the vendor serves for
+    it. To fetch it now on a security FMP feeds, run `fafnir ingest actions
+    --symbols SYM` or `fafnir ingest prices --symbols SYM --from D --to D`, with
+    --allow-secondary while Sharadar is the primary vendor. On a security Sharadar
+    feeds, run `fafnir ingest sharadar-actions --backfill --symbols SYM` or `fafnir
+    ingest sharadar-prices --backfill --symbols SYM`, which read the unheld key from
+    the ledger's current full file: the Sharadar nightly reads only the price deltas,
+    so it brings a bar back only if a delta carries it. Dry-run the price backfill
+    first: on a security FMP minted it is not bounded by the link's start. Revoking
+    an add removes the operator's row. A re-date is two overrides; revoke both.
 
     A `prices shift` or `prices rescale` is undone whole: any override of the edit
     revokes all of them, removes the operator's bars and writes the vendor's bars back
@@ -7013,6 +7024,10 @@ def _dq_run_statements(database, cfg, exchange, rerun):
         return
     detected = sum(out.detected.values())
     took = f"{time.monotonic() - started:.1f} s"
+    peak = (out.usage or {}).get("dorq_max_rss_mb")
+    if peak is not None:
+        # The figure #219 asks the host for, with the time.
+        took += f", dorq peak {peak:.0f} MB"
     if shadow:
         click.echo(
             f"dorq statements {out.version} (as of {out.window.as_of}, {took}):"

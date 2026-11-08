@@ -698,7 +698,8 @@ What differed from the issue's plan:
 
 `fafnir ingest fundamentals --backfill` loads SF1's statements into the three statement
 tables from the ledger's SF1 file ([ingestion.md](ingestion.md#statements-from-sf1-90)). On
-the production host it runs once, after migration 0035. The night's SF1 deltas take over
+the production host it ran on 2026-10-27 (run 491, after #216's reset); the steps below stand
+for a new host or a reload. The night's SF1 deltas take over
 from it (#106): until it has run, the night's fundamentals step says so and loads nothing.
 A later re-run is `scripts/backfill_fundamentals.sh`
 ([operations.md](operations.md#fundamentals-in-the-night)).
@@ -718,7 +719,7 @@ the day, not across the night's timer (22:30 ET), and one heavy command at a tim
 |---|---|---|
 | 1. Dump | `scripts/backup_dump.sh` | Record the path on #92 before anything writes |
 | 2. Deploy | `git pull && fafnir --version && fafnir db migrate` | Applies 0035–0037; add `pip install` if `pyproject.toml` changed ([releasing.md](releasing.md#deploying-it)) |
-| 3. A current file | `fafnir source sharadar-bulk --tables SF1 --force` | The ledger's SF1 file is from 2026-10-19: refresh it, so the deltas take over from a current one, and so it is paired with TICKERS (#238). About 0.6 GB |
+| 3. A current file | `fafnir source sharadar-bulk --tables SF1 --force` | Refresh the ledger's SF1 file, so the deltas take over from a current one, and so it is paired with the TICKERS file fetched just before it (#238). About 0.6 GB |
 | 4. The probe | `fafnir source probe-fundamentals` | Its verdicts against the 2026-10-24 table; `--json` stays on the host |
 | 5. Dry run | `time fafnir ingest fundamentals --backfill --dry-run` | Reads everything and writes nothing. Its `<table>:inserted` and `<table>:restated` counts are the rows the run will write |
 | 6. The backfill | `time fafnir ingest fundamentals --backfill` | One run, committed per vendor key, so a stopped run resumes where it stood: re-run the same command |
@@ -851,8 +852,7 @@ price files came in as projected, and SF1 came in smaller (632 MB, at 3.2M rows 
 
 - **Files.** A refresh downloads a new full set before the old one is
   superseded, so allow **~4 GB** at peak (two 1.9 GB sets). `daily` and `metrics` are not in that
-  figure; they are not needed before the fundamentals phase (P4), and each is of
-  the order of `stocks`.
+  figure; they are not downloaded: fafnir derives its metrics (ADR 0019).
   - **The night's files** are bounded by its prune
     ([ingestion.md](ingestion.md#sharadar-as-primary-prices-and-actions-98)).
     Each night downloads TICKERS and ACTIONS whole and two deltas. The prune keeps
@@ -950,6 +950,7 @@ Watch the monthly bandwidth gauge (query in §6) and pause as you approach the c
 - **Resumable** — kill/re-run freely; watermarks + `ON CONFLICT` upserts converge.
 - **Least privilege** — point `duk`/apps at `fafnir_app` (mart read-only); only
   `fafnir_ingest` writes.
-- **Active-only** — delisted retention (survivorship-bias-free) is a fast-follow.
+- **Active-only** — the FMP backfill is active-only; Sharadar's dead issuers from 1998
+  fill the rest (#71, #77).
 - **Adjusted prices cost no storage** — they're derived on read
   (`mart.v_daily_price_adjusted`).
