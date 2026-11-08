@@ -2,9 +2,10 @@
 
 - Status: **Proposed** (draft, 2026-10-24)
 - Status note (2026-11-08, the Sharadar plan's close-out, #131): implementation notes 1–3 shipped on
-  2026-10-24 (v2.1.0) and have run on the host since. Note 5's acceptance waits on three `duk` checks
-  on FMP's reduced tier, which are #128's: `duk -S fmp ph`, `duk yc` and `duk -S fmp ls --sectors`.
-  **[#128: Accepted on that date, or still proposed and why]**
+  2026-10-24 (v2.1.0) and have run on the host since. The three `duk` checks note 5 asks for answered
+  on FMP's reduced tier on 2026-11-08 (#128): `duk -S fmp ph AAPL` agrees with the warehouse's raw closes
+  on all 1,254 dates of five years, `duk yc` serves every session's 12 tenors, and `duk -S fmp ls`
+  serves the screen. **[to fill: Accepted on that date, or still proposed and why]**
 - Date: 2026-10-24
 - Depends on: [ADR 0011](0011-versioning.md) (one version, deployed by `git pull`),
   [ADR 0008](0008-remote-duk-access-and-mcp.md) (the MCP server is built on

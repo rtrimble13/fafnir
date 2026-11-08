@@ -1,18 +1,20 @@
 # Plan: Sharadar adoption
 
-- Status: **implemented**, closed **[#128: the date this merges]**. Plan v2 (revised 2026-10-18) was
+- Status: **implemented**, closed **[to fill: the date this merges]**. Plan v2 (revised 2026-10-18) was
   built in about three weeks. Plan v1 (2026-09-23, seventeen weekly sprints S01–S17 to 2027-01-22) is
   superseded; its calendar and status tables are in git history
   (`git show 1d26d82:doc/plans/sharadar-adoption.md`). The [Retrospective](#retrospective) compares the
   two.
 - **Sharadar has been the primary nightly vendor since 2026-10-22** (#125), verified and held for five
-  sessions (#126). FMP is the secondary, on a reduced tier since 2026-11-01 (#128), for what Sharadar does
-  not cover: the funds and the unlinked residue. Fundamentals come from SF1 (v3.0.0, 2026-10-26; the
+  sessions (#126). FMP is the secondary, on a reduced tier since 2026-11-01 (#128), and since 2026-11-05 a
+  backup feed only: every security Sharadar carries moves to it, and the open-end mutual funds may freeze
+  once `fmp_secondary` is off. Fundamentals come from SF1 (v3.0.0, 2026-10-26; the
   production load is #92). Tiingo, FRED, BLS and BEA were dropped on 2026-10-30. Every phase is closed
   (*Phases*). The issues were reconciled with the build on 2026-10-24, 2026-10-30 and at the close
   (*Issue dispositions*).
-- **Markers.** **[#128: …]** marks a figure that waits on #128's record from the host. None is left
-  when this plan closes.
+- **Markers.** **[to fill: …]** marks what the operator supplies before this revision merges: the close
+  date, the FMP tier's name and the prices paid, and ADR 0017's status. None is left when this plan
+  closes.
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -83,9 +85,12 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
   - the split-bearing stretches, by a bar-level rule (#197, #198);
   - since 2026-10-28, the 681 `vendor_history_disagrees` flags held back for a split, one security at a
     time with `--symbols` (#225). That pass is ordinary operations now (*Retrospective*).
-- **FMP's share is wider than eight funds.** On 2026-11-01 FMP alone fed 4,076 active securities: 3,943
-  mutual funds, 80 ETFs and 53 unlinked equities, plus the tracked declarations (#128).
-- **The reduced tier** is **[#128: the tier's name]**.
+- **FMP's share was wider than eight funds, and is shrinking.** On 2026-11-01 FMP alone fed 4,076 active
+  securities: 3,943 mutual funds, 80 ETFs and 53 unlinked equities, plus the tracked declarations. Since
+  FMP became a backup feed only (2026-11-05), the rest move to Sharadar: by 2026-11-08 FMP fed 3,961,
+  3,938 mutual funds and 23 other securities being moved (#128).
+- **The reduced tier** is **[to fill: the tier's name]**. It serves everything fafnir and `duk` still ask
+  of FMP (#128).
 
 **Survivorship floor: 1998-01-01.** Neither vendor has delistings before 1998, so cross-sectional work before
 that date is survivor-only under any plan. [ADR 0016](../adr/0016-sharadar-identity-and-survivorship-floor.md) (#67) records it.
@@ -123,14 +128,14 @@ Phases are ordered by dependency, not by calendar week. Each closes with a short
 | **P0** | Subscribe, client, probe, safety rails | #42, #43, #44, #45, #46, #47, #49, #50, #52, #57 | `probe-sharadar` passes on the paid key; FMP loaders cannot touch a non-FMP-fed security; precedence write path merged | ✅ 2026-10-19 |
 | **P1** | Land, link, mint | #55, #56, #58, #59, #62, #63, #64, #67, #68, #71 | ≥ 99% of active non-fund securities linked or explained; dead issuers minted (empty) | ✅ 2026-10-20 (code), the host by 2026-10-21: 95.2% linked, the rest explained (#64) |
 | **P2** | Backfill, compare, correct | #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** (shipped as v1.8.x; closed on v1.8.4) | ✅ 2026-10-22, on v1.8.4 |
-| **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** (tagged 2026-10-22) | ✅ 2026-11-01: five sessions held (#126), and the tier changed the same day. The tier's record is **[#128: the date it closes]** |
+| **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** (tagged 2026-10-22) | ✅ 2026-11-01: five sessions held (#126), and the tier changed the same day; #128 closed with its record on 2026-11-08 |
 | **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; a release (shipped as **v3.0.0** on 2026-10-26, a major where a minor was planned) | ✅ 2026-10-26 (code); the production load, recorded 2026-11-01 (#92) |
-| **P5** | Close-out | #117, #131 | `scripts/reconcile.sh` a cross-vendor check; plan marked implemented | ✅ #117 2026-10-30; #131 **[#128: the date this merges]** |
+| **P5** | Close-out | #117, #131 | `scripts/reconcile.sh` a cross-vendor check; plan marked implemented | ✅ #117 2026-10-30; #131 **[to fill: the date this merges]** |
 
 P3 and P4 are independent once P2 is done; run them in whichever order the comparison report and the SF1
 probe allow. P5's fund and FRED work (#88, #97, #104, #114, #116) was dropped on 2026-10-30: the funds and
 `duk yc` stay on FMP, so the reduced tier has to serve them (#128; *Issue dispositions (applied
-2026-10-30)*).
+2026-10-30)*). It does: see the decision log, 2026-11-01.
 
 ### The verification that replaces the parallel run
 
@@ -338,13 +343,13 @@ them acts, and removing them would take a migration.
 
 ## Issue dispositions (at the close)
 
-Three of the plan's issues were open on 2026-11-08: the tracking issue #41, #128 and #131. #125, #126 and
-#92 closed on 2026-11-01 with their records from the host (decision log, 2026-11-01). Every other issue
-in the phase table is closed, as completed or as not planned.
+Two of the plan's issues are open at the close: the tracking issue #41 and #131. #125, #126 and #92 closed
+on 2026-11-01 with their records from the host, and #128 on 2026-11-08 with its own (decision log). Every
+other issue in the phase table is closed, as completed or as not planned.
 
 | Issue | Disposition |
 |---|---|
-| #128 FMP tier | Closes on its record from the host: the `duk` checks and the first secondary night on the tier (**[#128: closed on …]**) |
+| #128 FMP tier | Closed 2026-11-08: the `duk` checks and five secondary nights on the tier, from the host; its docs are #246. Turning `fmp_secondary` off is the FMP backup-only work's |
 | #131 close-out | Closes with this revision |
 | #41 tracking | Closes with #131. The plan is the record; the issue was its index |
 
@@ -365,10 +370,10 @@ free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they wer
 
 | Item | Planned | Paid |
 |---|---|---|
-| Sharadar Bundle, max history, annual, 2026-10-18 to 2027-10-18 (#57); renewal reminder 2027-09-18 | $499 | **[#128: from the invoice]** |
-| FMP Premium, until the tier change on 2026-11-01 | $708 a year | **[#128: from the invoice]** |
-| FMP's reduced tier, from 2026-11-01 | ~$264 a year, if Starter | **[#128: the tier and its price]** |
-| The run rate from 2026-11-01 | ~$763 a year | **[#128: the sum]** |
+| Sharadar Bundle, max history, annual, 2026-10-18 to 2027-10-18 (#57); renewal reminder 2027-09-18 | $499 | **[to fill: from the invoice]** |
+| FMP Premium, until the tier change on 2026-11-01 | $708 a year | **[to fill: from the invoice]** |
+| FMP's reduced tier, from 2026-11-01 | ~$264 a year, if Starter | **[to fill: the tier and its price]** |
+| The run rate from 2026-11-01 | ~$763 a year | **[to fill: the sum]** |
 
 Nothing else was bought. There was no staging server and no Tiingo key, and the host's disk held the
 backfill (*Risks*).
@@ -381,7 +386,7 @@ backfill (*Risks*).
 | A bulk correction applies a vendor convention difference as if it were an error | Working agreement 2 (audited, revertible); categories decided from outside-reference spot checks before any bulk apply (#69) | Caught before the bulk apply. A sample showed whole-split-factor and ADR-ratio differences where Sharadar is not always right, so the split-bearing securities waited for a bar-level rule (#197, #198). Volume kept FMP's convention (#69) |
 | SEP precision too coarse to recover exact raw prices for split-heavy dead issuers | #49, #75 (`sharadar_split_ratio_mismatch`) | Measured at 3 decimal places (#49). 226 `sharadar_split_ratio_mismatch` flags were left open for split review (#81) |
 | Reused-ticker histories duplicated across vendors | #68 (`vendor_history_overlap`) before minting | It held. 2,546 dead issuers were held back by 4,206 open overlap flags (#77, #81), and cases are repaired one at a time (#243, GPUS and Blue Nile) |
-| The reduced FMP tier drops something the nightly still needs | #128 verifies the tier's contents **before** the change. Since 2026-10-30 nothing stands behind FMP for the funds or the treasury curve: the tier serves them, or they stop | On 2026-11-01 the new tier served the unadjusted EOD, an FMP-fed equity's latest bar, a fund's bars and distributions, and the action calendars (#128). **[#128: the `duk` checks and the first secondary night]** |
+| The reduced FMP tier drops something the nightly still needs | #128 verifies the tier's contents **before** the change. Since 2026-10-30 nothing stands behind FMP for the funds or the treasury curve: the tier serves them, or they stop | It did not. On 2026-11-01 the new tier served the unadjusted EOD, an FMP-fed equity's latest bar, a fund's bars and distributions, and the action calendars. By 2026-11-08 `duk -S fmp ph`, `duk yc`, `duk -S fmp ls` and the identifier search answered too. The one limit seen is per-minute: the actions step met HTTP 429 on 2 of the first 5 secondary nights, straight after the price step, which matters only while `fmp_secondary` is on (#128) |
 | FMP's licence does not permit retaining data after a downgrade | #43's letter; the agreement stays in force on a lower tier (the assessment's reading); cancellation only on written confirmation | Not tested: FMP was reduced, not cancelled. No reply is recorded on #43 |
 | Personal-licence eligibility fails (professional use) | #43 self-check before paying — the one remaining hard stop | Did not stop the plan: the subscription went ahead on 2026-10-18 (#57), and #43 closed on 2026-10-20 |
 | Backfill floods the DQ queue | #76 measures first; dorq's backfill path and the SQL checks as they are | It did, and was worked down: 33,906 outliers on dead issuers (#76), and the queue went from 51,277 conditions to 17,953 (#81). The first fundamentals run wrote about 308,000 flags, and the checks were recalibrated (#223) |
@@ -419,8 +424,9 @@ backfill (*Risks*).
 | 2026-10-30 | **Tiingo, FRED, BLS and BEA are not adopted.** #88, #97, #104, #114 and #116 are closed as not planned, and the economic-series milestone leaves the roadmap. The funds stay on FMP as the secondary vendor: three of the eight tracked funds, the other five uncovered, as today. `duk yc` stays on FMP's treasury rates in every mode. So the reduced FMP tier must serve both, or they stop (#128). The `tiingo` hooks in the code stay, dormant | #41, *Issue dispositions (applied 2026-10-30)* |
 | 2026-11-01 | **The cutover is verified and held for five sessions, with no rollback.** The first Sharadar-primary night (2026-10-23 UTC, runs 427–439) passed the runbook's verification: the 2026-10-22 bars on fed securities were Sharadar's alone, and FMP's secondary steps wrote nothing into a fed security. Seven sessions loaded through 2026-10-30, none with a quarantined bar. Two nights stopped on an SFP 503 (2026-10-27 and 2026-10-31) and were re-run by hand the same day; #233 (v3.1.0) now waits an outage out inside the night. What the first nights caught is #195, #196, #197, #199, #201 and #202. The FMP tier (#128) is no longer waiting on the cutover | #125, #126 |
 | 2026-11-01 | **The fundamentals reload is the production backfill.** Run 491 (2026-10-27, after #216's reset) read 3.10M SF1 rows and wrote 3.55M statement rows in 25 minutes, 8 quarantined; the panel's look-ahead invariant is 0. The balance-sheet identity holds for 96.2% of 909,725 periods, so the criterion is met by its other half: the 34,206 exceptions are flagged, and were accepted at the operator's direction on 2026-10-30. A security linked after it takes its history from `--backfill --symbols` (run 669: 334 dead issuers minted on 2026-11-01) | #92 |
-| 2026-11-01 | **FMP is on a reduced tier**, **[#128: the tier's name]**. The operator changed it once the five sessions held. The probes from the host the same day: the unadjusted EOD endpoint answers across AAPL's 2020 split at a ratio of exactly 4, so `core.daily_price`'s raw series, `duk -S fmp` and `fafnir source reconcile` keep their endpoint. An FMP-fed equity's latest bar, a fund's bars and 106 distributions, and the action calendars are served. FMP alone feeds 4,076 active securities, and its secondary steps used 5.1–6.8 MB and 4,215–4,452 requests a night (2026-10-27 to 10-31). **[#128: the `duk` checks, and the first secondary night on the tier]** | #128 |
-| **[#128: the date this merges]** | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **[#128: Accepted, or still proposed]**: its implementation notes 1–3 shipped on 2026-10-24, and its acceptance waits on the same three `duk` checks as #128 | #131 |
+| 2026-11-01 | **FMP reduced to a lower tier** (the operator). Checked from the host by 2026-11-08: the unadjusted EOD feed, a fund's bars and distributions, the action calendars, treasury rates (`duk yc`), the filtered screen (`duk -S fmp ls`) and the identifier search (`duk -S fmp ph cik:`) all answer on it, and `duk -S fmp ph AAPL` agrees with the warehouse's raw closes on every date of five years. The secondary night ran on it from 2026-11-03: prices and profiles every night, with no quarantine. Its per-minute limit shows: the corporate-actions step met HTTP 429 on 2 of the first 5 nights, straight after the price step | #128 |
+| 2026-11-05 | **FMP is a backup feed only.** Every security Sharadar carries moves to it: link, `vendor correct`, then `vendor feed`, 110 of them by 2026-11-06. The open-end mutual funds, which Sharadar does not carry, may freeze: `fmp_secondary = false` once the remaining non-fund securities have moved, with no code change for a not-fed state | #128 |
+| **[to fill: the date this merges]** | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **[to fill: Accepted, or still proposed]**: its implementation notes 1–3 shipped on 2026-10-24, and the three `duk` checks its note 5 asks for answered on 2026-11-08 (#128) | #131 |
 
 ## Retrospective
 
@@ -439,7 +445,7 @@ calendar and release, and the hours column is v1's alone.
 | P1 | S03–S05, Oct 12–Oct 30 | 46 | 10-19 to 10-20 (code); the host by 10-21 | — |
 | P2 | S06–S07, Nov 02–Nov 13 | 32 | 10-20 to 10-22 | v1.1.0 → v1.8.x, closed on v1.8.4 |
 | P4 | S08–S12, Nov 16–Dec 18 | 78 | 10-24 to 10-26 (code); the production load on 10-27 | v1.2.0 → **v3.0.0** |
-| P3 and P5 | S13–S17, Dec 21–Jan 22; cutover 2027-01-11 | 46 | Cutover 2026-10-22; five sessions by 11-01; the tier on 11-01; #117 on 10-30; the close **[#128: the date this merges]** | v2.0.0 → v2.0.0, on 2026-10-22 |
+| P3 and P5 | S13–S17, Dec 21–Jan 22; cutover 2027-01-11 | 46 | Cutover 2026-10-22; five sessions by 11-01; the tier on 11-01, its record 11-08; #117 on 10-30; the close **[to fill: the date this merges]** | v2.0.0 → v2.0.0, on 2026-10-22 |
 | **All** | 17 weeks, to 2027-01-22 | **237** | About three weeks from plan v2 | 28 releases, v1.6.0 to v3.1.4 |
 
 - **The cutover came 81 days before v1's date** (2026-10-22 against 2027-01-11). v1's end was set by its
@@ -512,6 +518,10 @@ cutover's own moves and the cases since.
 ### Left at the close, as last recorded
 
 These pass to ordinary operations, outside this plan:
+- FMP as a backup feed only (2026-11-05): `fmp_secondary = false` once the 23 non-fund securities FMP still
+  feeds have moved to Sharadar, and then the open-end mutual funds freeze (#128);
+- a defect #128 found, for its own issue: a failed FMP actions run still committed the dividends tagged
+  with its run id, while its run row records 0 rows inserted;
 - the 681 `vendor_history_disagrees` flags with a split, corrected one security at a time (#225,
   2026-10-28);
 - the 2,546 dead issuers held back by overlap flags, for `--allow-overlap` mints by agreement class (#77);
@@ -555,11 +565,12 @@ These pass to ordinary operations, outside this plan:
     - **The data dictionary is complete** for every table and view from migration 0025 to 0044. Its
       inventory gained `mart.v_share_factor_versions` and `mart.fn_daily_market_cap`, and its header
       moved to 0044.
-    - **Left for #128:** the FMP plan's name ("Professional"), the 300 requests a minute and the 50 GB a
-      month, which the reduced tier may change.
+    - **Left for the operator:** the FMP plan's name ("Professional") and its limits, ~300 requests a
+      minute and 50 GB a month. #128 did not record the reduced tier's, and its actions step met HTTP 429
+      at the 280-a-minute throttle.
     - **Left for its own change:** the skill's re-fetch steps for a bad bar, which name FMP's `ingest
       prices`. That changes playbook logic.
-  - **ADR 0017:** a status note; **[#128: Accepted, or still proposed]**.
+  - **ADR 0017:** a status note; **[to fill: Accepted, or still proposed]**.
   - **Measured:** nothing; docs only. `check_doc_links.py` passes.
 
 - **2026-11-01 to 2026-11-06 · P3, after the five sessions.** Three fixes and one repair:
