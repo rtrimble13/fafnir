@@ -118,6 +118,7 @@ from typing import IO, Optional, Sequence
 
 from fafnir.db.connection import Database
 from fafnir.dq import checks as _checks
+from fafnir.dq.recheck import CARRIED_BY_DORQ
 from fafnir.ingest import fundamentals_map as fm
 
 #: Calendar days around a repair within which a judged flag is taken to be about
@@ -1040,6 +1041,10 @@ def _statement_flags(db: Database, out: LabelExport, found: _Corrections) -> Non
                     scope=scope,
                 )
             )
+            continue
+        if CARRIED_BY_DORQ in (r["resolution_note"] or ""):
+            # Closed because dorq carries it (DR-0914): the condition still held,
+            # so the closure is no verdict on it.
             continue
         # Resolved: a data error when SF1 corrected the period in between.
         statement = scope.get("statement")

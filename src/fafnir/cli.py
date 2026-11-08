@@ -6901,13 +6901,19 @@ def dq_run(
                 "dorq statements: not run, the engine is sql (--engine both, or"
                 " --statements-only)"
             )
-    if not cfg.dorq_statements or cfg.dorq_statements_shadow:
-        # The SQL fundamentals checks are retired (DR-0914): without dorq writing
-        # the queue, nothing flags the statements.
+    if not (
+        statements and engine in ("dorq", "both") and not cfg.dorq_statements_shadow
+    ):
+        # The SQL fundamentals checks are retired (DR-0914): a run whose dorq did
+        # not write its statement flags to the queue flagged no statement at all.
+        # Read from what this run did, not the config alone: --engine,
+        # --statements and --no-statements decide it too.
         click.echo(
-            "fundamentals: the SQL statement checks are retired (DR-0914); dorq"
-            " judges the statements, and writes the queue only with [dq]"
-            " dorq_statements = true and dorq_statements_shadow = false",
+            "fundamentals: this run wrote no statement flag to the queue. The SQL"
+            " statement checks are retired (DR-0914), and dorq writes the queue"
+            " only when it judges the statements (engine dorq or both, with [dq]"
+            " dorq_statements or --statements) and [dq] dorq_statements_shadow ="
+            " false",
             err=True,
         )
 

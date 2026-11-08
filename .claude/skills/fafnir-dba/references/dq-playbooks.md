@@ -1497,7 +1497,9 @@ cutover (DR-0914) dorq judges the statements** (the `dorq_*` statements family
 below), and `dq run` writes none of the thirteen: their playbooks stay for the flags
 still open. `dq recheck` closes those on two grounds, each with its own note: the
 check's own query no longer selects the flag, or a dorq successor flag, open or
-accepted, carries it ("carried by dorq"). A flag neither closes is a condition the
+accepted, carries it ("carried by dorq"; a `fundamentals_suspicious_zero` or
+`fundamentals_negative_impossible` flag only when dorq carries every item its
+`detail` names). A flag neither closes is a condition the
 SQL check saw and dorq does not: judge it on the filing, as its playbook says. Every
 one is once per open condition. A statement condition's `record_key` names the period
 (`period_type`, `fiscal_date`), plus the `version_no` where the check reads every

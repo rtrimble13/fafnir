@@ -1320,7 +1320,9 @@ own note:
   versions chain again after a repair on the host, or the check was recalibrated.
 - **dorq carries it.** A dorq successor flag, open or accepted, on the same security
   and of a successor code that agrees with the flag's key (the rule `dq compare
-  --statements` matched by): the queue keeps one record of the condition, dorq's.
+  --statements` matched by): the queue keeps one record of the condition, dorq's. A
+  `fundamentals_suspicious_zero` or `fundamentals_negative_impossible` flag names
+  several items of its period, and closes only when dorq carries every one.
 
 A flag neither closes is a condition the SQL check saw and dorq does not: judge it on
 the filing, as its playbook says. After deploying the cutover, run `fafnir dq recheck

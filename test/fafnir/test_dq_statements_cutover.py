@@ -20,12 +20,12 @@ from fafnir.dq import recheck as rc
 pytestmark = pytest.mark.integration
 
 
-def _sql_flag(db, sid, check, table, key):
+def _sql_flag(db, sid, check, table, key, detail=None):
     return db.fetchval(
         "INSERT INTO ops.data_quality_flag (security_id, table_name, record_key,"
         " check_name, severity, detail, detected_at)"
-        " VALUES (%s, %s, %s, %s, 'warn', '{}', now()) RETURNING dq_flag_id",
-        (sid, table, json.dumps(key), check),
+        " VALUES (%s, %s, %s, %s, 'warn', %s, now()) RETURNING dq_flag_id",
+        (sid, table, json.dumps(key), check, json.dumps(detail or {})),
     )
 
 
@@ -136,6 +136,86 @@ def test_a_retired_flag_closes_when_a_dorq_successor_carries_it(db):
         rc.recheck_successors(db, checks=["stale"])
 
 
+def test_an_itemized_flag_is_carried_only_when_dorq_carries_every_item(db):
+    """``fundamentals_suspicious_zero`` and ``fundamentals_negative_impossible``
+    name their period's items in ``detail``: a dorq report on one item of several
+    leaves the flag open, so the other item's condition stays in the queue."""
+    quarter = {"statement": "income", "period_type": "quarter"}
+    zero = {
+        "check": "dorq_absent_as_zero",
+        "code": "DQ915",
+        "statement": "income",
+    }
+
+    def flag(symbol, check, key, detail, reports):
+        sid = base._security(db, symbol)
+        fid = _sql_flag(db, sid, check, "core.income_statement", key, detail)
+        for item in reports:
+            extra = {"item": item} if item else {}
+            base._flag(
+                db,
+                sid,
+                (
+                    base._statement_row(
+                        sid, key["fiscal_date"], **zero, extra_key=extra
+                    )
+                    if check == "fundamentals_suspicious_zero"
+                    else base._statement_row(
+                        sid,
+                        key["fiscal_date"],
+                        check="dorq_impossible_value",
+                        code="DQ902",
+                        statement="income",
+                        extra_key=extra,
+                    )
+                ),
+            )
+        return fid
+
+    period = {**quarter, "fiscal_date": "2010-03-31"}
+    items = {"items": ["revenue", "operating_income"]}
+    one_of_two = flag(
+        "ITMA", "fundamentals_suspicious_zero", period, items, ["revenue"]
+    )
+    both = flag(
+        "ITMB",
+        "fundamentals_suspicious_zero",
+        period,
+        items,
+        ["revenue", "operating_income"],
+    )
+    row = flag("ITMC", "fundamentals_suspicious_zero", period, items, [None])
+    versioned = {**period, "version_no": 1}
+    negative = flag(
+        "ITMD",
+        "fundamentals_negative_impossible",
+        versioned,
+        {"revenue": -5.0, "shares_basic": -1.0},
+        ["revenue"],
+    )
+    negatives = flag(
+        "ITME",
+        "fundamentals_negative_impossible",
+        versioned,
+        {"revenue": -5.0},
+        ["revenue"],
+    )
+    results = {
+        r.check_name: set(r.stale_flag_ids)
+        for r in rc.recheck_successors(
+            db,
+            checks=[
+                "fundamentals_suspicious_zero",
+                "fundamentals_negative_impossible",
+            ],
+        )
+    }
+    assert results["fundamentals_suspicious_zero"] == {both, row}
+    assert one_of_two not in results["fundamentals_suspicious_zero"]
+    assert results["fundamentals_negative_impossible"] == {negatives}
+    assert negative not in results["fundamentals_negative_impossible"]
+
+
 def test_cli_recheck_closes_a_held_condition_dorq_carries(db, tmp_path):
     """The SQL condition still holds, so its own rule keeps the flag open; the dorq
     successor flag on the same period closes it, with the cutover's reason."""
@@ -180,3 +260,4 @@ def test_cli_recheck_closes_a_held_condition_dorq_carries(db, tmp_path):
         " WHERE check_name = 'fundamentals_implausible_filing_lag'"
     )
     assert "DR-0914" in note and "DQ931" in note
+    assert rc.CARRIED_BY_DORQ in note
