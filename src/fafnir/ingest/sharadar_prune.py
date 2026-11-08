@@ -21,6 +21,9 @@ for:
 - **A superseded full file** is kept for ``keep_days`` (``[sharadar] keep_days``,
   default 7), and the newest one of each table whatever its age. That is a week of
   TICKERS and ACTIONS versions, and the previous SEP, SFP and SF1, for triage.
+- **The TICKERS file a kept SEP, SFP or SF1 full file was fetched with** is kept
+  with it, whatever its age (``filters.tickers_file_id``, #238): the readers map
+  each security to the ticker the full file names it by through that file.
 - **Anything else on record is deleted.** Its row is marked ``deleted`` and
   committed, then the file is unlinked. The row stays: it is the lineage of every
   load that read the file. A file that would not unlink is found again next time.
@@ -135,6 +138,19 @@ def _plan_ledger(db, root, result, *, keep_days, now) -> set[str]:
     keep_after = now - timedelta(days=keep_days)
     window_after = now - timedelta(days=max(keep_days, DELTA_WINDOW_DAYS))
 
+    # The TICKERS files a kept full file was fetched with (#238).
+    paired = {
+        int(r["filters"]["tickers_file_id"])
+        for r in rows
+        if r["kind"] == "full"
+        and (r["filters"] or {}).get("tickers_file_id") is not None
+        and (
+            r["file_id"]
+            in (current.get(r["vendor_table"]), previous.get(r["vendor_table"]))
+            or r["fetched_at"] >= keep_after
+        )
+    }
+
     for r in rows:
         table, file_id = r["vendor_table"], r["file_id"]
         if r["kind"] == "full":
@@ -146,6 +162,9 @@ def _plan_ledger(db, root, result, *, keep_days, now) -> set[str]:
                 continue
             if r["fetched_at"] >= keep_after:
                 result.kept["recent"] += 1
+                continue
+            if file_id in paired:
+                result.kept["paired"] += 1
                 continue
             reason = "superseded"
         else:

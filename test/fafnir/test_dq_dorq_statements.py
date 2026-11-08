@@ -1061,6 +1061,130 @@ def test_dq_compare_statements_precision_uses_statement_labels_only(
     assert [lab.is_statements for lab in labels] == [True, True, False]
 
 
+def test_dq_compare_statements_recall_pools_both_engines_confirmations(
+    db, fake_dorq, tmp_path
+):
+    sid, _ = _company(db)
+    _emit(
+        fake_dorq,
+        [
+            _statement_row(
+                sid,
+                "2024-06-30",
+                check="dorq_unit_error",
+                code="DQ912",
+                statement="income",
+                extra_key={"item": "revenue"},
+            ),
+            _statement_row(sid, "2024-03-31", extra_key={"identity": "balance_sheet"}),
+        ],
+    )
+    quarter = {"period_type": "quarter"}
+    _sql_flag(
+        db,
+        sid,
+        "balance_sheet_identity",
+        "core.balance_sheet",
+        {**quarter, "fiscal_date": "2024-03-31"},
+    )
+    # Closed since: the SQL check still found it.
+    _sql_flag(
+        db,
+        sid,
+        "cash_flow_tie",
+        "core.cash_flow_statement",
+        {**quarter, "fiscal_date": "2023-12-31"},
+    )
+    db.execute(
+        "UPDATE ops.data_quality_flag SET resolved_at = now() - interval '1 hour',"
+        " resolved_by = 'test' WHERE check_name = 'cash_flow_tie'"
+    )
+    # At info: not in the queue, so not found.
+    _sql_flag(
+        db,
+        sid,
+        "fundamentals_suspicious_zero",
+        "core.income_statement",
+        {**quarter, "fiscal_date": "2024-09-30", "statement": "income"},
+        "info",
+    )
+    night = dorq_statements.run(
+        db, _settings(fake_dorq, tmp_path), "NASDAQ", shadow=True
+    )
+    # Detected after the night started: not found by it.
+    db.execute(
+        "INSERT INTO ops.data_quality_flag (security_id, table_name, record_key,"
+        " check_name, severity, detail, detected_at) VALUES (%s,"
+        " 'core.cash_flow_statement', %s, 'cash_flow_tie', 'warn', '{}',"
+        " now() + interval '1 hour')",
+        (sid, json.dumps({**quarter, "fiscal_date": "2024-06-30"})),
+    )
+
+    def label(day, statement, kind, cls="data_error", **more):
+        return json.dumps(
+            {
+                "series": str(sid),
+                "date": day,
+                "class": cls,
+                "statement": statement,
+                "kind": kind,
+                **more,
+            }
+        )
+
+    labels = cmp.parse_labels(
+        iter(
+            [
+                # dorq's, confirmed on EDGAR: dorq found it, no SQL check did.
+                label("2024-06-30", "income", "edgar_confirmed", expect="DQ912"),
+                # Both found it.
+                label("2024-03-31", "balance_sheet", "edgar_confirmed", expect="DQ903"),
+                # The SQL check's, confirmed by its closure: dorq missed it.
+                label(
+                    "2023-12-31",
+                    "cash_flow",
+                    "cash_flow_tie_vendor_fixed",
+                    expect="DQ903",
+                ),
+                # Only an info flag: neither found it.
+                label("2024-09-30", "income", "corrected_zero", expect="DQ915"),
+                # Both flagged the period, neither with the code it expects.
+                label("2024-03-31", "balance_sheet", "corrected_value", expect="DQ911"),
+                # Flagged by SQL only after the night.
+                label("2024-06-30", "cash_flow", "corrected_value", expect="DQ903"),
+                # Not confirmed errors: left out.
+                label("2024-03-31", "balance_sheet", "x_accepted", "market_fact"),
+                json.dumps(
+                    {
+                        "series": "*",
+                        "date": "2024-03-31",
+                        "class": "data_error",
+                        "expect": "DQ951",
+                        "members": [sid],
+                    }
+                ),
+            ]
+        )
+    )
+    c = cst.compare(db, night.shadow_file, labels=labels)
+    r = c.recall
+    assert r.labels == 6
+    assert (r.dorq, r.dorq_any) == (2, 3)
+    assert (r.sql, r.sql_any) == (2, 3)
+    by = c.recall_by_kind
+    assert (by["edgar_confirmed"].dorq, by["edgar_confirmed"].sql) == (2, 1)
+    assert (
+        by["cash_flow_tie_vendor_fixed"].dorq,
+        by["cash_flow_tie_vendor_fixed"].sql,
+    ) == (0, 1)
+    assert by["corrected_value"].labels == 2 and by["corrected_value"].sql_any == 1
+    payload = c.as_dict()["recall"]
+    assert payload["dorq"]["recall"] == payload["sql"]["recall"] == 2 / 6
+    text = cst.format_comparison(c)
+    assert "Recall at warn+ (6 confirmed errors" in text
+    assert "SQL checks     found 2/6 (33%)" in text
+
+
 def test_cli_dq_compare_statements_reads_the_statements_directory(
     db, fake_dorq, tmp_path
 ):

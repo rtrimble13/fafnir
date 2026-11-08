@@ -114,7 +114,7 @@ import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Optional
+from typing import IO, Optional, Sequence
 
 from fafnir.db.connection import Database
 from fafnir.dq import checks as _checks
@@ -969,6 +969,36 @@ def _flag_scope(flag: dict, spans: dict) -> Optional[tuple]:
     return code, _scope_of(statement, None), first, max(first, decided_day)
 
 
+def place_statement_flags(
+    db: Database, rows: Sequence[dict]
+) -> list[tuple[dict, tuple]]:
+    """Each statement flag of ``rows`` with ``(code, scope, first, last)``, placed
+    as its label is (:func:`_flag_scope`); one that cannot be placed is left out.
+    A row needs ``security_id``, ``check_name``, ``table_name``, ``record_key``,
+    ``detail`` and ``decided_at``. `dq compare --statements` places the SQL
+    checks' flags the same way, to tell whether one found a label (its recall)."""
+    from fafnir.dq import compare_statements as cst
+
+    wanted: set[tuple] = set()
+    for r in rows:
+        if r["check_name"].startswith("dorq_"):
+            continue
+        if not cst.SUCCESSORS[r["check_name"]].match.startswith("fiscal_year"):
+            continue
+        year = (r["record_key"] or {}).get("fiscal_year")
+        if year in (None, ""):
+            continue
+        for y in (int(year) - 1, int(year)):
+            wanted.add((r["security_id"], r["table_name"], y))
+    spans = _year_spans(db, wanted) if wanted else {}
+    out = []
+    for r in rows:
+        placed = _flag_scope(r, spans)
+        if placed is not None:
+            out.append((r, placed))
+    return out
+
+
 def _statement_flags(db: Database, out: LabelExport, found: _Corrections) -> None:
     """Labels from closed statement flags: accepted is a filing fact; resolved with
     a vendor correction of its period in between is a data error."""
@@ -989,23 +1019,8 @@ def _statement_flags(db: Database, out: LabelExport, found: _Corrections) -> Non
         """,
         (list(cst.SUCCESSORS), list(STATEMENT_TABLES.values())),
     )
-    wanted: set[tuple] = set()
-    for r in rows:
-        if r["check_name"].startswith("dorq_"):
-            continue
-        if not cst.SUCCESSORS[r["check_name"]].match.startswith("fiscal_year"):
-            continue
-        year = (r["record_key"] or {}).get("fiscal_year")
-        if year in (None, ""):
-            continue
-        for y in (int(year) - 1, int(year)):
-            wanted.add((r["security_id"], r["table_name"], y))
-    spans = _year_spans(db, wanted) if wanted else {}
     fixed_keys: list[tuple] = []
-    for r in rows:
-        placed = _flag_scope(r, spans)
-        if placed is None:
-            continue
+    for r, placed in place_statement_flags(db, rows):
         code, scope, first, last = placed
         source = f"dq_flag:{r['dq_flag_id']}"
         verified = _verified(r["judgement_basis"])

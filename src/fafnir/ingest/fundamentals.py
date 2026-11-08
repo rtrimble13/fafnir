@@ -6,7 +6,10 @@
 Two modes, both reading the ledger (no API, no landing table):
 
 - ``--backfill``: the ledger's current SF1 full file, one ticker's rows at a time
-  (:func:`sharadar_ledger.select_by_ticker`).
+  (:func:`sharadar_ledger.select_by_ticker`). A key is read by the ticker the file
+  files it under, not tonight's (:func:`sharadar_prices.tickers_as_of_file`, #238):
+  SF1 rows carry no permaticker, and a key renamed since the file was fetched holds
+  its rows there under its old ticker, while its new one may be another issuer's.
 - **the nightly** (the default): the SF1 delta files recorded since the last nightly.
   Where two files hold a row, the one stamped later wins, and on the same stamp the
   later file's. The run's ``params.through`` names the last file applied, so a night
@@ -92,7 +95,7 @@ from fafnir.ingest import sharadar_ledger as ledger
 from fafnir.ingest import sharadar_map
 from fafnir.ingest.runlog import RunLog
 from fafnir.ingest.sharadar_master import SECURITY_TABLES
-from fafnir.ingest.sharadar_prices import report_progress
+from fafnir.ingest.sharadar_prices import report_progress, tickers_as_of_file
 from fafnir.logging_config import get_logger
 from fafnir.sources import sharadar_files as sf
 
@@ -981,17 +984,15 @@ def load(
     result.counts["key_without_fundamentals"] += len(keys) - len(in_scope)
     if limit is not None:
         in_scope = in_scope[:limit]
-    targets = {
-        listing[k]["ticker"]: _Key(k, listing[k]["ticker"], listing[k]["currency"])
-        for k in in_scope
-    }
-    result.keys = len(targets)
+    tonight = {k: listing[k]["ticker"] for k in in_scope}
+    result.keys = len(tonight)
     partial = security_ids is not None or limit is not None or period != "both"
 
-    if backfill and not targets:
+    if backfill and not tonight:
         raise FundamentalsError(
             "no security in scope has a Sharadar link and a fundamentals ticker"
         )
+    full = None
     if backfill:
         full = repo.current_sharadar_full(db, VENDOR_TABLE)
         if full is None:
@@ -1005,6 +1006,14 @@ def load(
         files, through = pending_deltas(db)
         result.files = [f["file_id"] for f in files]
         result.through = through if partial else max(result.files, default=through)
+    # By the ticker the file files each key's rows under: the full file's, through
+    # the TICKERS file fetched with it; a delta's is tonight's (#238).
+    targets = {
+        ticker: _Key(k, listing[k]["ticker"], listing[k]["currency"])
+        for k, ticker in tickers_as_of_file(
+            db, bulk_dir, full, tonight, result.counts
+        ).items()
+    }
 
     splits = _splits_by_key(
         db, bulk_dir, {t.vendor_key for t in targets.values()}, as_of

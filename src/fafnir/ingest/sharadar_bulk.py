@@ -16,6 +16,11 @@ For each table asked for:
 4. **Record it** in ``landing.sharadar_file`` with its row count, then mark the
    table's older full files superseded. The same content downloaded twice is one
    file, not two.
+5. **Pair it with TICKERS** (#238). A full SEP, SFP or SF1 file is fetched with
+   TICKERS, forced, just before it, and records that file as
+   ``filters.tickers_file_id``: its rows carry only the ticker of the day, and the
+   readers map each security to it through that file
+   (:func:`fafnir.ingest.sharadar_prices.tickers_as_of_file`).
 
 Each table is its own ``ops.ingestion_run`` (``source = sharadar``, ``endpoint =
 bulk:<table>``), with the bytes downloaded and, in ``params``, the rows, file and
@@ -62,6 +67,9 @@ logger = get_logger("ingest.sharadar_bulk")
 #: What the initial population downloads (plan v2, P1). Legacy codes are
 #: accepted and recorded under the modern name.
 DEFAULT_TABLES = ("tickers", "actions", "SEP", "SFP", "SF1")
+#: The tables whose rows carry only a ticker, so a full file of one is fetched with
+#: TICKERS and records which (#238): SEP, SFP and SF1.
+PAIRED_TABLES = ("stocks", "funds", "fundamentals")
 #: What the nightly fetches as deltas, by ``lastupdated``: the price tables (#98)
 #: and SF1 (#106).
 DELTA_TABLES = ("SEP", "SFP", "SF1")
@@ -216,13 +224,49 @@ def download_tables(
     force: bool = False,
 ) -> list[TableResult]:
     """:func:`download_table` for each table, in order; one table's failure does
-    not stop the rest."""
+    not stop the rest.
+
+    A full file of SEP, SFP or SF1 (:data:`PAIRED_TABLES`) is fetched with TICKERS,
+    whole and forced, just before it (#238). Its rows carry only the ticker of the
+    day, and a ticker can pass to another issuer later: the full file records that
+    TICKERS file (:func:`repository.pair_sharadar_tickers`), so its readers know
+    which security each ticker named. A table this run skips (a current full file,
+    and no ``force``) keeps the pairing it has."""
     if str(years) not in BULK_YEARS:
         raise ValueError(f"years must be one of {BULK_YEARS}, not {years!r}")
-    return [
-        download_table(db, client, t, bulk_dir, years=str(years), force=force)
+    fetching = [
+        t
         for t in tables
+        if sf.canonical_table(t) in PAIRED_TABLES
+        and (force or repo.current_sharadar_full(db, sf.canonical_table(t)) is None)
     ]
+    results: list[TableResult] = []
+    tickers: Optional[TableResult] = None
+    if fetching:
+        tickers = download_table(db, client, "tickers", bulk_dir, force=True)
+        results.append(tickers)
+    for t in tables:
+        if tickers is not None and sf.canonical_table(t) == "tickers":
+            continue  # fetched above
+        result = download_table(db, client, t, bulk_dir, years=str(years), force=force)
+        results.append(result)
+        if t in fetching and result.outcome in _HELD:
+            if tickers is not None and tickers.outcome in _HELD:
+                repo.pair_sharadar_tickers(db, result.file_id, tickers.file_id)
+                db.commit()
+            else:
+                logger.warning(
+                    "%s: TICKERS failed with it, so its readers skip the securities "
+                    "renamed since; fetch both again with `fafnir source "
+                    "sharadar-bulk --tables %s --force` (#238)",
+                    result.table,
+                    result.table,
+                )
+    return results
+
+
+#: The outcomes after which the ledger holds the table's file.
+_HELD = ("recorded", "unchanged")
 
 
 def delta_since(db: Database, vendor_table: str) -> Optional[date]:
