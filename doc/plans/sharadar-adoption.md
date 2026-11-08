@@ -6,14 +6,14 @@
   (`git show 1d26d82:doc/plans/sharadar-adoption.md`). The [Retrospective](#retrospective) compares the
   two.
 - **Sharadar has been the primary nightly vendor since 2026-10-22** (#125), verified and held for five
-  sessions (#126). FMP is the secondary, on a reduced tier since 2026-11-01 (#128), and since 2026-11-05 a
+  sessions (#126). FMP is the secondary, on its Starter tier since 2026-11-01 (#128), and since 2026-11-05 a
   backup feed only: every security Sharadar carries moves to it, and the open-end mutual funds may freeze
   once `fmp_secondary` is off. Fundamentals come from SF1 (v3.0.0, 2026-10-26; the
   production load is #92). Tiingo, FRED, BLS and BEA were dropped on 2026-10-30. Every phase is closed
   (*Phases*). The issues were reconciled with the build on 2026-10-24, 2026-10-30 and at the close
   (*Issue dispositions*).
 - **Markers.** **[to fill: …]** marks what the operator supplies before this revision merges: the close
-  date, the FMP tier's name and the prices paid. None is left when this plan closes.
+  date and what FMP Premium cost until the tier change. None is left when this plan closes.
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -88,7 +88,7 @@ reduced, not cancelled. What changes is how it is built, and what no longer need
   securities: 3,943 mutual funds, 80 ETFs and 53 unlinked equities, plus the tracked declarations. Since
   FMP became a backup feed only (2026-11-05), the rest move to Sharadar: by 2026-11-08 FMP fed 3,961,
   3,938 mutual funds and 23 other securities being moved (#128).
-- **The reduced tier** is **[to fill: the tier's name]**. It serves everything fafnir and `duk` still ask
+- **The reduced tier** is **Starter**, at $264 a year. It serves everything fafnir and `duk` still ask
   of FMP (#128).
 
 **Survivorship floor: 1998-01-01.** Neither vendor has delistings before 1998, so cross-sectional work before
@@ -365,14 +365,14 @@ Not this plan's, and still open at the close: #219 and #221, dorq's statements (
 Prices are from the assessment (2026-09-23) and the vendor pages as last read; confirm at checkout. Tiingo's
 free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they were.
 
-*[built] What was paid.* Neither #57 nor #128 records an amount, so the figures are the invoices':
+*[built] What was paid.* Neither #57 nor #128 records an amount; the operator gave them at the close:
 
 | Item | Planned | Paid |
 |---|---|---|
-| Sharadar Bundle, max history, annual, 2026-10-18 to 2027-10-18 (#57); renewal reminder 2027-09-18 | $499 | **[to fill: from the invoice]** |
+| Sharadar Bundle, max history, annual, 2026-10-18 to 2027-10-18 (#57); renewal reminder 2027-09-18 | $499 | $499 |
 | FMP Premium, until the tier change on 2026-11-01 | $708 a year | **[to fill: from the invoice]** |
-| FMP's reduced tier, from 2026-11-01 | ~$264 a year, if Starter | **[to fill: the tier and its price]** |
-| The run rate from 2026-11-01 | ~$763 a year | **[to fill: the sum]** |
+| FMP's reduced tier, from 2026-11-01 | ~$264 a year, if Starter | Starter, $264 a year |
+| The run rate from 2026-11-01 | ~$763 a year | $763 a year, as planned |
 
 Nothing else was bought. There was no staging server and no Tiingo key, and the host's disk held the
 backfill (*Risks*).
@@ -423,7 +423,7 @@ backfill (*Risks*).
 | 2026-10-30 | **Tiingo, FRED, BLS and BEA are not adopted.** #88, #97, #104, #114 and #116 are closed as not planned, and the economic-series milestone leaves the roadmap. The funds stay on FMP as the secondary vendor: three of the eight tracked funds, the other five uncovered, as today. `duk yc` stays on FMP's treasury rates in every mode. So the reduced FMP tier must serve both, or they stop (#128). The `tiingo` hooks in the code stay, dormant | #41, *Issue dispositions (applied 2026-10-30)* |
 | 2026-11-01 | **The cutover is verified and held for five sessions, with no rollback.** The first Sharadar-primary night (2026-10-23 UTC, runs 427–439) passed the runbook's verification: the 2026-10-22 bars on fed securities were Sharadar's alone, and FMP's secondary steps wrote nothing into a fed security. Seven sessions loaded through 2026-10-30, none with a quarantined bar. Two nights stopped on an SFP 503 (2026-10-27 and 2026-10-31) and were re-run by hand the same day; #233 (v3.1.0) now waits an outage out inside the night. What the first nights caught is #195, #196, #197, #199, #201 and #202. The FMP tier (#128) is no longer waiting on the cutover | #125, #126 |
 | 2026-11-01 | **The fundamentals reload is the production backfill.** Run 491 (2026-10-27, after #216's reset) read 3.10M SF1 rows and wrote 3.55M statement rows in 25 minutes, 8 quarantined; the panel's look-ahead invariant is 0. The balance-sheet identity holds for 96.2% of 909,725 periods, so the criterion is met by its other half: the 34,206 exceptions are flagged, and were accepted at the operator's direction on 2026-10-30. A security linked after it takes its history from `--backfill --symbols` (run 669: 334 dead issuers minted on 2026-11-01) | #92 |
-| 2026-11-01 | **FMP reduced to a lower tier** (the operator). Checked from the host by 2026-11-08: the unadjusted EOD feed, a fund's bars and distributions, the action calendars, treasury rates (`duk yc`), the filtered screen (`duk -S fmp ls`) and the identifier search (`duk -S fmp ph cik:`) all answer on it, and `duk -S fmp ph AAPL` agrees with the warehouse's raw closes on every date of five years. The secondary night ran on it from 2026-11-03: prices and profiles every night, with no quarantine. Its per-minute limit shows: the corporate-actions step met HTTP 429 on 2 of the first 5 nights, straight after the price step | #128 |
+| 2026-11-01 | **FMP reduced to a lower tier**, Starter at $264 a year (the operator). Checked from the host by 2026-11-08: the unadjusted EOD feed, a fund's bars and distributions, the action calendars, treasury rates (`duk yc`), the filtered screen (`duk -S fmp ls`) and the identifier search (`duk -S fmp ph cik:`) all answer on it, and `duk -S fmp ph AAPL` agrees with the warehouse's raw closes on every date of five years. The secondary night ran on it from 2026-11-03: prices and profiles every night, with no quarantine. Its per-minute limit shows: the corporate-actions step met HTTP 429 on 2 of the first 5 nights, straight after the price step | #128 |
 | 2026-11-05 | **FMP is a backup feed only.** Every security Sharadar carries moves to it: link, `vendor correct`, then `vendor feed`, 110 of them by 2026-11-06. The open-end mutual funds, which Sharadar does not carry, may freeze: `fmp_secondary = false` once the remaining non-fund securities have moved, with no code change for a not-fed state | #128 |
 | **[to fill: the date this merges]** | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **Accepted** on 2026-11-08, by the operator's decision: its implementation notes 1–3 shipped on 2026-10-24, and the `duk` checks its note 5 asks for answered on 2026-11-08 (#128) | #131 |
 
@@ -447,6 +447,8 @@ calendar and release, and the hours column is v1's alone.
 | P3 and P5 | S13–S17, Dec 21–Jan 22; cutover 2027-01-11 | 46 | Cutover 2026-10-22; five sessions by 11-01; the tier on 11-01, its record 11-08; #117 on 10-30; the close **[to fill: the date this merges]** | v2.0.0 → v2.0.0, on 2026-10-22 |
 | **All** | 17 weeks, to 2027-01-22 | **237** | About three weeks from plan v2 | 28 releases, v1.6.0 to v3.1.4 |
 
+- **The costs came in as planned, and sooner.** The run rate is $763 a year from 2026-11-01: Sharadar's
+  $499 and FMP Starter's $264, the figure v1 gave for after S17 (2027-01-22).
 - **The cutover came 81 days before v1's date** (2026-10-22 against 2027-01-11). v1's end was set by its
   sixty-session clock, not by the build ("The 60-session parallel run, not the build work, sets the end
   date"). Dropping the clock moved everything that waited on it.
