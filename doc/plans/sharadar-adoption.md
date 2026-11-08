@@ -12,8 +12,8 @@
   production load is #92). Tiingo, FRED, BLS and BEA were dropped on 2026-10-30. Every phase is closed
   (*Phases*). The issues were reconciled with the build on 2026-10-24, 2026-10-30 and at the close
   (*Issue dispositions*).
-- **Markers.** **[to fill: …]** marks what the operator supplies before this revision merges: the close
-  date and what FMP Premium cost until the tier change. None is left when this plan closes.
+- **Markers.** **[to fill: …]** marks the close date, set when this revision merges. None is left when
+  this plan closes.
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -370,7 +370,7 @@ free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they wer
 | Item | Planned | Paid |
 |---|---|---|
 | Sharadar Bundle, max history, annual, 2026-10-18 to 2027-10-18 (#57); renewal reminder 2027-09-18 | $499 | $499 |
-| FMP Premium, until the tier change on 2026-11-01 | $708 a year | **[to fill: from the invoice]** |
+| FMP Premium, until the tier change on 2026-11-01 | $708 a year | $708 a year |
 | FMP's reduced tier, from 2026-11-01 | ~$264 a year, if Starter | Starter, $264 a year |
 | The run rate from 2026-11-01 | ~$763 a year | $763 a year, as planned |
 
@@ -566,9 +566,9 @@ These pass to ordinary operations, outside this plan:
     - **The data dictionary is complete** for every table and view from migration 0025 to 0044. Its
       inventory gained `mart.v_share_factor_versions` and `mart.fn_daily_market_cap`, and its header
       moved to 0044.
-    - **Left for the operator:** the FMP plan's name ("Professional") and its limits, ~300 requests a
-      minute and 50 GB a month. #128 did not record the reduced tier's, and its actions step met HTTP 429
-      at the 280-a-minute throttle.
+    - **Left as they are, by the operator's decision:** the operating docs' FMP plan name
+      ("Professional") and its limits, ~300 requests a minute and 50 GB a month. #128 did not record
+      Starter's, and its actions step met HTTP 429 at the 280-a-minute throttle.
     - **Left for its own change:** the skill's re-fetch steps for a bad bar, which name FMP's `ingest
       prices`. That changes playbook logic.
   - **ADR 0017:** **Accepted** on 2026-11-08, with a status note on what was checked.
