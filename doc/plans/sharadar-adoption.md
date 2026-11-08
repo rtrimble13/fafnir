@@ -1,6 +1,6 @@
 # Plan: Sharadar adoption
 
-- Status: **implemented**, closed **[to fill: the date this merges]**. Plan v2 (revised 2026-10-18) was
+- Status: **implemented**, closed **2026-11-08**. Plan v2 (revised 2026-10-18) was
   built in about three weeks. Plan v1 (2026-09-23, seventeen weekly sprints S01–S17 to 2027-01-22) is
   superseded; its calendar and status tables are in git history
   (`git show 1d26d82:doc/plans/sharadar-adoption.md`). The [Retrospective](#retrospective) compares the
@@ -12,8 +12,6 @@
   production load is #92). Tiingo, FRED, BLS and BEA were dropped on 2026-10-30. Every phase is closed
   (*Phases*). The issues were reconciled with the build on 2026-10-24, 2026-10-30 and at the close
   (*Issue dispositions*).
-- **Markers.** **[to fill: …]** marks the close date, set when this revision merges. None is left when
-  this plan closes.
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -129,7 +127,7 @@ Phases are ordered by dependency, not by calendar week. Each closes with a short
 | **P2** | Backfill, compare, correct | #69, #73, #74, #75, #76, #77, #79, #80, #81 | Dead-issuer history loaded; comparison report posted; corrections applied and audited; DQ queue triaged; `v_security_lifecycle` live; release **v1.6.0** (shipped as v1.8.x; closed on v1.8.4) | ✅ 2026-10-22, on v1.8.4 |
 | **P3** | Cutover to the Sharadar nightly | #93, #98, #109, #111, #118, #120, #122, #124, #125, #126, #128, #130 | Sharadar-primary nightly green for five sessions; FMP tier reduced; release **v2.0.0** (tagged 2026-10-22) | ✅ 2026-11-01: five sessions held (#126), and the tier changed the same day; #128 closed with its record on 2026-11-08 |
 | **P4** | Fundamentals on SF1 | #83, #85, #86, #87, #90, #91, #92, #95, #96, #100, #101, #102, #106, #107, #108 | Panel refreshed nightly with the look-ahead invariant at zero; `duk fs/fa`; `doc/fundamentals.md`; a release (shipped as **v3.0.0** on 2026-10-26, a major where a minor was planned) | ✅ 2026-10-26 (code); the production load, recorded 2026-11-01 (#92) |
-| **P5** | Close-out | #117, #131 | `scripts/reconcile.sh` a cross-vendor check; plan marked implemented | ✅ #117 2026-10-30; #131 **[to fill: the date this merges]** |
+| **P5** | Close-out | #117, #131 | `scripts/reconcile.sh` a cross-vendor check; plan marked implemented | ✅ #117 2026-10-30; #131 2026-11-08 |
 
 P3 and P4 are independent once P2 is done; run them in whichever order the comparison report and the SF1
 probe allow. P5's fund and FRED work (#88, #97, #104, #114, #116) was dropped on 2026-10-30: the funds and
@@ -425,7 +423,7 @@ backfill (*Risks*).
 | 2026-11-01 | **The fundamentals reload is the production backfill.** Run 491 (2026-10-27, after #216's reset) read 3.10M SF1 rows and wrote 3.55M statement rows in 25 minutes, 8 quarantined; the panel's look-ahead invariant is 0. The balance-sheet identity holds for 96.2% of 909,725 periods, so the criterion is met by its other half: the 34,206 exceptions are flagged, and were accepted at the operator's direction on 2026-10-30. A security linked after it takes its history from `--backfill --symbols` (run 669: 334 dead issuers minted on 2026-11-01) | #92 |
 | 2026-11-01 | **FMP reduced to a lower tier**, Starter at $264 a year (the operator). Checked from the host by 2026-11-08: the unadjusted EOD feed, a fund's bars and distributions, the action calendars, treasury rates (`duk yc`), the filtered screen (`duk -S fmp ls`) and the identifier search (`duk -S fmp ph cik:`) all answer on it, and `duk -S fmp ph AAPL` agrees with the warehouse's raw closes on every date of five years. The secondary night ran on it from 2026-11-03: prices and profiles every night, with no quarantine. Its per-minute limit shows: the corporate-actions step met HTTP 429 on 2 of the first 5 nights, straight after the price step | #128 |
 | 2026-11-05 | **FMP is a backup feed only.** Every security Sharadar carries moves to it: link, `vendor correct`, then `vendor feed`, 110 of them by 2026-11-06. The open-end mutual funds, which Sharadar does not carry, may freeze: `fmp_secondary = false` once the remaining non-fund securities have moved, with no code change for a not-fed state | #128 |
-| **[to fill: the date this merges]** | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **Accepted** on 2026-11-08, by the operator's decision: its implementation notes 1–3 shipped on 2026-10-24, and the `duk` checks its note 5 asks for answered on 2026-11-08 (#128) | #131 |
+| 2026-11-08 | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **Accepted** on 2026-11-08, by the operator's decision: its implementation notes 1–3 shipped on 2026-10-24, and the `duk` checks its note 5 asks for answered on 2026-11-08 (#128) | #131 |
 
 ## Retrospective
 
@@ -444,7 +442,7 @@ calendar and release, and the hours column is v1's alone.
 | P1 | S03–S05, Oct 12–Oct 30 | 46 | 10-19 to 10-20 (code); the host by 10-21 | — |
 | P2 | S06–S07, Nov 02–Nov 13 | 32 | 10-20 to 10-22 | v1.1.0 → v1.8.x, closed on v1.8.4 |
 | P4 | S08–S12, Nov 16–Dec 18 | 78 | 10-24 to 10-26 (code); the production load on 10-27 | v1.2.0 → **v3.0.0** |
-| P3 and P5 | S13–S17, Dec 21–Jan 22; cutover 2027-01-11 | 46 | Cutover 2026-10-22; five sessions by 11-01; the tier on 11-01, its record 11-08; #117 on 10-30; the close **[to fill: the date this merges]** | v2.0.0 → v2.0.0, on 2026-10-22 |
+| P3 and P5 | S13–S17, Dec 21–Jan 22; cutover 2027-01-11 | 46 | Cutover 2026-10-22; five sessions by 11-01; the tier on 11-01, its record 11-08; #117 on 10-30; the close on 11-08 | v2.0.0 → v2.0.0, on 2026-10-22 |
 | **All** | 17 weeks, to 2027-01-22 | **237** | About three weeks from plan v2 | 28 releases, v1.6.0 to v3.1.4 |
 
 - **The costs came in as planned, and sooner.** The run rate is $763 a year from 2026-11-01: Sharadar's
