@@ -1,6 +1,10 @@
 # ADR 0017: Vendor access is one library inside fafnir, not a distribution per vendor
 
 - Status: **Proposed** (draft, 2026-10-24)
+- Status note (2026-11-08, the Sharadar plan's close-out, #131): implementation notes 1–3 shipped on
+  2026-10-24 (v2.1.0) and have run on the host since. Note 5's acceptance waits on three `duk` checks
+  on FMP's reduced tier, which are #128's: `duk -S fmp ph`, `duk yc` and `duk -S fmp ls --sectors`.
+  **[#128: Accepted on that date, or still proposed and why]**
 - Date: 2026-10-24
 - Depends on: [ADR 0011](0011-versioning.md) (one version, deployed by `git pull`),
   [ADR 0008](0008-remote-duk-access-and-mcp.md) (the MCP server is built on
@@ -196,7 +200,7 @@ and `fafi` versus `fafnir` is easier to confuse in an allowlist.
 Roughly in order, each independently useful:
 
 1. **This ADR**, the boundary test and the three moves in §1; `duk/sharadar_api.py`
-   onto `SharadarClient` (§2, Sharadar half). *Started 2026-10-24.*
+   onto `SharadarClient` (§2, Sharadar half). *Shipped 2026-10-24.*
 2. `FMPClient.treasury_rates`, `search_identifier`, `eod_dividend_adjusted`,
    `actively_trading_list` and `screen`; `duk/fmp_api.py` loses its request code
    and calls them; the boundary test asserts `duk` imports neither `requests` nor
