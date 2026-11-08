@@ -13,8 +13,7 @@
   (*Phases*). The issues were reconciled with the build on 2026-10-24, 2026-10-30 and at the close
   (*Issue dispositions*).
 - **Markers.** **[to fill: …]** marks what the operator supplies before this revision merges: the close
-  date, the FMP tier's name and the prices paid, and ADR 0017's status. None is left when this plan
-  closes.
+  date, the FMP tier's name and the prices paid. None is left when this plan closes.
 - Tracking issue: [#41](https://github.com/rtrimble13/fafnir/issues/41) · Assessment:
   [sharadar-coa-assessment.md](sharadar-coa-assessment.md) · Vendor comparison:
   [fafnir-vendor-assessment.md](fafnir-vendor-assessment.md)
@@ -426,7 +425,7 @@ backfill (*Risks*).
 | 2026-11-01 | **The fundamentals reload is the production backfill.** Run 491 (2026-10-27, after #216's reset) read 3.10M SF1 rows and wrote 3.55M statement rows in 25 minutes, 8 quarantined; the panel's look-ahead invariant is 0. The balance-sheet identity holds for 96.2% of 909,725 periods, so the criterion is met by its other half: the 34,206 exceptions are flagged, and were accepted at the operator's direction on 2026-10-30. A security linked after it takes its history from `--backfill --symbols` (run 669: 334 dead issuers minted on 2026-11-01) | #92 |
 | 2026-11-01 | **FMP reduced to a lower tier** (the operator). Checked from the host by 2026-11-08: the unadjusted EOD feed, a fund's bars and distributions, the action calendars, treasury rates (`duk yc`), the filtered screen (`duk -S fmp ls`) and the identifier search (`duk -S fmp ph cik:`) all answer on it, and `duk -S fmp ph AAPL` agrees with the warehouse's raw closes on every date of five years. The secondary night ran on it from 2026-11-03: prices and profiles every night, with no quarantine. Its per-minute limit shows: the corporate-actions step met HTTP 429 on 2 of the first 5 nights, straight after the price step | #128 |
 | 2026-11-05 | **FMP is a backup feed only.** Every security Sharadar carries moves to it: link, `vendor correct`, then `vendor feed`, 110 of them by 2026-11-06. The open-end mutual funds, which Sharadar does not carry, may freeze: `fmp_secondary = false` once the remaining non-fund securities have moved, with no code change for a not-fed state | #128 |
-| **[to fill: the date this merges]** | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **[to fill: Accepted, or still proposed]**: its implementation notes 1–3 shipped on 2026-10-24, and the three `duk` checks its note 5 asks for answered on 2026-11-08 (#128) | #131 |
+| **[to fill: the date this merges]** | **The plan is implemented.** Every phase is closed, and #131 and #41 close with this revision (*Retrospective*, *Issue dispositions (at the close)*). [ADR 0017](../adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) is **Accepted** on 2026-11-08, by the operator's decision: its implementation notes 1–3 shipped on 2026-10-24, and the `duk` checks its note 5 asks for answered on 2026-11-08 (#128) | #131 |
 
 ## Retrospective
 
@@ -570,7 +569,7 @@ These pass to ordinary operations, outside this plan:
       at the 280-a-minute throttle.
     - **Left for its own change:** the skill's re-fetch steps for a bad bar, which name FMP's `ingest
       prices`. That changes playbook logic.
-  - **ADR 0017:** a status note; **[to fill: Accepted, or still proposed]**.
+  - **ADR 0017:** **Accepted** on 2026-11-08, with a status note on what was checked.
   - **Measured:** nothing; docs only. `check_doc_links.py` passes.
 
 - **2026-11-01 to 2026-11-06 · P3, after the five sessions.** Three fixes and one repair:
