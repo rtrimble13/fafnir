@@ -118,14 +118,21 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
   (`etc/agent/sudoers.example`). That refusal reads like a policy block and is not
   one: never report a task as blocked on it. Every example in these files uses the
   full path for the same reason.
-- **If a vendor's key is absent, every repair needing that vendor's fetch is
-  blocked** — re-ingests, backfills, re-fetching a bad bar: Sharadar's for a
-  security it feeds, FMP's for a fund or an unlinked name (`repo.fmp_fed`). Each
-  probe costs 2 or 3 requests and fails fast. A Sharadar fetch the agent cannot
-  make is the operator's, run with the env file loaded
+- **A vendor's key blocks only the repairs that call that vendor's API.** FMP's
+  (the probe above) is needed only for the securities FMP still feeds
+  (`repo.fmp_fed`: the funds and the unlinked names): their re-ingests and bar
+  re-fetches (`source probe-prices`, `ingest prices --allow-secondary`, `ingest
+  actions --allow-secondary`). Without it those are blocked, and nothing on a
+  Sharadar-fed security is. Sharadar's repairs read the files already under
+  `[sharadar] bulk_dir` and need no key: `ingest sharadar-prices --backfill`,
+  `ingest sharadar-actions --backfill`, `vendor correct`. They are only as current
+  as the ledger's full file (`sharadar_files`). Sharadar's key is for its API alone
+  (`duk -S sharadar …`, `source sharadar-bulk|delta`), and since your sudo rule
+  does not load it, those reads are the operator's, run with the env file loaded
   (`sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; fafnir …'`,
-  as `doc/operations.md` does). Say so in the *first* report, not
-  when a repair fails halfway through a plan.
+  as `doc/operations.md` does). Each probe costs 2 or 3 requests and fails fast.
+  Say what is blocked in the *first* report, not when a repair fails halfway
+  through a plan.
 - **Know which version is deployed** before concluding a defect is unfixed. A fix
   that is merged is not a fix that is running — `/opt/fafnir` is upgraded by a
   `git pull` somebody has to do.

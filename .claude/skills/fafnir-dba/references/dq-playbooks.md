@@ -232,13 +232,40 @@ reached 149,613,176 and HUN carried a "10:1 split" it never had, both with a smo
 adjusted series. Read `min_close`/`max_close` in `mart.v_security_price_coverage`
 before accepting. `references/outlier-classification.md` has the full sort order.
 
-**Repair when** both series jump: load the action, then re-adjust.
+**Repair when** both series jump: load the action from the vendor that feeds the
+security (the query in [Re-fetching a bar](#re-fetching-a-bar-what-each-feed-allows)),
+then re-adjust. On an **FMP-fed** security, FMP's loader pulls the security's whole
+split and dividend history as the secondary vendor; it has no `--dry-run`:
 
 ```bash
-sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest actions --symbols <SYM>
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest actions --allow-secondary --symbols <SYM>
 sudo -u fafnir /opt/fafnir/.venv/bin/fafnir adjust --symbol <SYM>
 sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db refresh-marts
 ```
+
+On a **Sharadar-fed** one, FMP's loader skips the security (`which FMP does not
+feed; skipping actions`). Its actions come from Sharadar's ACTIONS file, which the
+nightly downloads whole and loads every night (`ingest sharadar`, step 6), so an
+action the file carries is normally on file already. The same load for the one
+security re-reads it from the current file. It reads the file on disk, needs no
+key, and a re-run writes nothing it already holds:
+
+```bash
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest sharadar-actions --backfill --symbols <SYM> --dry-run
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest sharadar-actions --backfill --symbols <SYM>
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db refresh-marts
+```
+
+The dry run's `to write` counts every action in scope, held ones included. The
+run's `new or changed` is what it added, and it recomputes the factors of the
+securities it changed.
+When it adds nothing, Sharadar's file does not carry the action, or a rule set it
+aside; the `skipped` lines name the rules: `near_existing` (another source holds
+one of the same type within 7 days, often FMP's at another date: a misdate,
+below), `outside_span` (on or before the link's `valid_from`, so it would adjust
+only FMP's bars), `suppressed` (an operator deleted it), `future`, `invalid`.
+When none of them accounts for it, Sharadar does not carry it: `actions add`, as
+for a split the feed never reported (below).
 
 A genuine 50%+ move with no action (a biotech readout, a takeover collapse) is a
 market fact — **accept**, and say in the note that no action exists and none
@@ -332,8 +359,12 @@ on the host and bar edits need 0026 — check `schema_state` before planning wit
 **Corporate actions behave the same way.** Revoking an `actions delete` override,
 or the pair of overrides `actions redate` leaves, lifts the suppression and removes
 the operator's row. It **does not bring the vendor's row back**. That happens only
-if a later actions load re-reads the date: the calendar sweep's overlap window is
-about a week, and the per-symbol rotation reaches each security once a month.
+if a later actions load re-reads the date. On an FMP-fed security, FMP's calendar
+sweep's overlap window is about a week, and the per-symbol rotation reaches each
+security once a month; `ingest actions --allow-secondary --symbols <SYM>` re-reads
+it now. On a Sharadar-fed one the nightly reads the whole ACTIONS file, so the next
+night re-reads the date unless a rule above sets it aside; `ingest sharadar-actions
+--backfill --symbols <SYM>`, dry run first, re-reads it now.
 
 After a revoke, read `core.corporate_action` for the security. If the vendor's event
 is missing and its date is confirmed, add it with `actions add`, as an operator
