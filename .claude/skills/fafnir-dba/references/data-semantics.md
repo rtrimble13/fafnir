@@ -340,7 +340,8 @@ overwrites, and it prints what it restated.
 
 ## 22. A row's `source` is who supplied it, not who feeds the security (ADR 0015)
 
-Once Sharadar loads, one security's history can hold rows from two vendors.
+Since Sharadar loaded (the backfill, then the 2026-10-22 cutover), one security's
+history can hold rows from two vendors.
 `core.daily_price.source` and `core.corporate_action.source` name the party that
 wrote **that row**; `core.security.source` names the vendor that **minted** the
 security. Neither says which vendor loads its next bar: that is the open link with
@@ -356,7 +357,8 @@ minted (`repo.fmp_fed`, #98), whichever vendor is primary.
 > replaces differing *prices* with Sharadar's, and keeps FMP's volume (#69's
 > convention, `--volume keep`).
 
-Precedence is `operator > sharadar > tiingo > fmp`. FMP never overwrites a Sharadar
+Precedence is `operator > sharadar > fmp` (`tiingo` keeps a dormant rank between
+them: not adopted, 2026-10-30). FMP never overwrites a Sharadar
 row, and no vendor overwrites an operator row. `mart` views do not expose `source`
 (ADR 0009); answer provenance questions on the ops tier.
 

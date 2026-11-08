@@ -27,7 +27,7 @@ resolving anything of that kind.
 | `sharadar_split_ratio_mismatch` | `ingest sharadar-prices`, the nightly included | below |
 | `symbol_change_conflict`, `security_delisting_contradicted` with `detail.source = 'sharadar'` | `ingest sharadar-universe` (#93) | their own entries below |
 
-What changes once Sharadar is primary is in [After the cutover](#after-the-cutover) at the end.
+What changed when Sharadar became primary (2026-10-22) is in [After the cutover](#after-the-cutover) at the end.
 
 **The statement checks** (SF1, #90 and #102) are their own family: [The fundamentals
 flags](#the-fundamentals-flags--statements-from-sf1), before the cutover notes.

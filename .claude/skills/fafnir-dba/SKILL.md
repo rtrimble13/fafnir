@@ -103,6 +103,11 @@ sudo -n -l
 # Read-only; confirms the DB config resolves.
 sudo -u fafnir /opt/fafnir/.venv/bin/fafnir dq list | head -3
 
+# 2 requests; fails fast if the Sharadar key is absent or served as the free tier.
+# The key is only in /etc/fafnir/fafnir.env, which this sudo rule does not load,
+# so a failure here can mean "not in this shell", not "not on the host".
+sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source ping --require-paid
+
 # 3 requests; fails fast if the FMP key is absent.
 sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
     --symbol AAPL --date 1990-01-02
@@ -113,10 +118,14 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir source probe-prices \
   (`etc/agent/sudoers.example`). That refusal reads like a policy block and is not
   one: never report a task as blocked on it. Every example in these files uses the
   full path for the same reason.
-- **If the FMP key is absent, every repair needing a fresh vendor fetch is
-  blocked** — re-ingests, backfills, re-fetching a bad bar. The probe costs 3
-  requests and fails fast. Say so in the *first* report, not when a repair fails
-  halfway through a plan.
+- **If a vendor's key is absent, every repair needing that vendor's fetch is
+  blocked** — re-ingests, backfills, re-fetching a bad bar: Sharadar's for a
+  security it feeds, FMP's for a fund or an unlinked name (`repo.fmp_fed`). Each
+  probe costs 2 or 3 requests and fails fast. A Sharadar fetch the agent cannot
+  make is the operator's, run with the env file loaded
+  (`sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; fafnir …'`,
+  as `doc/operations.md` does). Say so in the *first* report, not
+  when a repair fails halfway through a plan.
 - **Know which version is deployed** before concluding a defect is unfixed. A fix
   that is merged is not a fix that is running — `/opt/fafnir` is upgraded by a
   `git pull` somebody has to do.
@@ -170,7 +179,7 @@ a revoke that in fact left the security with none.
 | A price series | `price_history` (say raw or adjusted) |
 | A statement as known on a date | `statements_as_of` (pass `as_of` for anything historical) |
 | A security's factors, now or at a month-end | `factor_row` |
-| Live names the vendor stopped serving | `fafnir source vendor-gaps` (reads only) |
+| Live names FMP stopped serving (FMP-fed only) | `fafnir source vendor-gaps` (reads only) |
 | dorq against the SQL checks and the labels | `fafnir dq compare --labels-from-db` (reads only) |
 | Timers, journal, disk, backups | `scripts/monitor.sh` (changes nothing) |
 | To change something | the `fafnir` CLI, under `sudo -u fafnir` |

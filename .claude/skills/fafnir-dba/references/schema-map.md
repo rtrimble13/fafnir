@@ -8,7 +8,8 @@ landing  →  core  →  mart          ref / ops / meta cross-cut
 ```
 
 Provenance flows one direction and everything downstream is rebuildable.
-`landing.fmp_raw` holds immutable vendor payloads; `core` is the constrained
+`landing.fmp_raw` holds FMP's immutable payloads; `landing.sharadar_file` ledgers
+Sharadar's files on disk; `core` is the constrained
 source of truth; `mart` is the read seam (ADR 0009) — **no client outside the
 write path reads `core` or `ops` directly**, which is why `duk` names `mart`
 throughout.

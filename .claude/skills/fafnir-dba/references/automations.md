@@ -7,7 +7,9 @@ incremental and idempotent — a missed day is caught up on the next run.
 
 1. **The daily load**, `fafnir-daily` (`scripts/daily_update.sh`, `daily.log`).
    It runs one of two nights, by `[general] primary_price_vendor` (#111); the log's
-   first line names it (`primary vendor: fmp`). FMP mode:
+   first line names it (`primary vendor: sharadar`), and `fafnir status` prints
+   `Primary    : sharadar (FMP secondary on)`. Sharadar mode has run since the
+   cutover (2026-10-22); FMP mode is the rollback, and the code default:
 
    ```
    ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked
@@ -242,9 +244,11 @@ SELECT date_trunc('month', started_at) AS m, source, sum(bytes_downloaded)
 ```
 
 **Requests** — the actual constraint on the nightly window, and dominated by one
-step. `ingest actions` *ships* in `symbol` mode: a full split and dividend history
-for every active security, every night — ~16,000 requests and about an hour to
-capture a few hundred changed rows. The alternative (`actions_mode = "auto"`,
+step. In FMP mode `ingest actions` *ships* in `symbol` mode: a full split and dividend
+history for every active security, every night — ~16,000 requests and about an hour
+to capture a few hundred changed rows. In Sharadar mode it runs as the secondary
+(`--allow-secondary`), over what FMP still feeds: about 4,000 funds and unlinked
+names (`repo.fmp_fed`). The alternative (`actions_mode = "auto"`,
 ADR 0007) costs ~2 requests plus a first-load for anything newly minted and a 1/30
 reconciliation slice.
 
