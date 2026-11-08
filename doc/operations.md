@@ -922,7 +922,10 @@ fafnir override revoke 14 -m "FMP corrected it"               # undo one
   such cost.
 - **Revoking a delete does not write the row back** — run
   `fafnir ingest actions --symbols SYM` or `fafnir ingest prices --symbols SYM --from
-  D --to D` to fetch the vendor's current version. A re-date is two overrides;
+  D --to D` to fetch the vendor's current version, with `--allow-secondary` in
+  Sharadar mode. For a security Sharadar feeds, run `fafnir ingest sharadar-actions
+  --backfill --symbols SYM` or `fafnir ingest sharadar-prices --backfill --symbols
+  SYM`, which read the ledger's current full file. A re-date is two overrides;
   revoke both.
 
 #### Bars at the wrong date or the wrong scale
@@ -1081,7 +1084,7 @@ called each security inactive on the NYSE, and both froze them. FMP's price feed
 went on serving their bars. [ADR 0014](adr/0014-venue-transfer-is-not-a-delisting.md)
 records the design.
 
-**What the nightly does now.**
+**What the nightly does now.** In FMP mode:
 
 - **The delisting sweep** asks the price feed before stamping a recent delisting.
   If the vendor has bars *after* the date, the security is left trading and
@@ -1092,6 +1095,12 @@ records the design.
   whatever the vendor's `isActivelyTrading` says. When the universe load turns a
   row inactive while its last bar is within 5 sessions, it raises
   `security_inactive_but_trading` (info): often the first sign of a move.
+
+In Sharadar mode, `ingest sharadar-universe` declines a `delisted` event that the
+security's own bars contradict, flagging `security_delisting_contradicted`, and raises
+`security_inactive_but_trading` (warn) on a fed security held inactive while it
+trades, with `detail.next = venue_transfer` when the vendor lists the same ticker on
+another venue ([A fed security held inactive](#a-fed-security-held-inactive)).
 
 **Deciding a `security_delisting_contradicted` flag.** The bars cannot tell a move
 between listed venues from a move to OTC, so the flag waits for you. Until you
@@ -1624,10 +1633,11 @@ $F db refresh-marts                                   # 4. drop them from the ma
 
 ## Recovery
 
-- **Interrupted backfill** — just re-run `scripts/initial_backfill.sh`; watermarks
-  resume per symbol.
+- **Interrupted backfill** — just re-run `scripts/initial_backfill.sh` (FMP mode; it
+  refuses in Sharadar mode); watermarks resume per symbol.
 - **Suspected bad load** — the raw payload is in `landing.fmp_raw` (by endpoint +
-  symbol + `fetched_at`); re-pull the window to upsert corrected values.
+  symbol + `fetched_at`); Sharadar's are the files `landing.sharadar_file` ledgers
+  under `[sharadar] bulk_dir`. Re-pull the window to upsert corrected values.
 - **Suspected bad *feed*** — `fafnir source probe-prices` checks that FMP's
   unadjusted endpoint really is unadjusted (3 requests, writes nothing). See
   [backfill.md](backfill.md#confirming-the-price-feed).
