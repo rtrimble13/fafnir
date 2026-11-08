@@ -6912,6 +6912,21 @@ def dq_run(
                 "dorq statements: not run, the engine is sql (--engine both, or"
                 " --statements-only)"
             )
+    if not (
+        statements and engine in ("dorq", "both") and not cfg.dorq_statements_shadow
+    ):
+        # The SQL fundamentals checks are retired (DR-0914): a run whose dorq did
+        # not write its statement flags to the queue flagged no statement at all.
+        # Read from what this run did, not the config alone: --engine,
+        # --statements and --no-statements decide it too.
+        click.echo(
+            "fundamentals: this run wrote no statement flag to the queue. The SQL"
+            " statement checks are retired (DR-0914), and dorq writes the queue"
+            " only when it judges the statements (engine dorq or both, with [dq]"
+            " dorq_statements or --statements) and [dq] dorq_statements_shadow ="
+            " false",
+            err=True,
+        )
 
 
 def _dq_run_bars(
@@ -8784,8 +8799,14 @@ def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
     `dorq_*` flags are rechecked by re-running dorq over the full history of the
     securities that carry them (dorq is deterministic), closing each flag it no
     longer emits. Without --check, they are included whenever any are open.
+
+    The thirteen SQL fundamentals checks the statements cutover retired (DR-0914)
+    close a flag on a second ground too: a dorq successor flag, open or accepted,
+    carries its condition (the rule `dq compare --statements` matched by). Those
+    are listed as "carried by dorq", each with that reason.
     """
     from fafnir.db import repository as repo
+    from fafnir.dq import checks as dq_checks
     from fafnir.dq import dorq as dorq_engine
     from fafnir.dq import recheck as rc
 
@@ -8799,8 +8820,21 @@ def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
         results = None
         with Database(cfg.dsn) as database:
             results = []
+            carried: set[int] = set()  # the results "carried by dorq"
             if sql_checks or not named:
                 results += rc.recheck(database, checks=sql_checks or None)
+                retired = [
+                    c
+                    for c in (sql_checks or dq_checks.RETIRED_FUNDAMENTALS_CHECKS)
+                    if c in dq_checks.RETIRED_FUNDAMENTALS_CHECKS
+                ]
+                if retired:
+                    closing = {i for r in results for i in r.stale_flag_ids}
+                    by_dorq = rc.recheck_successors(
+                        database, checks=retired, exclude=sorted(closing)
+                    )
+                    carried = {len(results) + i for i in range(len(by_dorq))}
+                    results += by_dorq
             if dorq_checks or (not named and rc.open_dorq_checks(database)):
                 try:
                     results += rc.recheck_dorq(
@@ -8815,10 +8849,10 @@ def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
 
             total = sum(r.stale for r in results)
             width = max(len(r.check_name) for r in results)
-            for r in results:
+            for i, r in enumerate(results):
                 click.echo(
                     f"  {r.check_name:<{width}}  {r.stale:>7} of {r.open_flags:>7} "
-                    "no longer hold"
+                    + ("carried by dorq" if i in carried else "no longer hold")
                 )
             if not total:
                 click.echo("Nothing to close: every open flag's condition still holds.")

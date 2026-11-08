@@ -287,6 +287,35 @@ def test_a_rerun_of_the_backfill_writes_nothing(db, tmp_path):
     assert len(_flags(db)) == flags
 
 
+def test_a_column_the_map_does_not_know_is_flagged_once_by_name(db, tmp_path):
+    """DR-0914: the loader flags it (``dq run``'s check before the statements
+    cutover), for no security and keyed by the column's name: once, however many
+    rows and runs carry it."""
+    _security(db, "ZZA", KEY)
+
+    def row(*args):
+        return _row(*args).rstrip("\n") + ",7\n"
+
+    body = (
+        ",".join([*COLUMNS, "newfield"])
+        + "\n"
+        + row("ARQ", "2020-03-31", "2020-05-01", "2020-Q1")
+        + row("ARY", "2019-12-31", "2020-02-20", "2019-FY")
+    )
+    _record(db, tmp_path, "fundamentals", body)
+    _record(db, tmp_path, "actions", ACTIONS)
+    fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
+    (flag,) = _flags(db, fu.UNMAPPED)
+    assert (flag["security_id"], flag["record_key"], flag["severity"]) == (
+        None,
+        {"field": "newfield"},
+        "info",
+    )
+    assert flag["detail"] == {"rows": 2, "securities": 1}
+    fu.load(db, tmp_path, backfill=True, as_of=NIGHT)
+    assert len(_flags(db, fu.UNMAPPED)) == 1
+
+
 def test_the_nightly_restates_corrects_and_ignores_a_split(db, tmp_path):
     sid, _ = _backfilled(db, tmp_path)
     # A 3-for-1 since the backfill: SF1 restates the counts in the new terms.
@@ -362,7 +391,9 @@ def test_the_nightly_restates_corrects_and_ignores_a_split(db, tmp_path):
     assert result.counts["income:unchanged"] == 1
 
     restated = _flags(db, fu.RESTATEMENT)
-    assert [f["severity"] for f in restated] == ["info", "warn"]
+    # The backfill's and the nightly's alike: dorq's DQ932 judges a restatement
+    # since the statements cutover (DR-0914).
+    assert [f["severity"] for f in restated] == ["info", "info"]
     (corrected,) = _flags(db, fu.CORRECTION)
     assert corrected["detail"]["largest"][0]["moved"] == {
         "net_income": ["100.00", "101.00"]

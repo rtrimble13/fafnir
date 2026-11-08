@@ -43,8 +43,10 @@ incremental and idempotent — a missed day is caught up on the next run.
    With `[dq] dorq_statements = true` the same `dq run` then runs dorq on the
    statements: their whole history, as of the night's session, into
    `<dorq_shadow_dir>/statements/<as-of>.jsonl` while `dorq_statements_shadow`
-   holds (doc/dorq.md, *Statements*). That is a second dorq row a night, endpoint
-   `dq-statements-shadow`, with its own watermark. Its params carry:
+   holds (doc/dorq.md, *Statements*), and into the queue once the statements cutover
+   (DR-0914) has set it false: then the endpoint is `dq-statements`, and the SQL
+   fundamentals checks no longer run. That is a second dorq row a night, endpoint
+   `dq-statements-shadow` in shadow, with its own watermark. Its params carry:
    - `reports`;
    - `bytes_out`, dorq's output;
    - `dorq_max_rss_mb`, dorq's peak memory.

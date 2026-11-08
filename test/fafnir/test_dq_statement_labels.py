@@ -424,6 +424,37 @@ def test_a_flag_resolved_after_the_vendor_fixed_it_is_a_data_error(db):
     }
 
 
+def test_a_flag_closed_as_carried_by_dorq_is_no_verdict(db):
+    """The cutover's recheck closes a retired check's flag that a dorq successor
+    carries (DR-0914): its condition still held, so a correction of its period in
+    between does not make the closure a data error."""
+    from fafnir.dq import recheck as rc
+
+    sid = _company(db)
+    _flag(
+        db,
+        sid,
+        "fundamentals_negative_impossible",
+        "core.income_statement",
+        {
+            "statement": "income",
+            "period_type": "quarter",
+            "fiscal_date": "2024-03-31",
+            "version_no": 1,
+        },
+        detected=T0,
+        closed=T1 + dt.timedelta(days=2),
+        basis=None,
+        note=f"Re-checked: the statements cutover retired the check: "
+        f"{rc.CARRIED_BY_DORQ}, a DQ902 flag open or accepted.",
+    )
+    # The same cent move that makes an ordinary closure a vendor fix.
+    _correct(db, "income", sid, dt.date(2024, 3, 31), revenue=412_300_000.01)
+    export = lb.build(db)
+    assert [lab for lab in export.labels if lb.is_statements(lab)] == []
+    assert export.restore_statements == []
+
+
 def test_statement_labels_leave_the_bars_labels_as_they_were(db):
     sid = _company(db)
     before = [lab for lab in lb.build(db).labels if not lb.is_statements(lab)]

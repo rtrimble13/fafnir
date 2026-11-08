@@ -113,8 +113,8 @@ def _flags(db, check):
 def _run_twice(db, check):
     """The check's new flags, and its open flags after a second pass over the same
     data, which must write nothing."""
-    first = checks.FUNDAMENTALS_CHECKS[check](db)
-    assert checks.FUNDAMENTALS_CHECKS[check](db) == 0, "a second pass wrote again"
+    first = checks.RETIRED_FUNDAMENTALS_CHECKS[check](db)
+    assert checks.RETIRED_FUNDAMENTALS_CHECKS[check](db) == 0, "a second pass wrote"
     flags = _flags(db, check)
     assert len(flags) == first
     return flags
@@ -125,11 +125,25 @@ def _run_twice(db, check):
 # ---------------------------------------------------------------------------
 
 
-def test_run_all_keeps_its_keys_and_adds_one_per_check(db):
+def test_run_all_keeps_its_keys_with_the_fundamentals_checks_retired(db):
+    """DR-0914: dorq judges the statements. ``run_all`` keeps the fourteen keys, at
+    0, for one release, and writes no fundamentals flag even where a retired check
+    would find one."""
+    sid = _security(db, "ZZRETIRED")
+    _put(db, "income", sid, D(2010, 3, 31), label="2010-Q1", known_from=D(2010, 4, 2))
     out = checks.run_all(db)
-    assert list(out) == OLD_KEYS + list(checks.FUNDAMENTALS_CHECKS)
-    assert len(checks.FUNDAMENTALS_CHECKS) == 14
-    assert all(isinstance(v, int) for v in out.values())
+    assert list(out) == OLD_KEYS + list(checks.RETIRED_KEYS)
+    assert len(checks.RETIRED_KEYS) == 14
+    assert checks.FUNDAMENTALS_CHECKS == {}
+    assert all(out[k] == 0 for k in checks.RETIRED_KEYS)
+    assert _flags(db, "fundamentals_implausible_filing_lag") == []
+    # The retired thirteen are dorq's successors' (compare_statements.SUCCESSORS).
+    from fafnir.dq import compare_statements as cst
+
+    assert set(checks.RETIRED_FUNDAMENTALS_CHECKS) == set(cst.SUCCESSORS)
+    assert set(checks.RETIRED_KEYS) == set(cst.SUCCESSORS) | {
+        "fundamentals_unmapped_fields"
+    }
 
 
 def test_without_fundamentals_or_their_tables_nothing_runs_against_them(
@@ -138,17 +152,13 @@ def test_without_fundamentals_or_their_tables_nothing_runs_against_them(
     def refuse(_db):
         raise AssertionError("a fundamentals check ran")
 
-    monkeypatch.setattr(
-        checks,
-        "FUNDAMENTALS_CHECKS",
-        {k: refuse for k in checks.FUNDAMENTALS_CHECKS},
-    )
+    monkeypatch.setattr(checks, "FUNDAMENTALS_CHECKS", {"a_new_check": refuse})
     off = checks.run_all(db, include_fundamentals=False)
     assert list(off)[:5] == OLD_KEYS
-    assert all(off[k] == 0 for k in checks.FUNDAMENTALS_CHECKS)
+    assert off["a_new_check"] == 0
     # A database mid-migration: no statement tables, so nothing to check.
     monkeypatch.setattr(checks, "statements_exist", lambda _db: False)
-    assert all(checks.run_all(db)[k] == 0 for k in checks.FUNDAMENTALS_CHECKS)
+    assert checks.run_all(db)["a_new_check"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -691,23 +701,6 @@ def test_a_zero_between_two_reported_values(db):
     ]
 
 
-def test_unmapped_sf1_columns_by_name(db):
-    for i, sym in enumerate(("ZZU1", "ZZU2")):
-        _put(
-            db,
-            "income",
-            _security(db, sym),
-            D(2010, 12, 31),
-            label="2010-FY",
-            known_from=D(2011, 2, 1),
-            extra={"unmapped": {"newfield": str(i)}, "vendor_metric": {"pe": "9"}},
-        )
-    flags = _run_twice(db, "fundamentals_unmapped_fields")
-    assert [(f["security_id"], f["record_key"], f["detail"]) for f in flags] == [
-        (None, {"field": "newfield"}, {"rows": 2, "securities": 2})
-    ]
-
-
 def test_quarters_reported_year_to_date(db):
     ytd = _security(db, "ZZYTD")
     discrete = _security(db, "ZZDISC")
@@ -1018,7 +1011,7 @@ def test_recheck_closes_the_six_judgement_checks_once_their_condition_is_gone(db
         held, fixed = _security(db, f"ZZHELD{n}"), _security(db, f"ZZFIXED{n}")
         _make_condition(db, check, held)
         _make_condition(db, check, fixed)
-        assert checks.FUNDAMENTALS_CHECKS[check](db) == 2, check
+        assert checks.RETIRED_FUNDAMENTALS_CHECKS[check](db) == 2, check
         put_right[check] = fixed
     # Nothing has changed: recheck closes nothing.
     assert [r.stale for r in rc.recheck(db, checks=list(SIX))] == [0] * len(SIX)

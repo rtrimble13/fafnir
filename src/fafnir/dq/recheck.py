@@ -487,6 +487,127 @@ def recheck(
 
 
 # ---------------------------------------------------------------------------
+# The statements cutover (DR-0914): the retired checks' flags dorq carries
+# ---------------------------------------------------------------------------
+#
+# The cutover retired the thirteen SQL fundamentals checks (checks.
+# RETIRED_FUNDAMENTALS_CHECKS), and their open flags are closed by recheck, not by
+# a bulk resolve. A flag whose condition is gone closes by its check's own query
+# (RECHECKABLE). A flag whose condition still holds closes when dorq's successor
+# carries it: a dorq flag in the queue, open or accepted, on the same security and
+# of a successor code that agrees with what the flag's key names. That is the rule
+# `dq compare --statements` measured the overlap by (compare_statements.covers),
+# so the queue keeps one record of each condition. A flag that names several items
+# of its period (the zero and negative checks) is carried only when dorq carries
+# every item. A flag dorq does not carry stays open, for a person to judge, and the
+# note of one it does (CARRIED_BY_DORQ) tells the label export that the closure
+# was no verdict.
+
+
+#: In the note of a flag :func:`recheck_successors` closed: its condition still held
+#: when it closed, carried by dorq's flag, so `dq export-labels` reads no verdict
+#: from the closure (:func:`fafnir.dq.labels._statement_flags`).
+CARRIED_BY_DORQ = "a dorq successor flag carries the condition (DR-0914)"
+
+#: The retired checks one flag of which names several items of its period, in its
+#: ``detail``: dorq carries such a flag only when it carries every item.
+_ITEMIZED = {
+    # {"items": [column, ...]}
+    "fundamentals_suspicious_zero": lambda d: set(d.get("items") or ()),
+    # {column: the negative value, ...}
+    "fundamentals_negative_impossible": lambda d: set(d),
+}
+
+
+def _carried(name: str, rule, flag: dict, reports) -> bool:
+    """Whether dorq's ``reports`` on the flag's security carry it: one covers it
+    (:func:`fafnir.dq.compare_statements.covers`), and for an itemized check, the
+    covering reports name every item of its detail, or one names none (the row)."""
+    from fafnir.dq import compare_statements as cst
+
+    covering = [r for r in reports if cst.covers(rule, flag, r)]
+    if not covering:
+        return False
+    items_of = _ITEMIZED.get(name)
+    if items_of is None:
+        return True
+    items = items_of(flag.get("detail") or {})
+    if any(r.item is None for r in covering):
+        return True
+    return items <= {r.item for r in covering}
+
+
+def recheck_successors(
+    db: Database,
+    *,
+    checks: Optional[Sequence[str]] = None,
+    exclude: Sequence[int] = (),
+) -> list[RecheckResult]:
+    """The open flags of the retired SQL fundamentals checks that a dorq successor
+    flag carries, one result per check (:func:`_carried`). ``exclude``: flags
+    another rule already closes. Reads only, like :func:`recheck`."""
+    from fafnir.dq import compare_statements as cst
+    from fafnir.dq.checks import RETIRED_FUNDAMENTALS_CHECKS
+    from fafnir.ingest import fundamentals_map as fm
+
+    wanted = list(checks) if checks else list(RETIRED_FUNDAMENTALS_CHECKS)
+    unknown = [c for c in wanted if c not in RETIRED_FUNDAMENTALS_CHECKS]
+    if unknown:
+        raise ValueError(
+            f"not a retired fundamentals check: {', '.join(sorted(unknown))}"
+        )
+    flags = db.fetchall(
+        """
+        SELECT dq_flag_id, check_name, security_id, table_name, record_key, detail
+          FROM ops.data_quality_flag
+         WHERE check_name = ANY(%s) AND resolved_at IS NULL
+         ORDER BY dq_flag_id
+        """,
+        (wanted,),
+    )
+    securities = sorted(
+        {int(f["security_id"]) for f in flags if f["security_id"] is not None}
+    )
+    carried: dict[int, list] = {}
+    if securities:
+        rows = db.fetchall(
+            r"""
+            SELECT security_id, table_name, record_key, check_name, severity, detail
+              FROM ops.data_quality_flag
+             WHERE check_name LIKE 'dorq\_%%' AND security_id = ANY(%s)
+               AND table_name = ANY(%s)
+               AND (resolved_at IS NULL OR accepted_at IS NOT NULL)
+            """,
+            (securities, list(fm.TABLES.values())),
+        )
+        for row in rows:
+            report = cst.StatementReport.of(dict(row))
+            if report is not None and report.security_id is not None:
+                carried.setdefault(report.security_id, []).append(report)
+    skip = set(exclude)
+    out: list[RecheckResult] = []
+    for name in wanted:
+        rule = cst.SUCCESSORS[name]
+        mine = [f for f in flags if f["check_name"] == name]
+        ids = [
+            int(f["dq_flag_id"])
+            for f in mine
+            if int(f["dq_flag_id"]) not in skip
+            and f["security_id"] is not None
+            and _carried(name, rule, f, carried.get(int(f["security_id"]), ()))
+        ]
+        reason = (
+            f"the statements cutover retired the check: {CARRIED_BY_DORQ}, a "
+            f"{'/'.join(rule.codes)} flag open or accepted"
+        )
+        logger.info(
+            "recheck %s: %d of %d open flags carried by dorq", name, len(ids), len(mine)
+        )
+        out.append(RecheckResult(name, len(mine), ids, reason))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # dorq: rerun and negate (dorq plan §7.5, DR-0705)
 # ---------------------------------------------------------------------------
 #

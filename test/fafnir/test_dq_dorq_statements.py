@@ -627,6 +627,46 @@ def test_cli_statements_only_runs_no_sql_checks_and_no_bars(db, fake_dorq, tmp_p
     assert len(_calls(fake_dorq)) == 1
 
 
+@pytest.mark.parametrize(
+    "dq, args, warned",
+    [
+        # The engine is sql (the default): dorq does not judge the statements.
+        ({"dorq_statements": True, "dorq_statements_shadow": False}, [], True),
+        # --no-statements on a host configured to write the queue.
+        (
+            {
+                "engine": "both",
+                "dorq_statements": True,
+                "dorq_statements_shadow": False,
+            },
+            ["--no-statements"],
+            True,
+        ),
+        # The shadow holds: dorq writes its shadow file, not the queue.
+        ({"engine": "dorq", "dorq_statements": True}, [], True),
+        # --statements on a host whose config has them off: the queue is written.
+        (
+            {"engine": "dorq", "dorq_statements_shadow": False},
+            ["--statements"],
+            False,
+        ),
+        ({"dorq_statements_shadow": False}, ["--statements-only"], False),
+    ],
+)
+def test_dq_run_warns_when_this_run_wrote_no_statement_flag(
+    db, fake_dorq, tmp_path, dq, args, warned
+):
+    """The SQL statement checks are retired (DR-0914): the warning reads what this
+    run did (engine, --statements, --no-statements), not the config alone."""
+    sid, _ = _company(db)
+    _emit(fake_dorq, [_statement_row(sid, "2024-03-31")])
+    rcfile = _rc(tmp_path, db, fake_dorq, **dq)
+    result = CliRunner().invoke(cli.main, ["--config", str(rcfile), "dq", "run", *args])
+    assert result.exit_code == 0, result.output
+    said = result.output + (result.stderr or "")
+    assert ("this run wrote no statement flag to the queue" in said) == warned
+
+
 def test_ingest_writes_statement_flags_with_the_open_and_accepted_guards(
     db, fake_dorq, tmp_path
 ):
