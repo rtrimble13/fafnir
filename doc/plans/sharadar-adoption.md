@@ -103,7 +103,7 @@ Phases are ordered by dependency, not by calendar week. Each closes with a short
 P3 and P4 are independent once P2 is done; run them in whichever order the comparison report and the SF1
 probe allow. P5's fund and FRED work (#88, #97, #104, #114, #116) was dropped on 2026-10-30: the funds and
 `duk yc` stay on FMP, so the reduced tier has to serve them (#128; *Issue dispositions (applied
-2026-10-30)*).
+2026-10-30)*). It does: see the decision log, 2026-11-01.
 
 ### The verification that replaces the parallel run
 
@@ -365,6 +365,8 @@ free tier cost nothing, so dropping it (2026-10-30) leaves the rates as they wer
 | 2026-10-30 | **Tiingo, FRED, BLS and BEA are not adopted.** #88, #97, #104, #114 and #116 are closed as not planned, and the economic-series milestone leaves the roadmap. The funds stay on FMP as the secondary vendor: three of the eight tracked funds, the other five uncovered, as today. `duk yc` stays on FMP's treasury rates in every mode. So the reduced FMP tier must serve both, or they stop (#128). The `tiingo` hooks in the code stay, dormant | #41, *Issue dispositions (applied 2026-10-30)* |
 | 2026-11-01 | **The cutover is verified and held for five sessions, with no rollback.** The first Sharadar-primary night (2026-10-23 UTC, runs 427–439) passed the runbook's verification: the 2026-10-22 bars on fed securities were Sharadar's alone, and FMP's secondary steps wrote nothing into a fed security. Seven sessions loaded through 2026-10-30, none with a quarantined bar. Two nights stopped on an SFP 503 (2026-10-27 and 2026-10-31) and were re-run by hand the same day; #233 (v3.1.0) now waits an outage out inside the night. What the first nights caught is #195, #196, #197, #199, #201 and #202. The FMP tier (#128) is no longer waiting on the cutover | #125, #126 |
 | 2026-11-01 | **The fundamentals reload is the production backfill.** Run 491 (2026-10-27, after #216's reset) read 3.10M SF1 rows and wrote 3.55M statement rows in 25 minutes, 8 quarantined; the panel's look-ahead invariant is 0. The balance-sheet identity holds for 96.2% of 909,725 periods, so the criterion is met by its other half: the 34,206 exceptions are flagged, and were accepted at the operator's direction on 2026-10-30. A security linked after it takes its history from `--backfill --symbols` (run 669: 334 dead issuers minted on 2026-11-01) | #92 |
+| 2026-11-01 | **FMP reduced to a lower tier** (the operator). Checked from the host by 2026-11-08: the unadjusted EOD feed, a fund's bars and distributions, the action calendars, treasury rates (`duk yc`), the filtered screen (`duk -S fmp ls`) and the identifier search (`duk -S fmp ph cik:`) all answer on it, and `duk -S fmp ph AAPL` agrees with the warehouse's raw closes on every date of five years. The secondary night ran on it from 2026-11-03: prices and profiles every night, with no quarantine. Its per-minute limit shows: the corporate-actions step met HTTP 429 on 2 of the first 5 nights, straight after the price step | #128 |
+| 2026-11-05 | **FMP is a backup feed only.** Every security Sharadar carries moves to it: link, `vendor correct`, then `vendor feed`, 110 of them by 2026-11-06. The open-end mutual funds, which Sharadar does not carry, may freeze: `fmp_secondary = false` once the remaining non-fund securities have moved, with no code change for a not-fed state | #128 |
 
 ## [built] notes
 

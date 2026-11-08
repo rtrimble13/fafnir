@@ -36,6 +36,15 @@ Each vendor source needs that vendor's key, and nothing else: `-S fmp` reads
 `FMP_API_KEY` / `[api].fmp_key`, `-S sharadar` reads `SHARADAR_API_KEY` /
 `[api].sharadar_key`. A missing key is refused before any request is made.
 
+`-S fmp` runs on FMP's reduced tier since 2026-11-01 (#128). Checked on it:
+- `ph`, which uses the unadjusted feed;
+- `ph cik:`, through FMP's search;
+- `ls`;
+- `yc`.
+
+An identifier FMP finds on more than one exchange (a CIK with a NYSE and a TSX
+listing, say) prints the candidates on stderr and exits 1. Pass the ticker instead.
+
 ### What each source can serve
 
 | Command | `db` | `fmp` | `sharadar` |
