@@ -25,6 +25,11 @@ module runs it on the three statement tables beside the bars run of
   * **shadow** -- or the rows go to ``<dorq_shadow_dir>/statements/<as-of>.jsonl``:
     never the shadow directory's top level, where ``dq compare`` takes the last
     ``*.jsonl`` as the newest night of bars.
+  * **memory** -- dorq's output goes to a file in the run's working directory on
+    disk (:func:`fafnir.dq.dorq.work_dir`), and the nightly run streams it from
+    there to the shadow file or the queue, a row at a time. The night's reports
+    are never held: with ``--show-info`` over the whole history they are many, and
+    dorq itself holds them while DQ951 is on (#219).
 
 A run is recorded in ``ops.ingestion_run`` (``source = 'dorq'``) under its own
 endpoints, ``dq-statements`` and ``dq-statements-shadow``, each with its own
@@ -34,9 +39,8 @@ watermark, so the bars run's window and history pass never see it.
 from __future__ import annotations
 
 import datetime as dt
-import tempfile
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Iterable, Iterator, Optional, Sequence
 
 from psycopg import sql
 
@@ -54,6 +58,10 @@ ENDPOINT_SHADOW = "dq-statements-shadow"
 
 #: The statements' shadow files go here, under ``dorq_shadow_dir``.
 SHADOW_SUBDIR = "statements"
+
+#: The prefix of a statements run's working directory (under
+#: :func:`fafnir.dq.dorq.work_root`, pruned with the bars run's).
+WORK_PREFIX = engine.WORK_PREFIX + "statements-"
 
 #: The table a finding on no one statement is filed under (DQ943, DQ951), as the
 #: SQL statement checks file theirs. dorq writes it from its config's
@@ -347,15 +355,69 @@ def statements_copy_statement(
 # ---------------------------------------------------------------------------
 
 
-def file_under_statement(records: Sequence[dict]) -> list[dict]:
+def file_under_statement(records: Iterable[dict]) -> list[dict]:
     """Each row with a statement table: its own, or :data:`DEFAULT_TABLE` for a
     finding on no one statement, whatever the config's ``[fafnir] table_name``."""
-    out = []
+    return list(filed_under_statement(records))
+
+
+def filed_under_statement(records: Iterable[dict]) -> Iterator[dict]:
+    """:func:`file_under_statement`, one row at a time."""
     for r in records:
         if not is_statement_flag(r.get("table_name")):
             r = {**r, "table_name": DEFAULT_TABLE}
-        out.append(r)
-    return out
+        yield r
+
+
+def judge(
+    db: Database,
+    settings: engine.DorqSettings,
+    as_of: Optional[dt.date],
+    workdir: Path,
+    *,
+    security_ids: Optional[Sequence[int]] = None,
+) -> tuple[str, engine.Invocation]:
+    """Export the statements and run dorq on them, its output left on disk in
+    ``workdir``; return dorq's version and the finished run. Writes nothing to the
+    warehouse, and holds none of dorq's rows: the caller reads them, all at once
+    (:func:`run_statements`) or as a stream (:func:`run`).
+
+    The whole history of ``security_ids`` (every security by default), as of
+    ``as_of`` (dorq's ``--as-of``: DQ942 judges staleness against it). With
+    ``security_ids``, the metadata is theirs alone, so dorq does not take every
+    other security for one with no statements (DQ943).
+    """
+    version = engine.dorq_version(settings)
+    items = line_items(db)
+    paths = export_context(db, workdir, items, security_ids)
+    args = settings.base_args(settings.statements_config) + [
+        "-",
+        "--kind",
+        "statements",
+        "--format",
+        "fafnir",
+        "--exit-zero",
+        "--show-info",
+        "--items",
+        str(paths["items"]),
+        "--actions",
+        str(paths["actions"]),
+        "--meta",
+        str(paths["meta"]),
+    ]
+    if as_of is not None:
+        args += ["--as-of", as_of.isoformat()]
+    done = engine.run_to_file(
+        db, args, statements_copy_statement(items, security_ids), workdir, version
+    )
+    logger.info(
+        "dorq %s: %.1f MB of statements in, %.1f MB of reports out, at a peak of %s MB",
+        version,
+        done.bytes_sent / 1e6,
+        done.bytes_out / 1e6,
+        done.usage()["dorq_max_rss_mb"],
+    )
+    return version, done
 
 
 def run_statements(
@@ -365,51 +427,19 @@ def run_statements(
     *,
     security_ids: Optional[Sequence[int]] = None,
 ) -> engine.RunResult:
-    """Export the statements, run dorq on them, and parse its output. Writes
-    nothing to the warehouse.
-
-    The whole history of ``security_ids`` (every security by default), as of
-    ``as_of`` (dorq's ``--as-of``: DQ942 judges staleness against it). With
-    ``security_ids``, the metadata is theirs alone, so dorq does not take every
-    other security for one with no statements (DQ943).
-    """
-    version = engine.dorq_version(settings)
+    """:func:`judge`, with dorq's rows parsed into a list. For a run over a few
+    securities (``dq recheck``); the nightly run over every security streams them
+    instead (:func:`run`)."""
     window = engine.Window(as_of=as_of)
-    with tempfile.TemporaryDirectory(prefix="fafnir-dorq-statements-") as tmp:
-        workdir = Path(tmp)
-        items = line_items(db)
-        paths = export_context(db, workdir, items, security_ids)
-        args = settings.base_args(settings.statements_config) + [
-            "-",
-            "--kind",
-            "statements",
-            "--format",
-            "fafnir",
-            "--exit-zero",
-            "--show-info",
-            "--items",
-            str(paths["items"]),
-            "--actions",
-            str(paths["actions"]),
-            "--meta",
-            str(paths["meta"]),
-        ]
-        if as_of is not None:
-            args += ["--as-of", as_of.isoformat()]
-        records, sent = engine.invoke(
-            db, args, statements_copy_statement(items, security_ids), workdir, version
-        )
-    logger.info(
-        "dorq %s: %d statement violations from %.1f MB of statements",
-        version,
-        len(records),
-        sent / 1e6,
-    )
+    with engine.work_dir(settings, WORK_PREFIX) as workdir:
+        version, done = judge(db, settings, as_of, workdir, security_ids=security_ids)
+        records = list(engine.read_records(done.out_path))
+    logger.info("dorq %s: %d statement violations", version, len(records))
     return engine.RunResult(
         version=version,
         window=window,
         records=file_under_statement(records),
-        bytes_sent=sent,
+        bytes_sent=done.bytes_sent,
         config_hash=engine.config_hash_of(records),
     )
 
@@ -467,16 +497,21 @@ def run(
     )
     db.commit()
     try:
-        result = run_statements(db, settings, as_of)
-        records = result.records
-        shadow_file = None
-        flagged: dict[str, int] = {}
-        if shadow:
-            shadow_file = engine.write_shadow(
-                records, engine.shadow_path(str(shadow_dir(settings)), as_of)
+        with engine.work_dir(settings, WORK_PREFIX) as workdir:
+            version, done = judge(db, settings, as_of, workdir)
+            # dorq's rows stream from its output file to the shadow file or the
+            # queue's COPY, counted on the way: the night is never held (#219).
+            rows = engine.Tally(
+                filed_under_statement(engine.read_records(done.out_path))
             )
-        else:
-            flagged = engine.ingest(db, records, ingestion_run_id=run_id)
+            shadow_file = None
+            flagged: dict[str, int] = {}
+            if shadow:
+                shadow_file = engine.write_shadow(
+                    rows, engine.shadow_path(str(shadow_dir(settings)), as_of)
+                )
+            else:
+                flagged = engine.ingest(db, rows, ingestion_run_id=run_id)
     except BaseException as exc:
         # As the bars run does: a COPY cut short when dorq exits can leave the
         # transaction aborted, so discard it before recording the failure.
@@ -492,20 +527,21 @@ def run(
         status="success",
         flagged=sum(flagged.values()),
         params={
-            "dorq_version": result.version,
-            "dorq_config_hash": result.config_hash,
-            "bytes": result.bytes_sent,
-            "reports": len(records),
+            "dorq_version": version,
+            "dorq_config_hash": rows.config_hash,
+            "reports": rows.count,
+            **done.usage(),
         },
     )
     engine.write_watermark(db, endpoint, as_of)
     db.commit()
     return engine.DqRunOutcome(
-        version=result.version,
+        version=version,
         window=window,
-        detected=engine.count_by_check(records),
+        detected=rows.by_check(),
         flagged=flagged,
         shadow_file=shadow_file,
+        usage=done.usage(),
     )
 
 

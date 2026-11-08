@@ -6998,6 +6998,10 @@ def _dq_run_statements(database, cfg, exchange, rerun):
         return
     detected = sum(out.detected.values())
     took = f"{time.monotonic() - started:.1f} s"
+    peak = (out.usage or {}).get("dorq_max_rss_mb")
+    if peak is not None:
+        # The figure #219 asks the host for, with the time.
+        took += f", dorq peak {peak:.0f} MB"
     if shadow:
         click.echo(
             f"dorq statements {out.version} (as of {out.window.as_of}, {took}):"

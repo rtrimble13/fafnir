@@ -33,13 +33,18 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import itertools
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Iterator, Optional, Sequence
 
 from psycopg import sql
 
@@ -109,6 +114,9 @@ class DorqSettings:
     #: The statements run's config (``[dq] dorq_statements_config``); empty runs it
     #: ``--isolated``. See :mod:`fafnir.dq.dorq_statements`.
     statements_config: str = ""
+    #: Where a run keeps its working files (``[dq] dorq_work_dir``); empty is
+    #: ``dorq-work`` beside ``shadow_dir``. See :func:`work_root`.
+    work_dir: str = ""
 
     def base_args(self, config: Optional[str] = None) -> list[str]:
         """``dorq check`` with ``config`` (the bars run's by default)."""
@@ -130,6 +138,7 @@ def settings_from(cfg) -> DorqSettings:
         shadow_dir=cfg.dorq_shadow_dir,
         backfill_max=cfg.dorq_backfill_max,
         statements_config=cfg.dorq_statements_config,
+        work_dir=cfg.dorq_work_dir,
     )
 
 
@@ -152,6 +161,71 @@ def dorq_version(settings: DorqSettings) -> str:
     if done.returncode != 0:
         raise DorqError(f"{settings.path} --version exited {done.returncode}")
     return done.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Working files
+# ---------------------------------------------------------------------------
+#
+# A run writes the files beside its input (the calendar, the actions, the meta,
+# the items) and dorq's output to a directory of its own, removed when the run
+# ends. That directory is on disk, under work_root(), and not the system temporary
+# directory. The units run with PrivateTmp, and where /tmp is a tmpfs a file there
+# is memory: on 2026-11-07 the first statements night on the host was OOM-killed
+# with dorq's whole output in a tmpfs file and read whole into a list (#219).
+
+#: The prefix of a run's working directory under :func:`work_root`.
+WORK_PREFIX = "fafnir-dorq-"
+
+#: A working directory older than this is one a run left when it was killed (the
+#: OOM killer, a timeout), and the next run removes it. It is longer than any run
+#: takes (fafnir-dq's TimeoutStartSec is 2 h), so it is never a running one's.
+WORK_STALE_SECONDS = 6 * 3600
+
+
+def work_root(settings: DorqSettings) -> Path:
+    """Where runs keep their working directories: ``[dq] dorq_work_dir``, or
+    ``dorq-work`` beside the shadow directory (``/var/lib/fafnir/dorq-work`` for
+    the host's ``/var/lib/fafnir/dorq-shadow``). Beside it and not inside, so that
+    nothing reading the shadow directory ever meets a half-written file."""
+    if settings.work_dir:
+        return Path(settings.work_dir)
+    return Path(settings.shadow_dir).parent / "dorq-work"
+
+
+def prune_work(
+    root: Path,
+    *,
+    older_than: float = WORK_STALE_SECONDS,
+    now: Optional[float] = None,
+) -> int:
+    """Remove the working directories under ``root`` that runs left behind: those
+    named :data:`WORK_PREFIX` and older than ``older_than`` seconds. Returns how
+    many it removed. A run that ends, failing or not, removes its own; only a
+    killed one leaves it."""
+    cutoff = (time.time() if now is None else now) - older_than
+    removed = 0
+    for path in sorted(root.glob(WORK_PREFIX + "*")):
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("dorq: removed %d working directories left by killed runs", removed)
+    return removed
+
+
+@contextmanager
+def work_dir(settings: DorqSettings, prefix: str = WORK_PREFIX) -> Iterator[Path]:
+    """A working directory for one run under :func:`work_root`, removed when the
+    run ends. Leftovers of killed runs are pruned first (:func:`prune_work`)."""
+    root = work_root(settings)
+    root.mkdir(parents=True, exist_ok=True)
+    prune_work(root)
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=root) as tmp:
+        yield Path(tmp)
 
 
 # ---------------------------------------------------------------------------
@@ -512,16 +586,16 @@ def run_dorq(
     the warehouse.
 
     The bars go from ``COPY`` straight into dorq's stdin, so the 150M-row history
-    never lands on disk. dorq's stdout goes to a temporary file rather than a pipe
-    -- reading a pipe while writing another invites a deadlock -- and is parsed
-    once dorq has exited.
+    never lands on disk. dorq's stdout goes to a file in the run's working
+    directory (:func:`work_dir`) rather than a pipe -- reading a pipe while writing
+    another invites a deadlock -- and is parsed once dorq has exited. A bars
+    night's reports are few, so they are parsed into a list.
 
     The filter is applied here rather than by each caller, so the nightly run,
     ``--full`` and ``dq recheck`` all see the same reports.
     """
     version = dorq_version(settings)
-    with tempfile.TemporaryDirectory(prefix="fafnir-dorq-") as tmp:
-        workdir = Path(tmp)
+    with work_dir(settings) as workdir:
         paths = export_context(db, workdir, exchange_code, security_ids)
         args = settings.base_args() + [
             "-",
@@ -564,20 +638,50 @@ def run_dorq(
     )
 
 
-def invoke(
+@dataclass(frozen=True)
+class Invocation:
+    """One finished dorq process: where its output is, and what the run cost.
+
+    ``max_rss_kb`` is dorq's peak resident memory, from the kernel's accounting
+    of the child (``wait4``), or None where the platform does not give it.
+    """
+
+    out_path: Path
+    bytes_sent: int
+    bytes_out: int
+    max_rss_kb: Optional[int] = None
+
+    def usage(self) -> dict:
+        """The figures a run records in its ``ops.ingestion_run.params``: the bytes
+        sent to dorq and read back, and the peak memory of dorq and of this
+        process, in MB. This process's figure is its peak so far, the export and
+        anything run before it included."""
+        return {
+            "bytes": self.bytes_sent,
+            "bytes_out": self.bytes_out,
+            "dorq_max_rss_mb": (
+                round(self.max_rss_kb / 1024, 1)
+                if self.max_rss_kb is not None
+                else None
+            ),
+            "fafnir_max_rss_mb": self_max_rss_mb(),
+        }
+
+
+def run_to_file(
     db: Database,
     args: Sequence[str],
     copy_statement: sql.Composed,
     workdir: Path,
     version: str,
-) -> tuple[list[dict], int]:
-    """Run ``args`` with ``copy_statement``'s rows on its stdin; return dorq's rows
-    and the bytes sent. Raises :class:`DorqError` when dorq exits non-zero, with
-    the tail of its message.
+) -> Invocation:
+    """Run ``args`` with ``copy_statement``'s rows on its stdin, its output to
+    ``out.jsonl`` in ``workdir``. Raises :class:`DorqError` when dorq exits
+    non-zero (or is killed), with the tail of its message.
 
-    dorq's stdout goes to a file in ``workdir`` rather than a pipe -- reading a
-    pipe while writing another invites a deadlock -- and is parsed once dorq has
-    exited.
+    dorq's stdout goes to a file rather than a pipe -- reading a pipe while writing
+    another invites a deadlock. The file is left for the caller to read, a row at a
+    time if need be (:func:`read_records`): nothing here holds it in memory.
     """
     out_path = workdir / "out.jsonl"
     err_path = workdir / "err.txt"
@@ -587,16 +691,97 @@ def invoke(
             list(args), stdin=subprocess.PIPE, stdout=out, stderr=err
         )
         sent = stream_copy(db, proc, copy_statement)
-        status = proc.wait()
+        status, max_rss_kb = _wait(proc)
     if status != 0:
-        tail = err_path.read_text(errors="replace").strip()[-2000:]
+        tail = _tail(err_path).strip()
         raise DorqError(f"dorq {version} exited {status}: {tail or 'no message'}")
-    records = [
-        json.loads(line)
-        for line in out_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    return records, sent
+    return Invocation(
+        out_path=out_path,
+        bytes_sent=sent,
+        bytes_out=out_path.stat().st_size,
+        max_rss_kb=max_rss_kb,
+    )
+
+
+def read_records(path: Path) -> Iterator[dict]:
+    """dorq's rows from its output file, one at a time: the file is never read
+    whole, so a large night costs one row of memory, not the night."""
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                yield json.loads(line)
+
+
+def invoke(
+    db: Database,
+    args: Sequence[str],
+    copy_statement: sql.Composed,
+    workdir: Path,
+    version: str,
+) -> tuple[list[dict], int]:
+    """:func:`run_to_file`, then its rows as a list, and the bytes sent. For a run
+    whose reports are few (a bars night, a recheck); the statements night streams
+    them instead (:func:`fafnir.dq.dorq_statements.run`)."""
+    done = run_to_file(db, args, copy_statement, workdir, version)
+    return list(read_records(done.out_path)), done.bytes_sent
+
+
+def _wait(proc: subprocess.Popen) -> tuple[int, Optional[int]]:
+    """Wait for dorq; return its exit status (negative for a signal, as
+    ``Popen.returncode`` is) and its peak resident memory in KiB, or None where the
+    platform does not give it."""
+    try:
+        _, wstatus, usage = os.wait4(proc.pid, 0)
+    except (AttributeError, ChildProcessError):
+        return proc.wait(), None
+    proc.returncode = os.waitstatus_to_exitcode(wstatus)
+    rss = int(usage.ru_maxrss)
+    # Linux counts ru_maxrss in KiB, macOS in bytes.
+    return proc.returncode, rss // 1024 if sys.platform == "darwin" else rss
+
+
+def self_max_rss_mb() -> Optional[float]:
+    """This process's peak resident memory so far, in MB (None where the platform
+    has no ``resource`` module)."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - not on POSIX
+        return None
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    kib = rss // 1024 if sys.platform == "darwin" else rss
+    return round(kib / 1024, 1)
+
+
+def _tail(path: Path, limit: int = 2000) -> str:
+    """The last ``limit`` characters of a text file, read from its end."""
+    with Path(path).open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - 4 * limit))
+        return fh.read().decode("utf-8", errors="replace")[-limit:]
+
+
+class Tally:
+    """dorq's rows counted as they pass through: per check, in all, and the config
+    hash stamped on the first. Lets a run that streams its rows (to the shadow file
+    or the queue) report what it saw without holding them."""
+
+    def __init__(self, records: Iterable[dict]):
+        self._records = records
+        self.count = 0
+        self.config_hash: Optional[str] = None
+        self._by_check: dict[str, int] = {}
+
+    def __iter__(self) -> Iterator[dict]:
+        for r in self._records:
+            if self.count == 0:
+                self.config_hash = config_hash_of([r])
+            self.count += 1
+            self._by_check[r["check_name"]] = self._by_check.get(r["check_name"], 0) + 1
+            yield r
+
+    def by_check(self) -> dict[str, int]:
+        return dict(sorted(self._by_check.items()))
 
 
 def config_hash_of(records: Sequence[dict]) -> Optional[str]:
@@ -903,9 +1088,12 @@ def backfill(
 
 
 def ingest(
-    db: Database, records: Sequence[dict], *, ingestion_run_id: Optional[int] = None
+    db: Database, records: Iterable[dict], *, ingestion_run_id: Optional[int] = None
 ) -> dict[str, int]:
     """Write dorq's rows to ``ops.data_quality_flag``; return new flags per check.
+
+    ``records`` may be a list or a stream (:func:`read_records`): they are read
+    once, straight into the ``COPY``.
 
     One set-based insert, guarded exactly as the SQL checks are: a condition
     already open, or accepted, is not written again (two NOT EXISTS probes, each
@@ -917,8 +1105,11 @@ def ingest(
     Within one run, two rows for the same condition (two missing fields on one
     bar) become one flag, the more severe.
     """
-    if not records:
+    stream = iter(records)
+    first = next(stream, None)
+    if first is None:
         return {}
+    stream = itertools.chain([first], stream)
     # One transaction, so the ON COMMIT DROP table lives exactly as long as the
     # insert that reads it -- under autocommit too, where it would otherwise be
     # dropped after the CREATE.
@@ -935,7 +1126,7 @@ def ingest(
                 "COPY tmp_dorq_flag (security_id, table_name, record_key, check_name,"
                 " severity, detail) FROM STDIN"
             ) as copy:
-                for r in records:
+                for r in stream:
                     sid = r.get("security_id")
                     copy.write_row(
                         (
@@ -995,18 +1186,24 @@ def shadow_path(shadow_dir: str, as_of: Optional[dt.date]) -> Path:
     return Path(shadow_dir) / f"{stamp}.jsonl"
 
 
-def write_shadow(records: Sequence[dict], path: Path) -> Path:
+def write_shadow(records: Iterable[dict], path: Path) -> Path:
     """Write one shadow night: the rows dorq would have queued, as it emitted them.
 
-    Written to a temporary name and renamed, so `dq compare` never reads half a
-    night.
+    ``records`` may be a list or a stream (:func:`read_records`). Written to a
+    temporary name and renamed, so `dq compare` never reads half a night; a night
+    that fails part way (a row that does not parse) leaves no file at all, and the
+    previous one in place.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, sort_keys=True, separators=(",", ":")))
-            fh.write("\n")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r, sort_keys=True, separators=(",", ":")))
+                fh.write("\n")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     os.replace(tmp, path)
     return path
 
@@ -1097,6 +1294,9 @@ class DqRunOutcome:
     #: Set when the run judged nothing because the night was judged already: the
     #: run that did (``ingestion_run_id``, ``started_at``). See :func:`run`.
     judged_by: Optional[dict] = None
+    #: What the run cost (:meth:`Invocation.usage`), where it records it: the
+    #: statements run.
+    usage: Optional[dict] = None
 
 
 def judged_night(db: Database, endpoint: str, as_of: dt.date) -> Optional[dict]:

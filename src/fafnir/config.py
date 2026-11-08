@@ -24,7 +24,7 @@ Config sections
     restatement_max_ratio, restatement_max_volume_ratio, restatement_min_volume --
     see :mod:`fafnir.ingest.daily_price`
 ``[dq]``
-    engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir,
+    engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir, dorq_work_dir,
     dorq_lookback_sessions, dorq_threads, dorq_backfill_max -- see
     :mod:`fafnir.dq.dorq`; dorq_statements, dorq_statements_config,
     dorq_statements_shadow -- see :mod:`fafnir.dq.dorq_statements`
@@ -413,6 +413,15 @@ class FafnirConfig:
     @property
     def dorq_shadow_dir(self) -> str:
         return str(self._get("dq", "dorq_shadow_dir", "var/dorq-shadow"))
+
+    @property
+    def dorq_work_dir(self) -> str:
+        """Where a dorq run keeps its working files: the files beside its input and
+        dorq's output, before fafnir reads it. Empty (the default) is ``dorq-work``
+        beside ``dorq_shadow_dir``. On disk, never the system temporary directory:
+        under a unit's ``PrivateTmp`` on a tmpfs ``/tmp``, a file there is memory
+        (:func:`fafnir.dq.dorq.work_root`)."""
+        return str(self._get("dq", "dorq_work_dir", "") or "")
 
     @property
     def dorq_lookback_sessions(self) -> int:

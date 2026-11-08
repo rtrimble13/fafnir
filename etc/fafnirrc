@@ -132,6 +132,11 @@ log_dir = "var/fafnir/log"
 # The default, "var/dorq-shadow", is relative to the working directory. On a host,
 # make it absolute: the systemd units run from /opt/fafnir, the deployed checkout.
 # dorq_shadow_dir = "/var/lib/fafnir/dorq-shadow"
+# A run's working files (dorq's output among them) go to a directory of their own
+# under dorq_work_dir, removed when the run ends. Empty, the default, is
+# "dorq-work" beside dorq_shadow_dir. Keep it on disk: under a unit's PrivateTmp on a
+# tmpfs /tmp, the system temporary directory is memory (doc/dorq.md).
+# dorq_work_dir = ""
 # dorq_lookback_sessions = 260
 # dorq_threads = 0
 # A nightly run also judges the whole history of securities whose history before
