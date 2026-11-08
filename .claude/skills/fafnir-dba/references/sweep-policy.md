@@ -77,9 +77,14 @@ leave it open. "I could not check" is not "it is fine".
   density carry `sparse_coverage` instead and emit no `gap` flags; a `gap` flag
   therefore already means the check judged this security dense enough to check.
 - `cohort_size == 1` for that `(check_name, trade_date)`. **This is the whole
-  test.** A cohort above 1 is one missed load wearing many flags; propose
-  `ingest prices --symbols <SYM> --from <d> --to <d>` for the window and resolve
-  nothing.
+  test.** A cohort above 1 is one missed load wearing many flags; propose the
+  re-fetch from the vendor that feeds each security, and resolve nothing
+  ([dq-playbooks.md, Re-fetching a bar](dq-playbooks.md#re-fetching-a-bar-what-each-feed-allows)).
+  On FMP-fed ones that is `ingest prices --allow-secondary --symbols <SYM> --from
+  <d> --to <d>` for the window. On Sharadar-fed ones a missed night is read again
+  by the next (automations.md, "No bars tonight"), and an older date is
+  `ingest sharadar-prices --backfill --symbols <SYM>`, dry run first, with that
+  section's caveat for a row FMP minted.
 - Peers on the same venue have a bar for that date.
 - `prior_resolutions == 0` for this `(check, security)`, or the previous note
   explains a recurring, expected halt.
@@ -180,9 +185,13 @@ can lead to:
   (ADR 0015), so `ingest prices` and `source probe-prices` say nothing about these
   rows. `ingest sharadar-prices --backfill` has already read every row Sharadar's
   file holds for them, and a re-run reads only the dates a security lacks. A
-  session missing from the history is missing from the vendor's record.
-  `duk -S sharadar ph <TICKER> -s <d> -e <d>`, with the vendor's ticker
-  (`core.vendor_security.ticker`), shows what Sharadar serves now.
+  session missing from the history is missing from the vendor's record:
+  `ingest sharadar-prices --backfill --symbols <SYM> --dry-run`, which reads the
+  file on disk, says so with 0 `bars to write`. What Sharadar's API serves now is
+  the operator's read, since its key is only in `/etc/fafnir/fafnir.env`, which
+  your sudo rule does not load. Propose
+  `sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a; duk -S sharadar ph <TICKER> -s <d> -e <d>'`,
+  with the vendor's ticker (`core.vendor_security.ticker`).
 - **The history is final.** A delisted issuer gets no new bars, so its density and
   its gaps never change.
 

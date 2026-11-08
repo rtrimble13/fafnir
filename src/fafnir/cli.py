@@ -4973,10 +4973,16 @@ def override_revoke(ctx, override_ids, note, revoked_by, dry_run, yes):
       fafnir override revoke 14 -m "FMP now dates the split correctly"
 
     Revoking a delete lifts the suppression; it does not write the removed row back.
-    The next load brings back whatever the vendor serves for that key -- or run
-    `fafnir ingest actions --symbols SYM`, or `fafnir ingest prices --symbols SYM
-    --from D --to D`, to fetch it now. Revoking an add removes the operator's row.
-    A re-date is two overrides; revoke both.
+    A later load that re-reads the key brings back whatever the vendor serves for
+    it. To fetch it now on a security FMP feeds, run `fafnir ingest actions
+    --symbols SYM` or `fafnir ingest prices --symbols SYM --from D --to D`, with
+    --allow-secondary while Sharadar is the primary vendor. On a security Sharadar
+    feeds, run `fafnir ingest sharadar-actions --backfill --symbols SYM` or `fafnir
+    ingest sharadar-prices --backfill --symbols SYM`, which read the unheld key from
+    the ledger's current full file: the Sharadar nightly reads only the price deltas,
+    so it brings a bar back only if a delta carries it. Dry-run the price backfill
+    first: on a security FMP minted it is not bounded by the link's start. Revoking
+    an add removes the operator's row. A re-date is two overrides; revoke both.
 
     A `prices shift` or `prices rescale` is undone whole: any override of the edit
     revokes all of them, removes the operator's bars and writes the vendor's bars back
