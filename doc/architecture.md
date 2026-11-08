@@ -70,15 +70,15 @@ table.
 
 Getting genuinely raw prices takes care, because most of FMP's price payloads are
 adjusted already. On `historical-price-eod/full`, `close` is adjusted **for splits**
-and `adjClose` for splits *and* dividends — neither is raw. Prices are therefore
-pulled from **`historical-price-eod/non-split-adjusted`**, the one endpoint that
-returns prices as they actually traded. Feeding a pre-adjusted series into fafnir's
+and `adjClose` for splits *and* dividends — neither is raw. FMP's bars, for what FMP
+still feeds, are therefore pulled from **`historical-price-eod/non-split-adjusted`**,
+the one endpoint that returns prices as they actually traded. Feeding a pre-adjusted series into fafnir's
 own factors would adjust it twice: AAPL's 1990-01-02 close would enter as ~$0.35
 rather than its true ~$39.20, and the view would report ~$0.003. See
-[adr/0004-unadjusted-price-feed.md](adr/0004-unadjusted-price-feed.md). The one
-exception is Sharadar's backfilled history, which no source observed raw: it is
-recovered from the vendor's adjusted prices and its ACTIONS splits, and guarded by a
-DQ check (ADR 0004's amendment). Adjusted series are computed **on read** in `mart.v_daily_price_adjusted`.
+[adr/0004-unadjusted-price-feed.md](adr/0004-unadjusted-price-feed.md). Sharadar's
+bars, nightly since the cutover and the backfilled history alike, are recovered
+raw instead: the close is its `closeunadj`, and open, high, low and volume are
+un-adjusted with its ACTIONS splits, guarded by a DQ check (ADR 0004's amendment). Adjusted series are computed **on read** in `mart.v_daily_price_adjusted`.
 Because factors are derived deterministically from corporate actions, the adjusted
 series is **point-in-time stable and reproducible**. See
 [adr/0001-raw-prices-plus-adjustment-factors.md](adr/0001-raw-prices-plus-adjustment-factors.md).
@@ -99,14 +99,18 @@ series is **point-in-time stable and reproducible**. See
   the key every table uses. A security with no link (mutual funds, and the few
   `vendor link` could not place) keeps its FMP identity. See
   [adr/0016-sharadar-identity-and-survivorship-floor.md](adr/0016-sharadar-identity-and-survivorship-floor.md).
-- The universe has two halves. The **discovered** one maintains itself: the nightly
-  job re-reads the screener, so a security that lists today enters scope today (and,
-  having no watermark, gets its full history on the same run). The **declared** one
+- The universe has two halves. The **discovered** one maintains itself. Since the
+  cutover the nightly job reads Sharadar's TICKERS and ACTIONS
+  (`ingest sharadar-universe`): renames, delistings and new listings, resolved by
+  permaticker. In FMP mode it re-reads the screener, so a security that lists today
+  enters scope today (and, having no watermark, gets its full history on the same
+  run). The **declared** one
   (`ref.tracked_symbol`) covers what no screener returns — an open-end mutual fund
   has no listing venue, so it is not screenable and must be declared. Both write
   through the same upsert on the same key, so a symbol in both converges on one
   `security_id`. See
-  [adr/0006-curated-fund-universe.md](adr/0006-curated-fund-universe.md). Before that it applies ticker renames to the
+  [adr/0006-curated-fund-universe.md](adr/0006-curated-fund-universe.md). In FMP
+  mode, before the screener, it applies ticker renames to the
   security that already holds the history, because to the screener a rename is
   indistinguishable from a new listing — and minting it as one would fork a
   company's identity into two `security_id`s. See

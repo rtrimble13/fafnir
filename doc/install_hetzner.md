@@ -4,7 +4,7 @@ A complete, ordered walkthrough: from an empty Hetzner Cloud project to a harden
 PostgreSQL 16 host running fafnir on a nightly schedule.
 
 **Target:** Hetzner Cloud server · Ubuntu 24.04 LTS · PostgreSQL 16 · Python 3.11+ ·
-FMP **Professional** key.
+FMP **Professional** key · a Sharadar subscription (the primary vendor).
 
 The PostgreSQL, role, schema, scheduling-expression and backup/restore steps below
 were validated against a real PostgreSQL 16.13 cluster on Ubuntu 24.04.4, and the
@@ -129,7 +129,9 @@ host misconfigures. Create one firewall and attach it to the server:
 | Inbound | TCP | 22 | `<your-home-ip>/32` | SSH (tunnels ride on this) |
 | Inbound | ICMP | — | `0.0.0.0/0`, `::/0` | ping / MTR (optional) |
 
-Leave outbound unrestricted (fafnir needs HTTPS to FMP and the apt/PyPI mirrors).
+Leave outbound unrestricted (fafnir needs HTTPS to FMP, to Sharadar's
+`api.sharadar.com` and its bulk-file host `static-sharadar.nyc3.digitaloceanspaces.com`,
+and to the apt/PyPI mirrors).
 
 **Never open 5432.** Postgres stays on localhost; §11 tunnels it over SSH.
 
@@ -699,7 +701,7 @@ sudo tee /etc/fafnir/fafnir.env > /dev/null <<'ENV'
 # Socket + peer auth (§3.6): no database password needed.
 FAFNIR_DSN="host=/var/run/postgresql port=5432 dbname=fafnir user=fafnir_ingest"
 FMP_API_KEY="your_fmp_pro_key"
-# Once subscribed to Sharadar. fafnir reads this key from here only, never ~/.fafnirrc.
+# Sharadar, the primary vendor. fafnir reads this key from here only, never ~/.fafnirrc.
 SHARADAR_API_KEY="your_sharadar_key"
 FAFNIR_SQL_DIR="/opt/fafnir/sql"
 # The CLI's own rotating fafnir.log. Its config default is RELATIVE
@@ -977,13 +979,15 @@ Depth, chunking strategy, and the bandwidth math are covered in
 [backfill.md](backfill.md#6-full-backfill--a-single-run-of-a-few-hours). Verify with
 `fafnir dq run` and the queries in [backfill.md §7](backfill.md#7-verify) when it finishes.
 
-**Then Sharadar, if subscribed.** The install starts from FMP; Sharadar comes after,
+**Then Sharadar.** The install starts from FMP; Sharadar comes after,
 on top of it: the bulk files, the links, and the dead issuers FMP never had. That
 sequence and its timings are in
 [backfill.md › Sharadar initial population](backfill.md#sharadar-initial-population)
 and [the dead-issuer backfill](backfill.md#the-dead-issuer-backfill-on-the-production-host-77).
 There is no install that starts from Sharadar alone: fafnir mints live securities
-from FMP's screener, and only dead issuers and new listings from Sharadar.
+from FMP's screener, and only dead issuers and new listings from Sharadar. Once the
+night runs (§8), [the cutover](operations.md#cutover-to-sharadar-as-primary) switches
+it to Sharadar (`primary_price_vendor = "sharadar"`).
 
 ---
 
@@ -1299,7 +1303,7 @@ journalctl -u fafnir-daily.service --since '2 days ago'
 ```
 
 What to watch, and the SQL for each, is in
-[operations.md](operations.md#monitoring): freshness, quarantine spikes, FMP bandwidth,
+[operations.md](operations.md#monitoring): freshness, quarantine spikes, bandwidth by vendor,
 failed runs, and three signals that come from the nightly universe maintenance —
 `New (7d)`, by the vendor that minted them (a week of zeroes on a working key means
 the universe step is not running), unapplied ticker renames awaiting a decision, and

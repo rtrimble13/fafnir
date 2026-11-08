@@ -316,9 +316,9 @@ after FMP's night.
   - `fmp_only`, a bar FMP holds and Sharadar did not serve, on a date the files hold
     in whole.
 - **Reading it.** The night's own trade date is the row to read; the differences are
-  what the issue asks to have explained. No real nightly has advanced `through` yet,
-  so each dry run covers every delta since the full file, and the earlier dates
-  repeat. A standalone check is `fafnir ingest sharadar-prices --nightly --dry-run
+  what the issue asks to have explained. Before the cutover no real nightly advances
+  `through`, so each dry run covers every delta since the full file, and the earlier
+  dates repeat. A standalone check is `fafnir ingest sharadar-prices --nightly --dry-run
   --as-if-fed`.
 
 **Rollback.** `fafnir vendor feed --vendor fmp --all-linked` gives FMP back the
@@ -543,7 +543,7 @@ Bulk TICKERS writes its `table` column in legacy codes (`SEP`, `SFP`, `SF1`, `SF
 
 | Mode | For | What it writes |
 |---|---|---|
-| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71) | the whole history |
+| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98) | the whole history |
 | `--gap-fill` | the FMP securities linked to Sharadar | fill-only: the dates the security does not hold, from the link's `valid_from` |
 | `--nightly` | the securities Sharadar feeds | the delta files since the last nightly (*Sharadar as primary: prices and actions*) |
 
@@ -791,10 +791,11 @@ show|accept|reject`
 accepted link is `manual`, and like every link it is never moved by the engine. A
 rejected pair is never proposed again.
 
-**The nightly run.** `daily_update.sh` runs `--new` after the price step, not
+**The nightly run.** In FMP mode, `daily_update.sh` runs `--new` after the price step, not
 straight after the security master as #62 first had it. The decision compares the
 security's own bars, and a security minted tonight has none until its history is
-pulled. Before the first full run, `--new` says so and does nothing.
+pulled. Before the first full run, `--new` says so and does nothing. Sharadar mode
+does not run it.
 
 ### Dead issuers minted from Sharadar (#71)
 
@@ -1224,9 +1225,9 @@ the difference — prices, actions, factors, marts and `duk` all key off
 ```bash
 fafnir source probe-fund VFIAX          # FIRST: is the NAV series raw? (3 requests)
 fafnir track add VFIAX --note "core US equity sleeve"
-fafnir ingest tracked                   # mints it; also runs nightly
-fafnir ingest prices --symbols VFIAX    # no watermark yet -> full history
-fafnir ingest actions --symbols VFIAX && fafnir adjust
+fafnir ingest tracked --allow-secondary                 # mints it; also runs nightly
+fafnir ingest prices --symbols VFIAX --allow-secondary  # no watermark yet -> full history
+fafnir ingest actions --symbols VFIAX --allow-secondary && fafnir adjust
 duk ph VFIAX --adj -S db
 ```
 
