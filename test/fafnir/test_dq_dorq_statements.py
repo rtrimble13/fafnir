@@ -733,6 +733,113 @@ def test_a_failed_statements_run_is_recorded_and_moves_no_watermark(
 
 
 # ---------------------------------------------------------------------------
+# Memory (#219): the first host night was OOM-killed holding dorq's output
+# ---------------------------------------------------------------------------
+
+
+def test_a_statements_night_works_on_disk_and_records_what_it_cost(
+    db, fake_dorq, tmp_path
+):
+    sid, days = _company(db)
+    rows = [
+        _statement_row(sid, "2024-03-31", extra_key={"identity": "balance_sheet"}),
+        _statement_row(sid, "2024-06-30", check="dorq_bad_value", code="DQ911"),
+    ]
+    _emit(fake_dorq, rows)
+    emitted = (fake_dorq.parent / "statement-rows.jsonl").stat().st_size
+    work = tmp_path / "work"
+    settings = _settings(fake_dorq, tmp_path, work_dir=str(work))
+    out = dorq_statements.run(db, settings, "NASDAQ", shadow=True)
+
+    # The files beside dorq's input were in the configured working directory, not
+    # the system's temporary one, and nothing is left there after the run.
+    args = (fake_dorq.parent / "args-0.txt").read_text().splitlines()
+    items = args[args.index("--items") + 1]
+    assert items.startswith(str(work / "fafnir-dorq-statements-"))
+    assert list(work.iterdir()) == []
+
+    run = db.fetchone(
+        "SELECT params FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+    )["params"]
+    assert run["reports"] == 2 and run["bytes"] > 0
+    assert run["bytes_out"] == emitted
+    assert run["fafnir_max_rss_mb"] > 0
+    if sys.platform.startswith("linux"):
+        assert run["dorq_max_rss_mb"] > 0
+    assert out.usage == {k: run[k] for k in out.usage}
+    assert len(dorq.read_shadow(out.shadow_file)) == 2
+
+
+def test_cli_prints_dorq_peak_memory_with_the_time(db, fake_dorq, tmp_path):
+    sid, _ = _company(db)
+    _emit(fake_dorq, [_statement_row(sid, "2024-03-31")])
+    rcfile = _rc(tmp_path, db, fake_dorq)
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(rcfile), "dq", "run", "--statements-only"]
+    )
+    assert result.exit_code == 0, result.output
+    if sys.platform.startswith("linux"):
+        assert re.search(r" s, dorq peak \d+ MB\):", result.output), result.output
+
+
+def test_a_statements_night_never_holds_its_reports(db, fake_dorq, tmp_path):
+    """The night streams from dorq's output file to the shadow file. Its Python
+    memory stays a fraction of the output's size, where holding the reports as a
+    list costs several times it."""
+    import tracemalloc
+
+    sid, days = _company(db)
+    template = _statement_row(
+        sid, "2024-03-31", extra_key={"identity": "balance_sheet"}
+    )
+    n = 20_000
+    with (fake_dorq.parent / "statement-rows.jsonl").open("w") as fh:
+        for i in range(n):
+            row = {**template, "detail": {**template["detail"], "row": i}}
+            fh.write(json.dumps(row) + "\n")
+    settings = _settings(fake_dorq, tmp_path)
+    tracemalloc.start()
+    try:
+        out = dorq_statements.run(db, settings, "NASDAQ", shadow=True)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    params = db.fetchone(
+        "SELECT params FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+    )["params"]
+    assert params["reports"] == n and out.detected == {"dorq_identity_break": n}
+    with out.shadow_file.open() as fh:
+        assert sum(1 for _ in fh) == n
+    assert peak < params["bytes_out"] / 4, (peak, params["bytes_out"])
+
+
+@pytest.mark.parametrize("shadow", [True, False])
+def test_a_statements_night_that_fails_part_way_writes_nothing(
+    db, fake_dorq, tmp_path, shadow
+):
+    """A row that does not parse, met after others have streamed out, fails the
+    run: no shadow file and no half-written one, no flag, no watermark, and the
+    working directory gone."""
+    sid, days = _company(db)
+    good = json.dumps(_statement_row(sid, "2024-03-31"))
+    (fake_dorq.parent / "statement-rows.jsonl").write_text(good + "\nnot json\n")
+    work = tmp_path / "work"
+    settings = _settings(fake_dorq, tmp_path, work_dir=str(work))
+    with pytest.raises(json.JSONDecodeError):
+        dorq_statements.run(db, settings, "NASDAQ", shadow=shadow)
+    run = db.fetchone(
+        "SELECT endpoint, status FROM ops.ingestion_run"
+        " ORDER BY ingestion_run_id DESC LIMIT 1"
+    )
+    assert run["status"] == "failed"
+    assert db.fetchval("SELECT count(*) FROM ops.data_quality_flag") == 0
+    statements_dir = tmp_path / "sh" / "statements"
+    assert not statements_dir.exists() or list(statements_dir.iterdir()) == []
+    assert dorq.read_watermark(db, run["endpoint"]) is None
+    assert list(work.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
 # Recheck
 # ---------------------------------------------------------------------------
 

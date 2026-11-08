@@ -68,7 +68,10 @@ and `dq run --rerun` re-judges on purpose ([dorq.md](dorq.md)). With `[dq]
 dorq_statements`, the same `dq run` then has dorq judge the statements' whole
 history, into `<dorq_shadow_dir>/statements/` until their cutover
 ([dorq.md](dorq.md#statements)). It is a second `ops.ingestion_run` row a night
-(`dq-statements-shadow`), and it too judges a night once.
+(`dq-statements-shadow`), and it too judges a night once. Its run row and `dq.log`
+line carry dorq's peak memory. On a small host, cap the unit with a `MemoryMax=`
+drop-in, so that a night outgrowing it is killed inside its own cgroup and not beside
+Postgres ([dorq.md](dorq.md#memory-on-the-host)).
 
 The first four steps are **universe maintenance**, and their order is load-bearing:
 

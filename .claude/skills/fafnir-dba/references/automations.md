@@ -44,10 +44,21 @@ incremental and idempotent — a missed day is caught up on the next run.
    statements: their whole history, as of the night's session, into
    `<dorq_shadow_dir>/statements/<as-of>.jsonl` while `dorq_statements_shadow`
    holds (doc/dorq.md, *Statements*). That is a second dorq row a night, endpoint
-   `dq-statements-shadow`, with `params.reports` and its own watermark; `dq.log`
-   says `dorq statements <version> (as of <date>, <seconds> s)`. It judges a night
-   once, as the bars do, and its failure is a `dq run` failure, not the load's.
-   `fafnir status` shows its newest run under the `dorq` line.
+   `dq-statements-shadow`, with its own watermark. Its params carry:
+   - `reports`;
+   - `bytes_out`, dorq's output;
+   - `dorq_max_rss_mb`, dorq's peak memory.
+
+   `dq.log` says `dorq statements <version> (as of <date>, <seconds> s, dorq peak
+   <MB> MB)`. It judges a night once, as the bars do, and its failure is a `dq run`
+   failure, not the load's. `fafnir status` shows its newest run under the `dorq`
+   line.
+
+   **A row left `started`, with no `finished_at`, is a run the kernel killed.** The
+   first host night (2026-11-07, run 787) was OOM-killed this way, before #219's fix.
+   Read `systemctl show fafnir-dq.service -p Result -p MemoryPeak` (`oom-kill`), not
+   the journal. The run's working directory under `dorq_work_dir` is pruned by a
+   later run, once it is 6 hours old.
 
    It runs after a failed load too. dorq then finds no session newer than the night
    it last judged, says so in `dq.log` and writes no run row, no file and no

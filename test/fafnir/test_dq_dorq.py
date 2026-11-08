@@ -173,6 +173,106 @@ def test_shadow_files_are_named_by_as_of_date(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_a_shadow_night_that_fails_part_way_leaves_no_file(tmp_path):
+    """A row that does not parse, met while the night streams to its file, leaves
+    neither a half-written night nor its temporary file, and the previous night
+    where it was."""
+    path = dorq.shadow_path(str(tmp_path), dt.date(2024, 6, 3))
+    dorq.write_shadow([_row(1, "2024-06-03")], path)
+    before = path.read_bytes()
+
+    def rows():
+        yield _row(2, "2024-06-03")
+        raise json.JSONDecodeError("not json", "x", 0)
+
+    with pytest.raises(json.JSONDecodeError):
+        dorq.write_shadow(rows(), path)
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# Working files and memory (#219)
+# ---------------------------------------------------------------------------
+
+
+def test_working_files_go_beside_the_shadow_directory_unless_set(tmp_path):
+    """Never the system temporary directory, which a unit's PrivateTmp on a tmpfs
+    /tmp makes memory; and beside the shadow directory, not inside it."""
+    s = dorq.DorqSettings(shadow_dir="/var/lib/fafnir/dorq-shadow")
+    assert dorq.work_root(s) == dorq.Path("/var/lib/fafnir/dorq-work")
+    s = dorq.DorqSettings(shadow_dir="/x/sh", work_dir=str(tmp_path / "w"))
+    assert dorq.work_root(s) == tmp_path / "w"
+    with dorq.work_dir(s) as wd:
+        assert wd.parent == tmp_path / "w" and wd.name.startswith("fafnir-dorq-")
+        (wd / "out.jsonl").write_text("{}\n")
+    assert list((tmp_path / "w").iterdir()) == []
+
+
+def test_settings_carry_the_work_dir(tmp_path):
+    rc = tmp_path / "fafnirrc"
+    rc.write_text('[dq]\ndorq_work_dir = "/data/dorq-work"\n')
+    assert dorq.settings_from(FafnirConfig(str(rc))).work_dir == "/data/dorq-work"
+    cfg = FafnirConfig(str(tmp_path / "missing.toml"))
+    assert cfg.dorq_work_dir == "" and dorq.settings_from(cfg).work_dir == ""
+
+
+def test_prune_removes_only_what_killed_runs_left(tmp_path):
+    now = 1_000_000.0
+    old = tmp_path / "fafnir-dorq-abc"
+    old_statements = tmp_path / "fafnir-dorq-statements-def"
+    fresh = tmp_path / "fafnir-dorq-ghi"
+    other = tmp_path / "keep-me"
+    for d in (old, old_statements, fresh, other):
+        d.mkdir()
+        (d / "out.jsonl").write_text("{}\n")
+    for d in (old, old_statements, other):
+        os.utime(d, (now - dorq.WORK_STALE_SECONDS - 60,) * 2)
+    os.utime(fresh, (now - 60,) * 2)
+    assert dorq.prune_work(tmp_path, now=now) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["fafnir-dorq-ghi", "keep-me"]
+
+
+def test_records_are_read_a_row_at_a_time(tmp_path):
+    path = tmp_path / "out.jsonl"
+    path.write_text('{"a": 1}\n\n{"a": 2}\n')
+    rows = dorq.read_records(path)
+    assert next(rows) == {"a": 1}
+    assert list(rows) == [{"a": 2}]
+
+
+def test_a_tally_counts_the_rows_it_passes_on():
+    hashed = {**_row(1, "2024-06-03"), "detail": {"dorq": {"config_hash": "h1"}}}
+    tally = dorq.Tally(iter([hashed, _row(2, "2024-06-03")]))
+    assert tally.count == 0 and tally.config_hash is None
+    assert [r["security_id"] for r in tally] == [1, 2]
+    assert tally.count == 2 and tally.config_hash == "h1"
+    assert tally.by_check() == {hashed["check_name"]: 2}
+
+
+def test_an_error_message_is_read_from_its_end(tmp_path):
+    path = tmp_path / "err.txt"
+    path.write_text("x" * 100_000 + "the reason")
+    assert dorq._tail(path, 10) == "the reason"
+    assert len(dorq._tail(path)) == 2000
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="ru_maxrss in KiB")
+def test_waiting_for_dorq_gives_its_exit_status_and_peak_memory():
+    """The kernel's account of the child's peak resident memory, which the
+    statements run records (#219): a child that touches 60 MB peaks above it."""
+    child = dorq.subprocess.Popen(
+        [sys.executable, "-c", "b = bytearray(60_000_000); raise SystemExit(3)"]
+    )
+    status, rss_kb = dorq._wait(child)
+    assert status == 3 and child.returncode == 3
+    assert rss_kb is not None and rss_kb > 60_000_000 // 1024
+    killed = dorq.subprocess.Popen(
+        [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), 9)"]
+    )
+    assert dorq._wait(killed)[0] == -9
+
+
 # ---------------------------------------------------------------------------
 # With a database
 # ---------------------------------------------------------------------------
