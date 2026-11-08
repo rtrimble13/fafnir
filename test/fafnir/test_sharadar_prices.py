@@ -335,6 +335,62 @@ def test_gap_fill_adds_only_the_dates_fmp_lacks_from_the_link(db, tmp_path):
 
 
 @integration
+def test_backfill_bounds_a_fed_row_another_vendor_minted_by_the_link(db, tmp_path):
+    # Since the cutover (#125) `vendor feed` feeds every linked FMP-minted security,
+    # so `--backfill` reads them. Before the link the FMP row may hold another
+    # issuer's era (#68): only a security Sharadar minted is read before its link.
+    fmp = _security(db, "ZZF", source="fmp")
+    _vendor(db, "900006", "ZZF")
+    _link(db, fmp, "900006", Y(2010, 1, 4), feed=True)
+    repo.upsert_daily_prices(
+        db,
+        [
+            {
+                "security_id": fmp,
+                "trade_date": Y(2010, 1, 5),
+                "open": D("20"),
+                "high": D("20"),
+                "low": D("20"),
+                "close": D("20"),
+                "volume": 7,
+            }
+        ],
+    )
+    dead = _security(db, "ZZS1", source="sharadar")
+    _vendor(db, "900007", "ZZS1")
+    _link(db, dead, "900007", Y(2010, 1, 4), feed=True)
+    _file(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES
+        + _bar("ZZF", "2009-12-31", "10", "10")  # before the link: not read
+        + _bar("ZZF", "2010-01-05", "21", "21")  # FMP holds it
+        + _bar("ZZF", "2010-01-06", "21", "21")  # missing: filled
+        + _bar("ZZS1", "2009-12-31", "30", "30")  # its own: read all the same
+        + _bar("ZZS1", "2010-01-05", "31", "31"),
+    )
+    _file(db, tmp_path, "actions", ACTIONS)
+    plan = sp.load(
+        db, tmp_path, backfill=True, gap_fill=False, dry_run=True, as_of=Y(2026, 1, 2)
+    )
+    assert (plan.securities, plan.counts["to_write"]) == (2, 3)
+    assert plan.counts["held_or_outside"] == 2
+    result = sp.load(db, tmp_path, backfill=True, gap_fill=False, as_of=Y(2026, 1, 2))
+    assert result.written == 3
+    bars = _bars(db, fmp)
+    assert {d: b["source"] for d, b in bars.items()} == {
+        Y(2010, 1, 5): "fmp",
+        Y(2010, 1, 6): "sharadar",
+    }
+    assert bars[Y(2010, 1, 5)]["close"] == D("20")  # FMP's, untouched
+    assert repo.get_watermark(db, "sharadar", "SEP", fmp) == Y(2010, 1, 6)
+    assert set(_bars(db, dead)) == {Y(2009, 12, 31), Y(2010, 1, 5)}
+    # `--gap-fill` reads only the linked FMP securities Sharadar does not feed.
+    assert sp.load(db, tmp_path, backfill=False, gap_fill=True).securities == 0
+
+
+@integration
 def test_backfill_takes_its_own_bar_on_a_date_a_history_split_moved(db, tmp_path):
     # GPUS, 2026-11-06: a split moved another issuer's FMP bars off the row
     # Sharadar feeds (Blue Nile off NILE). Sharadar's bar for such a date is the

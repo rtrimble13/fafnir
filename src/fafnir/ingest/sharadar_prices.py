@@ -5,11 +5,14 @@ raw OHLCV recovered from SEP/SFP (plan SA-0601, #75).
 Two modes, either or both, reading the ledger's current ``stocks`` and ``funds``
 bulk files (no API, no landing copy), and a third, ``--nightly``, reading deltas:
 
-- ``--backfill``: the whole history of the securities Sharadar **feeds**, the dead
-  issuers #71 minted. Nobody else holds their bars.
-- ``--gap-fill``: **fill-only** for the FMP securities linked to Sharadar: the
-  dates FMP never served, from the link's ``valid_from`` on (before it, the FMP row
-  may hold another issuer's era, #68).
+- ``--backfill``: the securities Sharadar **feeds**. For the dead issuers #71
+  minted, the whole history: nobody else holds their bars. From the cutover (#125),
+  also the FMP securities `vendor feed` gave it, which are read from the link's
+  ``valid_from`` as below.
+- ``--gap-fill``: **fill-only** for the FMP securities linked to Sharadar that it
+  does not feed: the dates FMP never served, from the link's ``valid_from``. Since
+  the cutover these are normally the ones a rollback (`vendor feed --vendor fmp`)
+  gave back to FMP.
 - ``--nightly`` (#98): the delta files `source sharadar-delta` recorded since the
   last nightly, for the securities Sharadar feeds. A date the security does not
   hold is written; a bar of Sharadar's own the vendor revised is rewritten, beyond
@@ -20,6 +23,11 @@ bulk files (no API, no landing copy), and a third, ``--nightly``, reading deltas
   names the last file applied per table, so a night that failed is read again the
   next. ``--as-if-fed`` (a dry run) adds the FMP securities linked to Sharadar and
   compares the vendor's bars with FMP's: the cutover's acceptance check.
+
+In the two bulk modes, a security another vendor minted is read from its link's
+``valid_from``, fed or not: before it, the row may hold another issuer's era (#68).
+One Sharadar minted is read whole, and its link starts at its first price. The
+nightly bounds every security by its link.
 
 **Raw is recovered** (ADR 0004's amendment, #74). SEP's ``open/high/low/close/volume``
 are split-adjusted and ``closeunadj`` is the raw close, so the rest is
@@ -242,6 +250,7 @@ class _Target:
     vendor_key: str
     is_feed: bool
     valid_from: date
+    source: str  # who minted the security
     splits: list = field(default_factory=list)
     mismatched: list = field(default_factory=list)  # dates
 
@@ -350,15 +359,15 @@ def _load_run(
     result: PricesResult,
 ) -> None:
     """Recover, gate and write one run of a security's rows: the dates it does not
-    hold."""
+    hold, from the link's start unless Sharadar minted the security."""
     held = repo.price_dates(db, t.security_id)
-    wanted = [
-        r
-        for r in rows
-        if r["date"] <= as_of
-        and r["date"] not in held
-        and (t.is_feed or r["date"] >= t.valid_from)
-    ]
+    # From the link's start, unless Sharadar minted the security: its link starts at
+    # its first price, and the file's rows are its own history. A row another vendor
+    # minted may hold another issuer's era before the link (#68), fed or not, and
+    # since the cutover (#125) every linked FMP security is fed. The nightly and
+    # `vendor correct` bound it the same way.
+    start = date.min if t.source == VENDOR else t.valid_from
+    wanted = [r for r in rows if start <= r["date"] <= as_of and r["date"] not in held]
     result.counts["held_or_outside"] += len(rows) - len(wanted)
     if not wanted:
         return
@@ -527,6 +536,7 @@ def prepare(
                 key,
                 t["is_feed"],
                 t["valid_from"],
+                t["source"],
             )
 
     # The splits that turn the vendor's adjusted bars back into raw ones.
