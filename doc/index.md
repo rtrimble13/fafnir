@@ -67,12 +67,12 @@ read through the `duk` CLI.
     skill: the order that cleared 33,906 dead-history outliers, §2k's tests with
     thresholds, a scoped "already gone" set by id, and dorq `--full`'s effect on the
     shadow file (**applied**)
-  - [Sharadar adoption](plans/sharadar-adoption.md) — the living plan, revised
-    2026-10-18: Sharadar (Bundle, max history) becomes the system of record in one
-    warehouse — it fills the history FMP never had and corrects what FMP has wrong —
-    while FMP drops to a lower tier; six phases, the issue dispositions and the
-    decision log; tracked in [#41](https://github.com/rtrimble13/fafnir/issues/41)
-    (**in progress**)
+  - [Sharadar adoption](plans/sharadar-adoption.md) — the plan, revised 2026-10-18:
+    Sharadar (Bundle, max history) became the system of record in one warehouse — it
+    fills the history FMP never had and corrects what FMP has wrong — while FMP
+    dropped to a lower tier; six phases, the issue dispositions, the decision log and
+    a retrospective; tracked in [#41](https://github.com/rtrimble13/fafnir/issues/41)
+    (**implemented**)
   - [Sharadar COA assessment](plans/sharadar-coa-assessment.md) — the courses of
     action considered and why COA 2-M was chosen (reference)
   - [Market-data vendor assessment](plans/fafnir-vendor-assessment.md) — the vendor
@@ -99,7 +99,7 @@ read through the `duk` CLI.
   - [ADR 0014 — A venue transfer is not a delisting](adr/0014-venue-transfer-is-not-a-delisting.md)
   - [ADR 0015 — Multi-vendor provenance, precedence and audited corrections](adr/0015-multi-vendor-provenance-and-precedence.md)
   - [ADR 0016 — Sharadar's permaticker is the identity authority; survivorship floor 1998](adr/0016-sharadar-identity-and-survivorship-floor.md)
-  - [ADR 0017 — Vendor access is one library inside fafnir, not a distribution per vendor](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md) *(proposed)*
+  - [ADR 0017 — Vendor access is one library inside fafnir, not a distribution per vendor](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md)
   - [ADR 0018 — Bitemporal fundamentals on Sharadar SF1](adr/0018-bitemporal-fundamentals.md)
   - [ADR 0019 — fafnir derives its metrics; vendor metrics are not read](adr/0019-derived-metrics-not-vendor-metrics.md)
 

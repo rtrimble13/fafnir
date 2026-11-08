@@ -4,10 +4,10 @@ Every schema, table, view, materialized view and function fafnir stores or serve
 with its **grain**, **source**, **units**, **adjustment status** and **update
 cadence**. This is the contract between the warehouse and everything that reads it.
 
-It describes the schema at migration **0043** (`panel_share_factor`). It was
+It describes the schema at migration **0044** (`dq_label_statement_scope`). It was
 checked against the live catalog at 0040 (`pg_class`, `pg_attribute`,
 `pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
-on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's and 0043's objects
+on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's to 0044's objects
 are described from the migrations and their tests. A migration that adds, drops or re-types a column updates this file in
 the same pull request: the PR template's first box.
 
@@ -65,6 +65,7 @@ count, the planner's estimate otherwise. They are not maintained.
 | [`mart.v_income_statement_versions`, `_balance_sheet_`, `_cash_flow_statement_`](#the-statements-point-in-time-views-and-functions) | views | the core table's | — | — |
 | [`mart.v_statements_current`, `mart.v_fundamentals_ttm`](#the-statements-point-in-time-views-and-functions) | views | `(security_id, period_type)`; `(security_id, fiscal_date)` | — | — |
 | [`mart.fundamental_panel`](#the-factor-panel-materialized-view-and-functions) | materialized view | `(security_id, as_of_date)` | `db refresh-marts` | 1.83M |
+| [`mart.v_share_factor_versions`](#daily-market-cap-function-and-view) | view | `core.income_statement`'s | — | — |
 | [`mart.v_industry_fundamentals`](#martv_industry_fundamentals--the-panel-by-sector-and-industry-view) | view | `(group_level, as_of_date, sector_name, industry_name)` | — | — |
 | [`mart.security_fundamentals_latest`](#martsecurity_fundamentals_latest--each-securitys-factors-now-materialized-view) | materialized view | `security_id` | `db refresh-marts` | 5.4k |
 | [`mart.v_security_dq_open`](#martv_security_dq_open--open-dq-flags-per-security-view) | view | open `dq_flag_id` with a security | — | — |
@@ -87,8 +88,9 @@ count, the planner's estimate otherwise. They are not maintained.
 
 The mart functions are `mart.fn_statements_as_of` (two forms),
 `mart.fn_fundamentals_ttm`, `mart.fn_fundamental_panel`,
-`mart.fn_fundamental_snapshot`, `mart.fn_ratio`, `mart.fn_growth` and
-`mart.fn_security_betas`, described with the views they serve.
+`mart.fn_fundamental_snapshot`, `mart.fn_ratio`, `mart.fn_growth`,
+`mart.fn_security_betas` and `mart.fn_daily_market_cap`, described with the views
+they serve.
 
 ## Roles and privileges
 
@@ -114,9 +116,11 @@ The mart functions are `mart.fn_statements_as_of` (two forms),
 ## Schema: `core`
 
 ### `core.security` — security master
-**Grain:** one row per minted `security_id`. **Source:** FMP `stock-list` / `etf-list`
-(+ `profile` enrichment), and Sharadar's TICKERS for the securities it mints (the dead
-issuers, #71; new listings since the cutover, #93). **Cadence:** nightly, by `ingest
+**Grain:** one row per minted `security_id`. **Source:** Sharadar's TICKERS and
+ACTIONS: since the cutover its renames, delistings and new listings (#93), and the
+dead issuers it minted (#71). Then FMP's `company-screener` (`stock-list` /
+`etf-list` for the unfiltered universes; + `profile` enrichment) for what FMP minted
+before it. **Cadence:** nightly, by `ingest
 sharadar-universe` in Sharadar mode and `ingest securities` in FMP mode; profile
 fields on enrichment.
 
@@ -140,7 +144,7 @@ fields on enrichment.
 | `venue_override` / `venue_override_left` | TEXT | An operator-recorded venue (`fafnir security venue-transfer`, migration 0027), and the venue the security left. While set, the nightly upsert keeps `exchange_code` and `is_actively_trading` as they are, until the vendor reports a venue other than `venue_override_left`; then both clear. ADR 0014. |
 | `delisted_date` | DATE | NULL while listed; set (never deleted) on delist. |
 | `source` | TEXT | The party that **minted** the security, not the one that feeds it now ([ADR 0015](adr/0015-multi-vendor-provenance-and-precedence.md)). Values: `fmp` (default), `operator` and `sharadar` (`tiingo` is reserved and unused). The FMP loaders feed `source = 'fmp'` rows and nothing else: their universes filter on it, and a per-symbol pull that resolves to any other row is refused, because FMP serves that ticker for a different issuer. `operator` is a security minted by `fafnir security split-history` to hold one issuer's history split off a reused ticker: delisted, carrying a closed `symbol_xref` period, fed by nobody. `sharadar` is a dead issuer minted by `fafnir vendor mint-delisted` (#71, ADR 0016 §3): delisted, `is_actively_trading` false, the vendor's ticker as `primary_symbol`, a closed `symbol_xref` period (`source = 'sharadar'`) per ticker it traded under, and a `minted`, feeding link to its permaticker. Its bars come from the Sharadar backfill (#75). Since the cutover `ingest sharadar-universe` also mints new listings as `sharadar` rows: active, with an open ticker period (#93). |
-| `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. The nightly FMP load stamps `updated_at` on every row the screener still lists, so it is the record of what the screener returned (the screener payload is not kept in landing). |
+| `first_seen_at` / `updated_at` | TIMESTAMPTZ | Load process time. In FMP mode `ingest securities` stamps `updated_at` on every row the screener still lists, so it is the record of what the screener returned (the screener payload is not kept in landing). Since the cutover no night reads the screener: `updated_at` marks the last write by any loader (`ingest sharadar-universe`'s renames, delistings and mints, `ingest tracked`). |
 
 Soft natural key: `UNIQUE (source, primary_symbol) WHERE delisted_date IS NULL`
 (`ux_security_active_source_symbol`) makes the security upsert idempotent without
@@ -291,7 +295,7 @@ returns a total-return NAV series with no special case.
 | `open` `high` `low` `close` | NUMERIC(20,6) NOT NULL | **Raw** prices. Six decimal places: a price that rounds to zero at that scale is quarantined (`price_subresolution_price`), as is one too large for it (`price_price_out_of_range`). |
 | `volume` | BIGINT NOT NULL | Default 0. **Raw** volume (shares), in the share count of the day it traded. Taken from `unadjustedVolume` where the payload offers it, else `volume`. |
 | `vwap` | NUMERIC(20,6) | Volume-weighted average price (nullable). |
-| `source` | TEXT | Who supplied the bar (a `sharadar` bar is **vendor-derived raw**: recovered from SEP/SFP's `closeunadj` and the ACTIONS split product by `fafnir ingest sharadar-prices`, #75 and ADR 0004's amendment): `fmp`, `sharadar`, `tiingo`, or `operator` for a vendor bar an operator re-dated or re-scaled with `fafnir prices shift` / `rescale` (see `ops.operator_override`, migration 0026). Writes follow ADR 0015 precedence (`operator > sharadar > tiingo > fmp`): a vendor revises its own bars and leaves every other party's alone; a higher-ranked vendor replaces a lower one's bar only in an explicit correction, which keeps the replaced bar in `ops.vendor_correction` (0029). No vendor overwrites an `operator` bar: a vendor bar on its date is set aside. |
+| `source` | TEXT | Who supplied the bar (a `sharadar` bar is **vendor-derived raw**: recovered from SEP/SFP's `closeunadj` and the ACTIONS split product by `fafnir ingest sharadar-prices`, #75 and ADR 0004's amendment): `fmp`, `sharadar`, `tiingo` (reserved, unused), or `operator` for a vendor bar an operator re-dated or re-scaled with `fafnir prices shift` / `rescale` (see `ops.operator_override`, migration 0026). Writes follow ADR 0015 precedence (`operator > sharadar > tiingo > fmp`): a vendor revises its own bars and leaves every other party's alone; a higher-ranked vendor replaces a lower one's bar only in an explicit correction, which keeps the replaced bar in `ops.vendor_correction` (0029). No vendor overwrites an `operator` bar: a vendor bar on its date is set aside. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | Lineage. NULL on an `operator` bar; the vendor bar it replaced, with its run, is kept in the override's `detail.row`. |
 | `loaded_at` | TIMESTAMPTZ NOT NULL | |
 
@@ -322,7 +326,7 @@ happened (ADR 0007).
 | `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. Both `> 0` on a split (`ck_corp_action_split`). |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. NOT NULL and `>= 0` on a dividend (`ck_corp_action_dividend`). |
 | `currency` | TEXT NOT NULL | Default `USD`. |
-| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo`, or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
+| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo` (reserved, unused), or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 
@@ -1225,9 +1229,10 @@ NASDAQ's sessions (`daily_price.CALENDAR_FALLBACK_EXCHANGE`).
 by `fafnir ingest tracked`.
 
 The symbols the security master must hold *regardless of the screener*. The nightly
-universe is discovered from `company-screener`, which only returns exchange-listed
-securities — a mutual fund has no venue and never appears there. This table is how
-one is declared. The grain is deliberately the same soft key `upsert_security`
+universe is discovered from Sharadar's TICKERS since the cutover, and in FMP mode
+from `company-screener`, which only returns exchange-listed securities. A mutual
+fund has no venue and appears in neither. This table is how one is declared. The
+grain is deliberately the same soft key `upsert_security`
 conflicts on, so a declared symbol and a screened one converge on one `security_id`
 rather than forking. See [ADR 0006](adr/0006-curated-fund-universe.md).
 
@@ -1624,7 +1629,7 @@ NULL`.
 | `statement` | TEXT CHECK | A label about statements: `income`, `balance_sheet` or `cash_flow`. NULL: every statement, or a label about bars (0044). |
 | `period_type` | TEXT CHECK | `quarter` or `annual`. NULL: either. |
 | `version_no` | INTEGER CHECK | The version, 1 or more. NULL: any. |
-| `item` | TEXT | The line item, a statement table's column. NULL: any. |
+| `item` | TEXT CHECK | The line item, a statement table's column; never blank. NULL: any. |
 
 ---
 
@@ -1687,7 +1692,7 @@ current full file of each of `stocks`, `funds`, `fundamentals`, `tickers` and
 `version` (TEXT PK, `0001`…), `name`, `checksum` (SHA-256 of the up-migration),
 `applied_at`. Written by `fafnir db migrate`, removed by `fafnir db rollback`. On
 2026-10-31 the host held 0001–0040 (MCP `schema_state`); the repository's set ends at
-0041.
+0044.
 
 ---
 
@@ -1722,6 +1727,10 @@ not: the `source = 'fmp'` securities with no feeding Sharadar link (`repo.fmp_fe
 | `symbol-change` | `ingest symbol-changes` | `core.symbol_change`, `core.symbol_xref` | (source, old, new, change_date) |
 | `delisted-companies` | `ingest delisted` | `core.security.delisted_date` | security_id |
 
+In Sharadar mode only `ingest tracked`, `prices` and `actions` run, with
+`--allow-secondary`, while `[general] fmp_secondary` is true; the screener,
+symbol-change and delisted rows are FMP mode's.
+
 **Derived and operator-written:**
 
 | Writer | Target |
@@ -1735,5 +1744,5 @@ not: the `source = 'fmp'` securities with no feeding Sharadar link (`repo.fmp_fe
 | `track add\|rm` | `ref.tracked_symbol` |
 | `vendor link accept\|reject`, `vendor feed` | `core.security_vendor_xref`, `core.security_vendor_rejection` |
 
-Domains not built (economic series and the rest) are sketched in
-[extending.md](extending.md).
+Domains not built are on [extending.md](extending.md)'s roadmap. Economic series
+are not planned (2026-10-30, #227): `duk yc` stays on FMP's treasury rates.
