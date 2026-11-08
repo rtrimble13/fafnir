@@ -2039,7 +2039,7 @@ fails with `FMP returned no bars`. What repairs a wrong bar depends on whose it 
   `ingest sharadar-prices --backfill --symbols <SYM>` then reads it from the
   current full file. That file must postdate the vendor's fix (`sharadar_files`);
   a fresh one is the operator's `source sharadar-bulk --tables SEP --force` (`SFP`
-  for a fund), and the backfill's caveat below applies.
+  for a fund), and the backfill's bound below applies.
 
 **A date a Sharadar-fed security lacks** is for a backfill to fill. A missed night
 is read again by the next (automations.md, "No bars tonight"). The backfill reads
@@ -2050,11 +2050,16 @@ sudo -u fafnir /opt/fafnir/.venv/bin/fafnir ingest sharadar-prices --backfill --
 ```
 
 It reads the whole file, so run it in the background. `bars to write` counts every
-date the file holds that the security lacks. On a security Sharadar minted, run it
-for real. On one FMP minted, it is not bounded by `valid_from` (the nightly is):
-a count beyond the dates you meant includes dates before the link, which can be
-another issuer's era (#68). Do not run that; report it. `--gap-fill` reads only
-linked securities Sharadar does not feed, which since the cutover is normally none.
+date the file holds that the security lacks: over the whole history on a security
+Sharadar minted, and from the link's `valid_from` on one FMP minted, as the nightly
+reads it. Read the count against the dates you meant, then run it for real. A date
+before `valid_from` on an FMP-minted row is not the vendor's to fill, since the row
+can hold another issuer's era there (#68), and the backfill counts it
+`held_or_outside`. That bound holds from the release after v3.1.6. Up to v3.1.6 the
+backfill read a fed FMP-minted row's whole history, so on such a host do not run it
+on one; report it. A `bar_source = 'sharadar'` before `valid_from` on an FMP-minted
+row is one such a run wrote: report that too. `--gap-fill` reads only linked
+securities Sharadar does not feed, which since the cutover is normally none.
 
 **An operator-minted security** (`minted_by = 'operator'`, from `security
 split-history`) has no feed, and nothing re-fetches it.

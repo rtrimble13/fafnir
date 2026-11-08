@@ -644,12 +644,14 @@ def ingest_delisted(ctx, full, allow_secondary):
 @click.option(
     "--backfill",
     is_flag=True,
-    help="The whole history of the securities Sharadar feeds (minted).",
+    help="The securities Sharadar feeds: those it minted whole, the rest from the "
+    "link's start.",
 )
 @click.option(
     "--gap-fill",
     is_flag=True,
-    help="Fill-only for the FMP securities linked to Sharadar: dates FMP never served.",
+    help="Fill-only for the FMP securities linked to Sharadar that it does not feed: "
+    "dates FMP never served.",
 )
 @click.option(
     "--nightly",
@@ -681,9 +683,12 @@ def ingest_sharadar_prices(
       fafnir ingest sharadar-prices --nightly --dry-run --as-if-fed
 
     Reads the ledger's current stocks and funds files under [sharadar] bulk_dir.
-    --backfill loads the whole history of the securities Sharadar feeds (the
-    minted dead issuers); --gap-fill adds, fill-only, the dates an FMP security
-    linked to Sharadar does not hold, from the link's start. Raw prices are
+    --backfill loads the securities Sharadar feeds: the whole history of the dead
+    issuers it minted, and for the FMP securities the cutover fed it, the dates
+    they do not hold from the link's start (before it, the row may hold another
+    issuer's era). --gap-fill adds the same for an FMP security linked to Sharadar
+    that it does not feed (since the cutover, one a rollback gave back to FMP).
+    Neither reads a date the security holds. Raw prices are
     recovered from closeunadj with the ACTIONS split product (the vendor's ratio
     where they disagree, flagged sharadar_split_ratio_mismatch). Non-session and
     operator-edited dates are set aside, and bad bars quarantined, as for FMP.

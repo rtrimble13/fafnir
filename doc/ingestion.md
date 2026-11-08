@@ -543,12 +543,17 @@ Bulk TICKERS writes its `table` column in legacy codes (`SEP`, `SFP`, `SF1`, `SF
 
 | Mode | For | What it writes |
 |---|---|---|
-| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98) | the whole history |
-| `--gap-fill` | the FMP securities linked to Sharadar | fill-only: the dates the security does not hold, from the link's `valid_from` |
+| `--backfill` | the securities Sharadar feeds: the dead issuers it minted (#71), and from the cutover those `vendor feed` gave it (#98, #125) | a dead issuer's whole history; for one another vendor minted, the dates it does not hold from the link's `valid_from` |
+| `--gap-fill` | the FMP securities linked to Sharadar that it does not feed: since the cutover, normally only those a rollback (`vendor feed --vendor fmp`) gave back | fill-only: the dates the security does not hold, from the link's `valid_from` |
 | `--nightly` | the securities Sharadar feeds | the delta files since the last nightly (*Sharadar as primary: prices and actions*) |
 
 In the two bulk modes a date the security already holds, whoever supplied it, is
-never read, so a re-run writes nothing new.
+never read, so a re-run writes nothing new. A security another vendor minted is
+read from its link's `valid_from`, fed or not: before it, its row may hold another
+issuer's era (#68). Only a security Sharadar minted is read whole, and its link
+starts at its first price. Up to v3.1.6 a fed row was not bounded, so since the
+cutover a backfill of a linked FMP security wrote the vendor's bars on the dates
+before the link that the row lacked.
 
 **Which ticker a key is read by** (#238). SEP, SFP and SF1 rows carry no permaticker,
 only the ticker of the day the file was fetched, and Sharadar files a security's history
