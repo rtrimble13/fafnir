@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal
+from test.fafnir import upgrade_rows
 
 import pytest
 from click.testing import CliRunner
@@ -466,12 +467,8 @@ def test_0032_leaves_existing_rows_byte_identical(db):
     _engine(db, "ZZJ")
 
     def fingerprint():
-        return db.fetchone("""
-            SELECT (SELECT md5(string_agg(t::text, '|' ORDER BY security_id))
-                      FROM core.security t) AS security,
-                   (SELECT md5(string_agg(t::text, '|' ORDER BY vendor_key))
-                      FROM core.security_vendor_xref t) AS links
-            """)
+        # Column by column: a later migration's column is not a moved row (0045).
+        return upgrade_rows.snapshot(db, ("core.security", "core.security_vendor_xref"))
 
     before = fingerprint()
     # Every migration from 0032 on, as test_0031 does: a later one (0033) is above
@@ -482,10 +479,13 @@ def test_0032_leaves_existing_rows_byte_identical(db):
         assert (
             db.fetchval("SELECT to_regclass('core.security_vendor_rejection')") is None
         )
-        assert fingerprint() == before
+        now, then = upgrade_rows.on_shared_columns(fingerprint(), before)
+        assert now == then
     finally:
         applied = m.migrate(db.dsn)
-    assert applied == later and fingerprint() == before
+    assert applied == later
+    now, then = upgrade_rows.on_shared_columns(fingerprint(), before)
+    assert now == then
     assert [r["vendor_key"] for r in _links(db, sid)] == ["900080"]
 
 

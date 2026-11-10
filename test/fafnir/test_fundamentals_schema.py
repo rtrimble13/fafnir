@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import date, datetime, timedelta, timezone
+from test.fafnir import upgrade_rows
 
 import psycopg
 import pytest
@@ -323,17 +324,10 @@ def test_the_other_statements_take_the_same_rows(db, sid, statement):
 
 
 def _fingerprint(db) -> dict:
-    out = {}
-    for table, order in (
-        ("core.security", "security_id"),
-        ("core.symbol_xref", "security_id, symbol, valid_from"),
-        ("core.daily_price", "security_id, trade_date"),
-    ):
-        out[table] = db.fetchone(
-            f"SELECT count(*) AS n, md5(coalesce(string_agg(t::text, '|' ORDER BY {order}), '')) "
-            f"AS digest FROM {table} t"
-        )
-    return out
+    # Column by column: a later migration's column is not a moved row (0045).
+    return upgrade_rows.snapshot(
+        db, ("core.security", "core.symbol_xref", "core.daily_price")
+    )
 
 
 def test_the_upgrade_leaves_existing_rows_byte_identical(db, migrated_dsn, sid):
@@ -352,10 +346,11 @@ def test_the_upgrade_leaves_existing_rows_byte_identical(db, migrated_dsn, sid):
             (sid,),
         )
         before = _fingerprint(db)
-        assert before["core.daily_price"]["n"] == 1
+        assert len(before["core.daily_price"]["rows"]) == 1
     finally:
         m.migrate(migrated_dsn)
-    assert _fingerprint(db) == before
+    now, then = upgrade_rows.on_shared_columns(_fingerprint(db), before)
+    assert now == then
     assert db.fetchval("SELECT count(*) FROM ref.statement_line_item") == sum(
         len(v) for v in fm.STATEMENTS.values()
     )
