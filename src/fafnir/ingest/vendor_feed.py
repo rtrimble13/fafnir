@@ -110,6 +110,9 @@ def _feed_to(db, result, vendor, funds, security_ids) -> None:
             "WHERE vendor = %s AND vendor_key = %s AND valid_to IS NULL",
             (vendor, r["vendor_key"]),
         )
+        # A fed security is not frozen (ADR 0020): the marker `security freeze
+        # --unfed` stamped while nothing fed it comes off with the feed.
+        repo.thaw_feed(db, [sid])
         result.changes.append(FeedChange(sid, r["primary_symbol"], "fed", previous))
     if security_ids is not None:
         seen = {int(r["security_id"]) for r in rows}

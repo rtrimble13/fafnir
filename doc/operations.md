@@ -172,6 +172,17 @@ validate stops it before anything loads.
       longer serves them. They then stop updating for good: Sharadar carries no
       mutual funds, and no other fund vendor was adopted (Tiingo was dropped on
       2026-10-30).
+    - **Off: they are frozen, not stale (ADR 0020).** On the `false` branch the
+      night runs `fafnir security freeze --unfed --yes`: every security FMP alone
+      fed, in the nightly universe and not yet marked, gets
+      `core.security.feed_frozen_on` (its last bar) and a note. The freshness check
+      skips a frozen security, `dq recheck --check stale` closes any flag written
+      before the marker, and `dq compare` and dorq judge it as not fed. It still
+      reads as actively trading, with its ticker open; the screener shows
+      `feedFrozenOn` beside it. On the `true` branch the night runs `security thaw
+      --unfed --yes` first, so turning FMP back on is the one config change. A
+      feeding link to another vendor (`vendor feed`, `vendor link accept`) thaws a
+      security on its own.
   - **Not run:** FMP's universe sweeps (`symbol-changes`, `securities`, `delisted`)
     and `vendor link --new`. Sharadar's universe step replaces them (ADR 0016).
   - **FMP's loaders refuse to write in Sharadar mode.** `ingest symbol-changes`,

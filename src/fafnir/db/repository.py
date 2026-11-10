@@ -4685,6 +4685,96 @@ def fmp_price_universe(db: Database, *, include_inactive: bool = False) -> list[
     ]
 
 
+# The frozen-feed marker (ADR 0020, migration 0045). A security nothing feeds any
+# more still trades; the warehouse's copy of it stops at feed_frozen_on. The
+# freshness check, its recheck, `dq compare` and dorq's stale-feed drop all read the
+# marker, so a frozen security is never stale. `security freeze --unfed` stamps the
+# securities FMP alone fed once [general] fmp_secondary is false; `security thaw`,
+# `vendor feed` and a feeding link clear it.
+UNFED_FREEZE_NOTE = "fmp_secondary=false: no vendor feeds this security"
+
+
+def unfed_securities(db: Database) -> list[dict]:
+    """The securities nothing feeds that are not marked frozen yet: FMP's
+    (:func:`fmp_fed`), in the nightly universe, with their last bar. What
+    `security freeze --unfed` would stamp; empty once they are all marked."""
+    return db.fetchall(f"""
+        SELECT s.security_id, s.primary_symbol, s.company_name, s.is_fund,
+               (SELECT max(p.trade_date) FROM core.daily_price p
+                 WHERE p.security_id = s.security_id) AS last_bar
+          FROM core.security s
+         WHERE {fmp_fed("s.")} AND {nightly_universe("s.")}
+           AND s.feed_frozen_on IS NULL
+         ORDER BY s.security_id
+        """)
+
+
+def freeze_feed(db: Database, security_ids: Sequence[int], *, note: str) -> list[int]:
+    """Mark ``security_ids`` frozen on their last bar's date (today, for one with no
+    bars), with ``note``; those already marked are left as they are. Returns the
+    ids marked."""
+    if not security_ids:
+        return []
+    rows = db.fetchall(
+        """
+        UPDATE core.security s
+           SET feed_frozen_on = COALESCE(
+                   (SELECT max(p.trade_date) FROM core.daily_price p
+                     WHERE p.security_id = s.security_id),
+                   current_date),
+               feed_frozen_note = %s
+         WHERE s.security_id = ANY(%s) AND s.feed_frozen_on IS NULL
+        RETURNING s.security_id
+        """,
+        (note, list(security_ids)),
+    )
+    return [int(r["security_id"]) for r in rows]
+
+
+def frozen_securities(
+    db: Database,
+    *,
+    note: Optional[str] = None,
+    security_ids: Optional[Sequence[int]] = None,
+) -> list[dict]:
+    """The securities marked frozen: all of them, those with ``note``, or those
+    among ``security_ids``."""
+    return db.fetchall(
+        """
+        SELECT security_id, primary_symbol, company_name, is_fund,
+               feed_frozen_on, feed_frozen_note
+          FROM core.security
+         WHERE feed_frozen_on IS NOT NULL
+           AND (%s::text IS NULL OR feed_frozen_note = %s)
+           AND (%s::bigint[] IS NULL OR security_id = ANY(%s::bigint[]))
+         ORDER BY security_id
+        """,
+        (
+            note,
+            note,
+            list(security_ids) if security_ids is not None else None,
+            list(security_ids) if security_ids is not None else None,
+        ),
+    )
+
+
+def thaw_feed(db: Database, security_ids: Sequence[int]) -> list[int]:
+    """Clear the frozen-feed marker on ``security_ids``. Returns the ids that were
+    marked."""
+    if not security_ids:
+        return []
+    rows = db.fetchall(
+        """
+        UPDATE core.security
+           SET feed_frozen_on = NULL, feed_frozen_note = NULL
+         WHERE security_id = ANY(%s) AND feed_frozen_on IS NOT NULL
+        RETURNING security_id
+        """,
+        (list(security_ids),),
+    )
+    return [int(r["security_id"]) for r in rows]
+
+
 def is_operator_security(db: Database, security_id: int) -> bool:
     """True for a security minted by `security split-history`, which no loader feeds."""
     return bool(
@@ -7541,7 +7631,10 @@ def insert_vendor_link(
     is_feed: bool = False,
 ) -> None:
     """Open a link from a security to a vendor key. Only a security the vendor
-    minted (#71) is fed from the start; #98 assigns every other feed."""
+    minted (#71) is fed from the start; #98 assigns every other feed. A feeding
+    link clears the frozen-feed marker (ADR 0020): a fed security is not frozen."""
+    if is_feed:
+        thaw_feed(db, [security_id])
     db.execute(
         """
         INSERT INTO core.security_vendor_xref

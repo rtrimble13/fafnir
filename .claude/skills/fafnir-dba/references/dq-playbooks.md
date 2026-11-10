@@ -393,6 +393,7 @@ Written by `fafnir dq run` (freshness, against a venue's calendar).
 
 ```sql
 SELECT s.primary_symbol, s.is_actively_trading, s.delisted_date, s.is_fund,
+       s.feed_frozen_on, s.source,
        (SELECT max(trade_date) FROM core.daily_price p
          WHERE p.security_id = s.security_id) AS last_bar,
        (SELECT last_loaded_date FROM ops.load_watermark w
@@ -415,6 +416,14 @@ SELECT s.primary_symbol, s.is_actively_trading, s.delisted_date, s.is_fund,
 - **A live, liquid name** → **never resolve.** The loader is failing for it. Look
   at `ingestion_runs` and the watermark; a watermark stuck behind a quarantined
   bar is the usual cause, and the fix is the `price_*` playbook below.
+- **A name nothing feeds** (`core.security.feed_frozen_on` set, or FMP-minted with
+  no feeding link while `fafnir config get fmp_secondary` is false) → it is
+  **frozen, not stale** (ADR 0020). The check skips a marked security; a flag on
+  one was written before the marker, and `dq recheck --check stale` closes it. An
+  unmarked one means the night's `security freeze --unfed` has not run since the
+  flag flipped: run `sudo -u fafnir /opt/fafnir/.venv/bin/fafnir security freeze
+  --unfed --dry-run`, then with `--yes`, then the recheck. Never resolve or accept
+  it: both record a fact about the feed as if it were one about the security.
 
 **The threshold, and why one-session flags are not yours to close.** A security is
 stale once it is missing `STALE_MIN_SESSIONS_BEHIND` (2) open sessions counting the

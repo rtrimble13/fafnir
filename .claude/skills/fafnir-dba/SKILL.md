@@ -56,7 +56,10 @@ These are not style guidance. Each one is a way this system gets damaged.
    (ADR 0014), delete nothing, and each is undone by the other; `relist` lists a
    fed row held inactive trading again, on the vendor's ticker, and `delist` takes
    it back. Like `security merge`, they are yours to run after showing the dry run
-   and getting an explicit yes.
+   and getting an explicit yes. So are **`fafnir security freeze --unfed`** and
+   **`security thaw`** (ADR 0020): a marker on a security nothing feeds, which the
+   freshness check then skips; the night stamps it itself while
+   `fmp_secondary` is false, and neither touches a bar, a flag or a ticker.
 7. **The server checkout is deployed, not developed.** `/opt/fafnir` is a git
    checkout the venv installs from. Editing it to fix tonight's problem is
    invisible to the repo, destroyed by the next `git pull`, and leaves the

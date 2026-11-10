@@ -1176,7 +1176,9 @@ FMP built the warehouse, and its loaders still run in two cases:
   true: `ingest tracked`, `prices` and `actions` with `--allow-secondary`, for what FMP
   alone still feeds (`repo.fmp_fed`: the funds and the securities with no Sharadar
   link). Its universe sweeps (`symbol-changes`, `securities`, `delisted`) do not run,
-  and the CLI refuses every FMP loader in Sharadar mode without the flag.
+  and the CLI refuses every FMP loader in Sharadar mode without the flag. With the
+  flag false, the night marks what FMP alone fed as frozen (`security freeze
+  --unfed`, ADR 0020): no vendor reaches it, so it is not stale.
 - **As the whole night**, in FMP mode. A fresh install starts there:
   `primary_price_vendor = "fmp"` is the default, and live securities are minted from
   FMP's screener ([install_hetzner.md](install_hetzner.md)). A rollback returns to it

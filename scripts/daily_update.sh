@@ -204,12 +204,17 @@ sharadar_night() {
     secondary=$(fafnir config get fmp_secondary)
     if [ "${secondary}" = "true" ]; then
         echo "==> FMP as secondary (funds, unlinked securities)"
+        # FMP feeds them again: clear the markers `freeze --unfed` stamped.
+        upkeep fafnir security thaw --unfed --yes
         upkeep fafnir ingest tracked --allow-secondary
         upkeep fafnir ingest prices --allow-secondary
         upkeep fafnir ingest actions --allow-secondary
         upkeep fafnir adjust --changed
     else
         echo "==> FMP as secondary: off ([general] fmp_secondary = false)"
+        # Nothing feeds what only FMP fed: mark them frozen, not stale (ADR 0020).
+        # Idempotent; stamps only what is not marked yet.
+        upkeep fafnir security freeze --unfed --yes
     fi
 }
 

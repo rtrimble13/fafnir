@@ -421,6 +421,9 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     the equity close -- :data:`NAV_LAGGING_ASSET_TYPES`, or ``is_fund`` -- get
     :data:`NAV_LAG_TRADING_DAYS` more. The reference dates are
     :data:`FRESHNESS_CUTOFF_CTES`, which ``dq recheck`` negates.
+
+    A security no vendor feeds (``feed_frozen_on`` set, ADR 0020) is skipped: it
+    trades, but nothing is expected to reach it, so there is no feed to measure.
     """
     row = db.fetchone(
         f"""
@@ -431,7 +434,7 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
             JOIN core.daily_price p ON p.security_id = s.security_id
             CROSS JOIN market_latest ml
             CROSS JOIN cutoff co
-            WHERE s.is_actively_trading
+            WHERE s.is_actively_trading AND s.feed_frozen_on IS NULL
             GROUP BY s.security_id, s.asset_type, s.is_fund,
                      ml.d, co.listed_d, co.nav_d
             HAVING max(p.trade_date) < CASE

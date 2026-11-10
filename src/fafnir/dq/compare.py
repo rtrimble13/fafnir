@@ -528,7 +528,8 @@ CASE
     THEN 'traded_since'
   WHEN f.check_name = 'stale'
    AND (s.delisted_date <= COALESCE(%(as_of)s::date, 'infinity')
-        OR (s.delisted_date IS NULL AND NOT s.is_actively_trading))
+        OR (s.delisted_date IS NULL AND NOT s.is_actively_trading)
+        OR s.feed_frozen_on IS NOT NULL)
     THEN 'inactive'
   ELSE 'holding'
 END

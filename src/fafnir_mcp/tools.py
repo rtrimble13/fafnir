@@ -1108,7 +1108,7 @@ def dq_triage(
         "       c.cohort_size, c.cohort_flags,"
         "       coalesce(p.prior_resolutions, 0) AS prior_resolutions,"
         "       p.last_resolved_at, p.last_resolved_by, p.last_resolution_note,"
-        "       s.is_actively_trading, s.delisted_date, s.is_fund,"
+        "       s.is_actively_trading, s.delisted_date, s.is_fund, s.feed_frozen_on,"
         "       (f.check_name = ANY(%s)) AS never_auto_resolve"
         "  FROM open_flags f"
         "  LEFT JOIN core.security s ON s.security_id = f.security_id"
