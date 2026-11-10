@@ -366,6 +366,49 @@ dry-run against a prediction computed from its id file and approved before it ra
 
 ---
 
+## Approved plans
+
+Once the operator has approved a plan, asking again for each command the plan
+needs is not care, it is latency: on 2026-11-10 three of the day's round trips were
+"may I run the step you already said yes to". An approval covers the plan, not
+every keystroke.
+
+**What makes a plan approvable.** It names its steps, each with the predicted
+dry-run count (or the exact rows it changes), in the order they run, and says what
+each step leaves behind. "Yes", "go ahead" or "run the plan" against that text is
+the approval. A plan is a sweep's batches, a repair with its follow-on closures, or
+both.
+
+**What the approval covers:**
+
+- each named step: its dry run and its real command, in one turn, when the dry
+  run's count equals the prediction;
+- the step's **mechanical consequences**: the recheck that closes what a repair
+  settled, a follow-on dry run that only exists after the previous step ran
+  (SKILL.md, "A step whose dry run exists only after the previous step ran"),
+  the SQL verification of every effect (standing rule 10), the memory note;
+- a **fallback the plan named** ("if Sharadar's row is suppressed by the override,
+  an operator 1:15 row").
+
+**What it never covers**, and still stops and asks:
+
+- a security, check or date the plan did not name;
+- anything in the **Never** tier (report only), and `vendor link accept` or
+  `reject` (standing rule 12), and the operator commands (standing rule 6);
+- a dry run whose count differs from the prediction, or whose shape differs from
+  what the plan described (blockers, a different security, an unexpected
+  `No stored bar`): that stops the step and every step after it, and the report
+  shows both outputs. This holds in every mode;
+- a repair whose dry run reveals something the plan did not know (a second
+  issuer on the row, a split the plan did not mention).
+
+The approval of a plan **lifts the batch caps for that plan**, as operator-directed
+mode does for a named scope: the operator has taken the decision the caps protect.
+Everything else about a batch stands: one cause, one note, `--by claude`,
+`--per-flag` or `--by-rule`, verification in SQL before it is reported. A standing
+approval ("run the plan" given before the dry runs exist) is a yes to the counts
+stated, not to whatever the dry runs then show.
+
 ## Operator-directed bulk mode
 
 The caps above assume the sweep is the agent's own initiative. When the **operator
