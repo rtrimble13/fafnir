@@ -5,7 +5,7 @@
 - Implemented by: migration 0045 (`core.security.feed_frozen_on`,
   `feed_frozen_note`; `mart.v_security_profile`), `src/fafnir/db/repository.py`
   (`unfed_securities`, `freeze_feed`, `thaw_feed`, `frozen_securities`),
-  `fafnir security freeze | thaw`, `scripts/daily_update.sh` (the Sharadar night),
+  `fafnir security freeze | thaw`, `scripts/daily_update.sh` (both nights),
   `src/fafnir/dq/checks.py` (`check_freshness`), `src/fafnir/dq/recheck.py`
   (the `stale` negation), `src/fafnir/dq/compare.py` (the `inactive` state),
   `src/fafnir/dq/dorq.py` (`drop_not_trading`), `src/fafnir/ingest/vendor_feed.py`
@@ -68,7 +68,10 @@ Nothing in the schema could say that:
    accept` and the dead-issuer mint use) clear the marker on the security they feed.
    `fafnir security thaw --unfed` clears every marker the rule stamped, and the
    night runs it on the `fmp_secondary = true` branch before FMP's loaders, so
-   turning FMP back on is one config change. `security thaw <id>` clears one.
+   turning FMP back on is one config change. FMP mode's night runs it first as
+   well: there FMP feeds every security it minted, so a rollback from Sharadar
+   mode with `fmp_secondary = false` must not leave fed securities that the
+   freshness check skips. `security thaw <id>` clears one.
 
 4. **What reads it.** The freshness check skips a frozen security
    (`WHERE s.is_actively_trading AND s.feed_frozen_on IS NULL`). Its negation in
@@ -91,7 +94,8 @@ Nothing in the schema could say that:
   raised are never written. Any written between the flag's flip and the deploy
   close on the next `dq recheck --check stale`.
 - A frozen fund that FMP later serves again (the tier restored, `fmp_secondary`
-  back to true) thaws on the next night and loads from its watermark; the gap in
+  back to true, or a rollback to FMP mode) thaws on the next night and loads from
+  its watermark; the gap in
   its history between the freeze and the thaw is a real feed gap, and the gap
   check reports it as such.
 - `fmp_fed` is unchanged: a frozen security is still FMP's to feed if FMP's loaders

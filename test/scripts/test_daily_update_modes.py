@@ -49,6 +49,8 @@ exit 0
 FMP_NIGHT = [
     "config get primary_price_vendor",
     "db ensure-horizon",
+    # FMP feeds what it minted: no marker `freeze --unfed` stamped stands (ADR 0020).
+    "security thaw --unfed --yes",
     "ingest symbol-changes",
     "ingest securities",
     "ingest tracked",
@@ -166,6 +168,11 @@ def test_the_freeze_and_the_thaw_are_upkeep(tmp_path):
     done, calls = _night(tmp_path, "sharadar", fail="security thaw --unfed --yes")
     assert done.returncode == 0, done.stderr
     assert calls == SHARADAR_NIGHT
+    assert "'fafnir security thaw --unfed --yes' failed" in done.stdout
+
+    done, calls = _night(tmp_path, "fmp", fail="security thaw --unfed --yes")
+    assert done.returncode == 0, done.stderr
+    assert calls == FMP_NIGHT
     assert "'fafnir security thaw --unfed --yes' failed" in done.stdout
 
 

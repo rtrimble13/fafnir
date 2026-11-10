@@ -91,12 +91,12 @@ def run_cli(db, tmp_path, monkeypatch):
     with [general] fmp_secondary as the test says."""
     monkeypatch.delenv("FAFNIR_DSN", raising=False)
 
-    def run(*args, secondary=False):
+    def run(*args, secondary=False, primary="sharadar"):
         rc_path = tmp_path / "fafnirrc"
         rc_path.write_text(
             f'[database]\ndsn = "{db.dsn}"\n'
             "[general]\n"
-            'primary_price_vendor = "sharadar"\n'
+            f'primary_price_vendor = "{primary}"\n'
             f"fmp_secondary = {'true' if secondary else 'false'}\n"
         )
         return CliRunner().invoke(
@@ -351,6 +351,20 @@ def test_freeze_unfed_dry_run_then_yes_then_thaw(db, run_cli):
 
     nothing = run_cli("thaw", "--unfed", "--yes")
     assert nothing.exit_code == 0 and "Nothing to thaw" in nothing.output
+
+
+def test_fmp_mode_thaws_what_freeze_unfed_stamped(db, run_cli):
+    """FMP's own night runs `thaw --unfed`: after a rollback to FMP mode it feeds
+    every security it minted, so the markers must come off, or a feed that broke
+    would raise no stale flag. Freeze refuses in FMP mode; thaw must not."""
+    fund = _fund(db)
+    repo.freeze_feed(db, [fund], note=repo.UNFED_FREEZE_NOTE)
+    db.commit()
+
+    thaw = run_cli("thaw", "--unfed", "--yes", primary="fmp")
+    assert thaw.exit_code == 0, thaw.output
+    assert "Thawed 1 security" in thaw.output
+    assert _frozen(db, fund)["feed_frozen_on"] is None
 
 
 def test_thaw_by_id_leaves_other_notes_alone(db, run_cli):

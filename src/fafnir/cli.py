@@ -3159,8 +3159,8 @@ def security_thaw(ctx, security_ids, unfed, thawed_by, dry_run, yes):
     The marker comes off; the freshness check measures the security again from
     the next `dq run`. `vendor feed` and a feeding link clear it on their own, so
     this is for the other case: FMP feeding again ([general] fmp_secondary back
-    to true, which the night does itself), or a marker stamped in error. With
-    nothing to clear it says so and exits 0.
+    to true, or a rollback to FMP mode; both nights do it themselves), or a
+    marker stamped in error. With nothing to clear it says so and exits 0.
     """
     from fafnir.db import repository as repo
     from fafnir.ingest.runlog import RunLog
