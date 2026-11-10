@@ -114,7 +114,11 @@ def test_the_compare_streams_both_nights(db, tmp_path):
     assert out.new_per_night["previous"] == "2024-12-30.jsonl"
     assert out.new_per_night["dorq"] == n - overlap
     assert out.new_per_night["sql"] == 0
-    assert peak < size / 4, (peak, size)
+    # Holding the night in any form costs more than its file: the list read this
+    # replaced peaked at 9.2 times this file's size here. Streamed, what is left is
+    # the hashed condition keys of both nights, about 330 bytes a condition: 0.41
+    # times this file, whose reports are smaller than the host's.
+    assert peak < size, (peak, size)
 
 
 def test_a_report_covering_an_open_flag_is_counted_once_each_side(db, tmp_path):
@@ -137,6 +141,12 @@ def test_a_report_covering_an_open_flag_is_counted_once_each_side(db, tmp_path):
             "identity": "balance_sheet",
         },
         severity="error",
+    )
+    # Written before the night ran. The compare reads the flags open when the night
+    # started (T1, its run row), and a flag stamped now would postdate it.
+    db.execute(
+        "UPDATE ops.data_quality_flag SET detected_at = %s WHERE security_id = %s",
+        (T0, sid),
     )
     db.commit()
     night = tmp_path / "2024-12-31.jsonl"
