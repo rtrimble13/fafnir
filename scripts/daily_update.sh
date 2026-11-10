@@ -119,6 +119,15 @@ retry_transient() {
 fafnir db ensure-horizon
 
 fmp_night() {
+    # FMP feeds every security it minted, so none of them is frozen (ADR 0020). A
+    # rollback from Sharadar mode with fmp_secondary false leaves the markers `freeze
+    # --unfed` stamped, and the freshness check would go on skipping fed securities:
+    # a feed that broke would raise no stale flag. Clear them first. Most nights
+    # there is nothing to clear, and then it writes nothing. Upkeep, as on the
+    # Sharadar night's fmp_secondary branch: the next night tries again.
+    echo "==> Frozen feeds (FMP feeds them)"
+    upkeep fafnir security thaw --unfed --yes
+
     # Renames FIRST, before the security master reads the screener. A renamed ticker
     # is indistinguishable from a new listing on the screener side, so if the master
     # ran first it would mint a second security_id for a company fafnir already holds
@@ -204,12 +213,17 @@ sharadar_night() {
     secondary=$(fafnir config get fmp_secondary)
     if [ "${secondary}" = "true" ]; then
         echo "==> FMP as secondary (funds, unlinked securities)"
+        # FMP feeds them again: clear the markers `freeze --unfed` stamped.
+        upkeep fafnir security thaw --unfed --yes
         upkeep fafnir ingest tracked --allow-secondary
         upkeep fafnir ingest prices --allow-secondary
         upkeep fafnir ingest actions --allow-secondary
         upkeep fafnir adjust --changed
     else
         echo "==> FMP as secondary: off ([general] fmp_secondary = false)"
+        # Nothing feeds what only FMP fed: mark them frozen, not stale (ADR 0020).
+        # Idempotent; stamps only what is not marked yet.
+        upkeep fafnir security freeze --unfed --yes
     fi
 }
 

@@ -13,6 +13,7 @@ Every key and value here is synthetic. No vendor row is committed (ADR 0012 §8)
 from __future__ import annotations
 
 import datetime as dt
+from test.fafnir import upgrade_rows
 
 import psycopg
 import pytest
@@ -220,14 +221,8 @@ def test_a_stub_fold_moves_a_link_and_declines_a_collision(db):
 
 
 def _fingerprint(db):
-    return db.fetchone("""
-        SELECT (SELECT count(*) FROM core.security) AS securities,
-               (SELECT md5(string_agg(t::text, '|' ORDER BY security_id))
-                  FROM core.security t) AS security_md5,
-               (SELECT count(*) FROM core.daily_price) AS bars,
-               (SELECT md5(string_agg(t::text, '|' ORDER BY security_id, trade_date))
-                  FROM core.daily_price t) AS price_md5
-        """)
+    # Column by column: a later migration's column is not a moved row (0045).
+    return upgrade_rows.snapshot(db, ("core.security", "core.daily_price"))
 
 
 def test_0031_leaves_existing_rows_byte_identical(db):
@@ -240,9 +235,11 @@ def test_0031_leaves_existing_rows_byte_identical(db):
     try:
         assert m.rollback(db.dsn, steps=len(later))[-1] == "0031"
         assert db.fetchval("SELECT to_regclass('core.security_vendor_xref')") is None
-        assert _fingerprint(db) == before
+        now, then = upgrade_rows.on_shared_columns(_fingerprint(db), before)
+        assert now == then
     finally:
         # Re-applied whatever happened: the rest of the suite needs 0031.
         applied = m.migrate(db.dsn)
     assert applied == later
-    assert _fingerprint(db) == before
+    now, then = upgrade_rows.on_shared_columns(_fingerprint(db), before)
+    assert now == then

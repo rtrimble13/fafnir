@@ -699,11 +699,17 @@ def screen(*, dsn: str, limit: Optional[int] = None, **filters) -> pd.DataFrame:
     filter is refused (:data:`UNSUPPORTED_SCREEN_FILTERS`), not ignored.
     """
     clauses, params = _screen_clauses(**filters)
+    # feedFrozenOn is fafnir's own column (ADR 0020): the last session the
+    # warehouse holds for a security no vendor feeds. Read through the profile
+    # view, which the screener's role can see; the snapshot has no such column.
     sql = (
         'SELECT symbol, company_name AS "companyName", market_cap_usd AS "marketCap", '
         "sector_name AS sector, industry_name AS industry, beta, last_close AS price, "
-        "last_volume AS volume, exchange_code AS exchange, country "
-        f"FROM mart.security_latest WHERE {' AND '.join(clauses)} ORDER BY symbol"
+        "last_volume AS volume, exchange_code AS exchange, country, "
+        'fz.feed_frozen_on AS "feedFrozenOn" '
+        "FROM mart.security_latest "
+        "LEFT JOIN (SELECT security_id, feed_frozen_on FROM mart.v_security_profile) fz "
+        f"USING (security_id) WHERE {' AND '.join(clauses)} ORDER BY symbol"
     )
     if limit:
         sql += f" LIMIT {int(limit)}"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 from datetime import date
 from decimal import Decimal
+from test.fafnir import upgrade_rows
 
 import pytest
 
@@ -127,17 +128,14 @@ def _security(db, symbol, key, *, source="sharadar"):
             " currency) VALUES ('sharadar', %s, %s, %s, 'USD')",
             (table, key, symbol),
         )
-    repo.insert_vendor_link(
-        db,
-        security_id=sid,
-        vendor="sharadar",
-        vendor_key=key,
-        valid_from=Y(1990, 1, 2),
-        match_method="minted" if source == "sharadar" else "identifier",
-        confidence=None,
-        evidence={},
-        created_by="tester",
-        is_feed=True,
+    # Written directly, not by repo.insert_vendor_link: the upgrade test builds this
+    # warehouse on the schema before 0035, and today's code reads columns added
+    # since (a feeding link thaws core.security.feed_frozen_on, 0045).
+    db.execute(
+        "INSERT INTO core.security_vendor_xref (security_id, vendor, vendor_key,"
+        " valid_from, match_method, confidence, evidence, created_by, is_feed)"
+        " VALUES (%s, 'sharadar', %s, %s, %s, NULL, '{}'::jsonb, 'tester', true)",
+        (sid, key, Y(1990, 1, 2), "minted" if source == "sharadar" else "identifier"),
     )
     return sid
 
@@ -336,14 +334,16 @@ def _tables(db) -> list[str]:
 
 
 def _fingerprint(db, tables) -> dict:
-    """Rows and an md5 of every row's text, per table, order-free."""
-    return {
-        t: db.fetchone(
-            f"SELECT count(*) AS n, md5(coalesce(string_agg(x.t, '|' ORDER BY x.t), ''))"
-            f" AS digest FROM (SELECT t::text AS t FROM {t} t) x"
-        )
-        for t in tables
-    }
+    """Every row of each table, column by column (:mod:`upgrade_rows`): a column a
+    later migration adds is not a moved row (0045)."""
+    return upgrade_rows.snapshot(db, tables)
+
+
+def _moved(a, b) -> set:
+    """The tables whose rows differ between ``a`` and ``b`` on the columns both
+    have, order-free."""
+    a, b = upgrade_rows.on_shared_columns(a, b)
+    return {t for t in a if a[t] != b[t]}
 
 
 def _warehouse(db, tmp_path):
@@ -428,14 +428,13 @@ def test_the_upgrade_and_the_first_load_leave_every_existing_table_alone(
 
     # The upgrade: nothing that existed moves, meta's migration record aside.
     upgraded = _fingerprint(db, tables)
-    moved = {t for t in tables if upgraded[t] != before[t]}
-    assert moved == {"meta.schema_migration"}
+    assert _moved(upgraded, before) == {"meta.schema_migration"}
 
     # The first load writes the statements and its own bookkeeping, nothing else.
     result = fu.load(db, tmp_path, backfill=True, as_of=LOAD_DAY)
     assert result.written > 0
     loaded = _fingerprint(db, tables)
-    moved = {t for t in tables if loaded[t] != upgraded[t]}
+    moved = _moved(loaded, upgraded)
     assert moved <= {"ops.ingestion_run", "ops.data_quality_flag", "ops.load_watermark"}
     assert db.fetchval(
         "SELECT count(*) FROM core.income_statement WHERE security_id = %s", (live,)

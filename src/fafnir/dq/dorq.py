@@ -797,8 +797,9 @@ def drop_not_trading(
     """Leave out the :data:`STALE_FEED_CHECK` reports on securities not actively
     trading; return the rows kept and the count left out per check.
 
-    The rule is the SQL ``stale`` check's own (``WHERE s.is_actively_trading``),
-    read when the run is made. Nothing else is touched: a delisted security's bars
+    The rule is the SQL ``stale`` check's own (``WHERE s.is_actively_trading AND
+    s.feed_frozen_on IS NULL``: trading, and fed by someone -- ADR 0020), read when
+    the run is made. Nothing else is touched: a delisted security's bars
     still go to dorq, and its history is judged for bad prints, splits and the
     rest as before, so the judgement carries no survivorship bias. A row with no
     security (a cross-sectional report) is kept.
@@ -815,7 +816,8 @@ def drop_not_trading(
         for r in db.fetchall(
             """
             SELECT security_id FROM core.security
-             WHERE security_id = ANY(%s) AND NOT is_actively_trading
+             WHERE security_id = ANY(%s)
+               AND (NOT is_actively_trading OR feed_frozen_on IS NOT NULL)
             """,
             (ids,),
         )
@@ -827,7 +829,8 @@ def drop_not_trading(
     if not left_out:
         return kept, {}
     logger.info(
-        "dorq: left out %d stale-feed reports on securities not actively trading",
+        "dorq: left out %d stale-feed reports on securities not actively trading "
+        "or not fed",
         left_out,
     )
     return kept, {STALE_FEED_CHECK: left_out}

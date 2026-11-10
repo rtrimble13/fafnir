@@ -69,3 +69,17 @@ def test_the_nav_rule_matches_the_loaders():
     )
     for asset_type in checks.SESSION_TRADED_ASSET_TYPES:
         assert f"'{asset_type}'" in checks.NAV_PRICED_PREDICATE
+
+
+def test_a_frozen_security_is_skipped_not_stale():
+    """A security nothing feeds is frozen, not stale (ADR 0020).
+
+    With [general] fmp_secondary false, the 3,937 funds FMP alone fed take no new
+    bar; without the marker in the check's own WHERE, each would be flagged on the
+    third session after its last bar.
+    """
+    db = _CaptureDB()
+    checks.check_freshness(db)
+
+    where = db.sql.split("WHERE s.is_actively_trading", 1)[1].split("GROUP BY", 1)[0]
+    assert "s.feed_frozen_on IS NULL" in where

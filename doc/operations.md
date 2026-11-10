@@ -51,11 +51,13 @@ first below, is the default on a fresh install, which starts from FMP
 ([backfill.md](backfill.md)), and the night a rollback returns to.
 
 In FMP mode the daily job performs, in order:
-`ensure-horizon → ingest symbol-changes → ingest securities → ingest tracked →
-ingest delisted → ingest prices → vendor link --new → ingest actions → adjust →
-refresh-marts`. `vendor link --new` links tonight's new listings to Sharadar
+`ensure-horizon → security thaw --unfed → ingest symbol-changes → ingest securities
+→ ingest tracked → ingest delisted → ingest prices → vendor link --new → ingest
+actions → adjust → refresh-marts`. `security thaw --unfed` clears the frozen-feed
+markers a Sharadar night stamped, since FMP feeds what it minted (ADR 0020); most
+nights there is none. `vendor link --new` links tonight's new listings to Sharadar
 ([ingestion.md](ingestion.md#linking-to-a-vendors-identity)). Like the universe
-steps, it warns and carries on if it fails. That is FMP's night; in Sharadar mode
+steps, both warn and carry on if they fail. That is FMP's night; in Sharadar mode
 the job runs `ingest sharadar`, then the fundamentals from SF1's delta, then the
 marts ([FMP mode and Sharadar mode](#fmp-mode-and-sharadar-mode)).
 
@@ -172,6 +174,18 @@ validate stops it before anything loads.
       longer serves them. They then stop updating for good: Sharadar carries no
       mutual funds, and no other fund vendor was adopted (Tiingo was dropped on
       2026-10-30).
+    - **Off: they are frozen, not stale (ADR 0020).** On the `false` branch the
+      night runs `fafnir security freeze --unfed --yes`: every security FMP alone
+      fed, in the nightly universe and not yet marked, gets
+      `core.security.feed_frozen_on` (its last bar) and a note. The freshness check
+      skips a frozen security, `dq recheck --check stale` closes any flag written
+      before the marker, and `dq compare` and dorq judge it as not fed. It still
+      reads as actively trading, with its ticker open; the screener shows
+      `feedFrozenOn` beside it. On the `true` branch the night runs `security thaw
+      --unfed --yes` first, so turning FMP back on is the one config change, and
+      FMP mode's night runs it first too, so a rollback clears them as well. A
+      feeding link to another vendor (`vendor feed`, `vendor link accept`) thaws a
+      security on its own.
   - **Not run:** FMP's universe sweeps (`symbol-changes`, `securities`, `delisted`)
     and `vendor link --new`. Sharadar's universe step replaces them (ADR 0016).
   - **FMP's loaders refuse to write in Sharadar mode.** `ingest symbol-changes`,
@@ -268,7 +282,8 @@ in before the next night:
    to FMP the securities it minted. Sharadar's dead issuers keep their feed.
 2. **Set the mode back** to `primary_price_vendor = "fmp"`.
 
-The next night is FMP's. Its loaders resume from their watermarks. The rows Sharadar
+The next night is FMP's. It first clears any frozen-feed marker the Sharadar nights
+stamped (ADR 0020), then its loaders resume from their watermarks. The rows Sharadar
 wrote in the nights between stay: under precedence FMP never overwrites a row
 another vendor wrote, so it fills only the dates Sharadar did not. There is nothing
 to delete or reclaim

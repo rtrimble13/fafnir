@@ -3039,6 +3039,183 @@ def security_delist(ctx, security_id, delisted_on, note, delisted_by, dry_run, y
     click.echo("Run `fafnir db refresh-marts` to pick this up in the marts.")
 
 
+@security.command("freeze")
+@click.option(
+    "--unfed",
+    is_flag=True,
+    help="Every security no vendor feeds: FMP's, once [general] fmp_secondary is false.",
+)
+@click.option(
+    "--note",
+    "-m",
+    help="Why the feed stopped  [default: the --unfed note]",
+)
+@click.option("--by", "frozen_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_freeze(ctx, unfed, note, frozen_by, dry_run, yes):
+    """Mark the securities nothing feeds as frozen, not stale (ADR 0020).
+
+    \b
+      fafnir security freeze --unfed --dry-run
+      fafnir security freeze --unfed --yes      # the night, while fmp_secondary is false
+
+    Once [general] fmp_secondary is false the FMP loaders no longer run, and what
+    FMP alone fed -- the mutual funds, and the names with no Sharadar link -- takes
+    no new bar. Those securities still trade; the warehouse's copy of each stops at
+    its last bar. This stamps that date on core.security.feed_frozen_on with --note,
+    so the freshness check skips them instead of flagging each stale, `dq recheck
+    --check stale` closes any flag already written, and `dq compare` and dorq
+    judge them as not fed. Nothing else changes: is_actively_trading stays true,
+    no bar is touched, the ticker stays open.
+
+    Refuses --unfed while fmp_secondary is true: FMP still feeds them. Already
+    marked securities are left as they are, so the night may run it every time.
+    Undone by `security thaw`, and by a feeding link to another vendor.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest.runlog import RunLog
+
+    cfg = ctx.obj["config"]
+    if not unfed:
+        raise click.UsageError("Say which securities: --unfed.")
+    if cfg.primary_price_vendor == "sharadar" and cfg.fmp_secondary:
+        raise click.ClickException(
+            "[general] fmp_secondary is true: FMP still feeds these securities. "
+            "Nothing was changed."
+        )
+    if cfg.primary_price_vendor != "sharadar":
+        raise click.ClickException(
+            "FMP is the primary vendor: nothing is unfed. Nothing was changed."
+        )
+    if frozen_by is None:
+        frozen_by = _os_user()
+    note = (note or repo.UNFED_FREEZE_NOTE).strip()
+    if not note:
+        raise click.UsageError("--note must say why.")
+
+    with Database(cfg.dsn) as database:
+        rows = repo.unfed_securities(database)
+        funds = sum(1 for r in rows if r["is_fund"])
+        click.echo(
+            f"Unfed and not yet frozen: {_plural(len(rows), 'security', 'securities')} "
+            f"({funds} funds, {len(rows) - funds} others)."
+        )
+        for r in rows[:10]:
+            click.echo(
+                f"  {r['security_id']:>8}  {r['primary_symbol']:<10} last bar "
+                f"{r['last_bar'] or 'none'}  {r['company_name'] or ''}"
+            )
+        if len(rows) > 10:
+            click.echo(f"  ... and {len(rows) - 10} more")
+        if not rows:
+            click.echo("Nothing to freeze.")
+            return
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(f"Freeze {len(rows)} securities?", abort=True)
+
+        ids = [int(r["security_id"]) for r in rows]
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-freeze",
+            params={"unfed": True, "note": note, "by": frozen_by},
+        ) as run:
+            frozen = repo.freeze_feed(database, ids, note=note)
+            run.symbols_requested = len(ids)
+            run.params["frozen"] = len(frozen)
+            run.params["funds"] = funds
+            run_id = run.run_id
+
+    click.echo(
+        f"Froze {_plural(len(frozen), 'security', 'securities')} as {frozen_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
+    click.echo("Open stale flags on them close with `fafnir dq recheck --check stale`.")
+
+
+@security.command("thaw")
+@click.argument("security_ids", type=int, nargs=-1)
+@click.option(
+    "--unfed",
+    is_flag=True,
+    help="Every security `freeze --unfed` marked (by its note).",
+)
+@click.option("--by", "thawed_by", help="Who  [default: the OS user]")
+@click.option("--dry-run", is_flag=True, help="Show what would change; change nothing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def security_thaw(ctx, security_ids, unfed, thawed_by, dry_run, yes):
+    """Clear the frozen-feed marker (ADR 0020).
+
+    \b
+      fafnir security thaw --unfed --dry-run     # what `freeze --unfed` stamped
+      fafnir security thaw 12232 --yes           # one security
+
+    The marker comes off; the freshness check measures the security again from
+    the next `dq run`. `vendor feed` and a feeding link clear it on their own, so
+    this is for the other case: FMP feeding again ([general] fmp_secondary back
+    to true, or a rollback to FMP mode; both nights do it themselves), or a
+    marker stamped in error. With nothing to clear it says so and exits 0.
+    """
+    from fafnir.db import repository as repo
+    from fafnir.ingest.runlog import RunLog
+
+    cfg = ctx.obj["config"]
+    if unfed == bool(security_ids):
+        raise click.UsageError("Give security ids, or --unfed; not both, not neither.")
+    if thawed_by is None:
+        thawed_by = _os_user()
+
+    with Database(cfg.dsn) as database:
+        rows = repo.frozen_securities(
+            database,
+            note=repo.UNFED_FREEZE_NOTE if unfed else None,
+            security_ids=None if unfed else list(security_ids),
+        )
+        click.echo(f"Frozen: {_plural(len(rows), 'security', 'securities')}.")
+        for r in rows[:10]:
+            click.echo(
+                f"  {r['security_id']:>8}  {r['primary_symbol']:<10} frozen on "
+                f"{r['feed_frozen_on']}  {r['feed_frozen_note']}"
+            )
+        if len(rows) > 10:
+            click.echo(f"  ... and {len(rows) - 10} more")
+        if security_ids:
+            missing = sorted(set(security_ids) - {int(r["security_id"]) for r in rows})
+            for sid in missing:
+                click.echo(f"  {sid:>8}  not frozen")
+        if not rows:
+            click.echo("Nothing to thaw.")
+            return
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(f"Thaw {len(rows)} securities?", abort=True)
+
+        ids = [int(r["security_id"]) for r in rows]
+        with RunLog(
+            database,
+            source="operator",
+            endpoint="security-thaw",
+            params={"unfed": unfed, "security_ids": ids, "by": thawed_by},
+        ) as run:
+            thawed = repo.thaw_feed(database, ids)
+            run.symbols_requested = len(ids)
+            run.params["thawed"] = len(thawed)
+            run_id = run.run_id
+
+    click.echo(
+        f"Thawed {_plural(len(thawed), 'security', 'securities')} as {thawed_by} "
+        f"(ops.ingestion_run {run_id})."
+    )
+
+
 @security.command("relist")
 @click.argument("security_id", type=int)
 @click.option(
@@ -7912,8 +8089,9 @@ def _echo_wrapped(text: str) -> None:
     click.echo(textwrap.fill(text, width=min(_terminal_width(), 88)))
 
 
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+def _plural(count: int, noun: str, plural: Optional[str] = None) -> str:
+    """``count`` and ``noun``, made plural by ``s`` unless ``plural`` says how."""
+    return f"{count} {noun}" if count == 1 else f"{count} {plural or noun + 's'}"
 
 
 def _dq_json(payload) -> None:

@@ -173,6 +173,8 @@ SELECT f.dq_flag_id
    AND (
         -- the security stopped trading, so check_freshness no longer considers it
         NOT COALESCE(s.is_actively_trading, FALSE)
+        -- or nothing feeds it any more (ADR 0020): frozen, not stale
+     OR s.feed_frozen_on IS NOT NULL
         -- or it has taken a bar since. The flag is keyed on the last_date it had
         -- when written, so a later bar ends THAT occurrence: a security that falls
         -- behind again is a new record_key and a new flag.
@@ -304,7 +306,7 @@ RECHECKABLE: dict[str, _Rule] = {
         ("exch", "exch", "stale_listed", "exch", "stale_nav", "nav_types"),
         "the security has taken a bar later than the last_date this flag records, "
         "or is no longer far enough behind the market to be stale, or is no longer "
-        "actively trading",
+        "actively trading, or no vendor feeds it any more (frozen, ADR 0020)",
     ),
     "sparse_coverage": _Rule(
         _SPARSE_SQL,

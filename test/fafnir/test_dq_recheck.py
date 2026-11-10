@@ -416,3 +416,11 @@ def test_recheck_reports_checks_with_nothing_stale(db):
     assert result.exit_code == 0, result.output
     for name in sorted(rc.RECHECKABLE):
         assert name in result.output
+
+
+def test_the_stale_negation_closes_a_frozen_security():
+    """A security nothing feeds is frozen, not stale (ADR 0020): the check skips it,
+    so the negation must close the flag written before the marker, or the recheck
+    and the check disagree about the same security."""
+    rule = rc.RECHECKABLE["stale"]
+    assert "s.feed_frozen_on IS NOT NULL" in rule.sql

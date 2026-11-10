@@ -102,6 +102,7 @@ read through the `duk` CLI.
   - [ADR 0017 — Vendor access is one library inside fafnir, not a distribution per vendor](adr/0017-vendor-access-is-one-library-not-a-distribution-per-vendor.md)
   - [ADR 0018 — Bitemporal fundamentals on Sharadar SF1](adr/0018-bitemporal-fundamentals.md)
   - [ADR 0019 — fafnir derives its metrics; vendor metrics are not read](adr/0019-derived-metrics-not-vendor-metrics.md)
+  - [ADR 0020 — a security nothing feeds is frozen, not stale](adr/0020-an-unfed-security-is-frozen-not-stale.md)
 
 ## Reference
 
