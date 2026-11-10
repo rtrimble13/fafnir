@@ -80,6 +80,11 @@ read through the `duk` CLI.
   - [Fundamentals on SF1](plans/fundamentals-sf1.md) — the fundamentals build plan,
     retargeted to Sharadar SF1: knowledge intervals, share terms, the panel (#85; signed
     off 2026-10-25)
+  - [Synthetic index and benchmark series tool](plans/index-series-tool.md) — a plan
+    for a standalone C++ CLI that builds and maintains index series (sector, factor,
+    cap/equal/price-weighted, total return) from `duk` reads, the `duk` additions and
+    the series ingest path fafnir needs for it, and why it is neither part of portable
+    nor a `.port` file (**proposed**, 2026-11-08)
   - [Fundamentals build prompt (FMP era)](plans/fundamentals-build-prompt-fmp.md) —
     the original fundamentals build prompt, retargeted to SF1 in SA-0801 (reference)
 - Architecture Decision Records:
