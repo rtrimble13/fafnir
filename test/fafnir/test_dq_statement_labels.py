@@ -148,6 +148,7 @@ def _labels(db, **kw):
     return [lab for lab in lb.build(db, **kw).labels if lb.is_statements(lab)]
 
 
+@pytest.mark.integration
 def test_a_unit_correction_is_a_dq912_label_on_its_item_until_it_loaded(db):
     sid = _company(db)
     _correct(db, "income", sid, Q2, revenue=412_300_000_000)
@@ -170,6 +171,7 @@ def test_a_unit_correction_is_a_dq912_label_on_its_item_until_it_loaded(db):
     }
 
 
+@pytest.mark.integration
 def test_a_row_corrected_alike_is_one_label_with_no_item(db):
     sid = _company(db)
     _correct(
@@ -187,6 +189,7 @@ def test_a_row_corrected_alike_is_one_label_with_no_item(db):
     assert label["note"].endswith(": revenue, cost_of_revenue, net_income")
 
 
+@pytest.mark.integration
 def test_each_kind_of_move_is_its_own_label(db):
     sid = _company(db)
     _correct(
@@ -216,6 +219,7 @@ def test_each_kind_of_move_is_its_own_label(db):
     assert "2024-08-01 to 2024-08-06" in by_kind["corrected_filing_date"]["note"]
 
 
+@pytest.mark.integration
 def test_restore_statements_writes_the_rows_as_they_stood(db, tmp_path):
     sid = _company(db)
     _correct(db, "income", sid, Q2, revenue=412_300_000_000)
@@ -302,6 +306,7 @@ def _flag(
     )
 
 
+@pytest.mark.integration
 def test_an_accepted_statement_flag_is_a_filing_fact_on_its_successor(db):
     sid = _company(db)
     _flag(
@@ -354,6 +359,7 @@ def test_an_accepted_statement_flag_is_a_filing_fact_on_its_successor(db):
     assert fx["first"] == "1998-01-01"
 
 
+@pytest.mark.integration
 def test_a_flag_resolved_after_the_vendor_fixed_it_is_a_data_error(db):
     sid = _company(db)
     # The identity broke; SF1 corrected the row in between; recheck closed it.
@@ -424,6 +430,7 @@ def test_a_flag_resolved_after_the_vendor_fixed_it_is_a_data_error(db):
     }
 
 
+@pytest.mark.integration
 def test_statement_labels_leave_the_bars_labels_as_they_were(db):
     sid = _company(db)
     before = [lab for lab in lb.build(db).labels if not lb.is_statements(lab)]
@@ -445,6 +452,7 @@ def test_statement_labels_leave_the_bars_labels_as_they_were(db):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_label_add_states_a_statements_label_with_its_scope(db, tmp_path):
     sid = _company(db)
     rcfile = _rc(tmp_path, db)
@@ -541,6 +549,7 @@ def test_label_add_states_a_statements_label_with_its_scope(db, tmp_path):
         assert bad.exit_code != 0, extra
 
 
+@pytest.mark.integration
 def test_accept_with_a_label_states_it_on_the_statement_flags_scope(db, tmp_path):
     sid = _company(db)
     flag = db.fetchval(
@@ -593,6 +602,7 @@ def test_accept_with_a_label_states_it_on_the_statement_flags_scope(db, tmp_path
     ) == (Q2, "DQ915", "income", "quarter", 1, "preferred_dividends")
 
 
+@pytest.mark.integration
 def test_a_stated_statements_label_does_not_replace_a_bars_label(db):
     bars = {
         "series": "7",
@@ -618,6 +628,7 @@ def test_a_stated_statements_label_does_not_replace_a_bars_label(db):
     assert lb._same_decision({**derived, "item": "revenue"}, other_item)
 
 
+@pytest.mark.integration
 def test_import_reads_the_statement_scope(db, tmp_path):
     sid = _company(db)
     path = tmp_path / "hand.jsonl"
@@ -675,6 +686,7 @@ def test_import_reads_the_statement_scope(db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_verified_only_and_applies_until_behave_as_for_bars(db, tmp_path):
     sid = _company(db)
     _correct(db, "income", sid, Q2, revenue=412_300_000_000)
@@ -710,6 +722,7 @@ def test_verified_only_and_applies_until_behave_as_for_bars(db, tmp_path):
     assert "balance_sheet_identity_accepted" in {lab.kind for lab in used}
 
 
+@pytest.mark.integration
 def test_dq_compare_statements_judges_a_night_by_the_labels_that_applied(db, tmp_path):
     sid = _company(db)
     night = tmp_path / "2024-12-31.jsonl"
@@ -767,6 +780,7 @@ def test_dq_compare_statements_judges_a_night_by_the_labels_that_applied(db, tmp
     not (REAL_DORQ and EVAL),
     reason="set FAFNIR_TEST_DORQ (and dorq-eval beside it, or FAFNIR_TEST_DORQ_EVAL)",
 )
+@pytest.mark.integration
 def test_round_trip_through_dorq_and_dorq_eval(db, tmp_path):
     sid = _security(db, "STRT")
     _bars(db, sid, _sessions(db, dt.date(2023, 1, 3)), close=30.0)
