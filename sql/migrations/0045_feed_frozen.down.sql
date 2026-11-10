@@ -8,10 +8,16 @@
 
 BEGIN;
 
--- mart.fundamental_panel (0037) reads this view, so it cannot be dropped and
--- re-created; CREATE OR REPLACE keeps the two columns, reading NULL. The next up
--- migration that redefines the view may drop them.
-CREATE OR REPLACE VIEW mart.v_security_profile AS
+-- mart.v_security_profile goes back to exactly what 0039 made it. CREATE OR
+-- REPLACE cannot drop the two columns, and a view left wider than 0039's breaks
+-- the next down that redefines it: 0039's own restores 0020's column list, which
+-- Postgres refuses with "cannot drop columns from view". So the view is dropped
+-- and created again. Nothing depends on it: mart.fn_fundamental_panel and the
+-- other functions that read it record no dependency, and mart.fundamental_panel
+-- reads the function. A dependent added by hand stops this DROP, loudly, rather
+-- than being dropped with it. The grants are the ones it had (0020, 0021).
+DROP VIEW mart.v_security_profile;
+CREATE VIEW mart.v_security_profile AS
 SELECT
     s.security_id,
     s.primary_symbol            AS symbol,
@@ -37,9 +43,7 @@ SELECT
     s.first_seen_at,
     s.updated_at,
     cp.description,
-    cp.loaded_at                AS description_loaded_at,
-    NULL::date                  AS feed_frozen_on,
-    NULL::text                  AS feed_frozen_note
+    cp.loaded_at                AS description_loaded_at
 FROM core.security s
 LEFT JOIN ref.exchange      x   ON x.exchange_code = s.exchange_code
 LEFT JOIN core.v_security_classification cl ON cl.security_id = s.security_id
@@ -52,6 +56,8 @@ COMMENT ON VIEW mart.v_security_profile IS
     'the feeding vendor''s (core.v_security_classification, #109). market_cap_usd and '
     'beta are a company-screener snapshot refreshed with the security master -- not '
     'history; mart.security_latest derives its own.';
+
+GRANT SELECT ON mart.v_security_profile TO fafnir_read, fafnir_app, fafnir_ops;
 
 DROP INDEX IF EXISTS core.ix_security_feed_frozen;
 
