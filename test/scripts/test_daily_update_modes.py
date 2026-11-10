@@ -66,6 +66,7 @@ SHARADAR_NIGHT = [
     "ingest sharadar",
     "ingest fundamentals",
     "config get fmp_secondary",
+    "security thaw --unfed --yes",
     "ingest tracked --allow-secondary",
     "ingest prices --allow-secondary",
     "ingest actions --allow-secondary",
@@ -143,10 +144,29 @@ def test_sharadar_mode_without_fmp(tmp_path):
         "ingest sharadar",
         "ingest fundamentals",
         "config get fmp_secondary",
+        # What FMP alone fed is frozen, not stale (ADR 0020); FMP's loaders do not run.
+        "security freeze --unfed --yes",
         "db refresh-marts",
         "status",
     ]
     assert "fmp_secondary = false" in done.stdout
+    assert not [c for c in calls if "--allow-secondary" in c]
+
+
+def test_the_freeze_and_the_thaw_are_upkeep(tmp_path):
+    """A marker that cannot be stamped tonight must not cost the marts the night's
+    bars; the next night stamps it (ADR 0020)."""
+    done, calls = _night(
+        tmp_path, "sharadar", secondary="false", fail="security freeze --unfed --yes"
+    )
+    assert done.returncode == 0, done.stderr
+    assert calls[-2:] == ["db refresh-marts", "status"]
+    assert "'fafnir security freeze --unfed --yes' failed" in done.stdout
+
+    done, calls = _night(tmp_path, "sharadar", fail="security thaw --unfed --yes")
+    assert done.returncode == 0, done.stderr
+    assert calls == SHARADAR_NIGHT
+    assert "'fafnir security thaw --unfed --yes' failed" in done.stdout
 
 
 def test_rollback_is_the_setting_flipped_back(tmp_path):
