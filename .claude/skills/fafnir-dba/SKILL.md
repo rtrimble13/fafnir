@@ -22,7 +22,12 @@ These are not style guidance. Each one is a way this system gets damaged.
    writer will re-detect is the most common way this queue churns.
 2. **Never resolve by filter without showing its own dry run first.** Run the
    identical command with `--dry-run`, show the output, and only then run it for
-   real. Never put `--dry-run` and `--yes` in the same turn.
+   real. Outside an approved plan, never put `--dry-run` and `--yes` in the same
+   turn. **Inside one** — the operator has approved a plan whose steps and
+   predicted counts you stated — run each step's dry run and its real command in
+   one turn when the dry run's count equals the prediction, and stop the step and
+   everything after it when it does not (`references/sweep-policy.md`, "Approved
+   plans").
 3. **Every resolve carries evidence and an owner.** Always
    `--by claude --note "<what was checked, what was concluded>"`. Never `--note
    "resolved"`. The note is what the next person has instead of you.
