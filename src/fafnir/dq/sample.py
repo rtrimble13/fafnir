@@ -24,7 +24,7 @@ import hashlib
 import json
 import shlex
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, TextIO
+from typing import Iterable, Optional, Sequence, TextIO
 
 from fafnir.db.connection import Database
 from fafnir.dq import dorq as engine
@@ -86,13 +86,15 @@ def _rank(seed: int, key: tuple) -> str:
 
 
 def draw(
-    records: Sequence[dict],
+    records: Iterable[dict],
     *,
     size: int = DEFAULT_SIZE,
     per_code: int = DEFAULT_PER_CODE,
     seed: int = 1,
 ) -> Sample:
-    """The sample of ``records`` (a statements night, fafnir format)."""
+    """The sample of ``records`` (a statements night, fafnir format), read once.
+    Pass :func:`fafnir.dq.dorq.read_records` for a night's file: what is held is
+    one record per distinct condition at warn and above, never the file."""
     out = Sample(seed=seed, size=size, per_code=per_code)
     conditions: dict[tuple, dict] = {}
     cohorts: set[tuple] = set()

@@ -43,7 +43,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterator, Optional, Sequence
 
 from fafnir.db.connection import Database
 from fafnir.dq import dorq as engine
@@ -461,7 +461,9 @@ def _recall(
     by_security: dict[int, list[StatementReport]],
     slack: int,
 ) -> None:
-    """Both engines' recall on the confirmed errors among ``used``."""
+    """Both engines' recall on the confirmed errors among ``used``. ``by_security``
+    holds dorq's reports at warn and above on the securities those errors name;
+    the pass over the night keeps no other."""
     from fafnir.dq import labels as lb
 
     errors = [
@@ -507,8 +509,6 @@ def compare(
 ) -> StatementsComparison:
     from fafnir.dq.compare import previous_shadow_file
 
-    records = engine.read_shadow(shadow_file)
-    reports = [r for r in (StatementReport.of(x) for x in records) if r is not None]
     as_of = _date(Path(shadow_file).stem)
     night = (
         engine.night_run(db, dorq_statements.ENDPOINT_SHADOW, as_of) if as_of else None
@@ -519,43 +519,17 @@ def compare(
         run_id=(night or {}).get("ingestion_run_id"),
         state_at=(night or {}).get("started_at"),
         dorq_version=str(((night or {}).get("params") or {}).get("dorq_version") or ""),
-        reports=len(reports),
-        conditions=len({r.key for r in reports}),
         labelled=labels is not None,
     )
     flags = _sql_flags(db, out.state_at)
     open_flags = [f for f in flags if not f["accepted"]]
     accepted = [f for f in flags if f["accepted"]]
-    by_security: dict[int, list[StatementReport]] = {}
-    for r in reports:
-        if r.security_id is not None:
-            by_security.setdefault(r.security_id, []).append(r)
-
-    def covered_by(r: StatementReport, pool: Sequence[dict]) -> bool:
-        return any(covers(SUCCESSORS[f["check_name"]], f, r) for f in pool)
-
     flags_by_security: dict[int, list[dict]] = {}
     accepted_by_security: dict[int, list[dict]] = {}
     for f in open_flags:
         flags_by_security.setdefault(f["security_id"], []).append(f)
     for f in accepted:
         accepted_by_security.setdefault(f["security_id"], []).append(f)
-
-    for check, rule in SUCCESSORS.items():
-        entry = {"codes": list(rule.codes), "flags": 0, "also_dorq": 0}
-        entry.update({"severe": 0, "severe_also_dorq": 0})
-        for f in open_flags:
-            if f["check_name"] != check:
-                continue
-            matched = any(
-                covers(rule, f, r) for r in by_security.get(f["security_id"], ())
-            )
-            entry["flags"] += 1
-            entry["also_dorq"] += matched
-            if f["severity"] in _SEVERE:
-                entry["severe"] += 1
-                entry["severe_also_dorq"] += matched
-        out.by_sql_check[check] = entry
 
     index = None
     if labels is not None:
@@ -579,24 +553,51 @@ def compare(
         (star if lab.series == "*" else by_series.setdefault(lab.series, [])).append(
             lab
         )
-    severe: set = set()
-    for r in reports:
+    # The securities the confirmed errors name: the only ones whose reports the
+    # recall needs after the pass, and only at warn and above.
+    error_sids = {
+        int(lab.series)
+        for lab in index or ()
+        if lab.label_class == "data_error" and lab.series.isdigit()
+    }
+
+    # One pass over the night's file, a report at a time (#219: the file is dorq's
+    # whole standing view, 693 MB on the host on 2026-11-10, and reading it whole
+    # cost 6.5 times that and the OOM killer). What the pass keeps is small against
+    # the file: the condition keys as hashes, the open flags a report covers by id,
+    # the counters, and the severe reports on the securities the recall asks about.
+    keys: set[int] = set()
+    severe: set[int] = set()
+    covered: set[int] = set()
+    recall_reports: dict[int, list[StatementReport]] = {}
+    for record in engine.read_records(shadow_file):
+        r = StatementReport.of(record)
+        if r is None:
+            continue
+        out.reports += 1
+        h = _key_hash(r.key)
+        keys.add(h)
         entry = out.by_code.setdefault(
             r.code, {"reports": 0, "severe": 0, "also_sql": 0, "dorq_only": 0}
         )
         entry["reports"] += 1
         if r.severity in _SEVERE:
             entry["severe"] += 1
-            severe.add(r.key)
-        pool = flags_by_security.get(r.security_id, ()) if r.security_id else ()
-        if covered_by(r, pool):
-            entry["also_sql"] += 1
-        else:
-            entry["dorq_only"] += 1
-        if r.security_id is not None and covered_by(
-            r, accepted_by_security.get(r.security_id, ())
-        ):
-            out.on_accepted += 1
+            severe.add(h)
+        matched = False
+        if r.security_id is not None:
+            for f in flags_by_security.get(r.security_id, ()):
+                if covers(SUCCESSORS[f["check_name"]], f, r):
+                    covered.add(f["dq_flag_id"])
+                    matched = True
+            if any(
+                covers(SUCCESSORS[f["check_name"]], f, r)
+                for f in accepted_by_security.get(r.security_id, ())
+            ):
+                out.on_accepted += 1
+            if r.security_id in error_sids and r.severity in _SEVERE:
+                recall_reports.setdefault(r.security_id, []).append(r)
+        entry["also_sql" if matched else "dorq_only"] += 1
         if index is not None:
             own = by_series.get(str(r.security_id), []) if r.security_id else []
             outcome = judge(r, [*own, *star], slack_days)
@@ -605,10 +606,26 @@ def compare(
                 out.precision_by_code.setdefault(r.code, Precision()).add(outcome)
             if r.severity == "error":
                 out.precision_error.add(outcome)
+    out.conditions = len(keys)
     out.by_code = dict(sorted(out.by_code.items()))
     out.precision_by_code = dict(sorted(out.precision_by_code.items()))
+
+    for check, rule in SUCCESSORS.items():
+        entry = {"codes": list(rule.codes), "flags": 0, "also_dorq": 0}
+        entry.update({"severe": 0, "severe_also_dorq": 0})
+        for f in open_flags:
+            if f["check_name"] != check:
+                continue
+            matched = f["dq_flag_id"] in covered
+            entry["flags"] += 1
+            entry["also_dorq"] += matched
+            if f["severity"] in _SEVERE:
+                entry["severe"] += 1
+                entry["severe_also_dorq"] += matched
+        out.by_sql_check[check] = entry
+
     if index is not None:
-        _recall(db, out, index, by_security, slack_days)
+        _recall(db, out, index, recall_reports, slack_days)
 
     sql_severe = sum(e["severe"] for e in out.by_sql_check.values())
     out.standing = {
@@ -620,12 +637,8 @@ def compare(
 
     previous = previous_shadow_file(Path(shadow_file))
     if previous is not None:
-        before = {
-            r.key
-            for r in (StatementReport.of(x) for x in engine.read_shadow(previous))
-            if r is not None
-        }
-        new = {r.key for r in reports} - before
+        before = set(_condition_hashes(previous))
+        new = keys - before
         prev_night = engine.night_run(
             db, dorq_statements.ENDPOINT_SHADOW, _date(previous.stem)
         )
@@ -642,6 +655,21 @@ def compare(
             "bar": NEW_FLAGS_BAR,
         }
     return out
+
+
+def _key_hash(key: tuple) -> int:
+    """A condition key as one integer, so a night's distinct conditions cost a set
+    of ints rather than of tuples holding a JSON string each. ``hash`` is salted
+    per process, and both nights of a comparison are hashed in the same one."""
+    return hash(key)
+
+
+def _condition_hashes(shadow_file: Path) -> Iterator[int]:
+    """The condition keys of a night's reports, hashed, one at a time."""
+    for record in engine.read_records(shadow_file):
+        r = StatementReport.of(record)
+        if r is not None:
+            yield _key_hash(r.key)
 
 
 # ---------------------------------------------------------------------------

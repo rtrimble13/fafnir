@@ -7297,7 +7297,7 @@ def dq_sample(ctx, shadow_file, size, per_code, seed, out_path):
             "first."
         )
     drawn = smp.draw(
-        dorq_engine.read_shadow(path), size=size, per_code=per_code, seed=seed
+        dorq_engine.read_records(path), size=size, per_code=per_code, seed=seed
     )
     with Database(cfg.dsn) as database:
         sample_rows = smp.rows(database, drawn)

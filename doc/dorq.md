@@ -784,6 +784,16 @@ Since #219's fix, only dorq's copy remains:
 - the run row and the CLI line record dorq's own peak, which is the figure to
   watch.
 
+The readers of the shadow file stream it too. `dq compare --statements` read the
+night whole until 2026-11-10, when the first night that reached a file (run 809:
+505,793 reports, 693 MB) killed the compare itself on the host. It now makes one
+pass over the file a report at a time, and over the previous night's for the new
+conditions; what it holds is the condition keys as hashed integers, the open SQL
+flags a report covers by id, the counters, and the severe reports on the
+securities the confirmed errors name. `dq sample` reads the file the same way and
+holds one record per distinct condition at warn and above. A night of 20,000
+reports stays under a quarter of its file's size in Python memory (a test pins it).
+
 dorq's figure grows with the reports a night holds. What makes it small is the
 reports themselves: a statements history that judges clean.
 
