@@ -3099,7 +3099,7 @@ def security_freeze(ctx, unfed, note, frozen_by, dry_run, yes):
         rows = repo.unfed_securities(database)
         funds = sum(1 for r in rows if r["is_fund"])
         click.echo(
-            f"Unfed and not yet frozen: {_plural(len(rows), 'security')} "
+            f"Unfed and not yet frozen: {_plural(len(rows), 'security', 'securities')} "
             f"({funds} funds, {len(rows) - funds} others)."
         )
         for r in rows[:10]:
@@ -3132,7 +3132,7 @@ def security_freeze(ctx, unfed, note, frozen_by, dry_run, yes):
             run_id = run.run_id
 
     click.echo(
-        f"Froze {_plural(len(frozen), 'security')} as {frozen_by} "
+        f"Froze {_plural(len(frozen), 'security', 'securities')} as {frozen_by} "
         f"(ops.ingestion_run {run_id})."
     )
     click.echo("Open stale flags on them close with `fafnir dq recheck --check stale`.")
@@ -3177,7 +3177,7 @@ def security_thaw(ctx, security_ids, unfed, thawed_by, dry_run, yes):
             note=repo.UNFED_FREEZE_NOTE if unfed else None,
             security_ids=None if unfed else list(security_ids),
         )
-        click.echo(f"Frozen: {_plural(len(rows), 'security')}.")
+        click.echo(f"Frozen: {_plural(len(rows), 'security', 'securities')}.")
         for r in rows[:10]:
             click.echo(
                 f"  {r['security_id']:>8}  {r['primary_symbol']:<10} frozen on "
@@ -3211,7 +3211,7 @@ def security_thaw(ctx, security_ids, unfed, thawed_by, dry_run, yes):
             run_id = run.run_id
 
     click.echo(
-        f"Thawed {_plural(len(thawed), 'security')} as {thawed_by} "
+        f"Thawed {_plural(len(thawed), 'security', 'securities')} as {thawed_by} "
         f"(ops.ingestion_run {run_id})."
     )
 
@@ -8089,8 +8089,9 @@ def _echo_wrapped(text: str) -> None:
     click.echo(textwrap.fill(text, width=min(_terminal_width(), 88)))
 
 
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+def _plural(count: int, noun: str, plural: Optional[str] = None) -> str:
+    """``count`` and ``noun``, made plural by ``s`` unless ``plural`` says how."""
+    return f"{count} {noun}" if count == 1 else f"{count} {plural or noun + 's'}"
 
 
 def _dq_json(payload) -> None:

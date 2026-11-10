@@ -372,6 +372,13 @@ def test_thaw_by_id_leaves_other_notes_alone(db, run_cli):
     assert both.exit_code != 0
 
 
+def test_the_counts_say_securities():
+    """The night freezes thousands at once; its log must not read "securitys"."""
+    assert cli._plural(1, "security", "securities") == "1 security"
+    assert cli._plural(3937, "security", "securities") == "3937 securities"
+    assert cli._plural(2, "bar") == "2 bars"
+
+
 def test_the_profile_view_carries_the_marker(db):
     fund = _fund(db)
     repo.freeze_feed(db, [fund], note="test")
