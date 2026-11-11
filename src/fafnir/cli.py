@@ -8175,10 +8175,15 @@ def _echo_table(headers, rows, right=()):
 
 
 def _echo_wrapped(text: str) -> None:
-    """A prose line (a caveat, a hint) folded to the terminal, not run off it."""
+    """A prose line (a caveat, a hint) folded to the terminal, not run off it.
+
+    Never at a hyphen: the lines name flags (``--registrant-changed``) and dates,
+    and a flag split across two lines cannot be copied."""
     import textwrap
 
-    click.echo(textwrap.fill(text, width=min(_terminal_width(), 88)))
+    click.echo(
+        textwrap.fill(text, width=min(_terminal_width(), 88), break_on_hyphens=False)
+    )
 
 
 def _plural(count: int, noun: str, plural: Optional[str] = None) -> str:
