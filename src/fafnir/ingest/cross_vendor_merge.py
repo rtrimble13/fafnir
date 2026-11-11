@@ -531,8 +531,8 @@ def _plan_former_ticker(
             survivor_from = (ticker, was, day)
             other = db.fetchval(
                 "SELECT security_id FROM core.symbol_xref "
-                "WHERE symbol = %s AND valid_from = %s",
-                (ticker, day),
+                "WHERE symbol = %s AND valid_from = %s AND security_id <> %s",
+                (ticker, day, base.victim_id),
             )
             if other is not None:
                 blockers.append(
