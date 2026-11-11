@@ -614,15 +614,62 @@ def test_the_old_ticker_resolves_to_the_survivor_after_the_merge(db, run_cli):
     assert db.fetchval(repo.XREF_RESOLVE_SQL, ("ZZNEW",)) == survivor
 
 
-def test_without_a_rename_into_it_the_victims_own_period_start_is_kept(db, run_cli):
+def test_without_a_rename_into_it_the_period_starts_at_the_victims_first_bar(
+    db, run_cli
+):
+    """The victim's own period starts at the 1900 placeholder; recorded from there,
+    it would claim every earlier issuer of the ticker's dates (CHK, 2026-11)."""
     survivor, victim = _former_pair(db, took=False)
     out = run_cli(victim, survivor, "--across-vendors", "--yes")
     assert out.exit_code == 0, out.output
     assert _periods(db, survivor)[0] == (
         "ZZOLD",
-        date(1900, 1, 1),
+        PREFIX_DAYS[0],
         RENAMED - timedelta(days=1),
     )
+
+
+@pytest.mark.parametrize(
+    "held_from, held_to, refused",
+    [
+        # An earlier issuer of the ticker, gone before the victim's first bar.
+        (date(2010, 1, 4), date(2015, 6, 30), False),
+        # One whose dates the victim's period would overlap.
+        (date(2010, 1, 4), date(2025, 12, 31), True),
+    ],
+)
+def test_another_issuers_period_on_the_ticker_refuses_only_where_it_overlaps(
+    db, run_cli, held_from, held_to, refused
+):
+    survivor, victim = _former_pair(db, took=False)
+    other = repo.upsert_security(
+        db,
+        primary_symbol="ZZOLDQ",
+        company_name="An earlier ZZOLD",
+        asset_type="equity",
+        exchange_code="NYSE",
+        is_actively_trading=False,
+    )
+    assert repo.insert_symbol_period(
+        db,
+        security_id=other,
+        symbol="ZZOLD",
+        valid_from=held_from,
+        valid_to=held_to,
+        source="sharadar",
+    )
+    out = run_cli(victim, survivor, "--across-vendors", "--yes")
+    if refused:
+        assert out.exit_code != 0
+        assert (
+            f"security {other} holds a ZZOLD period from {held_from} to {held_to}"
+        ) in _flat(out), out.output
+        assert _row(db, victim) is not None
+    else:
+        assert out.exit_code == 0, out.output
+        assert _row(db, victim) is None
+    # The earlier issuer keeps its own period either way.
+    assert ("ZZOLD", held_from, held_to) in _periods(db, other)
 
 
 def test_a_related_ticker_the_events_do_not_date_needs_a_rename_date(db, run_cli):
