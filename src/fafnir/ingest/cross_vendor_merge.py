@@ -190,6 +190,11 @@ class CrossVendorPlan(NamedTuple):
     blockers: list
     mode: str = MODE_REMINT
     former: Optional[FormerTicker] = None
+    #: What the guard allowed and why, other than identifiers (a delisted key for
+    #: a victim on a former ticker).
+    remarks: list = []
+    #: The operator's --registrant-changed.
+    registrant_changed: bool = False
 
     @property
     def victim_dates(self) -> list:
@@ -225,12 +230,16 @@ def plan_cross_vendor_merge(
     survivor_id: int,
     unjoined: str = UNJOINED_REFUSE,
     rename_date: Optional[date] = None,
+    registrant_changed: bool = False,
 ) -> CrossVendorPlan:
     """Read the evidence for folding ``victim_id`` into the fed ``survivor_id``.
 
     ``rename_date`` dates the rename the vendor's events do not: the relist's move
     to the vendor's ticker for a re-mint, the rename away from the victim's ticker
-    for a victim on a former one."""
+    for a victim on a former one. ``registrant_changed`` is the operator's word,
+    for a victim on a former ticker, that the vendor carries an older registrant
+    under the fed key (a SPAC before its merger): the victim's CIK may then differ
+    from the survivor's, where the vendor gives the key the survivor's."""
     if unjoined not in UNJOINED_CHOICES:
         raise ValueError(f"unjoined must be one of {UNJOINED_CHOICES}")
     base = repo.compare_securities(db, survivor_id=survivor_id, victim_id=victim_id)
@@ -240,6 +249,8 @@ def plan_cross_vendor_merge(
         (victim_id,),
     )
     blockers: list[str] = []
+    notes: list[str] = []
+    remarks: list[str] = []
 
     # 1. The vendor's word: the survivor is fed, its key live, under the victim's
     # ticker -- or, for a victim on a former ticker, renamed away from it to the
@@ -266,8 +277,6 @@ def plan_cross_vendor_merge(
             blockers.append(f"the {vendor} master has no {key}")
         else:
             ticker = su.fafnir_ticker(master["ticker"])
-            if master["is_delisted"]:
-                blockers.append(f"{vendor} lists {key} as delisted")
             if ticker != base.victim_symbol:
                 former, why = _plan_former_ticker(
                     db,
@@ -281,12 +290,22 @@ def plan_cross_vendor_merge(
                 if former is not None:
                     mode = MODE_FORMER
                 blockers += why
+            # A re-mint is relisted on the vendor's ticker, which a delisted key
+            # cannot be. A victim on a former ticker is folded into the fed row as
+            # it stands, live or not: a dead company's old-ticker row is as much a
+            # duplicate as a live one's.
+            if master["is_delisted"] and mode == MODE_FORMER:
+                remarks.append(
+                    f"{vendor} lists {key} as delisted: the survivor is folded into "
+                    "as it stands, and nothing is relisted"
+                )
+            elif master["is_delisted"]:
+                blockers.append(f"{vendor} lists {key} as delisted")
     blockers += repo.vendor_link_conflicts(db, victim_id, survivor_id)
 
     # 2. Identifiers: a CIK must agree, unless the vendor gives the fed key the
     # victim's (a new registrant it carries as one security); a CUSIP or ISIN may
     # not, and is reported.
-    notes = []
     vendor_cik = master["cik"] if master else None
     for field, survivor_value, victim_value in base.identity_mismatches:
         if field == "cik" and _same_cik(survivor_value, victim_value):
@@ -300,12 +319,29 @@ def plan_cross_vendor_merge(
                 f"cik {survivor_value} vs {victim_value}, the CIK {vendor} gives "
                 f"{key}: a new registrant it carries as one security"
             )
+        elif (
+            field == "cik"
+            and mode == MODE_FORMER
+            and registrant_changed
+            and _same_cik(survivor_value, vendor_cik)
+        ):
+            notes.append(
+                f"cik {survivor_value} vs {victim_value}: {vendor} gives {key} the "
+                "survivor's, and the operator says it carries the victim's older "
+                "registrant under it (--registrant-changed)"
+            )
         elif field == "cik":
             blockers.append(
                 f"cik differs: survivor {survivor_value!r} vs victim "
                 f"{victim_value!r}"
                 + (f" ({vendor} gives {key} {vendor_cik!r})" if vendor_cik else "")
                 + " -- another registrant is not a rename"
+                + (
+                    "; if the vendor carries the victim's older registrant under "
+                    "this key (a SPAC before its merger), --registrant-changed says so"
+                    if mode == MODE_FORMER and not registrant_changed
+                    else ""
+                )
             )
         else:
             notes.append(f"{field} {survivor_value} vs {victim_value}")
@@ -432,6 +468,8 @@ def plan_cross_vendor_merge(
         blockers=blockers,
         mode=mode,
         former=former,
+        remarks=remarks,
+        registrant_changed=registrant_changed,
     )
 
 
