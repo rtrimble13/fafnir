@@ -2231,9 +2231,9 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
 @click.option(
     "--across-vendors",
     is_flag=True,
-    help="The survivor is the vendor-fed row and the victim FMP's re-mint of the "
-    "same company after a rename: identity from the vendor, the survivor's bars "
-    "kept, then relisted on the vendor's ticker (operations.md).",
+    help="The survivor is the vendor-fed row and the victim FMP's row of the same "
+    "company after a rename -- its re-mint on the new ticker, or its row left on "
+    "the old one: identity from the vendor, the survivor's bars kept (operations.md).",
 )
 @click.option(
     "--unjoined",
@@ -2246,8 +2246,9 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
 @click.option(
     "--rename-date",
     metavar="YYYY-MM-DD",
-    help="With --across-vendors: date the relist's move to the vendor's ticker when "
-    "the vendor's events name none.",
+    help="With --across-vendors: date the rename the vendor's events do not -- the "
+    "relist's move to the vendor's ticker, or the rename away from a victim's "
+    "former ticker.",
 )
 @click.pass_context
 def security_merge(
@@ -2293,12 +2294,20 @@ def security_merge(
     Run --dry-run first: the preview is the same comparison the guard reads.
 
     --across-vendors is for one company held twice after a rename: SURVIVOR_ID the
-    row the vendor feeds (usually inactive, on the old ticker), VICTIM_ID FMP's
-    re-mint under the ticker the vendor lists it as. The guard reads the vendor's
-    identity, the CIK and today's prices instead of the whole overlap, the
-    survivor's bars win the overlap, and the survivor is relisted on the vendor's
-    ticker in the same transaction. See operations.md, "A fed security held
-    inactive".
+    row the vendor feeds, VICTIM_ID FMP's row of the same company. The guard reads
+    the vendor's identity, the CIK and today's prices instead of the whole overlap,
+    and the survivor's bars win the overlap. Two shapes:
+
+    \b
+    - the survivor inactive on the old ticker, the victim FMP's re-mint on the
+      ticker the vendor lists it as: the survivor takes the victim's identifiers
+      and is relisted on the vendor's ticker, in the same transaction
+      (operations.md, "A fed security held inactive");
+    - the survivor already on the vendor's ticker, the victim FMP's row left on a
+      ticker the vendor's events rename the key away from (`vendor link`'s
+      duplicate_of_linked): the survivor keeps its identifiers, and the victim's
+      ticker period is recorded in its history up to the rename (operations.md,
+      "An FMP row left on a former ticker").
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import adjustments
@@ -2497,6 +2506,30 @@ def _echo_cross_vendor_plan(plan) -> None:
         f"Victim   {b.victim_id} ({b.victim_symbol}): {b.victim_bars} bars, "
         f"{b.victim_actions} actions, {b.victim_flags} flags"
     )
+    if plan.former is not None:
+        day, old, new = plan.former.rename
+        click.echo(
+            f"Ticker   : {b.victim_symbol} is a former ticker of {plan.vendor_key}: "
+            f"renamed {old} -> {new} on {day} ("
+            + (
+                f"{plan.vendor}'s events"
+                if plan.former.dated_by == "events"
+                else "--rename-date"
+            )
+            + "). The survivor keeps its own name and identifiers and is not relisted."
+        )
+        if plan.former.period is not None:
+            sym, start, end = plan.former.period
+            click.echo(f"           records {sym} {start}..{end} on the survivor")
+        else:
+            click.echo(
+                f"           the survivor holds a {b.victim_symbol} period already"
+            )
+        if plan.former.survivor_from is not None:
+            sym, was, now = plan.former.survivor_from
+            click.echo(
+                f"           the survivor's {sym} period starts {now} (was {was})"
+            )
     for line in plan.identifier_notes:
         click.echo(f"Identifier differs (reported, not a blocker): {line}")
     if plan.recent_sessions:
@@ -2560,7 +2593,11 @@ def _security_merge_across_vendors(
             ):
                 raise click.ClickException(f"No such security: {sid}")
         plan = cvm.plan_cross_vendor_merge(
-            database, victim_id=victim_id, survivor_id=survivor_id, unjoined=unjoined
+            database,
+            victim_id=victim_id,
+            survivor_id=survivor_id,
+            unjoined=unjoined,
+            rename_date=rename_date,
         )
         _echo_cross_vendor_plan(plan)
         if plan.blockers:
@@ -2582,9 +2619,15 @@ def _security_merge_across_vendors(
                 f"({r.actions_dropped} dropped), {r.flags_moved} flags; security "
                 f"{victim_id} deleted."
             )
-            if done.relisted.rename:
+            if done.relisted is not None and done.relisted.rename:
                 day, old, new = done.relisted.rename
                 click.echo(f"Relisted: {old} -> {new} on {day}")
+            for what, symbol, start, end in done.periods:
+                click.echo(
+                    f"Ticker period {what}: {symbol} {start}..{end}"
+                    if what == "recorded"
+                    else f"Ticker period {what}: {symbol} now from {end} (was {start})"
+                )
             click.echo(
                 f"After: {row['primary_symbol']}, "
                 f"{'trading' if row['is_actively_trading'] else 'inactive'}, "
@@ -2605,7 +2648,13 @@ def _security_merge_across_vendors(
         if not yes:
             click.confirm(
                 f"Merge {victim_id} into the {plan.vendor}-fed {survivor_id}, delete "
-                f"{victim_id} and relist {survivor_id} as {plan.vendor_ticker}?",
+                f"{victim_id} and "
+                + (
+                    f"record {plan.base.victim_symbol} in {survivor_id}'s ticker "
+                    "history?"
+                    if plan.mode == cvm.MODE_FORMER
+                    else f"relist {survivor_id} as {plan.vendor_ticker}?"
+                ),
                 abort=True,
             )
         with RunLog(
@@ -2621,6 +2670,7 @@ def _security_merge_across_vendors(
                 "vendor_key": plan.vendor_key,
                 "note": note,
                 "by": by,
+                "mode": plan.mode,
                 "unjoined": unjoined,
                 "overlap": {
                     "shared": plan.base.shared_days,
@@ -2657,7 +2707,9 @@ def _security_merge_across_vendors(
                 actions_dropped=done.report.actions_dropped,
                 identity_flags_resolved=done.identity_flags,
                 identity_before=done.identity_before,
-                identity_after=plan.victim_identity,
+                identity_after=(
+                    None if plan.mode == cvm.MODE_FORMER else plan.victim_identity
+                ),
                 duplicate_flags_resolved=closed,
                 relisted=(
                     {
@@ -2665,7 +2717,23 @@ def _security_merge_across_vendors(
                         "old": done.relisted.rename[1],
                         "new": done.relisted.rename[2],
                     }
-                    if done.relisted.rename
+                    if done.relisted is not None and done.relisted.rename
+                    else None
+                ),
+                former_ticker=(
+                    {
+                        "rename": {
+                            "date": plan.former.rename[0],
+                            "old": plan.former.rename[1],
+                            "new": plan.former.rename[2],
+                        },
+                        "dated_by": plan.former.dated_by,
+                        "periods": [
+                            {"what": w, "symbol": sym, "from": a, "to": b}
+                            for w, sym, a, b in done.periods
+                        ],
+                    }
+                    if plan.former is not None
                     else None
                 ),
             )

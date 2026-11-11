@@ -1089,7 +1089,7 @@ def vendor_master_row(
     return db.fetchone(
         """
         SELECT vendor_key, vendor_table, ticker, name, exchange, is_delisted,
-               first_price_date, last_price_date, cik
+               first_price_date, last_price_date, cik, related_tickers
           FROM core.vendor_security
          WHERE vendor = %s AND vendor_key = %s AND vendor_table = ANY(%s)
          ORDER BY vendor_table

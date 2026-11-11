@@ -53,12 +53,39 @@ The survivor takes the victim's name, CUSIP, ISIN and CIK (they describe the
 instrument as it trades now), and is relisted on the vendor's ticker
 (`security relist`'s own plan and write), in the same transaction: one row, active,
 fed, on the ticker the company trades under.
+
+**The victim on a former ticker** (:data:`MODE_FORMER`). The same company is held
+twice the other way round just as often: the fed row already trades on the vendor's
+ticker, and FMP's row is the one left on the OLD ticker, inactive. `vendor link`
+flags it ``duplicate_of_linked`` (MICS and RIME, the Singing Machine renamed
+Algorhythm: 909 of the 929 such flags on 2026-11-11). Step 1 then reads the
+vendor's ticker history instead of its current ticker:
+
+* the vendor's events rename the fed key away from the victim's ticker
+  (``tickerchangefrom``, :func:`former_rename`), to the ticker the vendor lists it
+  as now, and the survivor trades on that ticker already. Where the events name no
+  such rename, ``rename_date`` dates it, but only for a ticker the vendor's master
+  lists among the key's related tickers;
+* the CIK must agree (zero-padding aside): nothing in the vendor's word says an
+  older registrant's CIK was the key's;
+* steps 3 to 5 as above. "Today" is the last sessions the two rows share, the end
+  of the victim's history.
+
+What it writes differs in three ways. The survivor keeps its own name and
+identifiers: they are the current ones, and the victim's are what the company was.
+It is not relisted: it is listed on the vendor's ticker already. And the victim's
+ticker period, which the merge deletes with the victim, is recorded on the
+survivor from the vendor's rename into that ticker (or the victim's own period
+start) to the day before the rename away, with the survivor's own period on the
+vendor's ticker starting at the rename: the ticker history a rename applied in time
+would have left, so ``ticker_history`` still resolves the old ticker to the company
+on the days it traded under it.
 """
 
 from __future__ import annotations
 
 import bisect
-from datetime import date
+from datetime import date, timedelta
 from statistics import median
 from typing import NamedTuple, Optional, Sequence
 
@@ -90,6 +117,49 @@ UNJOINED_CHOICES = (UNJOINED_REFUSE, UNJOINED_DROP, UNJOINED_CARRY)
 #: row's: the vendor-identity flags `vendor link` raised on the unlinked re-mint.
 IDENTITY_CHECKS = ("vendor_xref_unmatched", "vendor_xref_ambiguous")
 
+#: The victim is FMP's re-mint on the ticker the vendor lists the fed key as.
+MODE_REMINT = "remint"
+#: The victim is FMP's row on a ticker the vendor renamed the fed key away from.
+MODE_FORMER = "former_ticker"
+
+
+class FormerTicker(NamedTuple):
+    """How a victim on a former ticker hands its ticker history to the survivor."""
+
+    #: The rename away from the victim's ticker: ``(date, old, new)``.
+    rename: tuple
+    #: Where the date came from: ``"events"`` or ``"rename_date"``.
+    dated_by: str
+    #: The victim's ticker period to record on the survivor, ``(symbol, from, to)``;
+    #: None where the survivor holds a period on that ticker already.
+    period: Optional[tuple]
+    #: The survivor's open period on the vendor's ticker moved to start at the
+    #: rename, ``(symbol, was, now)``; None where it starts there or later, or the
+    #: rename was to another ticker (a chain).
+    survivor_from: Optional[tuple]
+
+
+def former_rename(
+    events: Sequence[dict], victim_symbol: str
+) -> Optional[tuple[date, str, str]]:
+    """The newest of one key's renames away from ``victim_symbol`` (fafnir's
+    spelling), as ``(date, old, new)``, or None."""
+    found = [
+        r for r in su.renames(list(events)) if su.fafnir_ticker(r[1]) == victim_symbol
+    ]
+    return found[-1] if found else None
+
+
+def entered_on(events: Sequence[dict], symbol: str, before: date) -> Optional[date]:
+    """The date of the key's newest rename INTO ``symbol`` before ``before``: when
+    the vendor says it took that ticker. None where its events name none."""
+    found = [
+        day
+        for day, _old, new in su.renames(list(events))
+        if su.fafnir_ticker(new) == symbol and day < before
+    ]
+    return found[-1] if found else None
+
 
 class CrossVendorPlan(NamedTuple):
     """What a cross-vendor merge would do, and every reason it should not."""
@@ -116,6 +186,8 @@ class CrossVendorPlan(NamedTuple):
     victim_identity: dict
     unjoined_policy: str
     blockers: list
+    mode: str = MODE_REMINT
+    former: Optional[FormerTicker] = None
 
     @property
     def victim_dates(self) -> list:
@@ -150,8 +222,13 @@ def plan_cross_vendor_merge(
     victim_id: int,
     survivor_id: int,
     unjoined: str = UNJOINED_REFUSE,
+    rename_date: Optional[date] = None,
 ) -> CrossVendorPlan:
-    """Read the evidence for folding ``victim_id`` into the fed ``survivor_id``."""
+    """Read the evidence for folding ``victim_id`` into the fed ``survivor_id``.
+
+    ``rename_date`` dates the rename the vendor's events do not: the relist's move
+    to the vendor's ticker for a re-mint, the rename away from the victim's ticker
+    for a victim on a former one."""
     if unjoined not in UNJOINED_CHOICES:
         raise ValueError(f"unjoined must be one of {UNJOINED_CHOICES}")
     base = repo.compare_securities(db, survivor_id=survivor_id, victim_id=victim_id)
@@ -163,8 +240,10 @@ def plan_cross_vendor_merge(
     blockers: list[str] = []
 
     # 1. The vendor's word: the survivor is fed, its key live, under the victim's
-    # ticker.
+    # ticker -- or, for a victim on a former ticker, renamed away from it to the
+    # ticker the survivor trades on.
     vendor = key = ticker = master = None
+    mode, former = MODE_REMINT, None
     link = repo.feeding_link(db, survivor_id)
     victim_link = repo.feeding_link(db, victim_id)
     if victim_link is not None:
@@ -188,11 +267,18 @@ def plan_cross_vendor_merge(
             if master["is_delisted"]:
                 blockers.append(f"{vendor} lists {key} as delisted")
             if ticker != base.victim_symbol:
-                blockers.append(
-                    f"{vendor} lists {key} as {ticker}, not as the victim's "
-                    f"{base.victim_symbol}: the vendor does not say these are one "
-                    "company"
+                former, why = _plan_former_ticker(
+                    db,
+                    vendor=vendor,
+                    key=key,
+                    master=master,
+                    ticker=ticker,
+                    base=base,
+                    rename_date=rename_date,
                 )
+                if former is not None:
+                    mode = MODE_FORMER
+                blockers += why
     blockers += repo.vendor_link_conflicts(db, victim_id, survivor_id)
 
     # 2. Identifiers: a CIK must agree, unless the vendor gives the fed key the
@@ -203,7 +289,11 @@ def plan_cross_vendor_merge(
     for field, survivor_value, victim_value in base.identity_mismatches:
         if field == "cik" and _same_cik(survivor_value, victim_value):
             continue  # one CIK, zero-padded differently
-        if field == "cik" and _same_cik(victim_value, vendor_cik):
+        if (
+            field == "cik"
+            and mode == MODE_REMINT
+            and _same_cik(victim_value, vendor_cik)
+        ):
             notes.append(
                 f"cik {survivor_value} vs {victim_value}, the CIK {vendor} gives "
                 f"{key}: a new registrant it carries as one security"
@@ -338,14 +428,127 @@ def plan_cross_vendor_merge(
         victim_identity=dict(victim_identity),
         unjoined_policy=unjoined,
         blockers=blockers,
+        mode=mode,
+        former=former,
     )
+
+
+def _plan_former_ticker(
+    db: Database,
+    *,
+    vendor: str,
+    key: str,
+    master: dict,
+    ticker: str,
+    base: repo.MergePlan,
+    rename_date: Optional[date],
+) -> tuple[Optional[FormerTicker], list[str]]:
+    """Whether the victim holds a ticker the vendor renamed the fed key away from,
+    and the ticker periods the merge would leave. Returns the plan, or None and the
+    blocker that says why not."""
+    victim_symbol, survivor_id = base.victim_symbol, base.survivor_id
+    not_one = (
+        f"{vendor} lists {key} as {ticker}, not as the victim's {victim_symbol}: the "
+        "vendor does not say these are one company"
+    )
+    events = repo.vendor_events_for_keys(db, vendor, su.RENAME_EVENTS, [key])
+    rename = former_rename(events, victim_symbol)
+    dated_by = "events"
+    if rename is None:
+        related = {su.fafnir_ticker(t) for t in (master.get("related_tickers") or [])}
+        if victim_symbol not in related:
+            return None, [
+                not_one + f" ({vendor}'s events name no rename of {key} from "
+                f"{victim_symbol}, nor does it list {victim_symbol} among {key}'s "
+                "tickers)"
+            ]
+        if rename_date is None:
+            return None, [
+                not_one + f" ({vendor} lists {victim_symbol} among {key}'s tickers "
+                "but its events date no rename from it: pass --rename-date)"
+            ]
+        rename, dated_by = (rename_date, victim_symbol, ticker), "rename_date"
+    elif rename_date is not None and rename_date != rename[0]:
+        return None, [
+            f"--rename-date {rename_date} contradicts {vendor}'s own: {key} was "
+            f"renamed {rename[1]} -> {rename[2]} on {rename[0]}"
+        ]
+    day, _old, new = rename
+    blockers: list[str] = []
+    survivor = db.fetchone(
+        "SELECT primary_symbol FROM core.security WHERE security_id = %s",
+        (survivor_id,),
+    )
+    if survivor["primary_symbol"] != ticker:
+        blockers.append(
+            f"the survivor {survivor_id} is on {survivor['primary_symbol']}, not the "
+            f"ticker {vendor} lists {key} as ({ticker}): relist it first, or merge "
+            "the re-mint that holds the vendor's ticker"
+        )
+
+    # The victim's period, from the vendor's rename into its ticker or, failing
+    # that, the victim's own start; to the day before the rename away.
+    period = None
+    held = db.fetchval(
+        "SELECT 1 FROM core.symbol_xref WHERE security_id = %s AND symbol = %s",
+        (survivor_id, victim_symbol),
+    )
+    if not held:
+        start = entered_on(events, victim_symbol, day) or db.fetchval(
+            "SELECT min(valid_from) FROM core.symbol_xref "
+            "WHERE security_id = %s AND symbol = %s",
+            (base.victim_id, victim_symbol),
+        )
+        end = day - timedelta(days=1)
+        if start is None or start > end:
+            blockers.append(
+                f"no period of {victim_symbol} ends before the rename of {day}: "
+                "nothing dates the ticker history to carry"
+            )
+        else:
+            period = (victim_symbol, start, end)
+            other = db.fetchval(
+                "SELECT security_id FROM core.symbol_xref "
+                "WHERE symbol = %s AND valid_from = %s AND security_id <> %s",
+                (victim_symbol, start, base.victim_id),
+            )
+            if other is not None:
+                blockers.append(
+                    f"security {other} holds a {victim_symbol} period from {start} "
+                    "already: the victim's cannot be recorded on the survivor"
+                )
+
+    # The survivor's period on the vendor's ticker starts at the rename, where the
+    # rename was to that ticker and the period claims more.
+    survivor_from = None
+    if su.fafnir_ticker(new) == ticker:
+        was = db.fetchval(
+            "SELECT valid_from FROM core.symbol_xref "
+            "WHERE security_id = %s AND symbol = %s AND valid_to IS NULL",
+            (survivor_id, ticker),
+        )
+        if was is not None and was < day:
+            survivor_from = (ticker, was, day)
+            other = db.fetchval(
+                "SELECT security_id FROM core.symbol_xref "
+                "WHERE symbol = %s AND valid_from = %s",
+                (ticker, day),
+            )
+            if other is not None:
+                blockers.append(
+                    f"security {other} holds a {ticker} period from {day} already: "
+                    f"the survivor's cannot start there"
+                )
+    return FormerTicker(rename, dated_by, period, survivor_from), blockers
 
 
 class CrossVendorDone(NamedTuple):
     report: repo.MergeReport
-    relisted: object  # relist.RelistPlan
+    relisted: object  # relist.RelistPlan; None for a victim on a former ticker
     identity_flags: list
-    identity_before: dict
+    identity_before: dict  # empty when the survivor kept its own identity
+    #: The ticker periods written for a victim on a former ticker.
+    periods: tuple = ()
 
 
 def apply_cross_vendor_merge(
@@ -358,8 +561,10 @@ def apply_cross_vendor_merge(
 ) -> CrossVendorDone:
     """Merge, recompute the survivor's factors, close the identity flags the
     victim brought, and relist the survivor on the vendor's ticker, in the caller's
-    transaction. Raises :class:`repo.MergeRefused` or
-    :class:`fafnir.ingest.relist.RelistRefused`; the caller rolls back."""
+    transaction. For a victim on a former ticker, record its ticker period on the
+    survivor instead, and neither adopt its identity nor relist. Raises
+    :class:`repo.MergeRefused` or :class:`fafnir.ingest.relist.RelistRefused`; the
+    caller rolls back."""
     from fafnir.ingest import adjustments
     from fafnir.ingest import relist as rl
 
@@ -373,6 +578,18 @@ def apply_cross_vendor_merge(
         actions_before=plan.actions_before,
     )
     adjustments.compute_for_security(db, survivor_id)
+    flags_note = f"Merged across vendors into the {plan.vendor}-fed row: {note}"
+    if plan.mode == MODE_FORMER:
+        periods = _carry_former_ticker(db, survivor_id, plan.former, plan.vendor)
+        flags = repo.resolve_dq_flags(
+            db,
+            repo.DqFilter(
+                state="open", checks=IDENTITY_CHECKS, security_ids=(survivor_id,)
+            ),
+            note=flags_note,
+            resolved_by=by,
+        )
+        return CrossVendorDone(report, None, flags, {}, periods)
     # The victim's name and identifiers describe the instrument as it trades now.
     before = repo.adopt_identity(db, survivor_id, **plan.victim_identity)
     flags = repo.resolve_dq_flags(
@@ -393,6 +610,49 @@ def apply_cross_vendor_merge(
 def _already(plan) -> bool:
     """The survivor trades on the vendor's ticker already: nothing to relist."""
     return bool(plan.active_before) and plan.symbol == plan.vendor_ticker
+
+
+def _carry_former_ticker(
+    db: Database, survivor_id: int, former: FormerTicker, vendor: str
+) -> tuple:
+    """Write the ticker periods a victim on a former ticker leaves the survivor.
+
+    After the merge, which deleted the victim's own periods: the victim's ticker
+    from when the vendor took it (or the victim's period began) to the day before
+    the rename away, and the survivor's open period on the vendor's ticker from the
+    rename. Raises :class:`repo.MergeRefused` when a period the plan read as free
+    is taken now; the caller rolls the merge back with it."""
+    written = []
+    if former.period is not None:
+        symbol, start, end = former.period
+        if not repo.insert_symbol_period(
+            db,
+            security_id=survivor_id,
+            symbol=symbol,
+            valid_from=start,
+            valid_to=end,
+            source=vendor,
+        ):
+            raise repo.MergeRefused(
+                f"another security holds a {symbol} period from {start} now", None
+            )
+        written.append(("recorded", symbol, start, end))
+    if former.survivor_from is not None:
+        symbol, was, now = former.survivor_from
+        moved = db.execute(
+            """
+            UPDATE core.symbol_xref SET valid_from = %s
+             WHERE security_id = %s AND symbol = %s AND valid_to IS NULL
+               AND valid_from = %s
+            """,
+            (now, survivor_id, symbol, was),
+        )
+        if moved != 1:
+            raise repo.MergeRefused(
+                f"the survivor's open {symbol} period no longer starts {was}", None
+            )
+        written.append(("moved", symbol, was, now))
+    return tuple(written)
 
 
 def victim_dates_summary(dates: Sequence[date]) -> str:

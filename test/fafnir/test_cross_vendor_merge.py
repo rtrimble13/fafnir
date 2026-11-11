@@ -420,3 +420,266 @@ def test_force_and_the_cross_vendor_options_do_not_mix(db, run_cli):
     assert out.exit_code != 0 and "--force does not apply" in out.output
     out = run_cli(victim, shell, "--unjoined", "drop", "--dry-run")
     assert out.exit_code != 0 and "need --across-vendors" in out.output
+
+
+# ---------------------------------------------------------------------------
+# The victim on a former ticker: FMP's row left on the ticker the vendor renamed
+# the fed key away from, the fed row already on the new one (MICS and RIME,
+# 2026-11; `vendor link`'s duplicate_of_linked).
+# ---------------------------------------------------------------------------
+
+FKEY = "900602"
+TOOK = date(2025, 6, 2)  # the vendor's rename INTO the victim's ticker
+VICTIM_END = date(2026, 4, 30)  # FMP's old-ticker row stops some weeks after
+
+
+def _former_pair(
+    db,
+    *,
+    events=True,
+    took=True,
+    related=("ZZANC", "ZZOLD"),
+    survivor_symbol="ZZNEW",
+    victim_cik="0000123456",
+    vendor_cik=None,
+):
+    """The fed ZZNEW, on the vendor's ticker since the rename, and FMP's ZZOLD,
+    delisted at it. ZZOLD holds a prefix ZZNEW lacks and shares its sessions to
+    :data:`VICTIM_END` half a cent apart."""
+    db.execute(
+        "INSERT INTO core.vendor_security (vendor, vendor_table, vendor_key, ticker, "
+        "name, category, exchange, is_delisted, first_price_date, last_price_date, "
+        "cik, related_tickers) VALUES ('sharadar', 'stocks', %s, 'ZZNEW', 'ZZ CORP', "
+        "'Domestic Common Stock', 'NYSE', false, %s, %s, %s, %s)",
+        (FKEY, FIRST, LAST, vendor_cik, list(related) if related else None),
+    )
+    renames = []
+    if took:
+        renames.append((TOOK, "ZZANC", "ZZOLD"))
+    if events:
+        renames.append((RENAMED, "ZZOLD", "ZZNEW"))
+    for day, old, new in renames:
+        for action, contra in (("tickerchangefrom", old), ("tickerchangeto", new)):
+            db.execute(
+                "INSERT INTO core.vendor_security_event (vendor, vendor_key, "
+                "event_date, action, ticker, contra_ticker, contra_name) "
+                "VALUES ('sharadar', %s, %s, %s, 'ZZNEW', %s, 'N/A')",
+                (FKEY, day, action, contra),
+            )
+    survivor = _security(db, survivor_symbol, active=True, cusip="333333333")
+    repo.insert_vendor_link(
+        db,
+        security_id=survivor,
+        vendor="sharadar",
+        vendor_key=FKEY,
+        valid_from=FIRST,
+        match_method="manual",
+        confidence=None,
+        evidence={},
+        created_by="tester",
+        is_feed=True,
+    )
+    _bars(db, survivor, SHELL_DAYS)
+    victim = _security(
+        db,
+        "ZZOLD",
+        active=False,
+        cusip="444444444",
+        cik=victim_cik,
+        delisted=RENAMED,
+    )
+    _bars(db, victim, PREFIX_DAYS)
+    _bars(
+        db,
+        victim,
+        [d for d in SHELL_DAYS if d <= VICTIM_END],
+        nudge=Decimal("0.005"),
+    )
+    repo.add_dq_flag_once(
+        db,
+        check_name="vendor_xref_ambiguous",
+        security_id=victim,
+        record_key={"vendor": "sharadar"},
+        detail={
+            "reason": "duplicate_of_linked",
+            "candidates": [{"vendor_key": FKEY, "linked_security": survivor}],
+        },
+    )
+    return survivor, victim
+
+
+def _periods(db, sid):
+    return [
+        (p["symbol"], p["valid_from"], p["valid_to"])
+        for p in db.fetchall(
+            "SELECT symbol, valid_from, valid_to FROM core.symbol_xref "
+            "WHERE security_id = %s ORDER BY valid_from, symbol",
+            (sid,),
+        )
+    ]
+
+
+def test_a_victim_on_a_former_ticker_is_planned_from_the_vendors_events(db):
+    survivor, victim = _former_pair(db)
+    plan = cvm.plan_cross_vendor_merge(db, victim_id=victim, survivor_id=survivor)
+    assert plan.blockers == []
+    assert plan.mode == cvm.MODE_FORMER
+    assert plan.former.rename == (RENAMED, "ZZOLD", "ZZNEW")
+    assert plan.former.dated_by == "events"
+    assert plan.former.period == ("ZZOLD", TOOK, RENAMED - timedelta(days=1))
+    assert plan.former.survivor_from == ("ZZNEW", date(1900, 1, 1), RENAMED)
+    assert plan.identifier_notes == ["cusip 333333333 vs 444444444"]
+    assert plan.joined == PREFIX_DAYS and plan.unjoined == []
+
+
+def test_the_re_mint_shape_is_planned_as_before(db):
+    shell, victim = _pair(db)
+    plan = cvm.plan_cross_vendor_merge(db, victim_id=victim, survivor_id=shell)
+    assert (plan.mode, plan.former) == (cvm.MODE_REMINT, None)
+
+
+def test_a_dry_run_of_a_former_ticker_shows_the_periods_and_changes_nothing(
+    db, run_cli
+):
+    survivor, victim = _former_pair(db)
+    out = run_cli(victim, survivor, "--across-vendors", "--dry-run")
+    assert out.exit_code == 0, out.output
+    text = _flat(out)
+    assert (
+        f"ZZOLD is a former ticker of {FKEY}: renamed ZZOLD -> ZZNEW on {RENAMED} "
+        "(sharadar's events)"
+    ) in text
+    assert (
+        f"records ZZOLD {TOOK}..{RENAMED - timedelta(days=1)} on the survivor" in text
+    )
+    assert f"the survivor's ZZNEW period starts {RENAMED} (was 1900-01-01)" in text
+    assert "Dry run: nothing changed." in text
+    assert "Relisted" not in text
+    assert _row(db, victim) is not None
+    assert _periods(db, survivor) == [("ZZNEW", date(1900, 1, 1), None)]
+
+
+def test_the_merge_keeps_the_survivors_identity_and_records_the_old_ticker(db, run_cli):
+    survivor, victim = _former_pair(db)
+    out = run_cli(victim, survivor, "--across-vendors", "-m", "one company", "--yes")
+    assert out.exit_code == 0, out.output
+    assert _row(db, victim) is None
+    row = _row(db, survivor)
+    # The current identity is the survivor's; the victim's is what it was.
+    assert (
+        row["primary_symbol"],
+        row["company_name"],
+        row["cusip"],
+        row["is_actively_trading"],
+        row["delisted_date"],
+    ) == ("ZZNEW", "ZZNEW Corp", "333333333", True, None)
+    assert _periods(db, survivor) == [
+        ("ZZOLD", TOOK, RENAMED - timedelta(days=1)),
+        ("ZZNEW", RENAMED, None),
+    ]
+    # The survivor's bars on the overlap; the victim's prefix joins them.
+    closes = {
+        r["trade_date"]: r["close"]
+        for r in db.fetchall(
+            "SELECT trade_date, close FROM core.daily_price WHERE security_id = %s",
+            (survivor,),
+        )
+    }
+    assert len(closes) == len(SHELL_DAYS) + len(PREFIX_DAYS)
+    assert closes[FIRST] == _close(FIRST).quantize(Decimal("0.000001"))
+    assert not db.fetchall(
+        "SELECT check_name FROM ops.data_quality_flag WHERE resolved_at IS NULL "
+        "AND check_name = 'vendor_xref_ambiguous'"
+    )
+    run = db.fetchone(
+        "SELECT * FROM ops.ingestion_run WHERE endpoint = "
+        "'security-merge-across-vendors'"
+    )
+    assert run["status"] == "success"
+    assert run["params"]["mode"] == cvm.MODE_FORMER
+    assert run["params"]["relisted"] is None
+    assert run["params"]["identity_after"] is None
+    assert run["params"]["former_ticker"]["rename"]["new"] == "ZZNEW"
+    assert [p["what"] for p in run["params"]["former_ticker"]["periods"]] == [
+        "recorded",
+        "moved",
+    ]
+
+
+def test_the_old_ticker_resolves_to_the_survivor_after_the_merge(db, run_cli):
+    survivor, victim = _former_pair(db)
+    out = run_cli(victim, survivor, "--across-vendors", "--yes")
+    assert out.exit_code == 0, out.output
+    assert db.fetchval(repo.HISTORICAL_XREF_RESOLVE_SQL, ("ZZOLD",)) == survivor
+    assert db.fetchval(repo.XREF_RESOLVE_SQL, ("ZZNEW",)) == survivor
+
+
+def test_without_a_rename_into_it_the_victims_own_period_start_is_kept(db, run_cli):
+    survivor, victim = _former_pair(db, took=False)
+    out = run_cli(victim, survivor, "--across-vendors", "--yes")
+    assert out.exit_code == 0, out.output
+    assert _periods(db, survivor)[0] == (
+        "ZZOLD",
+        date(1900, 1, 1),
+        RENAMED - timedelta(days=1),
+    )
+
+
+def test_a_related_ticker_the_events_do_not_date_needs_a_rename_date(db, run_cli):
+    survivor, victim = _former_pair(db, events=False)
+    out = run_cli(victim, survivor, "--across-vendors", "--yes")
+    assert out.exit_code != 0
+    assert "its events date no rename from it: pass --rename-date" in _flat(out)
+    assert _row(db, victim) is not None
+    out = run_cli(
+        victim, survivor, "--across-vendors", "--rename-date", RENAMED, "--yes"
+    )
+    assert out.exit_code == 0, out.output
+    assert _row(db, victim) is None
+    assert ("ZZNEW", RENAMED, None) in _periods(db, survivor)
+
+
+@pytest.mark.parametrize(
+    "case, blocker",
+    [
+        ("unrelated", f"lists {FKEY} as ZZNEW, not as the victim's ZZOLD"),
+        ("off_ticker", "is on ZZMID, not the ticker sharadar lists"),
+        ("cik", "cik differs"),
+        ("contradicted", "contradicts sharadar's own"),
+        ("taken", "holds a ZZOLD period from"),
+    ],
+)
+def test_the_former_ticker_guard_refuses(db, run_cli, case, blocker):
+    kwargs = {
+        "unrelated": {"events": False, "related": None},
+        "off_ticker": {"survivor_symbol": "ZZMID"},
+        # The vendor naming the victim's CIK proves a re-mint's new registrant,
+        # not that an older one was the key's.
+        "cik": {"victim_cik": "0000999999", "vendor_cik": "0000999999"},
+    }.get(case, {})
+    survivor, victim = _former_pair(db, **kwargs)
+    args = [victim, survivor, "--across-vendors"]
+    if case == "contradicted":
+        args += ["--rename-date", RENAMED + timedelta(days=7)]
+    if case == "taken":
+        other = repo.upsert_security(
+            db,
+            primary_symbol="ZZOLX",
+            company_name="Another ZZOLD",
+            asset_type="equity",
+            exchange_code="NYSE",
+            is_actively_trading=False,
+        )
+        assert repo.insert_symbol_period(
+            db,
+            security_id=other,
+            symbol="ZZOLD",
+            valid_from=TOOK,
+            valid_to=None,
+            source="fmp",
+        )
+    out = run_cli(*args, "--yes")
+    assert out.exit_code != 0
+    assert blocker in _flat(out), out.output
+    assert "Nothing was changed." in out.output
+    assert _row(db, victim) is not None and _row(db, survivor) is not None
