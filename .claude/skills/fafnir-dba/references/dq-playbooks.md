@@ -1266,11 +1266,23 @@ Warn. `fafnir vendor link` could not choose. `detail.reason`:
   vendor's current ticker). This row is another `security_id` for the same issuer,
   almost always a rename the loader missed: the old ticker's row and the new
   one's, each holding the history FMP serves under both. Fold it into the linked
-  security with `security merge <security_id> <linked_security>`, after a dry run
-  and an explicit yes. The merge moves the link and the history the linked row
-  lacks. It refuses when an identifier differs (a rename's new CUSIP) or the
-  overlapping bars disagree, which it did for 306 of 319 in #64: propose `--force`
-  only with the blockers read and the operator's yes, never as a batch.
+  security, after a dry run and an explicit yes:
+  - **FMP's row on a ticker the vendor renamed the key away from** (the usual
+    shape: 909 of 929 on 2026-11-11; MICS into RIME) →
+    `security merge <security_id> <linked_security> --across-vendors`. The guard
+    reads the vendor's rename away from the victim's ticker, the CIK and the last
+    shared prices; the survivor keeps its identifiers, and the victim's ticker
+    period is recorded in its history up to the rename (operations.md, "An FMP row
+    left on a former ticker"). A CUSIP that differs is reported, not a blocker.
+  - **Otherwise** → plain `security merge <security_id> <linked_security>`. It
+    moves the link and the history the linked row lacks, and refuses when an
+    identifier differs (a rename's new CUSIP) or the overlapping bars disagree,
+    which it did for 306 of 319 in #64: propose `--force` only with the blockers
+    read and the operator's yes, never as a batch.
+
+  Both: read the dry run's victim-only bars and actions before the yes. On
+  2026-11-11 the plain dry run of MICS showed FMP's 1995 11:10 split "already held"
+  on RIME, so the operator's 6:5 replacement was not overwritten.
 - **`key_claimed_twice`:** as above, but no claimant is live on the current ticker
   (a chain of delisted rows, usually), so none was linked. `candidates` names the
   key and `also_claimed_by`. Fold the rows, then the next `vendor link` links the

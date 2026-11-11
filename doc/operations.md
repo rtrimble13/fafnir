@@ -1336,6 +1336,52 @@ AXS fund until 2025 and a copy of Stance's. Separate those first
 `prices delete` and then `security delist` at the old issuer's end), and the fund's
 own row becomes `next = relist`. Both were done on 2026-10-24.
 
+### An FMP row left on a former ticker
+
+The same company held twice the other way round: the fed row already trades on the
+vendor's ticker, and FMP's row is left on the ticker the company was renamed away
+from, inactive, with a copy of its history. MICS and RIME are the Singing Machine
+renamed Algorhythm on 2024-09-09. `vendor link` flags the FMP row
+`vendor_xref_ambiguous` with `reason = duplicate_of_linked`, naming the fed row as
+`linked_security`: 909 of the 929 such flags on 2026-11-11 had this shape.
+
+Plain `security merge` refuses most of them: the rename's new CUSIP, and rounding on
+the shared sessions. Fold them with the same cross-vendor merge, victim first:
+
+```bash
+fafnir security merge 10114 10984 --across-vendors --dry-run
+fafnir security merge 10114 10984 --across-vendors \
+    -m "MICS renamed RIME 2024-09-09 (Sharadar 124528)" --yes
+fafnir db refresh-marts
+```
+
+- **The guard reads the vendor's ticker history.**
+  - The vendor's events must rename the fed key away from the victim's ticker
+    (`tickerchangefrom`), and the survivor must already trade on the ticker the
+    vendor lists the key as. On a chain (SMDM to MICS to RIME) the newest rename
+    away from the victim's ticker counts.
+  - Where the events date no rename but the vendor's master lists the victim's
+    ticker among the key's related tickers, `--rename-date` dates it. A
+    `--rename-date` that contradicts the events refuses.
+  - The CIK must agree (zero-padding aside). The re-mint shape's allowance for a
+    new registrant does not apply: nothing in the vendor's word says an older
+    registrant's CIK was the key's.
+  - The prices and the victim-only bars as for the re-mint shape above. "Today" is
+    the last sessions the two rows share, the end of the victim's history.
+- **The survivor keeps its own name, CUSIP, ISIN and CIK.** They are the current
+  ones; the victim's are what the company was. The dry run reports the difference.
+- **It is not relisted.** It trades on the vendor's ticker already.
+- **The victim's ticker period moves into the survivor's history.** The merge
+  deletes the victim's ticker periods with it, so the old ticker would address
+  nothing. Instead it is recorded on the survivor, from the vendor's rename into
+  that ticker (or the victim's own period start) to the day before the rename away,
+  and the survivor's open period on the vendor's ticker starts at the rename: the
+  history a rename applied in time would have left. `ticker_history` and `duk ph
+  MICS` then reach the company. The dry run prints both periods, and refuses when
+  another security already holds a period the merge would write.
+- **The run log** (operator, `security-merge-across-vendors`) records
+  `mode = former_ticker`, the rename and the periods written.
+
 ### The fundamentals flags
 
 `fafnir dq run` runs fourteen checks over the SF1 statements (#102), after the price
@@ -1478,7 +1524,7 @@ Both decisions survive the engine:
 | Flag reason | Usual decision |
 |---|---|
 | `several_agree` | Reject the share class or duplicate that is not this security; the engine links the other. Or `accept` the right one when the evidence is outside the prices (CUSIP on a filing). |
-| `duplicate_of_linked` | Another row of the linked security's issuer, usually a missed rename: fold it into `linked_security` with `security merge <security_id> <linked_security>` (dry run first). It moves the Sharadar link and any history the linked row lacks, and refuses when an identifier differs (a rename's new CUSIP) or the overlapping bars disagree: in #64 it merged 13 of 319 active duplicates and refused 306, which stay flagged. |
+| `duplicate_of_linked` | Another row of the linked security's issuer, usually a missed rename: fold it into `linked_security` with `security merge <security_id> <linked_security>` (dry run first). It moves the Sharadar link and any history the linked row lacks, and refuses when an identifier differs (a rename's new CUSIP) or the overlapping bars disagree: in #64 it merged 13 of 319 active duplicates and refused 306, which stay flagged. When the row is FMP's, left on a ticker the vendor renamed the key away from (the usual shape), use `--across-vendors` instead: [An FMP row left on a former ticker](#an-fmp-row-left-on-a-former-ticker). |
 | `key_claimed_twice` | The same, with no live claimant on the vendor's current ticker: fold the rows; the next run links the survivor. |
 | `price_disagrees` | Compare `duk -S db ph <SYM>` with `duk -S sharadar ph <SYM>`. A constant ratio is a split on one side only: fix that, then rerun. Noise means a different issuer: `reject`. |
 | `no_candidate`, `insufficient_overlap` | Nothing to accept unless you know the key from elsewhere. Then `accept` with the evidence in `-m`. |
