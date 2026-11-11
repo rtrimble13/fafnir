@@ -1374,11 +1374,15 @@ fafnir db refresh-marts
 - **The victim's ticker period moves into the survivor's history.** The merge
   deletes the victim's ticker periods with it, so the old ticker would address
   nothing. Instead it is recorded on the survivor, from the vendor's rename into
-  that ticker (or the victim's own period start) to the day before the rename away,
+  that ticker (failing that, the victim's own period start, but never before its
+  first bar: a period at the 1900 placeholder would claim a reused ticker's earlier
+  issuer's dates) to the day before the rename away,
   and the survivor's open period on the vendor's ticker starts at the rename: the
   history a rename applied in time would have left. `ticker_history` and `duk ph
   MICS` then reach the company. The dry run prints both periods, and refuses when
-  another security already holds a period the merge would write.
+  the recorded period would overlap another security's period on that ticker (CHK
+  held the old Chesapeake to 2020), or another security already starts the
+  survivor's period there.
 - **The run log** (operator, `security-merge-across-vendors`) records
   `mode = former_ticker`, the rename and the periods written.
 

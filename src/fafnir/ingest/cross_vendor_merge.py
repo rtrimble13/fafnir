@@ -75,11 +75,13 @@ What it writes differs in three ways. The survivor keeps its own name and
 identifiers: they are the current ones, and the victim's are what the company was.
 It is not relisted: it is listed on the vendor's ticker already. And the victim's
 ticker period, which the merge deletes with the victim, is recorded on the
-survivor from the vendor's rename into that ticker (or the victim's own period
-start) to the day before the rename away, with the survivor's own period on the
-vendor's ticker starting at the rename: the ticker history a rename applied in time
-would have left, so ``ticker_history`` still resolves the old ticker to the company
-on the days it traded under it.
+survivor from the vendor's rename into that ticker (failing that, the victim's own
+period start, but never before its first bar) to the day before the rename away,
+with the survivor's own period on the vendor's ticker starting at the rename: the
+ticker history a rename applied in time would have left, so ``ticker_history``
+still resolves the old ticker to the company on the days it traded under it. It
+refuses when the recorded period would overlap another security's period on that
+ticker (a reused ticker's earlier issuer).
 """
 
 from __future__ import annotations
@@ -494,10 +496,8 @@ def _plan_former_ticker(
         (survivor_id, victim_symbol),
     )
     if not held:
-        start = entered_on(events, victim_symbol, day) or db.fetchval(
-            "SELECT min(valid_from) FROM core.symbol_xref "
-            "WHERE security_id = %s AND symbol = %s",
-            (base.victim_id, victim_symbol),
+        start = entered_on(events, victim_symbol, day) or _victim_period_start(
+            db, base.victim_id, victim_symbol
         )
         end = day - timedelta(days=1)
         if start is None or start > end:
@@ -507,15 +507,26 @@ def _plan_former_ticker(
             )
         else:
             period = (victim_symbol, start, end)
-            other = db.fetchval(
-                "SELECT security_id FROM core.symbol_xref "
-                "WHERE symbol = %s AND valid_from = %s AND security_id <> %s",
-                (victim_symbol, start, base.victim_id),
+            # Any other security's period on the ticker that the recorded one
+            # would overlap, not only one starting the same day: a reused ticker's
+            # earlier issuer (CHK, the old Chesapeake, to 2020) must keep its
+            # dates to itself, or point-in-time resolution finds two securities.
+            other = db.fetchone(
+                """
+                SELECT security_id, valid_from, valid_to FROM core.symbol_xref
+                 WHERE symbol = %s AND security_id <> %s
+                   AND valid_from <= %s
+                   AND COALESCE(valid_to, 'infinity'::date) >= %s
+                 ORDER BY valid_from LIMIT 1
+                """,
+                (victim_symbol, base.victim_id, end, start),
             )
             if other is not None:
                 blockers.append(
-                    f"security {other} holds a {victim_symbol} period from {start} "
-                    "already: the victim's cannot be recorded on the survivor"
+                    f"security {other['security_id']} holds a {victim_symbol} period "
+                    f"from {other['valid_from']} to {other['valid_to'] or 'open'}, "
+                    f"which the victim's {start}..{end} would overlap: the victim's "
+                    "cannot be recorded on the survivor"
                 )
 
     # The survivor's period on the vendor's ticker starts at the rename, where the
@@ -610,6 +621,22 @@ def apply_cross_vendor_merge(
 def _already(plan) -> bool:
     """The survivor trades on the vendor's ticker already: nothing to relist."""
     return bool(plan.active_before) and plan.symbol == plan.vendor_ticker
+
+
+def _victim_period_start(db: Database, victim_id: int, symbol: str) -> Optional[date]:
+    """Where the victim's ticker period begins when the vendor's events date no
+    rename into it: the victim's own period start, but never before its first bar.
+    A period at the 1900 placeholder claims every earlier issuer of a reused
+    ticker's dates; the victim's bars are the earliest date the row is evidence
+    for."""
+    own = db.fetchval(
+        "SELECT min(valid_from) FROM core.symbol_xref "
+        "WHERE security_id = %s AND symbol = %s",
+        (victim_id, symbol),
+    )
+    first_bar, _ = repo.security_bar_span(db, victim_id)
+    candidates = [d for d in (own, first_bar) if d is not None]
+    return max(candidates) if candidates else None
 
 
 def _carry_former_ticker(
