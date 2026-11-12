@@ -75,3 +75,14 @@ def test_entered_on_is_the_rename_into_the_ticker_before_the_rename_away():
     assert cvm.entered_on(CHAIN, "ZZANC", date(2022, 5, 24)) is None
     # A rename into the ticker after the date does not bound an earlier period.
     assert cvm.entered_on(CHAIN, "ZZOLD", date(2022, 5, 24)) is None
+
+
+def test_a_wrapped_hint_never_splits_a_flag(capsys, monkeypatch):
+    """The CLI's prose lines name flags; textwrap's default breaks at hyphens."""
+    from fafnir import cli
+
+    monkeypatch.setattr(cli, "_terminal_width", lambda: 40)
+    cli._echo_wrapped(
+        "if the vendor carries an older registrant, --registrant-changed says so"
+    )
+    assert "--registrant-changed" in capsys.readouterr().out

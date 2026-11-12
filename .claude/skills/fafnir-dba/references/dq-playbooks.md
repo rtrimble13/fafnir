@@ -1273,7 +1273,9 @@ Warn. `fafnir vendor link` could not choose. `detail.reason`:
     reads the vendor's rename away from the victim's ticker, the CIK and the last
     shared prices; the survivor keeps its identifiers, and the victim's ticker
     period is recorded in its history up to the rename (operations.md, "An FMP row
-    left on a former ticker"). A CUSIP that differs is reported, not a blocker.
+    left on a former ticker"). A CUSIP that differs is reported, not a blocker; a
+    delisted key is fine. A CIK that differs (a SPAC and the company it became)
+    needs `--registrant-changed`, which is the operator's decision, not yours.
   - **Otherwise** → plain `security merge <security_id> <linked_security>`. It
     moves the link and the history the linked row lacks, and refuses when an
     identifier differs (a rename's new CUSIP) or the overlapping bars disagree,

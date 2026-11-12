@@ -1365,7 +1365,13 @@ fafnir db refresh-marts
     `--rename-date` that contradicts the events refuses.
   - The CIK must agree (zero-padding aside). The re-mint shape's allowance for a
     new registrant does not apply: nothing in the vendor's word says an older
-    registrant's CIK was the key's.
+    registrant's CIK was the key's. Where you know it was, a SPAC before its merger
+    (AGC into GRAB), `--registrant-changed` says so: the difference is then reported,
+    not a blocker, where the vendor gives the key the survivor's CIK. It puts the
+    SPAC's pre-merger trading on the operating company's row, as the vendor carries
+    it; decide that before passing it.
+  - A delisted key does not refuse: the survivor is folded into as it stands, dead
+    or alive, and nothing is relisted (the re-mint shape still refuses one).
   - The prices and the victim-only bars as for the re-mint shape above. "Today" is
     the last sessions the two rows share, the end of the victim's history.
 - **The survivor keeps its own name, CUSIP, ISIN and CIK.** They are the current

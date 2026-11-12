@@ -2244,6 +2244,13 @@ def security_dedupe(ctx, symbol, limit, note, resolved_by, dry_run, yes):
     "do not join the survivor's series (another scale).",
 )
 @click.option(
+    "--registrant-changed",
+    is_flag=True,
+    help="With --across-vendors, for a victim on a former ticker: the vendor carries "
+    "the victim's older registrant under the fed key (a SPAC before its merger), so "
+    "the victim's CIK may differ where the vendor gives the key the survivor's.",
+)
+@click.option(
     "--rename-date",
     metavar="YYYY-MM-DD",
     help="With --across-vendors: date the rename the vendor's events do not -- the "
@@ -2262,6 +2269,7 @@ def security_merge(
     force,
     across_vendors,
     unjoined,
+    registrant_changed,
     rename_date,
 ):
     """Fold one security row into another, by id, when both are one instrument.
@@ -2331,11 +2339,12 @@ def security_merge(
             yes=yes,
             unjoined=unjoined,
             rename_date=_parse_date(rename_date) if rename_date else None,
+            registrant_changed=registrant_changed,
         )
         return
-    if unjoined != "refuse" or rename_date:
+    if unjoined != "refuse" or rename_date or registrant_changed:
         raise click.ClickException(
-            "--unjoined and --rename-date need --across-vendors."
+            "--unjoined, --rename-date and --registrant-changed need --across-vendors."
         )
 
     with Database(ctx.obj["config"].dsn) as database:
@@ -2532,6 +2541,8 @@ def _echo_cross_vendor_plan(plan) -> None:
             )
     for line in plan.identifier_notes:
         click.echo(f"Identifier differs (reported, not a blocker): {line}")
+    for line in plan.remarks:
+        click.echo(f"Note     : {line}")
     if plan.recent_sessions:
         click.echo(
             f"Today    : {plan.recent_agree} of the last {plan.recent_sessions} shared "
@@ -2575,7 +2586,17 @@ def _echo_cross_vendor_plan(plan) -> None:
 
 
 def _security_merge_across_vendors(
-    ctx, *, victim_id, survivor_id, note, by, dry_run, yes, unjoined, rename_date
+    ctx,
+    *,
+    victim_id,
+    survivor_id,
+    note,
+    by,
+    dry_run,
+    yes,
+    unjoined,
+    rename_date,
+    registrant_changed=False,
 ):
     from fafnir.db import repository as repo
     from fafnir.ingest import cross_vendor_merge as cvm
@@ -2598,6 +2619,7 @@ def _security_merge_across_vendors(
             survivor_id=survivor_id,
             unjoined=unjoined,
             rename_date=rename_date,
+            registrant_changed=registrant_changed,
         )
         _echo_cross_vendor_plan(plan)
         if plan.blockers:
@@ -2672,6 +2694,8 @@ def _security_merge_across_vendors(
                 "by": by,
                 "mode": plan.mode,
                 "unjoined": unjoined,
+                "registrant_changed": registrant_changed,
+                "remarks": plan.remarks,
                 "overlap": {
                     "shared": plan.base.shared_days,
                     "identical": plan.same,
@@ -8151,10 +8175,15 @@ def _echo_table(headers, rows, right=()):
 
 
 def _echo_wrapped(text: str) -> None:
-    """A prose line (a caveat, a hint) folded to the terminal, not run off it."""
+    """A prose line (a caveat, a hint) folded to the terminal, not run off it.
+
+    Never at a hyphen: the lines name flags (``--registrant-changed``) and dates,
+    and a flag split across two lines cannot be copied."""
     import textwrap
 
-    click.echo(textwrap.fill(text, width=min(_terminal_width(), 88)))
+    click.echo(
+        textwrap.fill(text, width=min(_terminal_width(), 88), break_on_hyphens=False)
+    )
 
 
 def _plural(count: int, noun: str, plural: Optional[str] = None) -> str:

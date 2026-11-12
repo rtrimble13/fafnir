@@ -442,6 +442,7 @@ def _former_pair(
     survivor_symbol="ZZNEW",
     victim_cik="0000123456",
     vendor_cik=None,
+    dead=False,
 ):
     """The fed ZZNEW, on the vendor's ticker since the rename, and FMP's ZZOLD,
     delisted at it. ZZOLD holds a prefix ZZNEW lacks and shares its sessions to
@@ -450,8 +451,8 @@ def _former_pair(
         "INSERT INTO core.vendor_security (vendor, vendor_table, vendor_key, ticker, "
         "name, category, exchange, is_delisted, first_price_date, last_price_date, "
         "cik, related_tickers) VALUES ('sharadar', 'stocks', %s, 'ZZNEW', 'ZZ CORP', "
-        "'Domestic Common Stock', 'NYSE', false, %s, %s, %s, %s)",
-        (FKEY, FIRST, LAST, vendor_cik, list(related) if related else None),
+        "'Domestic Common Stock', 'NYSE', %s, %s, %s, %s, %s)",
+        (FKEY, dead, FIRST, LAST, vendor_cik, list(related) if related else None),
     )
     renames = []
     if took:
@@ -466,7 +467,13 @@ def _former_pair(
                 "VALUES ('sharadar', %s, %s, %s, 'ZZNEW', %s, 'N/A')",
                 (FKEY, day, action, contra),
             )
-    survivor = _security(db, survivor_symbol, active=True, cusip="333333333")
+    survivor = _security(
+        db,
+        survivor_symbol,
+        active=not dead,
+        cusip="333333333",
+        delisted=LAST if dead else None,
+    )
     repo.insert_vendor_link(
         db,
         security_id=survivor,
@@ -730,3 +737,83 @@ def test_the_former_ticker_guard_refuses(db, run_cli, case, blocker):
     assert blocker in _flat(out), out.output
     assert "Nothing was changed." in out.output
     assert _row(db, victim) is not None and _row(db, survivor) is not None
+
+
+def test_a_dead_company_on_a_former_ticker_merges(db, run_cli):
+    """A delisted key refuses a re-mint, which would be relisted on it; a victim on
+    a former ticker is folded into the fed row as it stands (VBLT into NTBL)."""
+    survivor, victim = _former_pair(db, dead=True)
+    out = run_cli(victim, survivor, "--across-vendors", "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert (
+        f"Note : sharadar lists {FKEY} as delisted: the survivor is folded into as "
+        "it stands, and nothing is relisted"
+    ) in _flat(out)
+    out = run_cli(victim, survivor, "--across-vendors", "-m", "dead company", "--yes")
+    assert out.exit_code == 0, out.output
+    assert _row(db, victim) is None
+    row = _row(db, survivor)
+    assert (row["is_actively_trading"], row["delisted_date"]) == (False, LAST)
+    assert ("ZZOLD", TOOK, RENAMED - timedelta(days=1)) in _periods(db, survivor)
+    run = db.fetchone(
+        "SELECT params FROM ops.ingestion_run WHERE endpoint = "
+        "'security-merge-across-vendors'"
+    )
+    assert run["params"]["remarks"]
+
+
+def test_a_delisted_key_still_refuses_a_re_mint(db, run_cli):
+    shell, victim = _pair(db)
+    db.execute(
+        "UPDATE core.vendor_security SET is_delisted = true WHERE vendor_key = %s",
+        (KEY,),
+    )
+    out = run_cli(victim, shell, "--across-vendors", "--yes")
+    assert out.exit_code != 0
+    assert f"sharadar lists {KEY} as delisted" in _flat(out), out.output
+    assert _row(db, victim) is not None
+
+
+def test_registrant_changed_lets_an_older_cik_fold_where_the_vendor_gives_the_new(
+    db, run_cli
+):
+    """A SPAC and the company it became (AGC into GRAB): one vendor key, two
+    registrants. The operator's --registrant-changed allows the difference only
+    where the vendor gives the key the survivor's CIK."""
+    survivor, victim = _former_pair(
+        db, victim_cik="0000999999", vendor_cik="0000123456"
+    )
+    out = run_cli(victim, survivor, "--across-vendors", "--yes")
+    assert out.exit_code != 0
+    text = _flat(out)
+    assert "cik differs" in text and "--registrant-changed says so" in text
+    assert _row(db, victim) is not None
+    out = run_cli(victim, survivor, "--across-vendors", "--registrant-changed", "--yes")
+    assert out.exit_code == 0, out.output
+    assert "the operator says it carries the victim's older registrant" in _flat(out)
+    assert _row(db, victim) is None
+    # The survivor keeps its own, current CIK.
+    assert _row(db, survivor)["cik"] == "0000123456"
+    run = db.fetchone(
+        "SELECT params FROM ops.ingestion_run WHERE endpoint = "
+        "'security-merge-across-vendors'"
+    )
+    assert run["params"]["registrant_changed"] is True
+
+
+def test_registrant_changed_does_not_lift_a_cik_the_vendor_gives_the_victim(
+    db, run_cli
+):
+    survivor, victim = _former_pair(
+        db, victim_cik="0000999999", vendor_cik="0000999999"
+    )
+    out = run_cli(victim, survivor, "--across-vendors", "--registrant-changed", "--yes")
+    assert out.exit_code != 0
+    assert "cik differs" in _flat(out), out.output
+    assert _row(db, victim) is not None
+
+
+def test_registrant_changed_needs_across_vendors(db, run_cli):
+    survivor, victim = _former_pair(db)
+    out = run_cli(victim, survivor, "--registrant-changed", "--dry-run")
+    assert out.exit_code != 0 and "need --across-vendors" in out.output
