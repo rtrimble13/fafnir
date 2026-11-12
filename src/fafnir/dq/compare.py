@@ -26,6 +26,10 @@ night, over 20 sessions. A night's comparison measures all three:
   * **New flags per night.** The conditions in this night's file that the
     previous night's did not hold, against the SQL flags written between the two
     runs. The cutover bar is 70% fewer.
+  * **Recall on confirmed errors.** With labels, of the ``data_error`` labels on
+    one security about the window (scoped as precision is), how many dorq
+    reported at warn and above, and how many the SQL checks flagged: most SQL
+    outlier flags are real moves, so recall over them understates dorq.
   * **Precision.** Against the labels (`fafnir dq export-labels`, or the
     warehouse's own with ``--labels-from-db``), the share of dorq's reports that
     were right (``right / judged``, strict) and that were *some* fault
@@ -428,6 +432,47 @@ class Precision:
 
 
 @dataclass
+class Recall:
+    """Confirmed errors, and how many each engine found: with a code the label
+    expects (``dorq``, ``sql``), or with any code (``dorq_any``, ``sql_any``).
+    Shared by the bars comparison and the statements'
+    (:mod:`fafnir.dq.compare_statements`)."""
+
+    labels: int = 0
+    dorq: int = 0
+    dorq_any: int = 0
+    sql: int = 0
+    sql_any: int = 0
+
+    def add(self, dorq: bool, dorq_any: bool, sql: bool, sql_any: bool) -> None:
+        self.labels += 1
+        self.dorq += dorq
+        self.dorq_any += dorq_any
+        self.sql += sql
+        self.sql_any += sql_any
+
+    def _of(self, n: int) -> Optional[float]:
+        return n / self.labels if self.labels else None
+
+    def as_dict(self) -> dict:
+        return {
+            "labels": self.labels,
+            "dorq": {
+                "found": self.dorq,
+                "any": self.dorq_any,
+                "recall": self._of(self.dorq),
+                "recall_any": self._of(self.dorq_any),
+            },
+            "sql": {
+                "found": self.sql,
+                "any": self.sql_any,
+                "recall": self._of(self.sql),
+                "recall_any": self._of(self.sql_any),
+            },
+        }
+
+
+@dataclass
 class Comparison:
     shadow_file: str
     window_from: Optional[dt.date]
@@ -461,6 +506,10 @@ class Comparison:
     labels_time_scoped: bool = False
     labels_verified_only: bool = False
     labels_used: int = 0
+    # recall on the confirmed errors in the window, both engines'; and by the
+    # label's kind (where the confirmation came from)
+    recall: Recall = field(default_factory=Recall)
+    recall_by_kind: dict[str, Recall] = field(default_factory=dict)
     dorq_eval: Optional[dict] = None
     # the night's conditions, and each one's outcome against the labels, for the
     # all-nights summary (not in as_dict)
@@ -500,6 +549,14 @@ class Comparison:
                     "labels": self.labels_used,
                     "time_scoped": self.labels_time_scoped,
                     "verified_only": self.labels_verified_only,
+                }
+                if self.labelled
+                else None
+            ),
+            "recall": (
+                {
+                    **self.recall.as_dict(),
+                    "by_kind": {k: v.as_dict() for k, v in self.recall_by_kind.items()},
                 }
                 if self.labelled
                 else None
@@ -691,6 +748,98 @@ def _sql_new_flags(
     )
 
 
+def _sql_flags_found(
+    db: Database, state_at: Optional[dt.datetime], securities: Sequence[int]
+) -> list[dict]:
+    """Every flag of the SQL checks dorq is to replace on ``securities``, at warn
+    and above, detected by ``state_at`` (now when None), open or closed: what the
+    SQL checks found. Dated as the comparison dates them (``d``)."""
+    if not securities:
+        return []
+    return db.fetchall(
+        _FLAGS_CTE + """
+        SELECT f.check_name, f.security_id, f.d
+          FROM f
+         WHERE f.security_id = ANY(%(sids)s)
+           AND f.severity IN ('warn', 'error')
+           AND f.d IS NOT NULL
+        """,
+        {"checks": list(SUCCESSORS), "t": state_at, "sids": list(securities)},
+    )
+
+
+def _sql_code_expected(check: str, lab: "Label") -> bool:
+    """Whether an SQL flag of ``check`` names a fault the label expects: one of its
+    successor codes is one the label expects (or it expects none)."""
+    return not lab.expect or any(
+        code.startswith(SUCCESSORS[check]) for code in lab.expect
+    )
+
+
+def label_recall(
+    db: Database,
+    out: "Comparison",
+    used: Sequence[Label],
+    by_security: dict[int, list[Report]],
+    *,
+    lo: Optional[dt.date],
+    hi: Optional[dt.date],
+    backfilled: Sequence[int],
+    slack_days: int,
+) -> None:
+    """Both engines' recall on the confirmed errors among ``used``: the
+    ``data_error`` labels on one security about the night's window (``lo`` to
+    ``hi``, within the slack), or on a security whose whole history the run
+    judged. ``used`` is the labels precision judges by (time-scoped, verified
+    only), so recall is scoped exactly as precision is.
+
+    dorq found one when a report at warn and above on it overlaps it as precision
+    matches a report to a label (:func:`_overlaps`); the SQL checks, when a flag of
+    theirs at warn and above on its security, open or closed, detected by the
+    run's start, is dated within the label's dates and the slack. ``found`` needs a
+    code the label expects (an SQL flag: one of its check's successor codes);
+    ``any`` takes any code.
+
+    The recall over the ``holding`` SQL flags measures dorq against the SQL
+    checks, most of whose outlier flags are real moves; this measures both against
+    the faults that were confirmed.
+    """
+    slack = dt.timedelta(days=slack_days)
+    backfill = set(backfilled)
+
+    def in_night(lab: Label) -> bool:
+        if int(lab.series) in backfill or lo is None or hi is None:
+            return True
+        return lab.first <= hi + slack and lo - slack <= lab.last
+
+    errors = [
+        lab
+        for lab in used
+        if lab.label_class == "data_error" and lab.series.isdigit() and in_night(lab)
+    ]
+    sids = sorted({int(lab.series) for lab in errors})
+    flags: dict[int, list[dict]] = {}
+    for f in _sql_flags_found(db, out.state_at, sids):
+        flags.setdefault(int(f["security_id"]), []).append(f)
+    for lab in errors:
+        sid = int(lab.series)
+        dorq = dorq_any = False
+        for r in by_security.get(sid, ()):
+            if r.severity in ("warn", "error") and _overlaps(r, lab, slack_days):
+                dorq_any = True
+                dorq = dorq or not lab.expect or r.code in lab.expect
+        sql = sql_any = False
+        for f in flags.get(sid, ()):
+            if lab.first - slack <= f["d"] <= lab.last + slack:
+                sql_any = True
+                sql = sql or _sql_code_expected(f["check_name"], lab)
+        out.recall.add(dorq, dorq_any, sql, sql_any)
+        out.recall_by_kind.setdefault(lab.kind or "?", Recall()).add(
+            dorq, dorq_any, sql, sql_any
+        )
+    out.recall_by_kind = dict(sorted(out.recall_by_kind.items()))
+
+
 # ---------------------------------------------------------------------------
 # The night
 # ---------------------------------------------------------------------------
@@ -808,6 +957,8 @@ def compare(
         out.labels_time_scoped = not labels_ignore_time and state_at is not None
         out.labels_verified_only = verified_only
         index = LabelIndex(used)
+    else:
+        used = []
     by_security: dict[int, list[Report]] = {}
     for r in reports:
         for sid in r.securities:
@@ -869,6 +1020,18 @@ def compare(
                 )
             ),
         }
+
+    if index is not None:
+        label_recall(
+            db,
+            out,
+            used,
+            by_security,
+            lo=window_from,
+            hi=window_to,
+            backfilled=backfilled,
+            slack_days=slack_days,
+        )
 
     out.new_per_night = _new_per_night(
         db, shadow_file, reports, as_of, state_at, backfill
@@ -1262,6 +1425,28 @@ def format_comparison(c: Comparison) -> str:
             "  strict = right / judged; fault = (right + other fault) / judged."
         )
         lines.append("  Cutover needs 0.85 at warn+ and 0.95 at error (dorq plan §8).")
+        rc = c.recall
+        lines += [
+            "",
+            f"Recall at warn+ on confirmed errors ({rc.labels}: the data_error labels"
+            " on one security in the window, both engines' confirmations):",
+        ]
+        for name, found, any_ in (
+            ("dorq", rc.dorq, rc.dorq_any),
+            ("SQL checks", rc.sql, rc.sql_any),
+        ):
+            lines.append(
+                f"  {name:<11} found {share(found, rc.labels).strip():<12}"
+                f" with any code {share(any_, rc.labels).strip()}"
+            )
+        lines.append(
+            "  The holding recall above counts SQL flags, most outliers real moves;"
+            " this counts faults."
+        )
+        if c.recall_by_kind:
+            lines.append("  by label kind                labels   dorq    SQL")
+            for kind, k in c.recall_by_kind.items():
+                lines.append(f"    {kind:<27} {k.labels:>6} {k.dorq:>6} {k.sql:>6}")
     if c.dorq_eval is not None:
         lines += ["", "dorq-eval on the same night and labels:"]
         if "error" in c.dorq_eval:

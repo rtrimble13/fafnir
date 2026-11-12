@@ -984,3 +984,172 @@ def test_dorq_eval_is_run_on_the_same_night_and_labels(db, tmp_path, right, agre
         assert "DISAGREES" in text and "DQ201: compare 1/0/0, dorq-eval 0/0/0" in text
     broken = cmp.run_dorq_eval(str(tmp_path / "missing"), shadow, labels, None)
     assert "error" in broken
+
+
+# ---------------------------------------------------------------------------
+# Recall on confirmed errors
+# ---------------------------------------------------------------------------
+#
+# Recall over the holding SQL flags understates dorq: most SQL outlier flags are
+# real moves (201 of 247 in the 2026-11-11 window were closed, most accepted as
+# market facts), and dorq staying silent on them is right. Recall is also measured
+# on the data_error labels about the window, for both engines.
+
+
+class _FlagsDb:
+    """Answers label_recall's one query: the SQL flags found on the securities."""
+
+    def __init__(self, flags):
+        self.flags = flags
+        self.asked = []
+
+    def fetchall(self, query, params):
+        self.asked.append(params)
+        return [f for f in self.flags if f["security_id"] in params["sids"]]
+
+
+def _error(sid, first, last=None, expect="DQ201", kind="bar_deleted"):
+    return {
+        "series": str(sid),
+        "first": first,
+        "last": last or first,
+        "class": "data_error",
+        "expect": expect,
+        "kind": kind,
+    }
+
+
+def _recall(tmp_path, reports, labels, flags, *, backfilled=()):
+    c = cmp.Comparison(
+        shadow_file="x.jsonl",
+        window_from=dt.date(2024, 3, 4),
+        window_to=dt.date(2024, 3, 8),
+        dorq_reports=len(reports),
+        labelled=True,
+    )
+    by_security = {}
+    for r in (cmp.Report.of(x) for x in reports):
+        for sid in r.securities:
+            by_security.setdefault(sid, []).append(r)
+    db = _FlagsDb(flags)
+    cmp.label_recall(
+        db,
+        c,
+        _labels(tmp_path, *labels),
+        by_security,
+        lo=c.window_from,
+        hi=c.window_to,
+        backfilled=list(backfilled),
+        slack_days=3,
+    )
+    return c, db
+
+
+def _sqlf(sid, check, day):
+    return {"check_name": check, "security_id": sid, "d": dt.date.fromisoformat(day)}
+
+
+def test_recall_on_confirmed_errors_counts_both_engines(tmp_path):
+    c, db = _recall(
+        tmp_path,
+        [
+            _row(1, "2024-03-05"),  # dorq finds sid 1's bad print, with its code
+            _row(2, "2024-03-06", code="DQ202", check="dorq_scale_shift"),
+            _row(3, "2024-03-06", severity="info"),  # below warn: not found
+        ],
+        [
+            _error(1, "2024-03-05"),
+            _error(2, "2024-03-06"),  # DQ201 expected; dorq said DQ202
+            _error(3, "2024-03-06"),
+            _error(4, "2024-03-07", expect="DQ304", kind="stated"),
+        ],
+        [
+            _sqlf(1, "outlier", "2024-03-05"),  # outlier's successors take DQ201
+            _sqlf(4, "gap", "2024-03-08"),  # a gap is no stale feed: any code only
+            _sqlf(5, "outlier", "2024-03-05"),  # no label on 5: never asked about
+        ],
+    )
+    r = c.recall
+    assert r.labels == 4
+    assert (r.dorq, r.dorq_any) == (1, 2)
+    assert (r.sql, r.sql_any) == (1, 2)
+    assert db.asked[0]["sids"] == [1, 2, 3, 4]
+    assert set(c.recall_by_kind) == {"bar_deleted", "stated"}
+    assert c.recall_by_kind["stated"].sql_any == 1
+    d = c.as_dict()["recall"]
+    assert d["labels"] == 4 and d["dorq"]["recall"] == 0.25
+    assert d["sql"]["recall_any"] == 0.5 and "by_kind" in d
+
+
+def test_recall_counts_only_the_confirmed_errors_about_the_window(tmp_path):
+    c, _ = _recall(
+        tmp_path,
+        [_row(1, "2024-03-05"), _row(6, "2023-01-10")],
+        [
+            _error(1, "2024-03-05"),
+            _error(1, "2024-01-02"),  # long before the window
+            _error(1, "2024-03-10"),  # after it, but within the slack: counted
+            _error(6, "2023-01-10"),  # before it, on a backfilled security
+            {"series": "1", "date": "2024-03-05", "class": "market_fact"},
+            {"series": "*", "date": "2024-03-05", "class": "data_error"},
+            {**_error(1, "2024-03-05"), "class": "context_gap"},
+        ],
+        [],
+        backfilled=[6],
+    )
+    assert c.recall.labels == 3
+    assert c.recall.dorq == 2  # 1's in-window error, and 6's history
+
+
+def test_the_text_and_json_carry_recall_on_confirmed_errors(tmp_path):
+    c, _ = _recall(
+        tmp_path,
+        [_row(1, "2024-03-05")],
+        [_error(1, "2024-03-05"), _error(2, "2024-03-05")],
+        [_sqlf(2, "outlier", "2024-03-05")],
+    )
+    text = cmp.format_comparison(c)
+    assert "Recall at warn+ on confirmed errors (2:" in text
+    assert "dorq        found 1 (50%)" in text
+    assert "SQL checks  found 1 (50%)" in text
+    unlabelled = cmp.Comparison(
+        shadow_file="x", window_from=None, window_to=None, dorq_reports=0
+    )
+    assert unlabelled.as_dict()["recall"] is None
+    assert "confirmed errors" not in cmp.format_comparison(unlabelled)
+
+
+@pytest.mark.integration
+def test_compare_measures_recall_on_confirmed_errors_as_precision_is_scoped(
+    db, tmp_path
+):
+    """The labels are those precision uses: time-scoped to the run's start and,
+    with --verified-only, verified. The SQL flags are those detected by then."""
+    found = _mk(db, "CMPR1")
+    missed = _mk(db, "CMPR2")
+    _run_row(db, "2024-03-08", "2024-03-04", started="2024-03-09 04:00+00")
+    _flag(db, missed, "outlier", {"trade_date": "2024-03-06"})
+    _flag(
+        db,
+        found,
+        "outlier",
+        {"trade_date": "2024-03-05"},
+        detected="2024-03-10 00:00+00",  # after the run: the night could not see it
+    )
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow([_row(found, "2024-03-05")], shadow)
+    labels = _labels(
+        tmp_path,
+        {**_error(found, "2024-03-05"), "verified": True},
+        _error(missed, "2024-03-06"),
+        # Repaired before the night ran: the night read the corrected bars.
+        {**_error(missed, "2024-03-07"), "applies_until": "2024-03-08T12:00:00+00:00"},
+    )
+    c = cmp.compare(db, shadow, labels=labels)
+    assert c.recall.labels == 2
+    assert (c.recall.dorq, c.recall.sql) == (1, 1)
+    c = cmp.compare(db, shadow, labels=labels, verified_only=True)
+    assert c.recall.labels == 1
+    assert (c.recall.dorq, c.recall.sql) == (1, 0)
+    c = cmp.compare(db, shadow, labels=labels, labels_ignore_time=True)
+    assert c.recall.labels == 3

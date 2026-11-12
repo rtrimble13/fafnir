@@ -425,6 +425,34 @@ are several nights, with a summary over their distinct conditions at the end; wi
   --format csv`, so compare writes the night in that shape. Its "warn" row is
   warn only (compare's is warn and above), and it reads no `members`, so a
   cohort fact can differ.
+- **Recall on confirmed errors.** With labels, compare measures both engines
+  against the faults that were confirmed, not only dorq against the SQL flags.
+  The confirmed errors are the `data_error` labels on one security that are about
+  the night: their dates overlap the window within the slack, or they are on a
+  security the night backfilled. They are scoped exactly as precision is: those
+  that applied when the run started, and with `--verified-only`, those verified.
+  On each, compare asks:
+  - **dorq:** is a report at warn and above on it, matched as precision matches?
+  - **The SQL checks:** is an `outlier`, `gap` or `stale` flag on its security,
+    open or closed, detected by the run's start, dated within the label's dates
+    and the slack?
+
+  `found` needs a code the label expects. For an SQL flag, that is one of its
+  check's successor codes, as in the overlap table. `any` takes any code. A table
+  by the label's kind shows where the confirmations came from. The labels pool
+  both engines' confirmations (repairs made on SQL flags, verdicts stated on
+  dorq's reports), so neither engine's recall is 1 by construction. This
+  mirrors the statements' recall. In `--json` it is `recall` (`labels`, `dorq`
+  and `sql`, each with `found`, `any`, `recall` and `recall_any`, and
+  `by_kind`). A summary over several nights does not carry it.
+
+  **Why it exists.** The holding recall above is measured on the SQL flags, and
+  most SQL `outlier` flags are real moves. Of the 247 in the 2026-11-11 night's
+  window, 201 were closed, most accepted as market facts. dorq staying silent on
+  those is right, and the holding recall counts it as a miss (14-22% on the
+  November nights). This line asks the question the bar's recall clause is after:
+  of the faults that were real, how many each engine reported. The bar's text
+  below is unchanged; read its recall clause against both lines.
 
 dorq plan §8 sets the cutover bar:
 - precision of 0.85 or better at warn, and 0.95 or better at error;

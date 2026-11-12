@@ -58,6 +58,7 @@ from fafnir.dq.compare import (
     NEW_FLAGS_BAR,
     Label,
     Precision,
+    Recall,
     _date,
     applicable,
     statement_name,
@@ -66,45 +67,6 @@ from fafnir.dq.compare import (
 #: The bar for the standing count at warn and above: dorq's at most this share of
 #: the SQL checks' (plan §6).
 STANDING_BAR = 0.30
-
-
-@dataclass
-class Recall:
-    """Confirmed errors, and how many each engine found: with a code the label
-    expects (``dorq``, ``sql``), or with any code (``dorq_any``, ``sql_any``)."""
-
-    labels: int = 0
-    dorq: int = 0
-    dorq_any: int = 0
-    sql: int = 0
-    sql_any: int = 0
-
-    def add(self, dorq: bool, dorq_any: bool, sql: bool, sql_any: bool) -> None:
-        self.labels += 1
-        self.dorq += dorq
-        self.dorq_any += dorq_any
-        self.sql += sql
-        self.sql_any += sql_any
-
-    def _of(self, n: int) -> Optional[float]:
-        return n / self.labels if self.labels else None
-
-    def as_dict(self) -> dict:
-        return {
-            "labels": self.labels,
-            "dorq": {
-                "found": self.dorq,
-                "any": self.dorq_any,
-                "recall": self._of(self.dorq),
-                "recall_any": self._of(self.dorq_any),
-            },
-            "sql": {
-                "found": self.sql,
-                "any": self.sql_any,
-                "recall": self._of(self.sql),
-                "recall_any": self._of(self.sql_any),
-            },
-        }
 
 
 @dataclass(frozen=True)
