@@ -176,3 +176,61 @@ def test_the_text_says_what_the_queue_would_take():
     assert "as written to the queue: dorq 2 (-80%)" in text
     d = c.as_dict()
     assert d["withheld"] == 5 and d["standing"]["written"]["dorq"] == 4
+
+
+def test_carrying_holds_to_the_sql_checks_own_condition():
+    """covers() matches loosely for the compare; a carry withholds a write, so it
+    is held to the condition the SQL check itself keys."""
+    # A restated version that still fails is a new condition.
+    v1 = _flag(
+        "fundamentals_negative_impossible",
+        {**PERIOD, "version_no": 1, "statement": "income"},
+        table="core.income_statement",
+        detail={"revenue": -5},
+    )
+
+    def neg(version):
+        return _r(
+            _report(
+                code="DQ902",
+                check="dorq_negative_impossible",
+                statement="income",
+                item="revenue",
+                key={"version_no": version},
+            )
+        )
+
+    assert cst.accepted_covers(v1, neg(1))
+    assert not cst.accepted_covers(v1, neg(3))
+    # A stale flag is about its latest period: a later filing is a new occurrence.
+    stale = _flag(
+        "fundamentals_stale",
+        {"latest_fiscal_date": "2022-12-31"},
+        table="core.income_statement",
+    )
+
+    def dq942(fiscal):
+        return _r(_report(fiscal=fiscal, code="DQ942", check="dorq_stale_filing"))
+
+    assert cst.accepted_covers(stale, dq942("2022-12-31"))
+    assert not cst.accepted_covers(stale, dq942("2025-06-30"))
+    # A broken trailing four is the income statement's: no verdict on a cash flow
+    # gap the year before.
+    ttm = _flag(
+        "fundamentals_ttm_incomplete",
+        {"fiscal_year": 2024},
+        table="core.income_statement",
+    )
+
+    def dq941(statement):
+        return _r(
+            _report(
+                fiscal="2023-09-30",
+                code="DQ941",
+                check="dorq_period_gap",
+                statement=statement,
+            )
+        )
+
+    assert cst.accepted_covers(ttm, dq941("income"))
+    assert not cst.accepted_covers(ttm, dq941("cash_flow"))

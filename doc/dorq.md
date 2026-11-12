@@ -801,7 +801,13 @@ fafnir dq run --no-statements             # this run without them
    checks whose flag names several items of its period, `fundamentals_suspicious_zero`
    and `fundamentals_negative_impossible`: it covers a report on one of those items,
    or any report when it names none. A report on another item, or on the whole row,
-   is written. A shadow night withholds nothing: its file is dorq's whole view, and
+   is written. A carry withholds a write, so it is held to the SQL check's own
+   condition where the overlap's rule is looser: a flag keyed on a `version_no`
+   carries only that version (a restated version that still fails is a new
+   condition), a `fundamentals_stale` flag only a report on its
+   `latest_fiscal_date` (a later filing is a new occurrence), and a
+   `fundamentals_ttm_incomplete` flag only an income statement report. A shadow
+   night withholds nothing: its file is dorq's whole view, and
    `dq compare --statements` counts what the queue would take. A finding on no one statement goes under
    `core.income_statement`, as the SQL checks file theirs: DQ943 (statements missing)
    and DQ951's cohorts. A date can hold two DQ951 cohorts: the series revised that

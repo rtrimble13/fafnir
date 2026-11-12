@@ -226,11 +226,34 @@ def accepted_covers(flag: dict, r: StatementReport) -> bool:
     acceptance: it covers the report (:func:`covers`, under its check's rule) and,
     for an :data:`ITEMIZED` check that names items, the report is on one of them.
     A report on no item (the whole row) is carried only by a flag naming none:
-    accepting two negative items is no verdict on the row's others."""
-    rule = SUCCESSORS.get(flag["check_name"])
+    accepting two negative items is no verdict on the row's others.
+
+    Carrying withholds a write, so it is held to the SQL check's own condition,
+    which :func:`covers` (built to match, for the compare) is looser than:
+
+    * a flag naming a ``version_no`` carries only a report on that version: a
+      restated version that still fails is a new condition (``checks.py``);
+    * a ``fundamentals_stale`` flag carries only a report on its
+      ``latest_fiscal_date``: a later filing is a new occurrence;
+    * a ``fundamentals_ttm_incomplete`` flag, read from the income statement,
+      carries only a report on it: no verdict on another statement's gap."""
+    check = flag["check_name"]
+    rule = SUCCESSORS.get(check)
     if rule is None or not covers(rule, flag, r):
         return False
-    items_of = ITEMIZED.get(flag["check_name"])
+    key = flag.get("record_key") or {}
+    version = _int(key.get("version_no"))
+    if version is not None and r.version_no is not None and version != r.version_no:
+        return False
+    if check == "fundamentals_stale" and r.first != _date(
+        key.get("latest_fiscal_date")
+    ):
+        return False
+    if check == "fundamentals_ttm_incomplete" and r.statement != statement_name(
+        flag["table_name"]
+    ):
+        return False
+    items_of = ITEMIZED.get(check)
     if items_of is None:
         return True
     items = items_of(flag.get("detail") or {})
