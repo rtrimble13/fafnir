@@ -18,6 +18,10 @@ measures what the plan's cutover criteria (§6) ask of it:
   * **New flags per night.** The conditions in this night's file absent from the
     previous night's, against the SQL flags written between the two runs' starts.
     The bar is 70% fewer.
+  * **As written.** Both figures again on what the statements ingest would write
+    to the queue: less the reports an SQL flag accepted before the run carries
+    (:class:`AcceptedPredecessors`), which the ingest withholds. The queue judged
+    those conditions already, under the SQL check's name.
   * **Precision.** With labels, the share of reports that were right (strict) or
     some fault, at warn and above, at error, and per code, judged as dorq-eval
     judges a statements label: on the same security, its statement, period type,
@@ -41,9 +45,10 @@ Reads only.
 from __future__ import annotations
 
 import datetime as dt
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Sequence
+from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 from fafnir.db.connection import Database
 from fafnir.dq import dorq as engine
@@ -53,6 +58,7 @@ from fafnir.dq.compare import (
     NEW_FLAGS_BAR,
     Label,
     Precision,
+    Recall,
     _date,
     applicable,
     statement_name,
@@ -61,45 +67,6 @@ from fafnir.dq.compare import (
 #: The bar for the standing count at warn and above: dorq's at most this share of
 #: the SQL checks' (plan §6).
 STANDING_BAR = 0.30
-
-
-@dataclass
-class Recall:
-    """Confirmed errors, and how many each engine found: with a code the label
-    expects (``dorq``, ``sql``), or with any code (``dorq_any``, ``sql_any``)."""
-
-    labels: int = 0
-    dorq: int = 0
-    dorq_any: int = 0
-    sql: int = 0
-    sql_any: int = 0
-
-    def add(self, dorq: bool, dorq_any: bool, sql: bool, sql_any: bool) -> None:
-        self.labels += 1
-        self.dorq += dorq
-        self.dorq_any += dorq_any
-        self.sql += sql
-        self.sql_any += sql_any
-
-    def _of(self, n: int) -> Optional[float]:
-        return n / self.labels if self.labels else None
-
-    def as_dict(self) -> dict:
-        return {
-            "labels": self.labels,
-            "dorq": {
-                "found": self.dorq,
-                "any": self.dorq_any,
-                "recall": self._of(self.dorq),
-                "recall_any": self._of(self.dorq_any),
-            },
-            "sql": {
-                "found": self.sql,
-                "any": self.sql_any,
-                "recall": self._of(self.sql),
-                "recall_any": self._of(self.sql_any),
-            },
-        }
 
 
 @dataclass(frozen=True)
@@ -243,6 +210,119 @@ def covers(rule: Rule, flag: dict, r: StatementReport) -> bool:
     return rule.match == "security"
 
 
+#: The SQL checks one flag of which names several items of its period in its
+#: ``detail``, and how to read them: such a flag covers only a report on one of its
+#: items (or, naming none, the whole period).
+ITEMIZED: dict[str, Callable[[dict], set]] = {
+    # {"items": [column, ...]}
+    "fundamentals_suspicious_zero": lambda d: set(d.get("items") or ()),
+    # {column: the negative value, ...}
+    "fundamentals_negative_impossible": lambda d: set(d),
+}
+
+
+def accepted_covers(flag: dict, r: StatementReport) -> bool:
+    """Whether accepted SQL ``flag`` carries report ``r`` into the queue's
+    acceptance: it covers the report (:func:`covers`, under its check's rule) and,
+    for an :data:`ITEMIZED` check that names items, the report is on one of them.
+    A report on no item (the whole row) is carried only by a flag naming none:
+    accepting two negative items is no verdict on the row's others."""
+    rule = SUCCESSORS.get(flag["check_name"])
+    if rule is None or not covers(rule, flag, r):
+        return False
+    items_of = ITEMIZED.get(flag["check_name"])
+    if items_of is None:
+        return True
+    items = items_of(flag.get("detail") or {})
+    return not items or r.item in items
+
+
+def _slim(flag: dict) -> dict:
+    """An SQL flag as :func:`accepted_covers` reads it, its repeated strings (the
+    check, the table, the key's names, period types and dates) interned so that
+    164k flags share them."""
+
+    def intern(v):
+        return sys.intern(v) if isinstance(v, str) else v
+
+    key = flag.get("record_key") or {}
+    return {
+        "check_name": intern(flag["check_name"]),
+        "security_id": int(flag["security_id"]),
+        "table_name": intern(flag["table_name"]),
+        "record_key": {intern(k): intern(v) for k, v in key.items()},
+        "detail": flag.get("detail") if flag["check_name"] in ITEMIZED else None,
+    }
+
+
+class AcceptedPredecessors:
+    """The accepted flags of the thirteen SQL checks dorq succeeds, by security:
+    the queue's verdict on a condition, which carries to the successor report that
+    covers it (:func:`accepted_covers`).
+
+    dorq's write guard (:func:`fafnir.dq.dorq.ingest`) knows only dorq's own
+    ``check_name`` and ``record_key``. On 2026-11-11 175,748 of a statements night's
+    reports were on conditions the queue had accepted under an SQL check's name
+    (about 164k flags, SF1 as published), and at the cutover each would have
+    entered the queue again. The statements ingest withholds them through
+    :meth:`withhold`, and ``dq compare --statements`` counts what it would write.
+
+    Each flag is held as the few fields matching needs (no ``detail`` but an
+    itemized check's), its strings interned (:func:`_slim`): the ~164k accepted
+    on the host cost about 80 MB.
+    """
+
+    def __init__(self, flags: Iterable[dict]):
+        self.by_security: dict[int, list[dict]] = {}
+        for f in flags:
+            if f["security_id"] is not None:
+                self.by_security.setdefault(int(f["security_id"]), []).append(_slim(f))
+        self.flags = sum(len(v) for v in self.by_security.values())
+        self.withheld = 0
+
+    @classmethod
+    def load(
+        cls, db: Database, at: Optional[dt.datetime] = None
+    ) -> "AcceptedPredecessors":
+        """The flags accepted by ``at`` (by now when None), read a row at a time:
+        only their slim form is ever held."""
+        from psycopg.rows import dict_row
+
+        with db.conn.cursor(row_factory=dict_row) as cur:
+            return cls(
+                cur.stream(
+                    """
+                SELECT check_name, security_id, table_name, record_key,
+                       CASE WHEN check_name = ANY(%(itemized)s) THEN detail END
+                           AS detail
+                  FROM ops.data_quality_flag
+                 WHERE check_name = ANY(%(checks)s)
+                   AND security_id IS NOT NULL
+                   AND accepted_at IS NOT NULL
+                   AND accepted_at <= coalesce(%(t)s, now())
+                """,
+                    {"checks": list(SUCCESSORS), "itemized": list(ITEMIZED), "t": at},
+                )
+            )
+
+    def carries(self, r: StatementReport) -> bool:
+        if r.security_id is None:
+            return False
+        return any(
+            accepted_covers(f, r) for f in self.by_security.get(r.security_id, ())
+        )
+
+    def withhold(self, records: Iterable[dict]) -> Iterator[dict]:
+        """``records`` less those an accepted SQL flag carries, one at a time;
+        :attr:`withheld` counts what was left out."""
+        for record in records:
+            r = StatementReport.of(record)
+            if r is not None and self.carries(r):
+                self.withheld += 1
+                continue
+            yield record
+
+
 # ---------------------------------------------------------------------------
 # Labels
 # ---------------------------------------------------------------------------
@@ -318,6 +398,9 @@ class StatementsComparison:
     # reports covered by an SQL flag accepted before the run: the queue judged
     # the condition real or a fact
     on_accepted: int = 0
+    # reports the statements ingest withholds: an accepted SQL flag carries them
+    # (accepted_covers, which adds the itemized checks' item rule to covers)
+    withheld: int = 0
     # conditions at warn and above: dorq's against the SQL checks' open flags
     standing: dict = field(default_factory=dict)
     new_per_night: Optional[dict] = None
@@ -346,6 +429,7 @@ class StatementsComparison:
             "by_sql_check": self.by_sql_check,
             "by_code": self.by_code,
             "on_accepted": self.on_accepted,
+            "withheld": self.withheld,
             "standing": self.standing,
             "new_per_night": self.new_per_night,
             "precision": (
@@ -385,6 +469,7 @@ def _sql_flags(db: Database, state_at: Optional[dt.datetime]) -> list[dict]:
         """
         SELECT dq_flag_id, check_name, security_id, table_name, record_key,
                severity,
+               CASE WHEN check_name = ANY(%(itemized)s) THEN detail END AS detail,
                accepted_at IS NOT NULL
                    AND accepted_at <= coalesce(%(t)s, now()) AS accepted
           FROM ops.data_quality_flag
@@ -395,7 +480,7 @@ def _sql_flags(db: Database, state_at: Optional[dt.datetime]) -> list[dict]:
                     AND accepted_at <= coalesce(%(t)s, now())))
          ORDER BY dq_flag_id
         """,
-        {"t": state_at, "checks": list(SUCCESSORS)},
+        {"t": state_at, "checks": list(SUCCESSORS), "itemized": list(ITEMIZED)},
     )
 
 
@@ -523,13 +608,14 @@ def compare(
     )
     flags = _sql_flags(db, out.state_at)
     open_flags = [f for f in flags if not f["accepted"]]
-    accepted = [f for f in flags if f["accepted"]]
     flags_by_security: dict[int, list[dict]] = {}
-    accepted_by_security: dict[int, list[dict]] = {}
     for f in open_flags:
         flags_by_security.setdefault(f["security_id"], []).append(f)
-    for f in accepted:
-        accepted_by_security.setdefault(f["security_id"], []).append(f)
+    # The accepted flags, as the statements ingest's guard holds them: slim, and
+    # the rows they came from let go.
+    accepted = AcceptedPredecessors(f for f in flags if f["accepted"])
+    accepted_by_security = accepted.by_security
+    del flags
 
     index = None
     if labels is not None:
@@ -568,6 +654,9 @@ def compare(
     # the counters, and the severe reports on the securities the recall asks about.
     keys: set[int] = set()
     severe: set[int] = set()
+    # the same, less the reports the ingest withholds: the queue's view
+    written: set[int] = set()
+    written_severe: set[int] = set()
     covered: set[int] = set()
     recall_reports: dict[int, list[StatementReport]] = {}
     for record in engine.read_records(shadow_file):
@@ -585,6 +674,7 @@ def compare(
             entry["severe"] += 1
             severe.add(h)
         matched = False
+        withheld = False
         if r.security_id is not None:
             for f in flags_by_security.get(r.security_id, ()):
                 if covers(SUCCESSORS[f["check_name"]], f, r):
@@ -595,8 +685,14 @@ def compare(
                 for f in accepted_by_security.get(r.security_id, ())
             ):
                 out.on_accepted += 1
+                withheld = accepted.carries(r)
+                out.withheld += withheld
             if r.security_id in error_sids and r.severity in _SEVERE:
                 recall_reports.setdefault(r.security_id, []).append(r)
+        if not withheld:
+            written.add(h)
+            if r.severity in _SEVERE:
+                written_severe.add(h)
         entry["also_sql" if matched else "dorq_only"] += 1
         if index is not None:
             own = by_series.get(str(r.security_id), []) if r.security_id else []
@@ -633,12 +729,19 @@ def compare(
         "sql": sql_severe,
         "ratio": len(severe) / sql_severe if sql_severe else None,
         "bar": STANDING_BAR,
+        # what the queue would hold: less the conditions an accepted SQL flag
+        # carries, which the statements ingest does not write
+        "written": {
+            "dorq": len(written_severe),
+            "ratio": len(written_severe) / sql_severe if sql_severe else None,
+        },
     }
 
     previous = previous_shadow_file(Path(shadow_file))
     if previous is not None:
         before = set(_condition_hashes(previous))
         new = keys - before
+        new_written = len(written - before)
         prev_night = engine.night_run(
             db, dorq_statements.ENDPOINT_SHADOW, _date(previous.stem)
         )
@@ -653,6 +756,11 @@ def compare(
             "sql": sql_new,
             "change": (len(new) - sql_new) / sql_new if sql_new else None,
             "bar": NEW_FLAGS_BAR,
+            # the new conditions the statements ingest would write
+            "written": {
+                "dorq": new_written,
+                "change": (new_written - sql_new) / sql_new if sql_new else None,
+            },
         }
     return out
 
@@ -724,13 +832,22 @@ def format_comparison(c: StatementsComparison) -> str:
             f" {e['dorq_only']:>10}"
         )
     if c.on_accepted:
-        lines.append(f"  {c.on_accepted} on an SQL flag the queue accepted")
+        lines.append(
+            f"  {c.on_accepted} on an SQL flag the queue accepted, of which the"
+            f" ingest withholds {c.withheld}"
+        )
     s = c.standing
     lines.append("")
     lines.append(
         f"Standing at warn+: dorq {s['dorq']} against SQL {s['sql']}"
         f" ({_pct(s['ratio'])}; the bar is {_pct(s['bar'])} or less)"
     )
+    w = s.get("written")
+    if w is not None:
+        lines.append(
+            f"  as written to the queue: dorq {w['dorq']} ({_pct(w['ratio'])}),"
+            " less the conditions an accepted SQL flag carries"
+        )
     n = c.new_per_night
     if n is None:
         lines.append("New per night: n/a (no previous night)")
@@ -745,6 +862,16 @@ def format_comparison(c: StatementsComparison) -> str:
                 else ""
             )
         )
+        w = n.get("written")
+        if w is not None:
+            lines.append(
+                f"  as written to the queue: dorq {w['dorq']}"
+                + (
+                    f" ({'+' if w['change'] >= 0 else ''}{100 * w['change']:.0f}%)"
+                    if w["change"] is not None
+                    else ""
+                )
+            )
     if c.labelled:
         scope = ("time-scoped" if c.labels_time_scoped else "every label") + (
             ", verified only" if c.labels_verified_only else ""

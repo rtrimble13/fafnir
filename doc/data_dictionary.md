@@ -1459,7 +1459,11 @@ each condition so `detected_at` still says when the problem was first seen.
 `dorq_*` flags are dorq's (doc/dorq.md): `detail` is dorq's whole report, with
 `p_error`, the hypotheses and evidence, the suggested repair and `dorq.version` /
 `dorq.config_hash`. The cross-sectional ones (`dorq_cohort_gap`, `dorq_cohort_move`)
-have a NULL `security_id`. They are written with the same open/accepted guards as
+have a NULL `security_id`. A `dorq_cohort_gap` that fafnir judged again without the
+securities that end the session before its date (not trading, or frozen) carries
+the restated figures in `detail.detail` and `detail.message`, fafnir's estimate of
+its members in `detail.detail.members` (`detail.fafnir.members_estimated`), and
+dorq's own figures in `detail.fafnir` (doc/dorq.md, *Filter*). They are written with the same open/accepted guards as
 the SQL checks, by a run recorded in `ops.ingestion_run` with `source = 'dorq'`. A
 cross-sectional row's `record_key` carries the cohort's split `ratio` beside its
 `trade_date` (v1.5.0; dorq 0.10 writes it itself): two cohorts on one date are two

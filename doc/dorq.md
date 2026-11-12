@@ -204,14 +204,50 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    dorq's whole report (`p_error`, `hypotheses`, `evidence`, `suggested_action`,
    `dorq.version`, `dorq.config_hash`).
 4. **Filter.** Stale-feed reports (`dorq_stale_feed`, DQ304) on securities that
-   are not actively trading are left out. This is the SQL `stale` check's own rule
-   (`is_actively_trading`), read when the run is made. dorq cannot tell a delisting
+   are not actively trading, or that nothing feeds (`feed_frozen_on`, ADR 0020),
+   are left out. This is the SQL `stale` check's own rule (`is_actively_trading
+   AND feed_frozen_on IS NULL`), read when the run is made. dorq cannot tell a delisting
    from a feed outage: on the first shadow night, 1,127 of its 1,195 stale-feed
    reports were on securities fafnir already knew had stopped trading. Their other
    reports are kept. A delisted security's bars still go to dorq, so its history
    is still judged for bad prints, splits and the rest. The run logs how many it
    left out. `dq recheck` applies the same filter, so it closes an open
    `dorq_stale_feed` flag once its security stops trading.
+
+   **Cohort gaps without the series that end.** DQ303 (`dorq_cohort_gap`) counts
+   a series that stops before the as-of date as missing on the session after its
+   last bar, and dorq's `--meta` has no field that says a series ends. When 3,946
+   funds nothing feeds were frozen at their 2026-11-06 bar, every night with 11-09
+   in its window reported "4,008 of 15,837 series ... have none on this one ... a
+   failed load". A cohort also downgrades each member's DQ304 to info, below what
+   the run reports, and names no members. So the false cohort hid real stale
+   feeds: 37 thinly traded SFP ETFs that Sharadar stopped sending after 11-06,
+   which the SQL `stale` check flagged on 11-11, had no dorq report at warn and
+   above. So each cohort gap of a run over the whole universe is judged
+   again without the securities fafnir knows end the session before its date: not
+   actively trading or frozen (the rule above), with that session as their last
+   bar and a bar on at least 19 of the 20 sessions ending there (DQ303 counts only
+   the series it expected that day). They come out of the session's expected and
+   missing counts, the expected misses shrink in proportion, and DQ303's own
+   Poisson test runs at the config's `cohort_min_series` and `cohort_max_tail`
+   (from `dorq config show`).
+   - A cohort that no longer passes is left out, and counted in `dropped`. The
+     11-02 cohort (66 of 15,838) held 11 securities delisted on 10-30; without
+     them, 55 against 32.0 expected is not one.
+   - One that still passes is kept, its figures and message restated on the rest,
+     with dorq's own under `detail.fafnir`. It names its members, as
+     `detail.detail.members` (where dorq writes a cohort's, so `dq compare` and the
+     queue read them), with `detail.fafnir.members_estimated`. They are fafnir's
+     estimate: the near-daily securities, not ended, with no bar on the date and a
+     bar on the session before it or after it. Without the 3,954 that end on 11-06,
+     11-09 is 54 of 11,883 against 24.1 expected: still a cohort, because the SFP
+     ETFs that stopped together are one. It is now reported at error as what it
+     is, naming 48 securities (30 of them stopped on 11-06).
+
+   The ended securities' bars still go to dorq, so their history is still judged.
+   Not undone: the downgrade itself. The members' stale tails are not in the run's
+   output to restore, so a cohort left out leaves them unreported by dorq. The
+   fix for that is in dorq: a series-end field in `--meta` that DQ303 honours.
 5. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/<as-of>.jsonl`.
    Otherwise one set-based insert writes them, with the same two guards every SQL
    check carries: a condition already open, or accepted, is not written again. The
@@ -240,7 +276,7 @@ where it was. `started_at` and `finished_at` are the real times. `params` holds:
 |---|---|
 | `dorq_version` | the binary's version (null on a failed run; dorq's exit message names it) |
 | `dorq_config_hash` | the hash on the run's reports (null when dorq reported nothing) |
-| `dropped` | the reports the filter left out, per check: `{"dorq_stale_feed": 1127}` |
+| `dropped` | the reports the filter left out, per check: `{"dorq_stale_feed": 1127, "dorq_cohort_gap": 1}` |
 | `since`, `shadow`, `full` | the window's `--since`, whether the run went to the shadow, and whether it was `--full` |
 | `backfill` | a nightly run's backfill: `securities` (how many), `security_ids`, `before` (the window's first date), `reports` (added). When skipped, `skipped` says why and `security_ids` is empty |
 | `holding` | the SQL flags' state as the run found them, for `dq compare`: `since` (how far before the window it reaches) and `states` (`{dq_flag_id: holding\|traded_since\|inactive}` for every `outlier`/`gap`/`stale` flag open at the run's start that compare can fetch). Absent above 20,000 flags |
@@ -389,6 +425,34 @@ are several nights, with a summary over their distinct conditions at the end; wi
   --format csv`, so compare writes the night in that shape. Its "warn" row is
   warn only (compare's is warn and above), and it reads no `members`, so a
   cohort fact can differ.
+- **Recall on confirmed errors.** With labels, compare measures both engines
+  against the faults that were confirmed, not only dorq against the SQL flags.
+  The confirmed errors are the `data_error` labels on one security that are about
+  the night: their dates overlap the window within the slack, or they are on a
+  security the night backfilled. They are scoped exactly as precision is: those
+  that applied when the run started, and with `--verified-only`, those verified.
+  On each, compare asks:
+  - **dorq:** is a report at warn and above on it, matched as precision matches?
+  - **The SQL checks:** is an `outlier`, `gap` or `stale` flag on its security,
+    open or closed, detected by the run's start, dated within the label's dates
+    and the slack?
+
+  `found` needs a code the label expects. For an SQL flag, that is one of its
+  check's successor codes, as in the overlap table. `any` takes any code. A table
+  by the label's kind shows where the confirmations came from. The labels pool
+  both engines' confirmations (repairs made on SQL flags, verdicts stated on
+  dorq's reports), so neither engine's recall is 1 by construction. This
+  mirrors the statements' recall. In `--json` it is `recall` (`labels`, `dorq`
+  and `sql`, each with `found`, `any`, `recall` and `recall_any`, and
+  `by_kind`). A summary over several nights does not carry it.
+
+  **Why it exists.** The holding recall above is measured on the SQL flags, and
+  most SQL `outlier` flags are real moves. Of the 247 in the 2026-11-11 night's
+  window, 201 were closed, most accepted as market facts. dorq staying silent on
+  those is right, and the holding recall counts it as a miss (14-22% on the
+  November nights). This line asks the question the bar's recall clause is after:
+  of the faults that were real, how many each engine reported. The bar's text
+  below is unchanged; read its recall clause against both lines.
 
 dorq plan §8 sets the cutover bar:
 - precision of 0.85 or better at warn, and 0.95 or better at error;
@@ -720,7 +784,22 @@ fafnir dq run --no-statements             # this run without them
    That is a directory of its own, because `dq compare` takes the last `*.jsonl` in
    the shadow directory's top level as the newest night of bars. Otherwise the bars'
    ingest writes them, with the same open and accepted guards. Each row's
-   `table_name` is its statement's table. A finding on no one statement goes under
+   `table_name` is its statement's table.
+
+   **An accepted SQL flag carries to its successor.** The guards know only dorq's
+   own `check_name` and `record_key`, so a condition the queue accepted under one
+   of the thirteen SQL checks' names would be written again under dorq's. About
+   164k such flags were accepted by rule (SF1 as published: the ties, the
+   identity, the TTM and negative checks, the pre-SF1 gaps). On the 2026-11-11
+   night 175,748 reports were on them. So before the guards, the ingest withholds
+   a report that a flag of a check it succeeds, accepted at any time, covers. The
+   rule is the overlap's (the table under [the statements shadow
+   period](#the-statements-shadow-period)), with one more condition for the two
+   checks whose flag names several items of its period, `fundamentals_suspicious_zero`
+   and `fundamentals_negative_impossible`: it covers a report on one of those items,
+   or any report when it names none. A report on another item, or on the whole row,
+   is written. A shadow night withholds nothing: its file is dorq's whole view, and
+   `dq compare --statements` counts what the queue would take. A finding on no one statement goes under
    `core.income_statement`, as the SQL checks file theirs: DQ943 (statements missing)
    and DQ951's cohorts. A date can hold two DQ951 cohorts: the series revised that
    day, and those carrying one finding in rows loaded that day. dorq keys both on the
@@ -731,6 +810,8 @@ fafnir dq run --no-statements             # this run without them
    window, history pass and `dq compare` never read these rows. `params` holds:
    - `kind: statements`, `full: true`, `dorq_version`, `dorq_config_hash`;
    - `reports`;
+   - `withheld` (into the queue only): the reports an accepted SQL flag carries,
+     not written;
    - `bytes` and `bytes_out`: the statements sent and dorq's output;
    - `dorq_max_rss_mb`: dorq's peak resident memory, as the kernel accounts for
      the child;
@@ -846,12 +927,23 @@ fafnir dq compare --statements --json
   | `fundamentals_currency_mismatch` | DQ944 | the reporting currency |
 
   A period is the period type and fiscal date. Per dorq code: its reports, those at
-  warn and above, those an open SQL flag covers, and those no SQL check made.
+  warn and above, those an open SQL flag covers, and those no SQL check made. Then
+  the reports on an SQL flag accepted before the run, and how many of them the
+  queue's ingest would withhold (an itemized flag carries only its items; see
+  **Write** under [What a run does](#what-a-run-does-1)).
 - **Standing.** dorq's conditions at warn and above against the SQL checks' open
   flags at warn and above. The bar is 30% or less.
 - **New per night.** The conditions in this night's file absent from the previous
   statements night's, against the SQL flags of the thirteen written between the two
   runs' starts. The bar is 70% fewer.
+- **As written to the queue.** Standing and new per night again, on the conditions
+  the ingest would write: less those an SQL flag accepted before the run carries.
+  The file's figures count conditions the queue has judged already, under the SQL
+  check's name. The queue's figures are what the cutover would put in front of a
+  person. Both are printed, and in `--json` the queue's are `standing.written`
+  and `new_per_night.written`. A night whose conditions are open in the queue
+  under dorq's own names (none while the run is in shadow) would be smaller again,
+  by the open guard.
 - **Precision.** With labels, it is reported at warn and above, at error, and per
   code. Matching is dorq-eval's for a statements label: the same security, the
   statement, period type, version and item agreeing where both name one, and the
