@@ -955,11 +955,13 @@ def test_cli_recheck_closes_the_fixed_statement_flag(db, fake_dorq, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _sql_flag(db, sid, check, table, key, severity="warn", *, accepted=False):
+def _sql_flag(
+    db, sid, check, table, key, severity="warn", *, accepted=False, detail=None
+):
     db.execute(
         "INSERT INTO ops.data_quality_flag (security_id, table_name, record_key,"
         " check_name, severity, detail, detected_at, accepted_at, resolved_at,"
-        " resolved_by) VALUES (%s, %s, %s, %s, %s, '{}', now() - interval '1 day',"
+        " resolved_by) VALUES (%s, %s, %s, %s, %s, %s, now() - interval '1 day',"
         " %s, %s, %s)",
         (
             sid,
@@ -967,6 +969,7 @@ def _sql_flag(db, sid, check, table, key, severity="warn", *, accepted=False):
             json.dumps(key),
             check,
             severity,
+            json.dumps(detail or {}),
             *(["now()", "now()", "test"] if accepted else [None, None, None]),
         ),
     )
@@ -1104,6 +1107,116 @@ def test_dq_compare_statements_matches_successors_by_security_period_and_stateme
     n = cst.compare(db, second.shadow_file).new_per_night
     assert n["previous"] == night.shadow_file.name
     assert n["dorq"] == 1 and n["sql"] == 6
+
+
+def _accepted_predecessors(db, sid):
+    """SF1 as published: the queue accepted Q1's balance-sheet identity break and
+    two negative items, under the SQL checks' names."""
+    _sql_flag(
+        db,
+        sid,
+        "balance_sheet_identity",
+        "core.balance_sheet",
+        {"period_type": "quarter", "fiscal_date": "2024-03-31"},
+        "error",
+        accepted=True,
+    )
+    _sql_flag(
+        db,
+        sid,
+        "fundamentals_negative_impossible",
+        "core.income_statement",
+        {"statement": "income", "period_type": "quarter", "fiscal_date": "2024-03-31"},
+        accepted=True,
+        detail={"revenue": -5, "cost_of_revenue": -2},
+    )
+
+
+def _successor_reports(sid):
+    """Two reports those acceptances carry, and two they do not."""
+
+    def dq902(item):
+        return _statement_row(
+            sid,
+            "2024-03-31",
+            check="dorq_impossible_sign",
+            code="DQ902",
+            statement="income",
+            extra_key={"item": item},
+        )
+
+    return [
+        _statement_row(sid, "2024-03-31", extra_key={"identity": "balance_sheet"}),
+        _statement_row(sid, "2024-03-31", extra_key={"identity": "debt_split"}),
+        dq902("revenue"),
+        dq902("sga"),
+    ]
+
+
+def test_ingest_withholds_what_an_accepted_sql_flag_carries(db, fake_dorq, tmp_path):
+    sid, _ = _company(db)
+    _accepted_predecessors(db, sid)
+    _emit(fake_dorq, _successor_reports(sid))
+    settings = _settings(fake_dorq, tmp_path)
+    out = dorq_statements.run(db, settings, "NASDAQ", shadow=False)
+    assert out.flagged == {"dorq_identity_break": 1, "dorq_impossible_sign": 1}
+    written = db.fetchall(
+        "SELECT record_key FROM ops.data_quality_flag WHERE check_name LIKE 'dorq%%'"
+        " ORDER BY check_name"
+    )
+    assert [
+        r["record_key"].get("identity") or r["record_key"].get("item") for r in written
+    ] == ["debt_split", "sga"]
+    params = db.fetchval(
+        "SELECT params FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+    )
+    assert params["withheld"] == 2 and params["reports"] == 4
+    # A shadow night withholds nothing: the file is dorq's whole view.
+    night = dorq_statements.run(db, settings, "NASDAQ", shadow=True, rerun=True)
+    assert len(dorq.read_shadow(night.shadow_file)) == 4
+
+
+def test_dq_compare_statements_counts_what_the_queue_would_take(
+    db, fake_dorq, tmp_path
+):
+    sid, days = _company(db)
+    db.execute("DELETE FROM core.daily_price WHERE trade_date = %s", (days[-1],))
+    _accepted_predecessors(db, sid)
+    reports = _successor_reports(sid)
+    _emit(fake_dorq, reports)
+    settings = _settings(fake_dorq, tmp_path)
+    first = dorq_statements.run(db, settings, "NASDAQ", shadow=True)
+    c = cst.compare(db, first.shadow_file)
+    # Both DQ902s are on the accepted negatives' period; one item is not theirs.
+    assert c.on_accepted == 3 and c.withheld == 2
+    assert c.standing["dorq"] == 4
+    assert c.standing["written"]["dorq"] == 2
+    text = cst.format_comparison(c)
+    assert "as written to the queue: dorq 2" in text
+
+    # The next night adds a carried condition and one that is not.
+    db.execute(
+        "UPDATE ops.ingestion_run SET started_at = started_at - interval '2 days'"
+    )
+    _prices(db, sid, [days[-1]])
+    _emit(
+        fake_dorq,
+        reports
+        + [
+            _statement_row(
+                sid,
+                "2024-03-31",
+                check="dorq_impossible_sign",
+                code="DQ902",
+                statement="income",
+                extra_key={"item": "cost_of_revenue"},
+            ),
+            _statement_row(sid, "2024-06-30", extra_key={"identity": "balance_sheet"}),
+        ],
+    )
+    second = dorq_statements.run(db, settings, "NASDAQ", shadow=True)
+    n = cst.compare(db, second.shadow_file).new_per_night
+    assert n["dorq"] == 2 and n["written"]["dorq"] == 1
 
 
 def test_dq_compare_statements_precision_uses_statement_labels_only(

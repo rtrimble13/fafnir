@@ -21,7 +21,9 @@ module runs it on the three statement tables beside the bars run of
   * **window** -- the whole history, every night: the statements are small, and
     the plan's runtime target is two minutes on the host (plan §5.2, F4).
   * **ingest** -- :func:`fafnir.dq.dorq.ingest`, the open and accepted guards
-    included, with each row's ``table_name`` its statement's table.
+    included, with each row's ``table_name`` its statement's table, less the rows
+    an accepted flag of the SQL check it succeeds carries
+    (:class:`fafnir.dq.compare_statements.AcceptedPredecessors`).
   * **shadow** -- or the rows go to ``<dorq_shadow_dir>/statements/<as-of>.jsonl``:
     never the shadow directory's top level, where ``dq compare`` takes the last
     ``*.jsonl`` as the newest night of bars.
@@ -506,12 +508,27 @@ def run(
             )
             shadow_file = None
             flagged: dict[str, int] = {}
+            withheld: Optional[int] = None
             if shadow:
                 shadow_file = engine.write_shadow(
                     rows, engine.shadow_path(str(shadow_dir(settings)), as_of)
                 )
             else:
-                flagged = engine.ingest(db, rows, ingestion_run_id=run_id)
+                # A condition the queue accepted under an SQL check's name is
+                # accepted for its successor too (compare_statements.
+                # AcceptedPredecessors): dorq's own guard knows only dorq's names.
+                from fafnir.dq.compare_statements import AcceptedPredecessors
+
+                guard = AcceptedPredecessors.load(db)
+                flagged = engine.ingest(
+                    db, guard.withhold(rows), ingestion_run_id=run_id
+                )
+                withheld = guard.withheld
+                logger.info(
+                    "dorq statements: withheld %d reports an accepted SQL flag "
+                    "carries",
+                    withheld,
+                )
     except BaseException as exc:
         # As the bars run does: a COPY cut short when dorq exits can leave the
         # transaction aborted, so discard it before recording the failure.
@@ -530,6 +547,7 @@ def run(
             "dorq_version": version,
             "dorq_config_hash": rows.config_hash,
             "reports": rows.count,
+            **({"withheld": withheld} if withheld is not None else {}),
             **done.usage(),
         },
     )
