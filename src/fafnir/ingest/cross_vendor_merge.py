@@ -135,9 +135,10 @@ class FormerTicker(NamedTuple):
     #: The victim's ticker period to record on the survivor, ``(symbol, from, to)``;
     #: None where the survivor holds a period on that ticker already.
     period: Optional[tuple]
-    #: The survivor's open period on the vendor's ticker moved to start at the
-    #: rename, ``(symbol, was, now)``; None where it starts there or later, or the
-    #: rename was to another ticker (a chain).
+    #: The survivor's period on the vendor's ticker (open, or closed at a dead
+    #: company's delisting) moved to start at the rename, ``(symbol, was, now)``;
+    #: None where it starts there or later, or the rename was to another ticker (a
+    #: chain).
     survivor_from: Optional[tuple]
 
 
@@ -571,10 +572,15 @@ def _plan_former_ticker(
     # rename was to that ticker and the period claims more.
     survivor_from = None
     if su.fafnir_ticker(new) == ticker:
+        # Its period that runs to the rename or past it: open, or closed at the
+        # delisting where the vendor lists a dead company (mark_delisted closes
+        # every open period).
         was = db.fetchval(
             "SELECT valid_from FROM core.symbol_xref "
-            "WHERE security_id = %s AND symbol = %s AND valid_to IS NULL",
-            (survivor_id, ticker),
+            "WHERE security_id = %s AND symbol = %s "
+            "AND COALESCE(valid_to, 'infinity'::date) >= %s "
+            "ORDER BY valid_from DESC LIMIT 1",
+            (survivor_id, ticker, day),
         )
         if was is not None and was < day:
             survivor_from = (ticker, was, day)
@@ -684,9 +690,10 @@ def _carry_former_ticker(
 
     After the merge, which deleted the victim's own periods: the victim's ticker
     from when the vendor took it (or the victim's period began) to the day before
-    the rename away, and the survivor's open period on the vendor's ticker from the
-    rename. Raises :class:`repo.MergeRefused` when a period the plan read as free
-    is taken now; the caller rolls the merge back with it."""
+    the rename away, and the survivor's period on the vendor's ticker (open, or
+    closed at a dead company's delisting) from the rename. Raises
+    :class:`repo.MergeRefused` when a period the plan read as free is taken now;
+    the caller rolls the merge back with it."""
     written = []
     if former.period is not None:
         symbol, start, end = former.period
@@ -707,14 +714,13 @@ def _carry_former_ticker(
         moved = db.execute(
             """
             UPDATE core.symbol_xref SET valid_from = %s
-             WHERE security_id = %s AND symbol = %s AND valid_to IS NULL
-               AND valid_from = %s
+             WHERE security_id = %s AND symbol = %s AND valid_from = %s
             """,
             (now, survivor_id, symbol, was),
         )
         if moved != 1:
             raise repo.MergeRefused(
-                f"the survivor's open {symbol} period no longer starts {was}", None
+                f"the survivor's {symbol} period no longer starts {was}", None
             )
         written.append(("moved", symbol, was, now))
     return tuple(written)
