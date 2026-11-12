@@ -753,12 +753,14 @@ def _sql_flags_found(
 ) -> list[dict]:
     """Every flag of the SQL checks dorq is to replace on ``securities``, at warn
     and above, detected by ``state_at`` (now when None), open or closed: what the
-    SQL checks found. Dated as the comparison dates them (``d``)."""
+    SQL checks found. Dated as the comparison dates them (``d``), with the day it
+    was closed (``until``; None while open)."""
     if not securities:
         return []
     return db.fetchall(
         _FLAGS_CTE + """
-        SELECT f.check_name, f.security_id, f.d
+        SELECT f.check_name, f.security_id, f.d,
+               COALESCE(f.resolved_at, f.accepted_at)::date AS until
           FROM f
          WHERE f.security_id = ANY(%(sids)s)
            AND f.severity IN ('warn', 'error')
@@ -796,7 +798,8 @@ def label_recall(
     dorq found one when a report at warn and above on it overlaps it as precision
     matches a report to a label (:func:`_overlaps`); the SQL checks, when a flag of
     theirs at warn and above on its security, open or closed, detected by the
-    run's start, is dated within the label's dates and the slack. ``found`` needs a
+    run's start, is dated within the label's dates and the slack (a stale flag,
+    dated at the feed's last bar: when it spans them, to the day it was closed). ``found`` needs a
     code the label expects (an SQL flag: one of its check's successor codes);
     ``any`` takes any code.
 
@@ -830,7 +833,13 @@ def label_recall(
                 dorq = dorq or not lab.expect or r.code in lab.expect
         sql = sql_any = False
         for f in flags.get(sid, ()):
-            if lab.first - slack <= f["d"] <= lab.last + slack:
+            # A stale flag is dated at the feed's last bar, before the sessions it
+            # is about, and holds until it is closed: it found a feed gap it spans.
+            if f["check_name"] in PRE_WINDOW_CHECKS:
+                ends = f.get("until") or dt.date.max
+            else:
+                ends = f["d"]
+            if lab.first - slack <= ends and f["d"] <= lab.last + slack:
                 sql_any = True
                 sql = sql or _sql_code_expected(f["check_name"], lab)
         out.recall.add(dorq, dorq_any, sql, sql_any)

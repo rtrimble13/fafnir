@@ -436,7 +436,9 @@ are several nights, with a summary over their distinct conditions at the end; wi
   - **dorq:** is a report at warn and above on it, matched as precision matches?
   - **The SQL checks:** is an `outlier`, `gap` or `stale` flag on its security,
     open or closed, detected by the run's start, dated within the label's dates
-    and the slack?
+    and the slack? A `stale` flag is dated at the feed's last bar, before the
+    sessions it is about, so it counts when it spans them: from that bar to the
+    day it was closed, or on while it is open.
 
   `found` needs a code the label expects. For an SQL flag, that is one of its
   check's successor codes, as in the overlap table. `any` takes any code. A table
