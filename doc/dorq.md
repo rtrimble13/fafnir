@@ -720,7 +720,22 @@ fafnir dq run --no-statements             # this run without them
    That is a directory of its own, because `dq compare` takes the last `*.jsonl` in
    the shadow directory's top level as the newest night of bars. Otherwise the bars'
    ingest writes them, with the same open and accepted guards. Each row's
-   `table_name` is its statement's table. A finding on no one statement goes under
+   `table_name` is its statement's table.
+
+   **An accepted SQL flag carries to its successor.** The guards know only dorq's
+   own `check_name` and `record_key`, so a condition the queue accepted under one
+   of the thirteen SQL checks' names would be written again under dorq's. About
+   164k such flags were accepted by rule (SF1 as published: the ties, the
+   identity, the TTM and negative checks, the pre-SF1 gaps). On the 2026-11-11
+   night 175,748 reports were on them. So before the guards, the ingest withholds
+   a report that a flag of a check it succeeds, accepted at any time, covers. The
+   rule is the overlap's (the table under [the statements shadow
+   period](#the-statements-shadow-period)), with one more condition for the two
+   checks whose flag names several items of its period, `fundamentals_suspicious_zero`
+   and `fundamentals_negative_impossible`: it covers a report on one of those items,
+   or any report when it names none. A report on another item, or on the whole row,
+   is written. A shadow night withholds nothing: its file is dorq's whole view, and
+   `dq compare --statements` counts what the queue would take. A finding on no one statement goes under
    `core.income_statement`, as the SQL checks file theirs: DQ943 (statements missing)
    and DQ951's cohorts. A date can hold two DQ951 cohorts: the series revised that
    day, and those carrying one finding in rows loaded that day. dorq keys both on the
@@ -731,6 +746,8 @@ fafnir dq run --no-statements             # this run without them
    window, history pass and `dq compare` never read these rows. `params` holds:
    - `kind: statements`, `full: true`, `dorq_version`, `dorq_config_hash`;
    - `reports`;
+   - `withheld` (into the queue only): the reports an accepted SQL flag carries,
+     not written;
    - `bytes` and `bytes_out`: the statements sent and dorq's output;
    - `dorq_max_rss_mb`: dorq's peak resident memory, as the kernel accounts for
      the child;
@@ -846,12 +863,23 @@ fafnir dq compare --statements --json
   | `fundamentals_currency_mismatch` | DQ944 | the reporting currency |
 
   A period is the period type and fiscal date. Per dorq code: its reports, those at
-  warn and above, those an open SQL flag covers, and those no SQL check made.
+  warn and above, those an open SQL flag covers, and those no SQL check made. Then
+  the reports on an SQL flag accepted before the run, and how many of them the
+  queue's ingest would withhold (an itemized flag carries only its items; see
+  **Write** under [What a run does](#what-a-run-does-1)).
 - **Standing.** dorq's conditions at warn and above against the SQL checks' open
   flags at warn and above. The bar is 30% or less.
 - **New per night.** The conditions in this night's file absent from the previous
   statements night's, against the SQL flags of the thirteen written between the two
   runs' starts. The bar is 70% fewer.
+- **As written to the queue.** Standing and new per night again, on the conditions
+  the ingest would write: less those an SQL flag accepted before the run carries.
+  The file's figures count conditions the queue has judged already, under the SQL
+  check's name. The queue's figures are what the cutover would put in front of a
+  person. Both are printed, and in `--json` the queue's are `standing.written`
+  and `new_per_night.written`. A night whose conditions are open in the queue
+  under dorq's own names (none while the run is in shadow) would be smaller again,
+  by the open guard.
 - **Precision.** With labels, it is reported at warn and above, at error, and per
   code. Matching is dorq-eval's for a statements label: the same security, the
   statement, period type, version and item agreeing where both name one, and the
