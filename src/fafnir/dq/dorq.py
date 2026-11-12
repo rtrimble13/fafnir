@@ -35,6 +35,7 @@ import csv
 import datetime as dt
 import itertools
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -81,6 +82,24 @@ REVISION_COHORT_CHECK = "dorq_revision_cohort"
 #: only securities still actively trading; :func:`drop_not_trading` holds dorq's
 #: reports to that same rule.
 STALE_FEED_CHECK = "dorq_stale_feed"
+
+#: dorq's cohort-gap check (DQ303): a session that many near-daily series miss at
+#: once, read as a failed load. dorq counts a series that stops before the as-of
+#: date as missing on the session after its last bar, and its ``--meta`` has no
+#: field that says a series ends. :func:`adjust_ended_cohorts` takes out the
+#: series fafnir knows have ended.
+COHORT_GAP_CHECK = "dorq_cohort_gap"
+
+#: DQ303's thresholds as dorq's defaults set them (``[coverage]``), used when the
+#: run's own config cannot be read (:func:`cohort_thresholds`).
+COHORT_MIN_SERIES = 3
+COHORT_MAX_TAIL = 1e-6
+
+#: A security counts as one of DQ303's expected series on a session when it had a
+#: bar on at least this many of the :data:`ENDED_DENSITY_SESSIONS` open sessions
+#: ending with its last bar: dorq's ``confident_density`` (0.95), read on the bars.
+ENDED_DENSITY_SESSIONS = 20
+ENDED_DENSITY_MIN_BARS = 19
 
 #: The reports a backfill pass (:func:`backfill`) leaves out. A cohort of a few new
 #: names means nothing, and the nightly window has already judged staleness.
@@ -582,8 +601,9 @@ def run_dorq(
     security_ids: Optional[Sequence[int]] = None,
 ) -> RunResult:
     """Export, run dorq, and parse its output, less the stale-feed reports on
-    securities not actively trading (:func:`drop_not_trading`). Writes nothing to
-    the warehouse.
+    securities not actively trading (:func:`drop_not_trading`), and with the
+    universe's cohort gaps judged without the series that end
+    (:func:`adjust_ended_cohorts`). Writes nothing to the warehouse.
 
     The bars go from ``COPY`` straight into dorq's stdin, so the 150M-row history
     never lands on disk. dorq's stdout goes to a file in the run's working
@@ -628,6 +648,12 @@ def run_dorq(
     # Read before the filter: the hash is dorq's, whatever fafnir then leaves out.
     config_hash = config_hash_of(records)
     records, dropped = drop_not_trading(db, records)
+    if security_ids is None:
+        # A subset's cohort is not judged (CROSS_SECTIONAL_CHECKS); the universe's is.
+        records, cohorts_left_out = adjust_ended_cohorts(
+            db, settings, exchange_code, records
+        )
+        dropped = {**dropped, **cohorts_left_out}
     return RunResult(
         version=version,
         window=window,
@@ -834,6 +860,203 @@ def drop_not_trading(
         left_out,
     )
     return kept, {STALE_FEED_CHECK: left_out}
+
+
+def cohort_thresholds(settings: DorqSettings) -> tuple[int, float]:
+    """DQ303's ``cohort_min_series`` and ``cohort_max_tail`` in the bars run's
+    config, from ``dorq config show``; dorq's defaults when it cannot say."""
+    import tomllib
+
+    args = [settings.path, "config", "show"]
+    args += ["--config", settings.config] if settings.config else ["--isolated"]
+    try:
+        done = subprocess.run(
+            args, capture_output=True, text=True, timeout=30, check=False
+        )
+        coverage = tomllib.loads(done.stdout).get("coverage", {})
+        return (
+            int(coverage.get("cohort_min_series", COHORT_MIN_SERIES)),
+            float(coverage.get("cohort_max_tail", COHORT_MAX_TAIL)),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        logger.warning("dorq: config show failed (%s); DQ303's defaults used", exc)
+        return COHORT_MIN_SERIES, COHORT_MAX_TAIL
+
+
+def poisson_tail(k: int, lam: float) -> float:
+    """P(X >= k) for X ~ Poisson(lam): DQ303's test of a session's missing count."""
+    if k <= 0:
+        return 1.0
+    if lam <= 0:
+        return 0.0
+    if k <= lam:
+        # The upper tail holds at least the median: far above any cohort threshold.
+        lower, term = 0.0, math.exp(-lam)
+        for i in range(k):
+            lower += term
+            term *= lam / (i + 1)
+        return max(0.0, 1.0 - lower)
+    # Above the mean the terms fall from the first: sum them in log space.
+    log_term = -lam + k * math.log(lam) - math.lgamma(k + 1)
+    total, i = 0.0, k
+    while True:
+        term = math.exp(log_term)
+        total += term
+        i += 1
+        log_term += math.log(lam / i)
+        if term < total * 1e-16 or i > k + 100_000:
+            return min(1.0, total)
+
+
+def ended_on(db: Database, exchange_code: str, day: dt.date) -> int:
+    """The near-daily securities that end on the session before ``day``: fafnir knows
+    their series stop there, and dorq counts each as missing on ``day``.
+
+    *Ended* is :func:`drop_not_trading`'s rule -- not actively trading, or nothing
+    feeds it (``feed_frozen_on``, ADR 0020) -- with the last bar on the open session
+    before ``day`` and none after. *Near-daily* is a bar on at least
+    :data:`ENDED_DENSITY_MIN_BARS` of the :data:`ENDED_DENSITY_SESSIONS` sessions
+    ending there, as DQ303 counts only the series it expected that day.
+    """
+    return int(
+        db.fetchval(
+            """
+            WITH sessions AS (
+                SELECT trade_date FROM ref.trading_calendar
+                 WHERE exchange_code = %(exchange)s AND is_open
+                   AND trade_date < %(day)s
+                 ORDER BY trade_date DESC
+                 LIMIT %(sessions)s
+            ), recent AS (
+                SELECT p.security_id, max(p.trade_date) AS last_bar,
+                       count(*) FILTER (
+                           WHERE p.trade_date IN (SELECT trade_date FROM sessions)
+                       ) AS bars
+                  FROM core.daily_price p
+                 WHERE p.trade_date >= (SELECT min(trade_date) FROM sessions)
+                 GROUP BY p.security_id
+            )
+            SELECT count(*)
+              FROM recent r
+              JOIN core.security s ON s.security_id = r.security_id
+             WHERE r.last_bar = (SELECT max(trade_date) FROM sessions)
+               AND r.bars >= %(min_bars)s
+               AND (NOT s.is_actively_trading OR s.feed_frozen_on IS NOT NULL)
+            """,
+            {
+                "exchange": exchange_code,
+                "day": day,
+                "sessions": ENDED_DENSITY_SESSIONS,
+                "min_bars": ENDED_DENSITY_MIN_BARS,
+            },
+        )
+        or 0
+    )
+
+
+def adjust_ended_cohorts(
+    db: Database,
+    settings: DorqSettings,
+    exchange_code: str,
+    records: Sequence[dict],
+) -> tuple[list[dict], dict[str, int]]:
+    """Judge each :data:`COHORT_GAP_CHECK` report again without the series that end
+    the session before its date (:func:`ended_on`); return the rows kept and the
+    count left out per check.
+
+    dorq counts a series that stops before the as-of date as missing on the session
+    after its last bar, and fafnir cannot tell it which series end. On 2026-11-10
+    3,946 funds nothing feeds were frozen at their 11-06 bar (ADR 0020), and every
+    night with 11-09 in its window DQ303 reported "4,008 of 15,837 series ... have
+    none on this one ... a failed load". 3,944 of them were the frozen funds; with
+    the 3,954 ended series out, 54 of 11,883 remain against about 24.1 expected,
+    still a cohort (tail 1.1e-7). The 11-02 cohort (66 of 15,838) had 11 delisted
+    series in it, and without them is not one (55 against 32.0, tail 1.4e-4).
+
+    The ended series come out of the session's expected count and its missing
+    count, and its expected misses shrink in proportion (dorq's per-series
+    miss rate, read off its own figures). The Poisson test is DQ303's own, at the
+    run's thresholds (:func:`cohort_thresholds`). A cohort that no longer passes is
+    left out. One that still passes is kept with its figures and message restated
+    on the fed series, and dorq's own figures under ``detail.fafnir``.
+
+    The ended series' bars still go to dorq, so their history is judged for bad
+    prints and the rest. Not undone: the info downgrade DQ303 gives each member's
+    stale tail, which leaves a cohort that is left out without its explanation.
+    """
+    cohorts = [
+        i
+        for i, r in enumerate(records)
+        if r["check_name"] == COHORT_GAP_CHECK and r.get("security_id") is None
+    ]
+    if not cohorts:
+        return list(records), {}
+    min_series, max_tail = cohort_thresholds(settings)
+    out = list(records)
+    left_out: set[int] = set()
+    for i in cohorts:
+        record = out[i]
+        day = report_date(record)
+        detail = record.get("detail") or {}
+        inner = detail.get("detail") if isinstance(detail.get("detail"), dict) else {}
+        try:
+            expected = int(inner["series_expected"])
+            missing = int(inner["series_missing"])
+            explained = float(inner["expected_missing"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if day is None or expected <= 0:
+            continue
+        ended = min(ended_on(db, exchange_code, day), missing)
+        if not ended:
+            continue
+        fed_expected = expected - ended
+        fed_missing = missing - ended
+        fed_explained = explained * fed_expected / expected
+        tail = poisson_tail(fed_missing, fed_explained)
+        if fed_missing < min_series or tail > max_tail:
+            left_out.add(i)
+            logger.info(
+                "dorq: left out the cohort gap of %s: %d of its %d missing series "
+                "end the session before (not fed, or not trading)",
+                day,
+                ended,
+                missing,
+            )
+            continue
+        new_detail = dict(detail)
+        new_detail["detail"] = {
+            **inner,
+            "series_expected": fed_expected,
+            "series_missing": fed_missing,
+            "expected_missing": fed_explained,
+            "tail_probability": tail,
+        }
+        new_detail["fafnir"] = {
+            "series_ended": ended,
+            "dorq": {
+                k: inner[k]
+                for k in (
+                    "series_expected",
+                    "series_missing",
+                    "expected_missing",
+                    "tail_probability",
+                )
+            },
+            "message": detail.get("message"),
+        }
+        if "p_error" in detail:
+            new_detail["p_error"] = 1.0 - tail
+        new_detail["message"] = (
+            f"{fed_missing:,} of {fed_expected:,} series that have a bar on nearly "
+            "every session have none on this one, where healthy feeds would "
+            f"explain about {fed_explained:.1f}; a failed load, not {fed_missing:,} "
+            f"separate gaps ({ended:,} more stop the session before: not fed, or "
+            "not trading)"
+        )
+        out[i] = {**record, "detail": new_detail}
+    kept = [r for i, r in enumerate(out) if i not in left_out]
+    return kept, ({COHORT_GAP_CHECK: len(left_out)} if left_out else {})
 
 
 def stream_copy(
