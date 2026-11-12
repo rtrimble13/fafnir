@@ -219,7 +219,11 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
    last bar, and dorq's `--meta` has no field that says a series ends. When 3,946
    funds nothing feeds were frozen at their 2026-11-06 bar, every night with 11-09
    in its window reported "4,008 of 15,837 series ... have none on this one ... a
-   failed load". So each cohort gap of a run over the whole universe is judged
+   failed load". A cohort also downgrades each member's DQ304 to info, below what
+   the run reports, and names no members. So the false cohort hid real stale
+   feeds: 37 thinly traded SFP ETFs that Sharadar stopped sending after 11-06,
+   which the SQL `stale` check flagged on 11-11, had no dorq report at warn and
+   above. So each cohort gap of a run over the whole universe is judged
    again without the securities fafnir knows end the session before its date: not
    actively trading or frozen (the rule above), with that session as their last
    bar and a bar on at least 19 of the 20 sessions ending there (DQ303 counts only
@@ -231,12 +235,19 @@ fafnir dq run --engine dorq --no-shadow   # into the queue (after cutover)
      11-02 cohort (66 of 15,838) held 11 securities delisted on 10-30; without
      them, 55 against 32.0 expected is not one.
    - One that still passes is kept, its figures and message restated on the rest,
-     with dorq's own under `detail.fafnir`. Without the 3,954 that end on 11-06,
-     11-09 is 54 of 11,883 against 24.1 expected: still a cohort.
+     with dorq's own under `detail.fafnir`. It names its members, as
+     `detail.detail.members` (where dorq writes a cohort's, so `dq compare` and the
+     queue read them), with `detail.fafnir.members_estimated`. They are fafnir's
+     estimate: the near-daily securities, not ended, with no bar on the date and a
+     bar on the session before it or after it. Without the 3,954 that end on 11-06,
+     11-09 is 54 of 11,883 against 24.1 expected: still a cohort, because the SFP
+     ETFs that stopped together are one. It is now reported at error as what it
+     is, naming 48 securities (30 of them stopped on 11-06).
 
    The ended securities' bars still go to dorq, so their history is still judged.
-   Not undone: dorq downgrades each member's stale tail that a cohort explains to
-   info, and a cohort left out leaves those at info.
+   Not undone: the downgrade itself. The members' stale tails are not in the run's
+   output to restore, so a cohort left out leaves them unreported by dorq. The
+   fix for that is in dorq: a series-end field in `--meta` that DQ303 honours.
 5. **Write.** In shadow mode the rows go to `<dorq_shadow_dir>/<as-of>.jsonl`.
    Otherwise one set-based insert writes them, with the same two guards every SQL
    check carries: a condition already open, or accepted, is not written again. The

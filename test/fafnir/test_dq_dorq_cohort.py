@@ -23,13 +23,17 @@ from fafnir.dq import dorq
 class _FakeDb:
     """Answers :func:`dorq.ended_on`'s count; records the days it was asked."""
 
-    def __init__(self, ended):
+    def __init__(self, ended, members=()):
         self.ended = ended
+        self.members = list(members)
         self.days = []
 
     def fetchval(self, query, params):
         self.days.append(params["day"])
         return self.ended
+
+    def fetchall(self, query, params):
+        return [{"security_id": m} for m in self.members]
 
 
 def _cohort(day, expected, missing, explained, tail):
@@ -82,7 +86,7 @@ def test_the_frozen_funds_cohort_is_restated_on_the_series_still_fed(settings):
     of 11,883, about 24.1 expected) is still a cohort, and is said so."""
     report = _cohort("2026-11-09", 15837, 4008, 32.13057580070712, 0.0)
     bad_print = {"check_name": "dorq_bad_print", "security_id": 7, "detail": {}}
-    db = _FakeDb(3954)
+    db = _FakeDb(3954, members=[18126, 19467, 17506])  # BCGS, CLIM, LGDX
     kept, left_out = dorq.adjust_ended_cohorts(
         db, settings, "NASDAQ", [bad_print, report]
     )
@@ -98,6 +102,11 @@ def test_the_frozen_funds_cohort_is_restated_on_the_series_still_fed(settings):
     assert got["message"].startswith("54 of 11,883 series")
     assert "3,954 more stop the session before" in got["message"]
     assert got["fafnir"]["series_ended"] == 3954
+    # DQ303 names no members, and hides their stale tails at info: fafnir's
+    # estimate names them, as dorq writes a cohort's (a comma-separated scalar).
+    assert got["detail"]["members"] == "18126,19467,17506"
+    assert got["fafnir"]["members_estimated"] is True
+    assert dorq.member_ids(got["detail"]["members"]) == [17506, 18126, 19467]
     assert got["fafnir"]["dorq"]["series_missing"] == 4008
     assert got["fafnir"]["message"].startswith("4,008 of 15,837")
     # The record the caller holds is not changed underneath it.
@@ -238,6 +247,11 @@ def test_ended_on_counts_the_near_daily_series_that_stop_the_session_before(db):
     )
     db.commit()
     assert dorq.ended_on(db, "NASDAQ", cohort_day) == 2  # frozen and delisted
+
+    # The fed series missing the day: the outage alone. Not the ended two, nor the
+    # sparse one, nor the one that stopped a session earlier: dorq counts a series
+    # that stops once, on the session after its last bar.
+    assert dorq.fed_missing_on(db, "NASDAQ", cohort_day) == [outage]
 
     # A bar after the session before is a series that did not end there.
     _bars(db, delisted, [cohort_day])

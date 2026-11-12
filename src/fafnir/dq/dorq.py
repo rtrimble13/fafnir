@@ -954,6 +954,54 @@ def ended_on(db: Database, exchange_code: str, day: dt.date) -> int:
     )
 
 
+def fed_missing_on(db: Database, exchange_code: str, day: dt.date) -> list[int]:
+    """fafnir's estimate of a cohort gap's members once the ended series are out:
+    the near-daily securities (as :func:`ended_on` reads it) with no bar on ``day``
+    and either a bar on the session before it or one after it, that have not
+    ended. DQ303 names no members, and its downgrade of each one's stale tail to
+    info hides them: on 2026-11-09, 37 thinly traded SFP ETFs that
+    Sharadar stopped sending after 11-06 had no DQ304 at warn and above."""
+    rows = db.fetchall(
+        """
+        WITH sessions AS (
+            SELECT trade_date FROM ref.trading_calendar
+             WHERE exchange_code = %(exchange)s AND is_open
+               AND trade_date < %(day)s
+             ORDER BY trade_date DESC
+             LIMIT %(sessions)s
+        ), recent AS (
+            SELECT p.security_id, max(p.trade_date) AS last_bar,
+                   count(*) FILTER (
+                       WHERE p.trade_date IN (SELECT trade_date FROM sessions)
+                   ) AS bars,
+                   bool_or(p.trade_date = %(day)s) AS on_day
+              FROM core.daily_price p
+             WHERE p.trade_date >= (SELECT min(trade_date) FROM sessions)
+             GROUP BY p.security_id
+        )
+        SELECT r.security_id
+          FROM recent r
+          JOIN core.security s ON s.security_id = r.security_id
+         WHERE r.bars >= %(min_bars)s AND NOT r.on_day
+           -- A series that stopped is counted once, on the session after its last
+           -- bar: one that stopped earlier was missing a session before this one.
+           AND (r.last_bar = (SELECT max(trade_date) FROM sessions)
+                OR r.last_bar > %(day)s)
+           AND NOT (r.last_bar = (SELECT max(trade_date) FROM sessions)
+                    AND (NOT s.is_actively_trading
+                         OR s.feed_frozen_on IS NOT NULL))
+         ORDER BY r.security_id
+        """,
+        {
+            "exchange": exchange_code,
+            "day": day,
+            "sessions": ENDED_DENSITY_SESSIONS,
+            "min_bars": ENDED_DENSITY_MIN_BARS,
+        },
+    )
+    return [int(r["security_id"]) for r in rows]
+
+
 def adjust_ended_cohorts(
     db: Database,
     settings: DorqSettings,
@@ -980,9 +1028,19 @@ def adjust_ended_cohorts(
     left out. One that still passes is kept with its figures and message restated
     on the fed series, and dorq's own figures under ``detail.fafnir``.
 
+    A kept cohort also names its members, fafnir's estimate
+    (:func:`fed_missing_on`), as ``detail.detail.members``: DQ303 names none, and it
+    downgrades each member's stale tail to info, below what the run reports. That is
+    what the frozen funds' cohort cost beyond a false error: on 11-09 it hid the
+    stale feeds of 37 SFP ETFs Sharadar stopped sending after 11-06, which the SQL
+    ``stale`` check flagged on 11-11. Those ETFs are a cohort on their own, so dorq
+    would downgrade their DQ304s even without the funds; restated, the cohort says
+    so at error and names them.
+
     The ended series' bars still go to dorq, so their history is judged for bad
-    prints and the rest. Not undone: the info downgrade DQ303 gives each member's
-    stale tail, which leaves a cohort that is left out without its explanation.
+    prints and the rest. Not undone: the downgrade itself. The stale tails dorq
+    reports at info are not in the run's output to restore, so a cohort that is
+    left out leaves its members' stale feeds unreported by dorq.
     """
     cohorts = [
         i
@@ -1024,6 +1082,7 @@ def adjust_ended_cohorts(
                 missing,
             )
             continue
+        members = fed_missing_on(db, exchange_code, day)
         new_detail = dict(detail)
         new_detail["detail"] = {
             **inner,
@@ -1031,9 +1090,17 @@ def adjust_ended_cohorts(
             "series_missing": fed_missing,
             "expected_missing": fed_explained,
             "tail_probability": tail,
+            # As dorq writes a cohort's members (a scalar: dq compare and the
+            # queue read it so), unless dorq named them itself.
+            **(
+                {"members": ",".join(str(m) for m in members)}
+                if members and "members" not in inner
+                else {}
+            ),
         }
         new_detail["fafnir"] = {
             "series_ended": ended,
+            "members_estimated": bool(members) and "members" not in inner,
             "dorq": {
                 k: inner[k]
                 for k in (
