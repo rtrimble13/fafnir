@@ -873,7 +873,13 @@ def cohort_thresholds(settings: DorqSettings) -> tuple[int, float]:
         done = subprocess.run(
             args, capture_output=True, text=True, timeout=30, check=False
         )
-        coverage = tomllib.loads(done.stdout).get("coverage", {})
+        if done.returncode != 0:
+            raise subprocess.SubprocessError(
+                f"exit {done.returncode}: {done.stderr.strip()[:200]}"
+            )
+        coverage = tomllib.loads(done.stdout).get("coverage") or {}
+        if not isinstance(coverage, dict):
+            raise TypeError(f"[coverage] is {type(coverage).__name__}")
         return (
             int(coverage.get("cohort_min_series", COHORT_MIN_SERIES)),
             float(coverage.get("cohort_max_tail", COHORT_MAX_TAIL)),
@@ -1102,7 +1108,7 @@ def adjust_ended_cohorts(
             "series_ended": ended,
             "members_estimated": bool(members) and "members" not in inner,
             "dorq": {
-                k: inner[k]
+                k: inner.get(k)
                 for k in (
                     "series_expected",
                     "series_missing",
@@ -1276,6 +1282,11 @@ def condition_record_key(record: dict) -> dict:
         return key
     inner = (record.get("detail") or {}).get("detail")
     inner = inner if isinstance(inner, dict) else {}
+    if record.get("check_name") == COHORT_GAP_CHECK:
+        # One cohort gap per session: its date is the condition. Its members, which
+        # fafnir estimates when it restates the gap (:func:`adjust_ended_cohorts`),
+        # change as series end or come back, and must not make it a new one.
+        return key
     if record.get("check_name") == REVISION_COHORT_CHECK and "cohort" not in key:
         # DQ951 keys a cohort on its date alone, and a date can have two: the
         # series revised that day (info), and those carrying one finding in rows

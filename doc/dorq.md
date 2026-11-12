@@ -390,7 +390,8 @@ are several nights, with a summary over their distinct conditions at the end; wi
   apart by the cohort's split `ratio` -- dorq 0.10's own key -- in compare's sets,
   the backfill's dedupe and the queue's `record_key`. Not by `members`: a cohort's
   membership changes as it is re-judged (six series on 10-12, five on 10-13), and
-  dorq 0.8.1 writes none.
+  dorq 0.8.1 writes none. A cohort gap (DQ303) is keyed on its date alone: there
+  is one per session, and the members fafnir estimates for it change as series end.
 
   A report on a flag the queue *accepted* as a market fact is counted at the
   foot. With `--labels` it counts as false when it is of a DQ2xx code on that
