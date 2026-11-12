@@ -1383,7 +1383,8 @@ fafnir db refresh-marts
   that ticker (failing that, the victim's own period start, but never before its
   first bar: a period at the 1900 placeholder would claim a reused ticker's earlier
   issuer's dates) to the day before the rename away,
-  and the survivor's open period on the vendor's ticker starts at the rename: the
+  and the survivor's period on the vendor's ticker (open, or closed at a dead
+  company's delisting) starts at the rename: the
   history a rename applied in time would have left. `ticker_history` and `duk ph
   MICS` then reach the company. The dry run prints both periods, and refuses when
   the recorded period would overlap another security's period on that ticker (CHK

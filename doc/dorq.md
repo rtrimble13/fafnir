@@ -390,7 +390,8 @@ are several nights, with a summary over their distinct conditions at the end; wi
   apart by the cohort's split `ratio` -- dorq 0.10's own key -- in compare's sets,
   the backfill's dedupe and the queue's `record_key`. Not by `members`: a cohort's
   membership changes as it is re-judged (six series on 10-12, five on 10-13), and
-  dorq 0.8.1 writes none.
+  dorq 0.8.1 writes none. A cohort gap (DQ303) is keyed on its date alone: there
+  is one per session, and the members fafnir estimates for it change as series end.
 
   A report on a flag the queue *accepted* as a market fact is counted at the
   foot. With `--labels` it counts as false when it is of a DQ2xx code on that
@@ -435,7 +436,9 @@ are several nights, with a summary over their distinct conditions at the end; wi
   - **dorq:** is a report at warn and above on it, matched as precision matches?
   - **The SQL checks:** is an `outlier`, `gap` or `stale` flag on its security,
     open or closed, detected by the run's start, dated within the label's dates
-    and the slack?
+    and the slack? A `stale` flag is dated at the feed's last bar, before the
+    sessions it is about, so it counts when it spans them: from that bar to the
+    day it was closed, or on while it is open.
 
   `found` needs a code the label expects. For an SQL flag, that is one of its
   check's successor codes, as in the overlap table. `any` takes any code. A table
@@ -798,7 +801,13 @@ fafnir dq run --no-statements             # this run without them
    checks whose flag names several items of its period, `fundamentals_suspicious_zero`
    and `fundamentals_negative_impossible`: it covers a report on one of those items,
    or any report when it names none. A report on another item, or on the whole row,
-   is written. A shadow night withholds nothing: its file is dorq's whole view, and
+   is written. A carry withholds a write, so it is held to the SQL check's own
+   condition where the overlap's rule is looser: a flag keyed on a `version_no`
+   carries only that version (a restated version that still fails is a new
+   condition), a `fundamentals_stale` flag only a report on its
+   `latest_fiscal_date` (a later filing is a new occurrence), and a
+   `fundamentals_ttm_incomplete` flag only an income statement report. A shadow
+   night withholds nothing: its file is dorq's whole view, and
    `dq compare --statements` counts what the queue would take. A finding on no one statement goes under
    `core.income_statement`, as the SQL checks file theirs: DQ943 (statements missing)
    and DQ951's cohorts. A date can hold two DQ951 cohorts: the series revised that

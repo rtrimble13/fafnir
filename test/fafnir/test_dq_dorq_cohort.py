@@ -114,6 +114,29 @@ def test_the_frozen_funds_cohort_is_restated_on_the_series_still_fed(settings):
     assert kept[1]["record_key"] == {"trade_date": "2026-11-09"}
 
 
+def test_a_restated_cohort_keeps_dorqs_condition(settings):
+    """A cohort gap is its session: the members fafnir estimates change as series
+    end or come back, and re-judging 11-09 on a later night must find the same
+    condition, not open a second one beside it."""
+    report = _cohort("2026-11-09", 15837, 4008, 32.13057580070712, 0.0)
+    keys = {dorq.condition_key(report)}
+    for members in ([18126, 19467, 17506], [18126, 19467], []):
+        kept, _ = dorq.adjust_ended_cohorts(
+            _FakeDb(3954, members=members), settings, "NASDAQ", [report]
+        )
+        keys.add(dorq.condition_key(kept[0]))
+    assert len(keys) == 1
+    assert dorq.condition_record_key(kept[0]) == {"trade_date": "2026-11-09"}
+
+
+def test_a_cohort_without_dorqs_tail_is_restated(settings):
+    report = _cohort("2026-11-09", 15837, 4008, 32.13057580070712, 0.0)
+    del report["detail"]["detail"]["tail_probability"]
+    kept, _ = dorq.adjust_ended_cohorts(_FakeDb(3954), settings, "NASDAQ", [report])
+    assert kept[0]["detail"]["fafnir"]["dorq"]["tail_probability"] is None
+    assert kept[0]["detail"]["detail"]["series_missing"] == 54
+
+
 def test_a_cohort_the_ended_series_explain_is_left_out(settings):
     """11-02: 66 of 15,838, eleven of them delisted on 10-30. Without them, 55
     against 32.0 is not improbable enough (tail 1.4e-4 > 1e-6)."""
@@ -175,6 +198,17 @@ def test_the_thresholds_are_the_runs_config(tmp_path):
         _FakeDb(3954), settings, "NASDAQ", [report]
     )
     assert kept == [] and left_out == {dorq.COHORT_GAP_CHECK: 1}
+
+
+def test_a_failed_config_show_gives_dq303s_defaults(tmp_path):
+    fake = tmp_path / "dorq"
+    fake.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(2)\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    settings = dorq.DorqSettings(path=str(fake), config=str(tmp_path / "d.toml"))
+    assert dorq.cohort_thresholds(settings) == (
+        dorq.COHORT_MIN_SERIES,
+        dorq.COHORT_MAX_TAIL,
+    )
 
 
 def test_no_dorq_to_ask_gives_dq303s_defaults(settings):

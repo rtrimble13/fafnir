@@ -1045,8 +1045,13 @@ def _recall(tmp_path, reports, labels, flags, *, backfilled=()):
     return c, db
 
 
-def _sqlf(sid, check, day):
-    return {"check_name": check, "security_id": sid, "d": dt.date.fromisoformat(day)}
+def _sqlf(sid, check, day, until=None):
+    return {
+        "check_name": check,
+        "security_id": sid,
+        "d": dt.date.fromisoformat(day),
+        "until": dt.date.fromisoformat(until) if until else None,
+    }
 
 
 def test_recall_on_confirmed_errors_counts_both_engines(tmp_path):
@@ -1079,6 +1084,28 @@ def test_recall_on_confirmed_errors_counts_both_engines(tmp_path):
     d = c.as_dict()["recall"]
     assert d["labels"] == 4 and d["dorq"]["recall"] == 0.25
     assert d["sql"]["recall_any"] == 0.5 and "by_kind" in d
+
+
+def test_a_stale_flag_finds_the_feed_gap_it_spans(tmp_path):
+    """A stale flag is keyed on the feed's last bar, before the missing sessions a
+    feed_gap label states: over Easter (last bar Thursday 04-02, the gap from
+    Monday 04-06) that is more than the slack, and a stall labelled late is weeks
+    past it. The flag spans the gap until it is closed."""
+    c, _ = _recall(
+        tmp_path,
+        [],
+        [
+            _error(1, "2024-03-07", "2024-03-08", expect="DQ304", kind="feed_gap"),
+            _error(2, "2024-03-04", "2024-03-08", expect="DQ304", kind="feed_gap"),
+            _error(3, "2024-03-04", "2024-03-08", expect="DQ304", kind="feed_gap"),
+        ],
+        [
+            _sqlf(1, "stale", "2024-03-01"),  # open: holds through the label
+            _sqlf(2, "stale", "2024-02-01", until="2024-03-20"),
+            _sqlf(3, "stale", "2024-01-02", until="2024-01-20"),  # closed before it
+        ],
+    )
+    assert (c.recall.sql, c.recall.sql_any) == (2, 2)
 
 
 def test_recall_counts_only_the_confirmed_errors_about_the_window(tmp_path):

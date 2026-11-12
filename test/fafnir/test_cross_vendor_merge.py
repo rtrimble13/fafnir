@@ -754,7 +754,12 @@ def test_a_dead_company_on_a_former_ticker_merges(db, run_cli):
     assert _row(db, victim) is None
     row = _row(db, survivor)
     assert (row["is_actively_trading"], row["delisted_date"]) == (False, LAST)
-    assert ("ZZOLD", TOOK, RENAMED - timedelta(days=1)) in _periods(db, survivor)
+    # The vendor's ticker starts at the rename on a dead company too, though its
+    # period was closed at the delisting.
+    assert _periods(db, survivor) == [
+        ("ZZOLD", TOOK, RENAMED - timedelta(days=1)),
+        ("ZZNEW", RENAMED, LAST),
+    ]
     run = db.fetchone(
         "SELECT params FROM ops.ingestion_run WHERE endpoint = "
         "'security-merge-across-vendors'"
