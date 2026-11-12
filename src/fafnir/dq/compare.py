@@ -752,9 +752,13 @@ def _sql_flags_found(
     db: Database, state_at: Optional[dt.datetime], securities: Sequence[int]
 ) -> list[dict]:
     """Every flag of the SQL checks dorq is to replace on ``securities``, at warn
-    and above, detected by ``state_at`` (now when None), open or closed: what the
-    SQL checks found. Dated as the comparison dates them (``d``), with the day it
-    was closed (``until``; None while open)."""
+    and above, detected by ``state_at`` (now when None) and still open then: what
+    the SQL checks were saying when dorq ran, as the night's file is what dorq was
+    saying. A flag closed before the run is left out. A bar fault is often closed
+    by the load that made it (a gap re-checked away when the vendor fills the
+    session with a wrong bar), and dorq gets no credit for its earlier nights
+    either. Dated as the comparison dates them (``d``), with the day it was closed
+    (``until``; None while open)."""
     if not securities:
         return []
     return db.fetchall(
@@ -765,6 +769,8 @@ def _sql_flags_found(
          WHERE f.security_id = ANY(%(sids)s)
            AND f.severity IN ('warn', 'error')
            AND f.d IS NOT NULL
+           AND COALESCE(f.resolved_at, f.accepted_at, 'infinity'::timestamptz)
+               >= COALESCE(%(t)s::timestamptz, 'infinity'::timestamptz)
         """,
         {"checks": list(SUCCESSORS), "t": state_at, "sids": list(securities)},
     )
@@ -797,9 +803,10 @@ def label_recall(
 
     dorq found one when a report at warn and above on it overlaps it as precision
     matches a report to a label (:func:`_overlaps`); the SQL checks, when a flag of
-    theirs at warn and above on its security, open or closed, detected by the
-    run's start, is dated within the label's dates and the slack (a stale flag,
-    dated at the feed's last bar: when it spans them, to the day it was closed). ``found`` needs a
+    theirs at warn and above on its security, detected by the run's start and
+    still open then, is dated within the label's dates and the slack (a stale
+    flag, dated at the feed's last bar: when it spans them, to the day it was
+    closed). ``found`` needs a
     code the label expects (an SQL flag: one of its check's successor codes);
     ``any`` takes any code.
 
