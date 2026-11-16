@@ -1005,6 +1005,7 @@ class _FlagsDb:
 
     def fetchall(self, query, params):
         self.asked.append(params)
+        assert "'infinity'::timestamptz)" in query  # open at the run's start
         return [f for f in self.flags if f["security_id"] in params["sids"]]
 
 
@@ -1180,3 +1181,39 @@ def test_compare_measures_recall_on_confirmed_errors_as_precision_is_scoped(
     assert (c.recall.dorq, c.recall.sql) == (1, 0)
     c = cmp.compare(db, shadow, labels=labels, labels_ignore_time=True)
     assert c.recall.labels == 3
+
+
+@pytest.mark.integration
+def test_recall_counts_only_the_sql_flags_open_when_dorq_ran(db, tmp_path):
+    """A gap re-checked away before the night because the vendor filled the
+    session -- with a wrong bar, the label says -- is not something the SQL checks
+    were saying when dorq ran; one closed after the run's start still is."""
+    gone = _mk(db, "CMPR3")
+    held = _mk(db, "CMPR4")
+    _run_row(db, "2024-03-08", "2024-03-04", started="2024-03-09 04:00+00")
+    _flag(
+        db,
+        gone,
+        "gap",
+        {"trade_date": "2024-03-05"},
+        detected="2024-03-06 04:00+00",
+        resolved="2024-03-08 05:00+00",
+    )
+    _flag(
+        db,
+        held,
+        "gap",
+        {"trade_date": "2024-03-05"},
+        detected="2024-03-06 04:00+00",
+        resolved="2024-03-10 05:00+00",
+    )
+    shadow = tmp_path / "2024-03-08.jsonl"
+    dorq.write_shadow([_row(gone, "2024-03-07", severity="info")], shadow)
+    labels = _labels(
+        tmp_path,
+        _error(gone, "2024-03-05", expect="DQ301", kind="no_valid_bar"),
+        _error(held, "2024-03-05", expect="DQ301", kind="no_valid_bar"),
+    )
+    c = cmp.compare(db, shadow, labels=labels)
+    assert c.recall.labels == 2
+    assert (c.recall.dorq, c.recall.sql_any) == (0, 1)

@@ -435,10 +435,20 @@ are several nights, with a summary over their distinct conditions at the end; wi
   On each, compare asks:
   - **dorq:** is a report at warn and above on it, matched as precision matches?
   - **The SQL checks:** is an `outlier`, `gap` or `stale` flag on its security,
-    open or closed, detected by the run's start, dated within the label's dates
-    and the slack? A `stale` flag is dated at the feed's last bar, before the
-    sessions it is about, so it counts when it spans them: from that bar to the
-    day it was closed, or on while it is open.
+    detected by the run's start and still open then, dated within the label's
+    dates and the slack? A `stale` flag is dated at the feed's last bar, before
+    the sessions it is about, so it counts when it spans them: from that bar to
+    the day it was closed, or on while it is open.
+
+  Both engines are asked what they were saying when the run started: dorq by the
+  night's file, the SQL checks by their open flags. A flag closed before the run
+  does not count. A bar fault is often closed by the load that made it. On
+  2026-11-10 the vendor filled 28 thin ETFs' missing sessions with zero-volume
+  carries of the prior close, and the night's re-check closed their `gap` and
+  `stale` flags because a bar now existed. Counting those closed flags gave the
+  SQL checks 28 of 28 on the wrong bars, against dorq's 0, three nights after
+  neither engine could see them. The statements' recall still counts closed
+  flags: a statement flag is closed by a person's judgement, not by a load.
 
   `found` needs a code the label expects. For an SQL flag, that is one of its
   check's successor codes, as in the overlap table. `any` takes any code. A table
