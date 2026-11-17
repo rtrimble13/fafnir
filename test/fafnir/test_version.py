@@ -21,6 +21,7 @@ import pytest
 
 import duk
 import fafnir
+import fafnir_api
 import fafnir_mcp
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +43,7 @@ def test_the_version_is_three_numbers():
 def test_every_package_reports_the_same_version():
     """The re-exports are the mechanism; this is the assertion they exist for."""
     assert fafnir_mcp.__version__ == fafnir.__version__
+    assert fafnir_api.__version__ == fafnir.__version__
     assert duk.__version__ == fafnir.__version__
 
 

@@ -142,6 +142,11 @@ change. See [adr/0003-postgres-now-timescale-later.md](adr/0003-postgres-now-tim
 | `fafnir_read` | read core/mart/ref | research, notebooks |
 | `fafnir_app` | read **mart** (+ ref) only | external apps, MCP, `duk -S db` |
 
+A reader that cannot open a database connection reads through the host's HTTP API
+with an API key ([ADR 0021](adr/0021-http-api-and-api-keys.md)). The API holds no
+privilege of its own: it connects as a member of `fafnir_app` and serves the reads
+`duk -S db` makes, so a key reaches what that role reaches and nothing else.
+
 Reporting/research connects read-only. No application role owns `DROP`/`ALTER` in
 production. Every query is parameterized.
 

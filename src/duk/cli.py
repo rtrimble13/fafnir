@@ -230,7 +230,7 @@ def parse_security_argument(argument):
 def require_source_credentials(ctx, source, *, needs_key=True):
     """Exit 1 with an actionable message when the active source cannot be read.
 
-    ``db`` needs a DSN; ``fmp`` and ``sharadar`` need that vendor's key. Stated
+    ``db`` needs a DSN or an API address; ``fmp`` and ``sharadar`` need that vendor's key. Stated
     once so every command gives the same instruction, and so a missing DSN under
     the db default reads as configuration advice rather than a psycopg traceback.
     """
@@ -238,10 +238,12 @@ def require_source_credentials(ctx, source, *, needs_key=True):
     logger = ctx.obj.get("logger", logging.getLogger("duk"))
     if source == "db":
         if not cfg.dsn:
-            logger.error("No warehouse DSN configured")
+            logger.error("No warehouse DSN or API address configured")
             click.echo(
                 "Error: no fafnir DSN configured. Set FAFNIR_DSN or [database].dsn "
-                "in ~/.dukrc, or read a vendor directly with -S fmp / -S sharadar.",
+                "in ~/.dukrc (or, for the HTTP API, FAFNIR_API_URL / "
+                "[api].fafnir_url and a key), or read a vendor directly with "
+                "-S fmp / -S sharadar.",
                 err=True,
             )
             sys.exit(1)

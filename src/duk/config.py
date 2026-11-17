@@ -2,7 +2,9 @@
 Configuration management for duk (fafnir edition).
 
 duk reads from one of three sources:
-  * ``db``       -- the fafnir PostgreSQL warehouse (mart schema); the default
+  * ``db``       -- the fafnir warehouse (mart schema); the default. Reached by a
+                    libpq DSN, or with no database connection at all through the
+                    host's HTTP API and an API key (ADR 0021)
   * ``fmp``      -- the FMP API directly (``live`` is the older spelling)
   * ``sharadar`` -- the Sharadar API directly
 
@@ -12,6 +14,7 @@ unless told otherwise. A vendor source needs that vendor's key.
 
 Config file: ``~/.dukrc`` (TOML). Reuses the original keys and adds:
   [api].sharadar_key, [api].sharadar_base_url
+  [api].fafnir_url, [api].fafnir_key     (the warehouse's HTTP API)
   [database].dsn
   [general].default_source
   [general].console_format   ("auto" | "table" | "csv" | "json")
@@ -23,6 +26,8 @@ import os
 import tomllib
 from pathlib import Path
 from typing import Any, Optional
+
+from duk.datasource.base import ApiAddress
 
 
 class DukConfig:
@@ -67,13 +72,46 @@ class DukConfig:
             return env_url
         return (self._get("api", "sharadar_base_url", "") or "").strip()
 
-    # -- database (db mode) -------------------------------------------------
+    # -- the warehouse (-S db) ----------------------------------------------
+    @property
+    def fafnir_api_url(self) -> str:
+        """Base URL of the warehouse's HTTP API (ADR 0021), e.g.
+        ``https://fafnir.example.com``."""
+        env_url = os.environ.get("FAFNIR_API_URL", "").strip()
+        if env_url:
+            return env_url
+        return (self._get("api", "fafnir_url", "") or "").strip()
+
+    @property
+    def fafnir_api_key(self) -> str:
+        env_key = os.environ.get("FAFNIR_API_KEY", "").strip()
+        if env_key:
+            return env_key
+        return (self._get("api", "fafnir_key", "") or "").strip()
+
     @property
     def dsn(self) -> str:
+        """Where the warehouse is: a libpq DSN, or an :class:`ApiAddress` when it
+        is reached through its HTTP API. Empty when neither is configured.
+
+        The environment beats the file, and at each level a DSN beats an API
+        address: a machine that can open a database connection (the host, a laptop
+        with the tunnel up) uses it, and ``FAFNIR_API_URL=... duk ...`` still
+        overrides a DSN the file names.
+        """
         env_dsn = os.environ.get("FAFNIR_DSN", "").strip()
         if env_dsn:
             return env_dsn
-        return (self._get("database", "dsn", "") or "").strip()
+        env_url = os.environ.get("FAFNIR_API_URL", "").strip()
+        if env_url:
+            return ApiAddress(env_url, self.fafnir_api_key)
+        file_dsn = (self._get("database", "dsn", "") or "").strip()
+        if file_dsn:
+            return file_dsn
+        file_url = (self._get("api", "fafnir_url", "") or "").strip()
+        if file_url:
+            return ApiAddress(file_url, self.fafnir_api_key)
+        return ""
 
     @property
     def default_source(self) -> str:

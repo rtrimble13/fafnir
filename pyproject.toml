@@ -55,10 +55,20 @@ mcp = [
     "mcp>=2.1,<3",
 ]
 
+# The HTTP API's server (ADR 0021). Optional for the same reason mcp is: only a
+# host serving the API pays for it. The application itself (fafnir_api.app) is
+# standard-library WSGI and needs nothing here; waitress is what `fafnir-api`
+# serves it with. A client -- duk reading through the API -- needs no extra at
+# all: requests is already a core dependency.
+api = [
+    "waitress>=3.0",
+]
+
 [project.scripts]
 fafnir = "fafnir.cli:main"
 duk = "duk.cli:main"
 fafnir-mcp = "fafnir_mcp.cli:main"
+fafnir-api = "fafnir_api.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

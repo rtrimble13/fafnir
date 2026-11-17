@@ -769,6 +769,9 @@ Three tiers, and the tier is the whole of the authorization:
 | research | `fafnir_read` | + `core` | notebooks, ad-hoc analysis |
 | ops | `fafnir_ops` | + `ops`, `landing`, `meta` | an operations agent on the host |
 
+A reader with no SSH access is the exception to "a role per reader": it holds an
+[API key](#api-keys), and every key reads at the app tier through one role.
+
 Adding a person:
 
 ```bash
@@ -832,6 +835,56 @@ registration — the whole procedure, with the audit and revocation queries, is
 > sudo -u postgres psql -d fafnir -c 'CREATE ROLE fafnir_ops NOLOGIN;'
 > sudo -u fafnir /opt/fafnir/.venv/bin/fafnir db migrate
 > ```
+
+### API keys
+
+A reader that cannot use SSH reads through the HTTP API with a key
+([ADR 0021](adr/0021-http-api-and-api-keys.md); setting the service up is
+[install_hetzner.md §14](install_hetzner.md#14-the-http-api-optional)). A key is
+the fourth kind of reader and the only one that is not a Postgres role: every key
+reads as `fafnir_api`, a member of `fafnir_app`, so a key reads what the app tier
+reads and nothing more.
+
+```bash
+fafnir api key create rob-laptop --note "Rob, MacBook"      # prints the key, once
+fafnir api key create portable-ci --expires-days 90
+fafnir api key list                                         # live keys
+fafnir api key list --all                                   # and the revoked ones
+fafnir api key revoke rob-laptop
+```
+
+- **One key per device or job, named for it.** The name is what `revoke` takes
+  and what the logs attribute a query to. A shared key cannot be revoked for one
+  holder.
+- **The key is shown once.** `ops.api_key` holds its SHA-256. A lost key is
+  revoked and replaced, never recovered. `create` prints it alone on standard
+  output, so it can be piped straight into a secrets manager.
+- **Give anything unattended an expiry.** An expired key is refused with *this key
+  has expired* and stays in the list until revoked.
+- **Revocation takes up to 30 seconds** on a running service (its key cache).
+  Restart `fafnir-api` to make it immediate.
+- **Rotating** is `revoke` then `create` under the same name, or `create` a second
+  name, move the reader, then `revoke` the first.
+
+Who read what:
+
+```bash
+journalctl -u fafnir-api --since today | grep 'key=rob-laptop'
+# 203.0.113.7 POST /v1/reads/price_history status=200 key=rob-laptop read=price_history ms=14 bytes=2210
+```
+
+```sql
+-- Queries running now, by key.
+SELECT application_name, state, query_start, left(query, 60)
+  FROM pg_stat_activity WHERE application_name LIKE 'fafnir-api:%';
+```
+
+The log line carries the key's name, the read and the outcome. It never carries
+the key or a read's arguments.
+
+Turning the API off without touching the keys: `sudo systemctl stop fafnir-api`,
+or `ALTER ROLE fafnir_api NOLOGIN` to stop it at the database. Closing 443 at the
+Cloud Firewall takes it off the internet and leaves it running for the host.
 
 ## Working the DQ queue
 

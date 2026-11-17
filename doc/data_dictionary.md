@@ -82,6 +82,7 @@ count, the planner's estimate otherwise. They are not maintained.
 | [`ops.operator_override`](#opsoperator_override--operator-corrections-grain-override_id) | table | `override_id` | `actions`, `prices`, `security split-history` | 343k |
 | [`ops.vendor_correction`](#opsvendor_correction--rows-one-vendor-replaced-grain-correction_id) | table | `correction_id` | `vendor correct` | 704k |
 | [`ops.dq_label`](#opsdq_label--labels-a-person-stated-grain-label_id) | table | `label_id` | `dq label`, `dq accept\|resolve --label` | 129 |
+| [`ops.api_key`](#opsapi_key--keys-of-the-http-api-grain-key_id) | table | `key_id` | `fafnir api key create\|revoke` | — |
 | [`landing.fmp_raw`](#landingfmp_raw--raw-immutable-payloads-grain-raw_id) | table | `raw_id` | the FMP loaders | 915k (6.2 GB) |
 | [`landing.sharadar_file`](#landingsharadar_file--the-sharadar-file-ledger-grain-file_id) | table | `file_id` | `source sharadar-bulk\|delta\|prune` | 34 |
 | [`meta.schema_migration`](#metaschema_migration--migration-bookkeeping-grain-version) | table | `version` | `db migrate` | 40 |
@@ -110,6 +111,10 @@ they serve.
   `fafnir_ops`, and revoked from PUBLIC.
 - **Login roles.** Per-person and per-agent login roles are members of these groups.
   They are deployment facts, not migrations.
+- **`ops.api_key` is the exception in `ops`.** `fafnir_ops` does not read it
+  (migration 0046 revokes it), and the one role that does besides `fafnir_ingest` is
+  the login role the HTTP API serves as: a member of `fafnir_app` that the install
+  grants `SELECT` on this table alone ([ADR 0021](adr/0021-http-api-and-api-keys.md)).
 
 ---
 
@@ -1638,6 +1643,26 @@ NULL`.
 | `item` | TEXT CHECK | The line item, a statement table's column; never blank. NULL: any. |
 
 ---
+
+### `ops.api_key` — keys of the HTTP API. **Grain:** `key_id`.
+
+Migration 0046, [ADR 0021](adr/0021-http-api-and-api-keys.md). One row per key ever
+issued by `fafnir api key create`; a revoked key keeps its row. Written by
+`fafnir_ingest` (the `fafnir api key` commands) and read by the login role
+`fafnir-api` serves as, which the install grants `SELECT` on this table alone. No
+other role reads it: the migration revokes it from `fafnir_ops`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `key_id` | TEXT PK | 12 hex characters: the public half of `ffn_<key_id>_<secret>`. Names the row; safe to log. |
+| `name` | TEXT | Who or what holds the key (`rob-laptop`). Unique among live keys; appears in the API's access log and in `application_name` (`fafnir-api:<name>`). |
+| `key_sha256` | TEXT | SHA-256 (hex) of the whole key. The key itself is stored nowhere. |
+| `created_at` | TIMESTAMPTZ | |
+| `created_by` | TEXT | OS user who issued it, or `--by`. |
+| `expires_at` | TIMESTAMPTZ | NULL: never. A key is refused from this instant. |
+| `revoked_at` | TIMESTAMPTZ | NULL: live. Set by `fafnir api key revoke`, with `revoked_by`. |
+| `revoked_by` | TEXT | |
+| `note` | TEXT | Free text from `--note`. |
 
 ## Schema: `landing`
 

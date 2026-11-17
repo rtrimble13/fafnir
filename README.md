@@ -177,7 +177,7 @@ than guessing. See **[doc/duk.md](doc/duk.md)**.
 | [install_hetzner.md](doc/install_hetzner.md) | Fresh install on a Hetzner Cloud server: provision → Postgres → fafnir → cron |
 | [backfill.md](doc/backfill.md) | Initial setup & historical backfill: FMP first, then Sharadar's population, dead issuers and fundamentals |
 | [operations.md](doc/operations.md) | Daily upkeep runbook, cron, backfill, recovery |
-| [duk.md](doc/duk.md) | CLI usage: the warehouse (`db`) vs a vendor (`fmp`, `sharadar`) |
+| [duk.md](doc/duk.md) | CLI usage: the warehouse (`db`) vs a vendor (`fmp`, `sharadar`); reading it remotely through the SSH tunnel or the HTTP API with an API key |
 | [fundamentals.md](doc/fundamentals.md) | The statements and the factor panel: reading them point in time, without look-ahead |
 | [agent.md](doc/agent.md) | Run an operations agent on the host: DQ triage, automations, data questions |
 | [extending.md](doc/extending.md) | The roadmap; add a source, a table, or an MCP tool |

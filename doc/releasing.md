@@ -117,7 +117,7 @@ the two is how a version comparison silently stops working.
 
 One place: `__version__` in `src/fafnir/__init__.py`.
 
-`fafnir_mcp` and `duk` re-export it, and `pyproject.toml` reads it through
+`fafnir_mcp`, `fafnir_api` and `duk` re-export it, and `pyproject.toml` reads it through
 `[tool.setuptools.dynamic]`, so the distribution metadata cannot drift from the
 source. `test/fafnir/test_version.py` asserts each of those links, including that
 no second `__version__` literal has appeared anywhere in `src/`.

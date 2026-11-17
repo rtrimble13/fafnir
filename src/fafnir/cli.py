@@ -9367,5 +9367,131 @@ def _vendor_status_lines(label: str, st: dict) -> list[str]:
     return [(head if i == 0 else " " * len(head)) + x for i, x in enumerate(lines)]
 
 
+# ---------------------------------------------------------------------------
+# API keys (ADR 0021)
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def api():
+    """The warehouse's HTTP API: its keys. The service itself is `fafnir-api`."""
+
+
+@api.group("key")
+def api_key():
+    """Issue, list and revoke API keys (ops.api_key, migration 0046)."""
+
+
+@api_key.command("create")
+@click.argument("name")
+@click.option(
+    "--expires-days",
+    type=click.IntRange(min=1),
+    help="Stop working this many days from now [default: never]",
+)
+@click.option("--note", help="Who or what holds the key, and why")
+@click.option("--by", help="Who is issuing it [default: the OS user]")
+@click.pass_context
+def api_key_create(ctx, name, expires_days, note, by):
+    """Issue a key called NAME and print it, once.
+
+    NAME says who or what holds the key (`rob-laptop`, `portable-ci`): it is what
+    `revoke` takes, and what the access log and pg_stat_activity attribute a query
+    to. Lowercase letters, digits, '.', '_' and '-', up to 40 characters.
+
+    The key is printed alone on standard output, so it can be piped to a secrets
+    manager, and is not stored: only its SHA-256 is. A lost key is replaced, not
+    recovered.
+    """
+    from fafnir_api import keys
+
+    if not keys.valid_name(name):
+        raise click.ClickException(
+            f"'{name}' is not a key name: lowercase letters, digits, '.', '_' and "
+            "'-', starting with a letter or digit, at most 40 characters"
+        )
+    key_id, token = keys.generate()
+    with Database(ctx.obj["config"].dsn) as database:
+        if database.fetchone(
+            "SELECT 1 AS x FROM ops.api_key WHERE name = %s AND revoked_at IS NULL",
+            (name,),
+        ):
+            raise click.ClickException(
+                f"a live key named '{name}' exists. Revoke it first "
+                f"(`fafnir api key revoke {name}`), or choose another name"
+            )
+        row = database.fetchone(
+            "INSERT INTO ops.api_key (key_id, name, key_sha256, created_by, "
+            "expires_at, note) VALUES (%s, %s, %s, %s, "
+            "now() + make_interval(days => %s), %s) RETURNING expires_at",
+            (key_id, name, keys.digest(token), by or _os_user(), expires_days, note),
+        )
+    expiry = (
+        f"expires {row['expires_at']:%Y-%m-%d}" if row["expires_at"] else "no expiry"
+    )
+    click.echo(
+        f"Key '{name}' ({key_id}) issued, {expiry}. It is shown once and not "
+        "stored: put it where duk reads it (FAFNIR_API_KEY, or [api].fafnir_key "
+        "in ~/.dukrc).",
+        err=True,
+    )
+    click.echo(token)
+
+
+@api_key.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Include revoked keys")
+@click.pass_context
+def api_key_list(ctx, show_all):
+    """List the keys: name, id, state, and when each was issued."""
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = database.fetchall(
+            "SELECT key_id, name, created_at, created_by, expires_at, revoked_at, "
+            "note, (expires_at IS NOT NULL AND expires_at <= now()) AS expired "
+            "FROM ops.api_key WHERE %s OR revoked_at IS NULL "
+            "ORDER BY created_at, key_id",
+            (show_all,),
+        )
+    if not rows:
+        click.echo("No keys." if show_all else "No live keys.")
+        return
+    click.echo(f"{'NAME':<24} {'KEY ID':<12} {'STATE':<18} {'ISSUED':<10} BY / NOTE")
+    for r in rows:
+        if r["revoked_at"]:
+            state = f"revoked {r['revoked_at']:%Y-%m-%d}"
+        elif r["expired"]:
+            state = f"expired {r['expires_at']:%Y-%m-%d}"
+        elif r["expires_at"]:
+            state = f"until {r['expires_at']:%Y-%m-%d}"
+        else:
+            state = "live"
+        tail = r["created_by"] + (f": {r['note']}" if r["note"] else "")
+        click.echo(
+            f"{r['name']:<24} {r['key_id']:<12} {state:<18} "
+            f"{r['created_at']:%Y-%m-%d} {tail}"
+        )
+
+
+@api_key.command("revoke")
+@click.argument("name")
+@click.option("--by", help="Who is revoking it [default: the OS user]")
+@click.pass_context
+def api_key_revoke(ctx, name, by):
+    """Revoke the live key called NAME (or with that key id).
+
+    A running fafnir-api stops honouring it within its key cache's lifetime, 30
+    seconds. The row is kept, so the access log stays traceable.
+    """
+    with Database(ctx.obj["config"].dsn) as database:
+        row = database.fetchone(
+            "UPDATE ops.api_key SET revoked_at = now(), revoked_by = %s "
+            "WHERE revoked_at IS NULL AND (name = %s OR key_id = %s) "
+            "RETURNING key_id, name",
+            (by or _os_user(), name, name),
+        )
+    if row is None:
+        raise click.ClickException(f"no live key named '{name}'")
+    click.echo(f"Revoked '{row['name']}' ({row['key_id']}).")
+
+
 if __name__ == "__main__":
     main()

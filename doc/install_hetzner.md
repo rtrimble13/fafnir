@@ -37,7 +37,9 @@ system user that owns the code and runs the jobs). Three database roles, per the
 `fafnir_read` (read core+mart), `fafnir_app` (read mart only — this is what `duk` uses).
 
 **Nothing listens on the public internet.** Postgres binds to localhost; remote
-`duk` access goes through an SSH tunnel (§11).
+`duk` access goes through an SSH tunnel (§11). The one exception is opt-in: the
+HTTP API of §14, for readers that cannot use SSH, which puts a reverse proxy on
+443.
 
 ---
 
@@ -1487,7 +1489,176 @@ sudo -u fafnir -H /opt/fafnir/scripts/monitor.sh     # every §10 check; exits 0
 
 # --- From your laptop, with the §11 tunnel up -------------------------------
 duk -S db ph SPY --adj -n 5                          # reads as fafnir_app
+
+# --- Only if you set up the HTTP API (§14) ----------------------------------
+sudo -u fafnir-api /opt/fafnir/.venv/bin/fafnir-api --dsn "dbname=fafnir user=fafnir_api" --check   # OK
+sudo ss -lntp | grep 8787                            # 127.0.0.1 only
+curl -s https://<API_NAME>/v1/health                 # {"status": "ok"}
 ```
 
 Steady-state operation, reconciliation, and recovery from here on:
 **[operations.md](operations.md)**.
+
+---
+
+## 14. The HTTP API (optional)
+
+Everything above leaves `sshd` as the only thing listening to the internet, and
+§11's tunnel as the way in. This section adds a second way, for readers that
+cannot open an SSH tunnel: a hosted or sandboxed agent, a CI job, a second
+machine you do not want to give an account on the host. They read with `duk`
+over HTTPS, authenticating with an API key
+([ADR 0021](adr/0021-http-api-and-api-keys.md)).
+
+Skip it if the tunnel serves everyone who reads. It costs a public port, a DNS
+name and a certificate, and a key is a weaker credential than an SSH key: it is a
+secret that sits on the reader's disk. What it serves is exactly what `duk -S db`
+reads, as a role that can read `mart` and `ref` and write nothing.
+
+You need a DNS name pointing at the server (`<API_NAME>` below).
+
+### 14.1 The role
+
+```bash
+sudo -u postgres psql -d fafnir <<'SQL'
+-- A member of fafnir_app: SELECT on mart and ref, like any duk reader.
+CREATE ROLE fafnir_api LOGIN IN ROLE fafnir_app;
+ALTER ROLE fafnir_api SET default_transaction_read_only = on;
+ALTER ROLE fafnir_api SET statement_timeout = '30s';     -- bounds a request
+ALTER ROLE fafnir_api SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE fafnir_api CONNECTION LIMIT 16;                -- over --threads
+
+-- The one thing in ops it may see: the keys it checks requests against.
+GRANT USAGE ON SCHEMA ops TO fafnir_api;
+GRANT SELECT ON ops.api_key TO fafnir_api;
+SQL
+```
+
+`ops.api_key` arrives with migration `0046`; run `fafnir db migrate` first if the
+`GRANT` says it does not exist. The grant is made here and not by the migration
+because which role serves the API is a fact about this host, not about the schema.
+
+### 14.2 The service user and peer auth
+
+The API runs as its own OS user, which maps to that role over the socket. No
+password, as for the nightly job (§3.6):
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin fafnir-api
+
+echo 'fafnirmap  fafnir-api  fafnir_api' | sudo tee -a /etc/postgresql/16/main/pg_ident.conf
+
+# Above "local all all peer": first match wins. Skip it if pg_hba.conf already
+# has the "+fafnir_app" line from operations.md › Adding a reader, which covers
+# every member of fafnir_app.
+sudo sed -i '/^# TYPE  DATABASE/a local   all             fafnir_api                              peer map=fafnirmap' \
+     /etc/postgresql/16/main/pg_hba.conf
+sudo systemctl reload postgresql@16-main
+```
+
+It is deliberately not the `fafnir` user. That user's environment file holds the
+write role's DSN and the vendor keys, and a service that answers the internet
+should be unable to read either.
+
+### 14.3 Install and check
+
+```bash
+sudo -u fafnir -H /opt/fafnir/.venv/bin/pip install -e '/opt/fafnir[api]'
+
+sudo -u fafnir-api /opt/fafnir/.venv/bin/fafnir-api \
+    --dsn "dbname=fafnir user=fafnir_api" --check
+```
+
+```
+role:              fafnir_api
+read-only default: on
+statement_timeout: 30s
+reads mart / ref:  yes
+reads ops.api_key: yes
+can write:         no
+live keys:         0
+OK
+```
+
+`fafnir-api` will not serve as a role that can write, and it takes its DSN from
+`--dsn` or `FAFNIR_API_DSN` only: never from `~/.fafnirrc` or `FAFNIR_DSN`, which
+name `fafnir_ingest`. If `--check` says `can write: YES`, the DSN is wrong; fix
+that, not the check.
+
+### 14.4 Run it
+
+```bash
+sudo cp /opt/fafnir/etc/api/fafnir-api.service.example /etc/systemd/system/fafnir-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fafnir-api
+systemctl status fafnir-api --no-pager
+curl -s http://127.0.0.1:8787/v1/health          # {"status": "ok"}
+```
+
+It listens on `127.0.0.1:8787`, in plain HTTP. Do not change that to a public
+address: the next step is what faces the internet.
+
+### 14.5 TLS: Caddy on 443
+
+```bash
+sudo apt-get install -y caddy
+sudo cp /opt/fafnir/etc/api/Caddyfile.example /etc/caddy/Caddyfile
+sudoedit /etc/caddy/Caddyfile                    # replace fafnir.example.com
+sudo systemctl reload caddy
+
+# Both firewalls (§1.3, §2.4).
+hcloud firewall add-rule fafnir-fw --direction in --protocol tcp --port 443 \
+    --source-ips 0.0.0.0/0 --source-ips ::/0
+sudo ufw allow 443/tcp
+
+curl -s https://<API_NAME>/v1/health             # {"status": "ok"}
+```
+
+Caddy obtains the certificate on first start and renews it. That needs 443 open
+to the world, which is also what a reader on a changing address needs. If every
+reader has a fixed address you can pin `--source-ips` to them instead, but then
+Let's Encrypt cannot reach the host to validate, and Caddy must be configured for
+a DNS challenge.
+
+### 14.6 Issue a key, and read
+
+On the host, as the `fafnir` user (keys are written by the write role):
+
+```bash
+sudo -u fafnir -H bash -c 'set -a; . /etc/fafnir/fafnir.env; set +a
+  /opt/fafnir/.venv/bin/fafnir api key create rob-laptop --note "Rob, MacBook"'
+```
+
+The key is printed once, alone on standard output, and is not stored: only its
+SHA-256 is. On the reader:
+
+```toml
+# ~/.dukrc   (chmod 600)
+[api]
+fafnir_url = "https://<API_NAME>"
+fafnir_key = "ffn_…"
+```
+
+```bash
+duk ph SPY --adj -n 5
+```
+
+`duk` needs nothing else: no tunnel, no `psycopg`, no extra. Day-to-day key
+handling (listing, revoking, expiry, what the logs show) is
+[operations.md](operations.md#api-keys); the reader's side is
+[duk.md](duk.md#without-a-tunnel-the-http-api).
+
+### 14.7 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `fafnir-api: refusing to start … can write` | `FAFNIR_API_DSN` names the wrong role | Point it at `fafnir_api`; never at `fafnir_ingest` |
+| `--check`: `reads ops.api_key: NO` | The two `GRANT`s of §14.1 were not run | Run them as `postgres` |
+| `--check`: `cannot connect … Peer authentication failed` | No `pg_ident` line for `fafnir-api`, or the `pg_hba` rule sits below `local all all peer` | §14.2, then reload PostgreSQL |
+| `duk`: *refused the key: unknown key* | Typo, or a key from another host | `fafnir api key list` on the host; issue a new one |
+| `duk`: *refused the key: this key was revoked* / *has expired* | As it says | `fafnir api key create` |
+| `duk`: *cannot verify the certificate* | The name does not match, or Caddy has not obtained one yet | `journalctl -u caddy`; check DNS and that 443 is open |
+| `duk`: *the host's fafnir is older than this duk* | The reader was upgraded before the host | Upgrade the host ([releasing.md](releasing.md)) |
+| `duk`: *HTTP 504 … time limit* | The read ran past `statement_timeout` | Narrow the read, or raise the role's timeout |
+| `duk`: *HTTP 500 … (request ab12cd34)* | A fault in the service | `journalctl -u fafnir-api \| grep ab12cd34` has the traceback |
+
