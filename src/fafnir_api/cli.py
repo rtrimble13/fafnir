@@ -200,19 +200,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return _check(dsn)
 
-    try:
-        import waitress
-    except ImportError:
-        print(
-            "fafnir-api: serving needs waitress. Install the api extra: "
-            "pip install -e '.[api]'",
-            file=sys.stderr,
-        )
-        return 2
-
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
+    # Checked before anything else, the server's own dependency included: "this
+    # role can write" is the answer that matters, on any host, installed or not.
     # A role that can write, or that cannot check a key, is a misconfiguration and
     # is fatal. A warehouse that cannot be reached is an outage and is not: the
     # service starts, answers 503 until PostgreSQL is back, and needs no restart.
@@ -236,6 +228,16 @@ def main(argv: list[str] | None = None) -> int:
             "in the clear. Put the reverse proxy in front and listen on 127.0.0.1.",
             file=sys.stderr,
         )
+
+    try:
+        import waitress
+    except ImportError:
+        print(
+            "fafnir-api: serving needs waitress. Install the api extra: "
+            "pip install -e '.[api]'",
+            file=sys.stderr,
+        )
+        return 2
 
     from fafnir_api.app import make_app
     from fafnir_api.keys import DatabaseKeyStore
