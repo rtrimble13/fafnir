@@ -68,7 +68,9 @@ The statements (DR-0913; the dorq fundamentals plan, §5.7)
     shape. A statement flag closed by judgement:
 
     * accepted (the filing shows it), SQL or dorq -> ``market_fact`` on the code
-      that succeeds its check, or its own (``<check>_accepted``);
+      that succeeds its check, or its own (``<check>_accepted``); except a check
+      in :data:`ACCEPTED_AS_VENDOR_ERROR`, whose condition is SF1's error however
+      it is closed -> ``data_error`` expecting that code (``<check>_accepted``);
     * resolved with a vendor correction of its period between its detection and
       its closure -> ``data_error`` on that code, added to the correction's label
       (``<check>_vendor_fixed`` when the correction moved nothing beyond
@@ -174,6 +176,17 @@ STATEMENT_KINDS = frozenset(
         "fiscal_year_change",
         "real_zero",
     }
+)
+
+#: Statement checks whose condition is the vendor's error by definition, so an
+#: accepted flag is a ``data_error`` label, not a filing fact. Quarters stored
+#: year to date: SF1's quarters are discrete (#83), and a 10-Q's year-to-date cash
+#: flow is SF1's to difference. Accepting one keeps the error on record when nobody
+#: will report it; it does not say the filing shows it. On 2026-11-19, 824 such
+#: flags were accepted at operator direction, which as ``market_fact`` labels
+#: would have judged every DQ916 report on them false.
+ACCEPTED_AS_VENDOR_ERROR = frozenset(
+    {"fundamentals_ytd_suspect", "dorq_cumulative_quarters"}
 )
 
 #: dorq's statement names, and fafnir's tables for them.
@@ -1025,18 +1038,24 @@ def _statement_flags(db: Database, out: LabelExport, found: _Corrections) -> Non
         source = f"dq_flag:{r['dq_flag_id']}"
         verified = _verified(r["judgement_basis"])
         if r["accepted"]:
+            # Most accepted statement flags are a filing fact. A few checks'
+            # conditions are the vendor's error whatever the filing says: an
+            # acceptance there keeps a known error on record, so it is a fault on
+            # the successor's code, not a false report.
+            vendor_error = r["check_name"] in ACCEPTED_AS_VENDOR_ERROR
             out.labels.append(
                 _label(
                     r["security_id"],
                     first,
                     last,
-                    "market_fact",
+                    "data_error" if vendor_error else "market_fact",
                     f"{r['check_name']}_accepted",
                     source,
                     r["resolution_note"],
                     decided_at=r["decided_at"],
                     verified=verified,
-                    codes=code,
+                    expect=code if vendor_error else "",
+                    codes="" if vendor_error else code,
                     scope=scope,
                 )
             )

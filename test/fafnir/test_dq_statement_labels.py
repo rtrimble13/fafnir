@@ -360,6 +360,39 @@ def test_an_accepted_statement_flag_is_a_filing_fact_on_its_successor(db):
 
 
 @pytest.mark.integration
+def test_an_accepted_ytd_suspect_is_a_vendor_error_not_a_filing_fact(db):
+    # Quarters stored year to date are SF1's error whatever the filing says, so
+    # accepting one keeps the error on record: a fault DQ916 is right to report.
+    sid = _company(db)
+    _flag(
+        db,
+        sid,
+        "fundamentals_ytd_suspect",
+        "core.income_statement",
+        {"item": "revenue", "fiscal_year": 2024},
+        accepted=True,
+        basis="by_rule",
+        note="Accepted at operator direction: SF1 year-to-date quarters",
+    )
+    (label,) = [
+        lab for lab in _labels(db) if lab["kind"] == "fundamentals_ytd_suspect_accepted"
+    ]
+    assert label["class"] == "data_error"
+    assert label["expect"] == "DQ916" and "codes" not in label
+    assert label["statement"] == "income"
+    assert label["first"] == "2024-03-31" and label["last"] == "2024-06-30"
+    assert label["verified"] is False and label["applies_until"] is None
+
+
+def test_the_vendor_error_checks_are_statement_checks_dorq_succeeds():
+    from fafnir.dq import compare_statements as cst
+    from fafnir.dq.dorq_statements import STATEMENT_CHECKS
+
+    for check in lb.ACCEPTED_AS_VENDOR_ERROR:
+        assert check in cst.SUCCESSORS or check in STATEMENT_CHECKS.values(), check
+
+
+@pytest.mark.integration
 def test_a_flag_resolved_after_the_vendor_fixed_it_is_a_data_error(db):
     sid = _company(db)
     # The identity broke; SF1 corrected the row in between; recheck closed it.
