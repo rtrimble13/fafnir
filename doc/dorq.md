@@ -627,6 +627,7 @@ does change one, and from how a statement flag was closed (DR-0913):
 | beyond tolerance otherwise | `data_error`, any of DQ902, DQ903, DQ904, DQ911 to DQ916, DQ921, DQ922, DQ932 (`corrected_value`) |
 | SF1 corrected a filing date | `data_error`, DQ931 (`corrected_filing_date`) |
 | a statement flag accepted, SQL or `dorq_*` | `market_fact` on its successor's code (`<check>_accepted`): the filing shows it |
+| an accepted `fundamentals_ytd_suspect` or `dorq_cumulative_quarters` | `data_error`, DQ916 (`<check>_accepted`): quarters stored year to date are SF1's error, so accepting one keeps the error on record and does not make it a filing fact (`ACCEPTED_AS_VENDOR_ERROR`) |
 | a statement flag resolved after SF1 corrected its period | `data_error` on its code: added to the correction's label, or `<check>_vendor_fixed` where the correction moved nothing beyond tolerance |
 | a row of `ops.dq_label` with a statement scope | as stated |
 
