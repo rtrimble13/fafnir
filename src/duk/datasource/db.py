@@ -16,17 +16,49 @@ migration 0020. Add a ``mart`` view instead.
 
 from __future__ import annotations
 
+import functools
 from datetime import date, datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from duk import identifiers
 from duk._deferred import pandas as pd
 from duk.datasource.base import (
     RESAMPLE_RULES,
+    ApiAddress,
     DataSourceError,
     shape_price_dataframe,
 )
 from duk.date_utils import get_api_date_range
+
+#: Every read of this module by name, as written below (no dispatch): what the
+#: fafnir HTTP API serves, and all it serves (ADR 0021). Filled by :func:`_served`.
+SERVED_READS: dict[str, Callable] = {}
+
+
+def _served(fn: Callable) -> Callable:
+    """Mark a read as one the warehouse answers over either transport.
+
+    Called with a libpq DSN, the read runs here, against PostgreSQL. Called with
+    an :class:`ApiAddress`, the same call is made of the host's HTTP API, which
+    runs this same function there and returns what it returned
+    (``duk.datasource.remote``). So a command reads identically over both, and a
+    read added to this module is served by decorating it: the server's surface is
+    this registry, and cannot differ from what the client asks for.
+
+    Only whole reads are marked. The helpers that take a cursor stay local to
+    whichever side is holding the connection.
+    """
+    SERVED_READS[fn.__name__] = fn
+
+    @functools.wraps(fn)
+    def read(*, dsn: str, **kwargs):
+        if isinstance(dsn, ApiAddress):
+            from duk.datasource import remote
+
+            return remote.call(dsn, fn.__name__, kwargs)
+        return fn(dsn=dsn, **kwargs)
+
+    return read
 
 
 def _parse_date(value: Optional[str | date], label: str) -> Optional[date]:
@@ -49,8 +81,9 @@ def _parse_date(value: Optional[str | date], label: str) -> Optional[date]:
 def _connect(dsn: str):
     if not dsn:
         raise DataSourceError(
-            "db source selected but no DSN configured. Set FAFNIR_DSN or "
-            "[database].dsn in ~/.dukrc, or use --source live."
+            "db source selected but no warehouse configured. Set FAFNIR_DSN or "
+            "[database].dsn in ~/.dukrc (or FAFNIR_API_URL / [api].fafnir_url for "
+            "the HTTP API), or use --source fmp."
         )
     try:
         import psycopg
@@ -242,12 +275,14 @@ _TICKER_PERIODS_SQL = """
 """
 
 
+@_served
 def ticker_periods(*, dsn: str, symbol: str) -> list[dict]:
     """The securities that have traded under ``symbol``, newest first."""
     with _connect(dsn) as conn, conn.cursor() as cur:
         return _rows(cur, _TICKER_PERIODS_SQL, (symbol.upper(),))
 
 
+@_served
 def resolve_identifier(*, dsn: str, identifier: identifiers.Identifier) -> list[dict]:
     """`_resolve_by_identifier` with its own connection, for callers outside a cursor."""
     with _connect(dsn) as conn, conn.cursor() as cur:
@@ -295,6 +330,7 @@ def _daily_bars(
     return rows
 
 
+@_served
 def exact_bars(
     *,
     dsn: str,
@@ -339,6 +375,7 @@ def exact_bars(
     return rows
 
 
+@_served
 def price_history(
     *,
     dsn: str,
@@ -478,6 +515,7 @@ def _market_caps(cur, security_ids, start, end) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+@_served
 def resolve_symbols(*, dsn: str, symbols: list[str]) -> dict[str, Optional[int]]:
     """Each ticker's ``security_id`` by the resolution ladder (None: not found), on
     one connection: a constituent list is hundreds of tickers."""
@@ -498,6 +536,7 @@ def _limited(rows: list, limit: Optional[int], start_date, end_date) -> list:
     )
 
 
+@_served
 def market_cap_rows(
     *,
     dsn: str,
@@ -536,6 +575,7 @@ def market_cap_rows(
     return out
 
 
+@_served
 def market_cap_history(
     *,
     dsn: str,
@@ -583,6 +623,7 @@ def market_cap_history(
     return pd.concat(pieces, ignore_index=True)[columns]
 
 
+@_served
 def issuer_class(*, dsn: str, security_id: int) -> Optional[dict]:
     """The issuer's share class that holds the statements, when ``security_id``
     holds none of its own (a secondary class: GOOG answered by GOOGL), else None.
@@ -687,6 +728,7 @@ def _screen_clauses(
     return clauses, params
 
 
+@_served
 def screen(*, dsn: str, limit: Optional[int] = None, **filters) -> pd.DataFrame:
     """Screen securities from mart.security_latest. Mirrors the live screener columns.
 
@@ -720,6 +762,7 @@ def screen(*, dsn: str, limit: Optional[int] = None, **filters) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@_served
 def sector_names(*, dsn: str) -> list[str]:
     """Every sector name the warehouse knows (``ref.sector``), alphabetically."""
     with _connect(dsn) as conn, conn.cursor() as cur:
@@ -727,6 +770,7 @@ def sector_names(*, dsn: str) -> list[str]:
         return [r["sector_name"] for r in cur.fetchall()]
 
 
+@_served
 def industry_names(*, dsn: str) -> list[str]:
     """Every industry name the warehouse knows (``ref.industry``), alphabetically."""
     with _connect(dsn) as conn, conn.cursor() as cur:
@@ -790,6 +834,7 @@ def _counted(
     return frame
 
 
+@_served
 def list_sectors(*, dsn: str, **filters) -> pd.DataFrame:
     """Sectors with ``security_count``: how many securities a screen with
     ``filters`` returns in each (actively trading by default, as :func:`screen`).
@@ -801,6 +846,7 @@ def list_sectors(*, dsn: str, **filters) -> pd.DataFrame:
     return _counted(dsn, _SECTOR_COUNT_SQL, "sector_name", scoped, filters)
 
 
+@_served
 def list_industries(*, dsn: str, **filters) -> pd.DataFrame:
     """Industries with the ``sector_name`` their securities are classified in and
     ``security_count``, scoped by ``filters`` as :func:`list_sectors` is. With a
@@ -809,6 +855,7 @@ def list_industries(*, dsn: str, **filters) -> pd.DataFrame:
     return _counted(dsn, _INDUSTRY_COUNT_SQL, "industry_name", scoped, filters)
 
 
+@_served
 def list_actively_trading(*, dsn: str, limit: Optional[int] = None) -> pd.DataFrame:
     sql = (
         "SELECT symbol, company_name AS name FROM mart.security_latest "
@@ -872,6 +919,7 @@ NAME_CANDIDATE_LIMIT = 20
 _STATS_LOOKBACK_DAYS = 5 * 366
 
 
+@_served
 def resolve_company(*, dsn: str, query: str) -> list[dict]:
     """Resolve a ticker, an identifier or a company name to candidate securities.
 
@@ -947,6 +995,7 @@ def _fundamentals(cur, security_id: int) -> Optional[dict]:
     return dict(found) if found else None
 
 
+@_served
 def company_summary(*, dsn: str, security_id: int) -> dict:
     """Assemble the raw facts behind `duk ls <company>`.
 
@@ -1101,6 +1150,7 @@ def _statements_of(cur, security_id: int) -> Optional[dict]:
     return found[0] if len(found) == 1 else None
 
 
+@_served
 def statements(
     *,
     dsn: str,
@@ -1161,6 +1211,7 @@ def statements(
     return out
 
 
+@_served
 def factor_row(
     *,
     dsn: str,
@@ -1252,6 +1303,7 @@ _TICKER_HISTORY_SQL = """
 """
 
 
+@_served
 def ticker_history(
     *,
     dsn: str,
@@ -1309,6 +1361,7 @@ _CORPORATE_ACTIONS_SQL = """
 ACTION_TYPES = ("split", "dividend")
 
 
+@_served
 def corporate_actions(
     *,
     dsn: str,
@@ -1376,6 +1429,7 @@ _CALENDAR_DAYS_SQL = """
 """
 
 
+@_served
 def calendars(*, dsn: str) -> list[dict]:
     """Each venue's calendar: its span, and how many open and closed days it marks."""
     with _connect(dsn) as conn, conn.cursor() as cur:
@@ -1383,6 +1437,7 @@ def calendars(*, dsn: str) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+@_served
 def calendar_days(
     *,
     dsn: str,

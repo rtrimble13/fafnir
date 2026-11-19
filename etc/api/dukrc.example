@@ -1,0 +1,18 @@
+# ~/.dukrc for a machine that reads the warehouse through its HTTP API
+# (ADR 0021): no SSH tunnel, no database connection, no psycopg needed.
+#
+# The key is issued on the host with `fafnir api key create <name>` and shown
+# once. It is a bearer secret: whoever holds this file reads the warehouse until
+# the key is revoked. Keep the file 0600, issue one key per machine, and where a
+# secrets manager or an injecting proxy can hold the key, leave fafnir_key out and
+# supply FAFNIR_API_KEY in the environment.
+#
+# There is deliberately no [database] section. A DSN configured here would win
+# over the address below (doc/duk.md › Without a tunnel).
+
+[api]
+fafnir_url = "https://fafnir.example.com"
+fafnir_key = "ffn_REPLACE_ME"
+
+[general]
+default_source = "db"

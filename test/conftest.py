@@ -68,3 +68,32 @@ def db(migrated_dsn):
             RESTART IDENTITY CASCADE
             """)
         yield database
+
+
+@pytest.fixture()
+def serve_wsgi():
+    """Serve a WSGI app over real HTTP on a loopback port; returns its base URL.
+
+    For the HTTP API (ADR 0021): the client half is only tested once a request has
+    actually crossed a socket, headers and all. ``wsgiref`` is the standard
+    library's server, so this needs nothing the unit suite does not have.
+    """
+    import threading
+    from wsgiref.simple_server import WSGIRequestHandler, make_server
+
+    class _Quiet(WSGIRequestHandler):
+        def log_message(self, *args):  # the suite's output is not an access log
+            pass
+
+    servers = []
+
+    def start(app) -> str:
+        server = make_server("127.0.0.1", 0, app, handler_class=_Quiet)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()

@@ -10,6 +10,10 @@
   not run. §4 names the two views that close it. Amended in place rather than
   superseded because this ADR was still Proposed then and nothing had been built
   on it.
+- Amended by: [ADR 0021](0021-http-api-and-api-keys.md) (2026-11-17), which adds
+  an HTTP API with API keys beside the tunnel, for readers that cannot use SSH.
+  The "HTTP service on the warehouse host" alternative rejected below is accepted
+  there for `duk`'s reads only, and not for MCP. Everything else here stands.
 - Depends on: [ADR 0002](0002-surrogate-security-id-and-bitemporal-readiness.md)
 - Related: [install_hetzner.md §11](../install_hetzner.md), [extending.md](../extending.md),
   [duk.md](../duk.md),

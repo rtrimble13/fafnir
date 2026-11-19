@@ -1,0 +1,30 @@
+# /etc/caddy/Caddyfile
+#
+# TLS for the fafnir HTTP API (ADR 0021; doc/install_hetzner.md §14). Caddy obtains
+# and renews the certificate itself; the name must resolve to this host and 443
+# must be reachable for that to work.
+#
+# Replace fafnir.example.com with your name.
+
+fafnir.example.com {
+	encode gzip
+
+	# The API and nothing else. Anything outside /v1/ never reaches the service.
+	@api path /v1/*
+	handle @api {
+		# A read's arguments are small; the service refuses more than 1 MB too.
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		respond 404
+	}
+
+	# Caddy's access log redacts the Authorization header by default. Leave it
+	# that way: the header is the key.
+	log {
+		output file /var/log/caddy/fafnir-api.log
+	}
+}

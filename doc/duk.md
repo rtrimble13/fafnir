@@ -90,6 +90,9 @@ fmp_key = ""              # or FMP_API_KEY env (-S fmp)
 sharadar_key = ""         # or SHARADAR_API_KEY env (-S sharadar)
 # sharadar_base_url = "https://api.sharadar.com/v1.0/data"   # override if the probe says so
 
+# fafnir_url = "https://fafnir.example.com"   # the warehouse's HTTP API (-S db), or FAFNIR_API_URL env
+# fafnir_key = "ffn_..."                      # its key, or FAFNIR_API_KEY env
+
 [database]
 dsn = "host=localhost dbname=fafnir user=fafnir_app"   # or FAFNIR_DSN env (-S db)
 
@@ -103,6 +106,11 @@ For db mode, point `duk` at the least-privilege `fafnir_app` role (mart read-onl
 Every relation `duk` reads is a `mart` (or `ref`) one, so that role is sufficient --
 see [ADR 0009](adr/0009-mart-is-the-read-seam.md). It was not before migration 0020,
 when symbol resolution still read `core`.
+
+The warehouse is reached one of two ways, and the commands do not differ between
+them: by a libpq DSN (`[database].dsn`), on the host or through the SSH tunnel, or
+with no database connection at all through the host's HTTP API
+(`[api].fafnir_url` and a key): [Without a tunnel](#without-a-tunnel-the-http-api).
 
 ## Commands
 
@@ -719,6 +727,89 @@ and `.company_summary()` do the I/O and return plain dicts; `duk.company_summary
 is pure functions over those dicts (`build_summary`, `render_text`, `render_flat`,
 `render_candidates`) with no SQL and no click, so the whole report can be built and
 asserted without a database. `build_summary`'s output is the `--json` contract.
+
+## Without a tunnel: the HTTP API
+
+Where SSH is not available (a hosted or sandboxed agent, a CI job, a machine with
+no account on the host), `duk` reads the warehouse over HTTPS with an API key.
+The host runs `fafnir-api`
+([install_hetzner.md §14](install_hetzner.md#14-the-http-api-optional));
+[ADR 0021](adr/0021-http-api-and-api-keys.md) is the design.
+
+```toml
+# ~/.dukrc   (chmod 600 -- the key is a secret)
+[api]
+fafnir_url = "https://fafnir.example.com"
+fafnir_key = "ffn_3f9c0a1b22d4_..."
+```
+
+or, with nothing on disk:
+
+```bash
+export FAFNIR_API_URL=https://fafnir.example.com
+export FAFNIR_API_KEY=ffn_3f9c0a1b22d4_...
+duk ph AAPL --adj -n 5
+```
+
+A starting file is [`etc/api/dukrc.example`](../etc/api/dukrc.example). The key is
+issued on the host (`fafnir api key create <name>`,
+[operations.md](operations.md#api-keys)) and shown once.
+
+**Nothing about the commands changes.** `-S db` is still the warehouse; every
+command, flag and identifier form in this document works, and prints what it
+prints over a DSN, `--exact` decimals included. The host runs the same read
+`duk` would have run locally and sends back its result with types intact, so the
+two cannot disagree; the test suite runs each read and a set of commands both
+ways and compares them. `-S fmp` and `-S sharadar` are unaffected: they never
+touched the warehouse.
+
+**Which one is used** when both are configured: the environment beats the file,
+and at each level a DSN beats an API address.
+
+| Order | Setting | Reaches the warehouse by |
+|---|---|---|
+| 1 | `FAFNIR_DSN` | database connection |
+| 2 | `FAFNIR_API_URL` | HTTP API |
+| 3 | `[database].dsn` | database connection |
+| 4 | `[api].fafnir_url` | HTTP API |
+
+So `FAFNIR_API_URL=... duk ...` reads through the API on a machine whose file
+names a DSN, and a file with both reads through the DSN.
+
+**What to expect that differs:**
+
+- A read is one HTTPS request, a few tens of milliseconds over a database
+  connection on the same machine. A command makes one to four.
+- No `psycopg` is needed on the reader, and no tunnel service.
+- `duk` will not send the key over plain `http://` except to a loopback address,
+  and never puts it in a URL.
+- The key is all-or-nothing over what `duk -S db` reads, as a role that can write
+  nothing. There is no per-key scope.
+- If the host's fafnir is older than this `duk`, a command it does not have yet
+  says so: *the host's fafnir is older than this duk*.
+- The MCP server (`fafnir-mcp`) still needs a DSN; it does not read through the
+  API.
+
+The failures, each one line:
+
+| `duk` says | Meaning |
+|---|---|
+| *no fafnir API key configured* | An address is set and no key: `FAFNIR_API_KEY` or `[api].fafnir_key` |
+| *refused the key: unknown key* / *was revoked* / *has expired* | Ask for a new one |
+| *cannot reach the fafnir API at …* | Name, network or firewall; `curl https://…/v1/health` |
+| *is rate-limiting this key; retry in Ns* | Over the per-key rate (600 a minute by default) |
+| *HTTP 504 … time limit* | The read ran past the API role's statement timeout |
+
+**Without `duk`.** The API is `duk`'s own and its JSON is typed
+(`{"$dec": "189.8400"}`; `duk.datasource.wire` documents the tags), but it is
+plain HTTPS:
+
+```bash
+curl -s https://fafnir.example.com/v1/reads -H "Authorization: Bearer $FAFNIR_API_KEY"
+curl -s https://fafnir.example.com/v1/reads/exact_bars \
+     -H "Authorization: Bearer $FAFNIR_API_KEY" -H 'Content-Type: application/json' \
+     -d '{"args": {"symbol": "AAPL", "limit": 2}}'
+```
 
 ## From Claude Code on a laptop
 

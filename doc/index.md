@@ -32,6 +32,8 @@ read through the `duk` CLI.
   directly (`fmp`, `sharadar`); also
   [from Claude Code on a laptop](duk.md#from-claude-code-on-a-laptop): the socket
   tunnel, the agent role, and the Bash sandbox
+  and [without a tunnel](duk.md#without-a-tunnel-the-http-api): the HTTP API and
+  its API keys ([ADR 0021](adr/0021-http-api-and-api-keys.md))
 - [Operations Agent](agent.md) — running an agent on the host for DQ triage,
   automation diagnosis and data questions: roles, MCP wiring, audit, revocation
 - [Nightly Report Email](nightly_report.md) — the agent's morning summary of the

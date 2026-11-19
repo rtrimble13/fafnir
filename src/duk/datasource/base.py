@@ -11,6 +11,24 @@ class DataSourceError(Exception):
     """Raised when a requested data source is unavailable or misconfigured."""
 
 
+class ApiAddress(str):
+    """Where the warehouse is, when that is its HTTP API and not a libpq DSN
+    (ADR 0021): the API's base URL, carrying the key that authenticates to it.
+
+    A ``str``, so it travels wherever a DSN does -- ``cfg.dsn``, every ``dsn=``
+    argument -- and ``duk.datasource.db`` tells the two apart by type, never by
+    looking at the text. The key is an attribute and not part of the string, so
+    printing or logging the address shows the URL alone.
+    """
+
+    api_key: str
+
+    def __new__(cls, url: str, api_key: str = "") -> "ApiAddress":
+        self = super().__new__(cls, url.strip().rstrip("/"))
+        self.api_key = api_key
+        return self
+
+
 # The sources duk can read from. `db` is the warehouse and the default; the two
 # vendor names read a vendor's API directly, which is how a series gets checked
 # against the warehouse (scripts/reconcile.sh) or read before it is loaded.

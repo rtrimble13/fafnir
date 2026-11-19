@@ -1,0 +1,54 @@
+# /etc/systemd/system/fafnir-api.service
+#
+# The warehouse's HTTP API (ADR 0021; doc/install_hetzner.md §14). Not a
+# template: copy it, adjust the paths if yours differ, `systemctl daemon-reload`.
+#
+# It runs as its own OS user, fafnir-api, which peer authentication maps to the
+# Postgres role fafnir_api: read-only, mart + ref + ops.api_key. It is NOT the
+# fafnir user, and it does not read /etc/fafnir/fafnir.env -- that file holds the
+# write role's DSN and the vendor keys, and this service must be able to reach
+# neither.
+
+[Unit]
+Description=fafnir HTTP API (read-only)
+Documentation=file:///opt/fafnir/doc/install_hetzner.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=fafnir-api
+Group=fafnir-api
+
+# The read role, over the local socket. No password: peer auth (pg_ident.conf).
+Environment=FAFNIR_API_DSN="dbname=fafnir user=fafnir_api"
+# Loopback only. Caddy holds 443 and the certificate, and forwards here.
+Environment=FAFNIR_API_HOST=127.0.0.1
+Environment=FAFNIR_API_PORT=8787
+# Requests per key per minute.
+Environment=FAFNIR_API_RATE=600
+
+# Refuses to start as a role that can write, or one that cannot read the keys.
+ExecStartPre=/opt/fafnir/.venv/bin/fafnir-api --check
+ExecStart=/opt/fafnir/.venv/bin/fafnir-api --threads 8
+Restart=on-failure
+RestartSec=5
+
+# It needs the code, the socket and a loopback port. Nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
