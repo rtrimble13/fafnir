@@ -6896,7 +6896,7 @@ def list_dq_labels(
                l.last_date, l.class, l.kind, l.expect, l.codes, l.note, l.verified,
                l.source, l.decided_by, l.decided_at, l.applies_until, l.revoked_at,
                l.revoked_by, l.revoked_note, l.statement, l.period_type,
-               l.version_no, l.item
+               l.version_no, l.item, l.sample_id, l.sample_item, l.weight
           FROM ops.dq_label l
           LEFT JOIN core.security s ON s.security_id = l.security_id
          WHERE {' AND '.join(clauses)}

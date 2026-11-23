@@ -247,7 +247,12 @@ dorq is measured against labels (`fafnir dq compare --labels-from-db`; doc/dorq.
 and the labels are the decisions this queue records. Whether dorq replaces the SQL
 checks is decided by an audit, not by these labels: `doc/plans/dorq-efficacy.md`
 (#267). An audit label is verified by Claude on an outside source, cited in its note,
-and never judged from either engine's output; read that plan before labelling for it. A label is derived on its own
+and never judged from either engine's output; read that plan before labelling for it.
+The cycle is `dq sample --domain` → `dq audit worksheet` → `dq audit verdicts` →
+`dq compare --audit` (doc/dorq.md, "The audit"). **A verifier works from the
+worksheet and outside sources only**: it does not read `ops.dq_audit_item.engines`
+or `strata`, the flag queue, or a shadow file for the units it judges, though the
+ops tier could. A label is derived on its own
 only where the disposition is unambiguous: a repair (`reason` data_error), an
 outlier or `dorq_*` flag accepted or resolved. Everything else is stated, and the
 moment to state it is when you judge:
