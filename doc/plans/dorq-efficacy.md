@@ -3,7 +3,8 @@
 - Status: **approved 2026-11-23**, not started. Tracking:
   [#267](https://github.com/rtrimble13/fafnir/issues/267).
 - dorq's side of the plan, with the code-level findings, is in the dorq repository at
-  `doc/plans/dorq-efficacy-plan.md`. This file is fafnir's side: the success bar, the
+  `doc/plans/dorq-efficacy-plan.md` (tracked in
+  [rtrimble13/dorq#40](https://github.com/rtrimble13/dorq/issues/40)). This file is fafnir's side: the success bar, the
   decisions, the integration and measurement work, and the gate.
 - It comes from a review of dorq v0.14.0 (commit e013694) against fafnir v3.2.0 and
   the shadow nights 2026-11-06 to 11-20.
@@ -60,8 +61,8 @@ there. **The statements cutover (#221, PR #241) waits for the gate (#276).**
    - a blind second verification by an independent agent on a random 10% of each
      cycle, with the cycle re-verified when agreement falls below 90%;
    - no personal data in any outside request.
-7. **Access to `rtrimble13/dorq`.** The fine-grained token is to be extended to the
-   dorq repository, for contents, issues and pull requests.
+7. **Access to `rtrimble13/dorq`.** The fine-grained token was extended to the dorq
+   repository (contents, issues, pull requests) on 2026-11-23.
 8. **Order.** Measurement, then precision, then recall, then depth. Re-measure on the
    audit after each phase.
 
@@ -122,38 +123,38 @@ Detail and file:line evidence are in the dorq plan.
 
 | Phase | Key | Repo | Item | Issue |
 |---|---|---|---|---|
-| 0 Measurement | DE-01 | dorq | Survey-weighted evaluation and a two-engine comparison (dorq-eval, calibrate) | dorq |
-| | DE-02 | dorq | Calibration honours `verified`; one map per code | dorq |
+| 0 Measurement | DE-01 | dorq | Survey-weighted evaluation and a two-engine comparison (dorq-eval, calibrate) | [dorq#41](https://github.com/rtrimble13/dorq/issues/41) |
+| | DE-02 | dorq | Calibration honours `verified`; one map per code | [dorq#42](https://github.com/rtrimble13/dorq/issues/42) |
 | | DE-03 | fafnir | An engine-independent audit sample, verified by Claude, with weights | [#268](https://github.com/rtrimble13/fafnir/issues/268) |
 | | DE-04 | fafnir | `dq compare --audit`: the gate as decided | [#269](https://github.com/rtrimble13/fafnir/issues/269) |
 | | DE-05 | fafnir | Baseline audit before any model change | [#270](https://github.com/rtrimble13/fafnir/issues/270) |
-| 1 Precision | DE-11 | dorq | A series-level model for identity and tie breaks; "unexplained" is not an error by default | dorq |
-| | DE-12 | dorq | One condition, one report | dorq |
-| | DE-13 | dorq | Provisional findings are pending | dorq |
-| | DE-14 | dorq | The heuristic bar checks (DQ403, DQ107, DQ705) become models or info | dorq |
+| 1 Precision | DE-11 | dorq | A series-level model for identity and tie breaks; "unexplained" is not an error by default | [dorq#43](https://github.com/rtrimble13/dorq/issues/43) |
+| | DE-12 | dorq | One condition, one report | [dorq#44](https://github.com/rtrimble13/dorq/issues/44) |
+| | DE-13 | dorq | Provisional findings are pending | [dorq#45](https://github.com/rtrimble13/dorq/issues/45) |
+| | DE-14 | dorq | The heuristic bar checks (DQ403, DQ107, DQ705) become models or info | [dorq#46](https://github.com/rtrimble13/dorq/issues/46) |
 | | DE-15 | fafnir | Statements nightly input | [#271](https://github.com/rtrimble13/fafnir/issues/271) |
 | | DE-16 | fafnir | Adopt dorq's per-condition record keys | [#272](https://github.com/rtrimble13/fafnir/issues/272) |
-| 2 Recall | DE-21 | dorq | Cross-sectional evidence in both directions, with configurable group keys | dorq |
-| | DE-22 | dorq | Optional per-bar `source` and load-date columns: seams and load cohorts | dorq |
-| | DE-23 | dorq | DQ916's recall on quarters stored year to date (17/821) | dorq |
+| 2 Recall | DE-21 | dorq | Cross-sectional evidence in both directions, with configurable group keys | [dorq#47](https://github.com/rtrimble13/dorq/issues/47) |
+| | DE-22 | dorq | Optional per-bar `source` and load-date columns: seams and load cohorts | [dorq#48](https://github.com/rtrimble13/dorq/issues/48) |
+| | DE-23 | dorq | DQ916's recall on quarters stored year to date (17/821) | [dorq#49](https://github.com/rtrimble13/dorq/issues/49) |
 | | DE-24 | fafnir | The history pass selects by `loaded_at` | [#273](https://github.com/rtrimble13/fafnir/issues/273) |
 | | DE-25 | fafnir | `peer_group`, `tick_size` and `--market` | [#274](https://github.com/rtrimble13/fafnir/issues/274) |
 | | DE-26 | fafnir | Per-bar source and `loaded_at` in the export | [#275](https://github.com/rtrimble13/fafnir/issues/275) |
-| 3 Depth | DE-31 | dorq | Compare like vintages (DQ932, DQ904, DQ903) | dorq |
-| | DE-32 | dorq | A class-conditional price model; `leverage` in `--meta` | dorq |
-| | DE-33 | dorq | Heavier real-change tails in share counts; DQ922 once per period; the DQ931 lag floor | dorq |
-| | DE-34 | dorq | DQ941 learns the issuer's cadence | dorq |
-| | DE-35 | dorq | Every constant configurable and calibratable; statement settings per profile | dorq |
+| 3 Depth | DE-31 | dorq | Compare like vintages (DQ932, DQ904, DQ903) | [dorq#50](https://github.com/rtrimble13/dorq/issues/50) |
+| | DE-32 | dorq | A class-conditional price model; `leverage` in `--meta` | [dorq#51](https://github.com/rtrimble13/dorq/issues/51) |
+| | DE-33 | dorq | Heavier real-change tails in share counts; DQ922 once per period; the DQ931 lag floor | [dorq#52](https://github.com/rtrimble13/dorq/issues/52) |
+| | DE-34 | dorq | DQ941 learns the issuer's cadence | [dorq#53](https://github.com/rtrimble13/dorq/issues/53) |
+| | DE-35 | dorq | Every constant configurable and calibratable; statement settings per profile | [dorq#54](https://github.com/rtrimble13/dorq/issues/54) |
 | Gate | DE-40 | fafnir | Go/no-go per domain | [#276](https://github.com/rtrimble13/fafnir/issues/276) |
 
-"dorq" in the issue column means the issue lives in `rtrimble13/dorq`. Links are added
-when those issues are opened.
+"dorq#N" in the issue column is an issue in `rtrimble13/dorq`.
 
 ## Status
 
 | Date | Event |
 |---|---|
 | 2026-11-23 | Review of dorq 0.14.0. Plan approved; fafnir issues #267-#276 opened |
+| 2026-11-23 | Token extended to `rtrimble13/dorq`; dorq issues #40-#54 and dorq PR #55 (its plan doc) opened |
 
 ## For agents working an item
 
