@@ -57,6 +57,7 @@ def db(migrated_dsn):
                      core.symbol_xref, core.symbol_change, core.company_profile,
                      core.security, ops.data_quality_flag, ops.ingestion_run,
                      ops.load_watermark, ops.operator_override, ops.dq_label,
+                     ops.dq_audit_item, ops.dq_audit_cycle,
                      ops.vendor_correction,
                      core.security_vendor_xref, core.security_vendor_rejection,
                      core.vendor_security,

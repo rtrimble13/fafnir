@@ -7337,6 +7337,15 @@ def _dq_run_statements(database, cfg, exchange, rerun):
     help="Statements nights (<dorq_shadow_dir>/statements/) against the SQL "
     "fundamentals checks dorq succeeds, not bars.",
 )
+@click.option(
+    "--audit",
+    "audit_cycles",
+    multiple=True,
+    metavar="CYCLE",
+    help="The cutover gate on an audit cycle (DE-04): weighted precision and "
+    "recall with intervals, the paired test, calibration and volume, and the "
+    "verdict. Give it more than once for consecutive cycles.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.pass_context
 def dq_compare(
@@ -7349,6 +7358,7 @@ def dq_compare(
     slack,
     dorq_eval,
     statements,
+    audit_cycles,
     as_json,
 ):
     """Compare shadow nights of dorq with the SQL checks and the labels.
@@ -7388,6 +7398,13 @@ def dq_compare(
     from fafnir.dq import dorq as dorq_engine
 
     cfg = ctx.obj["config"]
+    if audit_cycles:
+        if shadow_files or labels or labels_from_db or statements or dorq_eval:
+            raise click.ClickException(
+                "--audit reads its cycles' own nights and labels: give it alone."
+            )
+        _dq_compare_audit(cfg, audit_cycles, as_json)
+        return
     if labels and labels_from_db:
         raise click.ClickException("--labels or --labels-from-db, not both.")
     if (labels_ignore_time or verified_only) and not (labels or labels_from_db):
@@ -7501,6 +7518,18 @@ def dq_compare(
 @dq.command("sample")
 @click.argument("shadow_file", required=False, type=click.Path(dir_okay=False))
 @click.option(
+    "--domain",
+    type=click.Choice(["bars", "statements"]),
+    help="Draw an audit cycle of this domain (DE-03) instead of the DR-0914 "
+    "statements sample.",
+)
+@click.option("--cycle", "cycle_id", help="With --domain: the new cycle's id.")
+@click.option(
+    "--night",
+    metavar="YYYY-MM-DD",
+    help="With --domain: the shadow night to sample  [default: the newest]",
+)
+@click.option(
     "--size",
     default=200,
     show_default=True,
@@ -7509,11 +7538,39 @@ def dq_compare(
 )
 @click.option(
     "--per-code",
-    default=10,
-    show_default=True,
     type=click.IntRange(min=0),
-    help="At least this many of every code, or all a code has.",
+    help="At least this many of every code, or all a code has  [default: 10; "
+    "with --domain, the units each dorq code should give: 8 bars, 6 statements]",
 )
+@click.option(
+    "--per-check",
+    type=click.IntRange(min=0),
+    help="With --domain: units from each SQL check's new flags, and as many from "
+    "its standing ones  [default: 10 bars, 6 statements]",
+)
+@click.option(
+    "--errors",
+    type=click.IntRange(min=0),
+    help="With --domain: units from dorq's reports at error  [default: 25, 20]",
+)
+@click.option(
+    "--withheld",
+    type=click.IntRange(min=0),
+    help="With --domain statements: units from the reports the ingest withholds "
+    "[default: 10]",
+)
+@click.option(
+    "--random",
+    "random_n",
+    type=click.IntRange(min=0),
+    help="With --domain: units neither engine keyed  [default: 40, 30]",
+)
+@click.option(
+    "--near",
+    type=click.IntRange(min=0),
+    help="With --domain bars: of those, units near the thresholds  [default: 25]",
+)
+@click.option("--exchange", default="NASDAQ", show_default=True)
 @click.option(
     "--seed",
     default=1,
@@ -7527,15 +7584,52 @@ def dq_compare(
     default="-",
     show_default=True,
     type=click.Path(dir_okay=False, allow_dash=True),
-    help="The CSV; `-` is stdout.",
+    help="The CSV; `-` is stdout. Not with --domain.",
+)
+@click.option("--by", "by", help="With --domain: who drew it  [default: the OS user]")
+@click.option("--note", help="With --domain: a note on the cycle.")
+@click.option(
+    "--dry-run", is_flag=True, help="With --domain: show the design; write nothing."
 )
 @click.pass_context
-def dq_sample(ctx, shadow_file, size, per_code, seed, out_path):
-    """A stratified sample of a statements night, to verify on EDGAR (DR-0914).
+def dq_sample(
+    ctx,
+    shadow_file,
+    domain,
+    cycle_id,
+    night,
+    size,
+    per_code,
+    per_check,
+    errors,
+    withheld,
+    random_n,
+    near,
+    exchange,
+    seed,
+    out_path,
+    by,
+    note,
+    dry_run,
+):
+    """A sample of a night to verify: an audit cycle (DE-03), or the DR-0914
+    statements sample.
 
     \b
-      fafnir dq sample --out sample.csv          # the newest statements night
+      fafnir dq sample --domain bars --cycle 2026-11-24-bars --seed 1124
+      fafnir dq sample --domain statements --cycle 2026-11-24-st --seed 1124 --dry-run
+      fafnir dq sample --out sample.csv          # DR-0914: the newest statements night
       fafnir dq sample <dorq_shadow_dir>/statements/2026-11-20.jsonl --seed 7
+
+    With --domain, an audit cycle for the cutover gate (doc/dorq.md, "The audit"):
+    the night's frame is every unit either engine keyed (dorq's conditions at warn
+    and above, by code; the SQL checks' flags open when dorq ran, new and
+    standing, by check) and the units neither keyed (random bars and missing
+    sessions, with those near the thresholds, or statement periods). Each unit is
+    drawn with a known probability by a hash of the seed, so the same night and
+    seed give the same cycle on any host. The cycle and its units, with the data
+    as it stood, go to ops.dq_audit_cycle and ops.dq_audit_item; `dq audit
+    worksheet` gives the verifier the blind worksheet.
 
     The night's distinct conditions at warn and above, about one security each:
     --per-code of every code (or all it has), then the rest of --size in an order
@@ -7553,6 +7647,44 @@ def dq_sample(ctx, shadow_file, size, per_code, seed, out_path):
     from fafnir.dq import sample as smp
 
     cfg = ctx.obj["config"]
+    audit_only = {
+        "--cycle": cycle_id,
+        "--night": night,
+        "--per-check": per_check,
+        "--errors": errors,
+        "--withheld": withheld,
+        "--random": random_n,
+        "--near": near,
+        "--by": by,
+        "--note": note,
+        "--dry-run": dry_run or None,
+    }
+    if domain:
+        _dq_audit_sample(
+            cfg,
+            domain,
+            shadow_file,
+            cycle_id=cycle_id,
+            night=night,
+            counts={
+                "per_code": per_code,
+                "per_check": per_check,
+                "errors": errors,
+                "withheld": withheld,
+                "random": random_n,
+                "near": near,
+            },
+            exchange=exchange,
+            seed=seed,
+            by=by or _os_user(),
+            note=note,
+            dry_run=dry_run,
+        )
+        return
+    given = [name for name, value in audit_only.items() if value is not None]
+    if given:
+        raise click.ClickException(f"{', '.join(given)}: only with --domain.")
+    per_code = 10 if per_code is None else per_code
     if shadow_file:
         path: Optional[Path] = Path(shadow_file)
     else:
@@ -7576,6 +7708,287 @@ def dq_sample(ctx, shadow_file, size, per_code, seed, out_path):
         with open(out_path, "w", encoding="utf-8", newline="") as fh:
             smp.write_csv(fh, sample_rows)
     click.echo(smp.summary(drawn, str(path)), err=True)
+
+
+def _dq_audit_sample(
+    cfg,
+    domain,
+    shadow_file,
+    *,
+    cycle_id,
+    night,
+    counts,
+    exchange,
+    seed,
+    by,
+    note,
+    dry_run,
+):
+    """`dq sample --domain`: draw an audit cycle and store it."""
+    from dataclasses import replace
+    from pathlib import Path
+
+    from fafnir.dq import audit
+    from fafnir.dq import compare as cmp
+    from fafnir.dq import compare_statements as cst
+    from fafnir.dq import dorq as dorq_engine
+
+    if not cycle_id:
+        raise click.ClickException("--domain needs --cycle (the new cycle's id).")
+    if shadow_file and night:
+        raise click.ClickException("A shadow file or --night, not both.")
+    settings = dorq_engine.settings_from(cfg)
+    if domain == "bars":
+        where = Path(cfg.dorq_shadow_dir)
+        newest = cmp.latest_shadow_file(cfg.dorq_shadow_dir)
+    else:
+        where = Path(cfg.dorq_shadow_dir) / "statements"
+        newest = cst.latest_shadow_file(settings)
+    if shadow_file:
+        path = Path(shadow_file)
+    elif night:
+        path = where / f"{_parse_date(night).isoformat()}.jsonl"
+    else:
+        path = newest
+    if path is None or not path.is_file():
+        raise click.ClickException(f"No {domain} shadow file: {path or where}.")
+    if counts.get("withheld") and domain == "bars":
+        raise click.ClickException("--withheld is for statements.")
+    if counts.get("near") and domain == "statements":
+        raise click.ClickException("--near is for bars.")
+    targets = audit.DEFAULT_TARGETS[domain]
+    targets = replace(targets, **{k: v for k, v in counts.items() if v is not None})
+    with Database(cfg.dsn) as database:
+        if audit.load_cycle(database, cycle_id) is not None:
+            raise click.ClickException(f"Cycle {cycle_id} exists.")
+        cycle = audit.draw_cycle(
+            database,
+            domain,
+            path,
+            cycle_id=cycle_id,
+            seed=seed,
+            targets=targets,
+            exchange_code=exchange,
+        )
+        click.echo(audit.format_design(cycle))
+        if dry_run:
+            click.echo("\nDry run: nothing written.")
+            return
+        audit.write_cycle(database, cycle, by=by, note=note)
+        written = database.fetchval(
+            "SELECT count(*) FROM ops.dq_audit_item WHERE cycle_id = %s", (cycle_id,)
+        )
+    click.echo(f"\nWrote cycle {cycle_id}: {written} units.")
+
+
+@dq.group("audit")
+def dq_audit():
+    """The audit cycles that decide the dorq cutover (DE-03, #268).
+
+    \b
+      fafnir dq sample --domain bars --cycle C --seed N   # draw a cycle
+      fafnir dq audit worksheet C --out ws.jsonl         # the blind worksheet
+      fafnir dq audit verdicts C verdicts.jsonl --by claude
+      fafnir dq audit worksheet C --second --out ws2.jsonl
+      fafnir dq audit verdicts C second.jsonl --second --by claude-second
+      fafnir dq compare --audit C                        # the gate
+    """
+
+
+@dq_audit.command("list")
+@click.pass_context
+def dq_audit_list(ctx):
+    """The cycles, with how far their verification has got. Reads only."""
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        rows = database.fetchall("""
+            SELECT c.cycle_id, c.domain, c.night, c.seed, c.dorq_version,
+                   count(i.*) AS units,
+                   count(*) FILTER (WHERE i.status = 'judged') AS judged,
+                   count(*) FILTER (WHERE i.status = 'unverifiable') AS unverifiable,
+                   count(*) FILTER (WHERE i.second_check) AS second,
+                   count(*) FILTER (WHERE i.second IS NOT NULL) AS second_done
+              FROM ops.dq_audit_cycle c
+              LEFT JOIN ops.dq_audit_item i ON i.cycle_id = c.cycle_id
+             GROUP BY 1, 2, 3, 4, 5 ORDER BY c.night, c.cycle_id
+            """)
+    _echo_table(
+        ["CYCLE", "DOMAIN", "NIGHT", "SEED", "DORQ", "UNITS", "JUDGED", "UNVER", "2ND"],
+        [
+            [
+                r["cycle_id"],
+                r["domain"],
+                str(r["night"]),
+                str(r["seed"]),
+                r["dorq_version"] or "",
+                str(r["units"]),
+                str(r["judged"]),
+                str(r["unverifiable"]),
+                f"{r['second_done']}/{r['second']}",
+            ]
+            for r in rows
+        ],
+        right=(3, 5, 6, 7),
+    )
+
+
+@dq_audit.command("worksheet")
+@click.argument("cycle_id")
+@click.option(
+    "--second", is_flag=True, help="Only the units drawn for the second verification."
+)
+@click.option(
+    "--out",
+    "out_path",
+    default="-",
+    show_default=True,
+    type=click.Path(dir_okay=False, allow_dash=True),
+    help="The JSONL; `-` is stdout.",
+)
+@click.pass_context
+def dq_audit_worksheet(ctx, cycle_id, second, out_path):
+    """The blind worksheet of a cycle: per unit, its number and the data as it
+    stood when drawn. Never the strata, the probability, what either engine said,
+    or a verdict: the verifier judges each unit on an outside source alone.
+    Reads only.
+
+    Each line is one unit. A verdict file answers it line for line (doc/dorq.md,
+    "The audit"): {"item", "verdict": error|correct|unverifiable, "kind",
+    "source", "value", "note", "first", "last", "line_items"}.
+    """
+    import sys
+
+    from fafnir.dq import audit
+
+    cfg = ctx.obj["config"]
+    with Database(cfg.dsn) as database:
+        cycle = audit.load_cycle(database, cycle_id)
+        if cycle is None:
+            raise click.ClickException(f"No cycle {cycle_id}.")
+        rows = audit.worksheet(
+            cycle, audit.load_items(database, cycle_id), second=second
+        )
+    if out_path == "-":
+        n = audit.write_jsonl(rows, sys.stdout)
+    else:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            n = audit.write_jsonl(rows, fh)
+    click.echo(f"{n} units.", err=True)
+
+
+@dq_audit.command("verdicts")
+@click.argument("cycle_id")
+@click.argument(
+    "verdict_file", type=click.Path(exists=True, dir_okay=False, allow_dash=True)
+)
+@click.option(
+    "--second",
+    is_flag=True,
+    help="The blind second verification: kept on the units, never as labels.",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    help="Re-verify units already judged: their labels are revoked and replaced.",
+)
+@click.option("--by", "by", help="Who verified  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Check the file and count; write nothing."
+)
+@click.pass_context
+def dq_audit_verdicts(ctx, cycle_id, verdict_file, second, replace, by, dry_run):
+    """Store a cycle's verdicts. A first verdict becomes labels (verified, with the
+    cycle, the unit and the weight); `dq export-labels` writes them with dorq's
+    `sample` and `weight`. Every verdict cites its outside source and the value
+    read there. VERDICT_FILE `-` is stdin: on the host the fafnir user reads none
+    of the agent's files.
+
+    \b
+      fafnir dq audit verdicts C - --by claude --dry-run < verdicts.jsonl
+    """
+    import sys
+
+    from fafnir.dq import audit
+
+    cfg = ctx.obj["config"]
+    if second and replace:
+        raise click.ClickException("--replace is for first verdicts.")
+    with Database(cfg.dsn) as database:
+        cycle = audit.load_cycle(database, cycle_id)
+        if cycle is None:
+            raise click.ClickException(f"No cycle {cycle_id}.")
+        items = audit.load_items(database, cycle_id)
+        by_no = {int(i["item_no"]): i for i in items}
+        try:
+            if verdict_file == "-":
+                verdicts = audit.parse_verdicts(sys.stdin, cycle["domain"], by_no)
+            else:
+                with open(verdict_file, encoding="utf-8") as fh:
+                    verdicts = audit.parse_verdicts(fh, cycle["domain"], by_no)
+        except audit.VerdictError as exc:
+            raise click.ClickException(f"{verdict_file}: {exc}") from exc
+        result = audit.import_verdicts(
+            database,
+            cycle,
+            items,
+            verdicts,
+            by=by or _os_user(),
+            second=second,
+            replace=replace,
+            dry_run=dry_run,
+        )
+    if result.refused:
+        raise click.ClickException(
+            "Refused, nothing written:\n  " + "\n  ".join(result.refused)
+        )
+    what = "second verdicts" if second else "verdicts"
+    click.echo(
+        f"{'Dry run: would store' if dry_run else 'Stored'} {result.items} {what}"
+        + (
+            ""
+            if second
+            else f": {result.labels} labels, {result.unverifiable} unverifiable"
+            + (f", {result.replaced} re-verified" if result.replaced else "")
+        )
+        + "."
+    )
+
+
+def _dq_compare_audit(cfg, cycle_ids, as_json) -> None:
+    """`dq compare --audit`: the gate on each cycle, then, per domain, how many
+    consecutive cycles (by night) met it."""
+    from fafnir.dq import audit
+
+    gates = []
+    with Database(cfg.dsn) as database:
+        for cycle_id in cycle_ids:
+            cycle = audit.load_cycle(database, cycle_id)
+            if cycle is None:
+                raise click.ClickException(f"No cycle {cycle_id}.")
+            gates.append(
+                audit.gate(
+                    cycle,
+                    audit.load_items(database, cycle_id),
+                    audit.cycle_labels(database, cycle_id),
+                )
+            )
+    streak: dict[str, int] = {}
+    for g in sorted(gates, key=lambda g: (g.domain, g.night)):
+        streak[g.domain] = streak.get(g.domain, 0) + 1 if g.verdict == "met" else 0
+    if as_json:
+        _dq_json({"cycles": [g.as_dict() for g in gates], "consecutive_met": streak})
+        return
+    for i, g in enumerate(gates):
+        if i:
+            click.echo("\n" + "=" * 78 + "\n")
+        click.echo(audit.format_gate(g))
+    if len(gates) > 1:
+        click.echo("")
+        for domain, n in sorted(streak.items()):
+            click.echo(
+                f"{domain}: met on the last {n} consecutive cycle(s); the cutover "
+                "needs 2."
+            )
 
 
 @dq.command("export-labels")

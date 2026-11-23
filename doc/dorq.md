@@ -480,6 +480,150 @@ dorq plan §8 sets the cutover bar:
 
 It must hold over at least 20 sessions. Then set `dorq_shadow = false`.
 
+### The audit: the cutover gate (DE-03, DE-04)
+
+The bar above is measured on labels the queue derives, and those cannot show which
+engine is better: most come from the SQL checks' own dispositions, and the
+statements sample was drawn from dorq's reports. Since 2026-11-23 the cutover is
+decided on an **audit cycle** instead (doc/plans/dorq-efficacy.md): a sample of one
+night of one domain that neither engine selected, each unit drawn with a known
+probability, each verified on an outside source.
+
+```bash
+F="sudo -u fafnir /opt/fafnir/.venv/bin/fafnir"
+$F dq sample --domain bars --cycle 2026-11-24-bars --seed 1124 --dry-run   # the design
+$F dq sample --domain bars --cycle 2026-11-24-bars --seed 1124             # store it
+$F dq audit worksheet 2026-11-24-bars > ws.jsonl                # blind, for the verifier
+$F dq audit verdicts 2026-11-24-bars - --by claude --dry-run < verdicts.jsonl
+$F dq audit verdicts 2026-11-24-bars - --by claude < verdicts.jsonl
+$F dq audit worksheet 2026-11-24-bars --second > ws2.jsonl      # the second verifier's
+$F dq audit verdicts 2026-11-24-bars - --second --by claude-second < second.jsonl
+$F dq compare --audit 2026-11-24-bars [--audit <the next cycle>] [--json]
+$F dq audit list
+```
+
+The worksheet goes to stdout and the verdicts come from stdin (`-`): on the host
+the agent and the fafnir user share no writable directory.
+
+**The unit** is a bar or a missing session, `(security, trade date)`, or a
+statement period, `(security, period type, fiscal date)`; `-` stands for the period
+type of a finding about no one period (a stale filer). A report or flag is
+*keyed* at the unit its own key names: its security, or each member of a
+cross-sectional row, and the date it is about.
+
+**The frame and its strata**, for the night (`--night`, default the newest):
+
+| Stratum | What | Target (bars, statements) |
+|---|---|---|
+| `dorq:<code>` | dorq's conditions at warn and above, by code; on statements as written | `--per-code` 8, 6 |
+| `dorq:error` | dorq's at error | `--errors` 25, 20 |
+| `dorq:withheld` | statements: reports the ingest withholds (an accepted SQL predecessor) | `--withheld` 0, 10 |
+| `sql:<check>:new`, `sql:<check>:standing` | the SQL checks' flags at warn and above open when dorq's run started, new since the previous night's run or older | `--per-check` 10, 6 each |
+| `none:random` | units neither engine keyed: the window's bars and missing sessions (securities fed in the 20 sessions before it, not delisted or frozen); every statement period | `--random` 40, 30 |
+| `none:near` | of those, bars near the thresholds: a move of 30-50%, a session missing on a series that traded 60-80% of those 20 sessions | `--near` 25, 0 |
+
+A stratum's rate is its target over its frame size, at most 1. A unit's
+**inclusion probability** is the largest rate of the strata it is in, and it is
+drawn when the MD5 of `seed|domain|security|period type|date` (13 hex digits, as a
+fraction) falls below it. Python computes the hash for the engines' units and
+Postgres for the rest, with the same result, so a seed draws the same cycle on any
+host, and a larger target keeps every unit a smaller one drew. The expected size is
+the sum of the targets less the overlaps. `design` records, per stratum, the frame
+size, target, rate and units drawn, and the volume each engine would have written.
+
+**Blind verification** (decided 2026-11-23: Claude verifies every label, with no
+human spot check). The worksheet gives each unit its number, its security and date,
+and `data`: the data as it stood when drawn. For a bar that is the stored bar (or
+none), five bars either side, the corporate actions within 30 days, the tickers that
+day and whether it was a session. For a statement period it is every version of
+each statement with the values of the items to verify, and the periods on file within
+two years. It never gives the strata, the probability, what either engine said, or
+a verdict. Item numbers follow the hash, not the strata. The items to verify on a
+period are a core set (revenue, net income, shares; assets, liabilities, equity,
+cash, shares outstanding; operating cash flow), the items any engine named on the
+unit, and two more of each statement drawn by the seed, so the list does not show
+which an engine named.
+
+The verifier answers each unit with one JSON line:
+
+```json
+{"item": 17, "verdict": "error", "kind": "missing_bar",
+ "source": "https://stooq.com/q/d/?s=abcd.us", "value": "2026-11-19: close 4.12, volume 5,300",
+ "note": "The bar is missing; the quote shows a full session."}
+{"item": 18, "verdict": "correct", "kind": "matches_filing",
+ "source": "EDGAR 0000320193-25-000079", "value": "Revenues 94,036 (USD m), NetIncomeLoss 23,434"}
+{"item": 19, "verdict": "unverifiable", "note": "No source carries this OTC fund before 2021."}
+```
+
+- `verdict` is `error`, `correct` or `unverifiable`. A verdict other than
+  unverifiable must cite `source` (an EDGAR accession or URL, or a quote page) and
+  `value`, what was read there. No label is judged from either engine's output, and
+  no outside request carries personal data (a generic contact in the EDGAR
+  User-Agent).
+- `kind`, on bars: an error is `bad_price`, `scale_error`, `wrong_history`,
+  `date_shift`, `phantom_bar`, `missing_bar`, `stale_feed`, `bad_volume`,
+  `unreported_split`, `split_misdated`, `split_wrong` or `dividend_wrong`; correct is
+  `matches_source`, `no_trading` or `real_move`. On statements: an error is
+  `wrong_value`, `scale_error`, `ytd_as_quarter`, `missing_period`, `wrong_period`,
+  `duplicate_period` or `stale_filer`; correct is `matches_filing`, `filing_fact` (the
+  stored value reproduces a filing that itself breaks an identity or tie: not a data
+  error, decision 2) or `no_filing`.
+- `first`/`last`, optional, give the span of the condition. It must hold the unit's
+  date.
+- On statements, `line_items` names the wrong items. Without it, the whole period is
+  wrong (a missing period, a year to date stored as a quarter).
+
+A verdict becomes labels: verified, `source` `audit:<cycle>`, with `sample_id`,
+`sample_item` and `weight` = 1 / the inclusion probability. On bars an error expects
+the codes its kind names (`missing_bar`: DQ301, DQ302, DQ303, DQ305; the table is
+`BAR_FAULTS` in `fafnir.dq.audit`), and a correct bar is a market fact on every code.
+On statements any code whose scope names the wrong item or period is right, and the
+statements verified right are market facts at their current version. A report on an
+older version stays unjudged. `--replace` re-verifies units already judged; their
+labels are revoked. `dq export-labels` writes the labels with dorq's `sample` and
+`weight` (dorq DE-01).
+
+**The second verification.** A tenth of the cycle, rounded up and drawn by a second
+hash, is verified again blind by an independent agent. Its verdicts go to the unit
+(`--second`), never to the labels. The gate reports the agreement, the same verdict
+on error or not. Below 90%, the cycle is not usable until the units named are
+re-verified.
+
+**The gate** (`dq compare --audit`), per cycle. It uses only the cycle's judged
+units, each weighted by 1 / its inclusion probability:
+
+- **Precision**, strict (right / judged) and fault (right or another fault), at warn
+  and above and at error, for both engines, over what each keyed at the unit: dorq's
+  reports as written (statements also before withholding), the SQL flags open when
+  dorq ran. A point estimate is Hájek's ratio. Its 95% interval is Wilson's on Kish's
+  effective n, (Σw)²/Σw². dorq's precision is also given per code.
+- **Recall** on the cycle's confirmed errors (units with a fault label): found when
+  a report or flag at warn and above covers the unit within the slack (3 days) with a
+  code the fault names (`any`: with any code). dorq's are as written. The SQL
+  checks' are detected by dorq's start, open or closed.
+- **The paired test.** The weighted difference, dorq's recall minus SQL's, with its
+  one-sided 95% lower bound by Newcombe's hybrid score method (method 10, on the
+  effective n), and the exact one-sided McNemar p on the unweighted discordant units.
+  The recall line is met when the lower bound is above 0: dorq finds more at
+  one-sided 95%. A tie is not met.
+- **Calibration**: the expected calibration error of dorq's `p_error` over the
+  reports keyed at judged units that were right or false, ten bins, weighted.
+- **Volume as written**, from the cycle's design: dorq's distinct conditions at warn
+  and above (statements: less those withheld) against the SQL checks' open flags at
+  warn and above, standing; and new against the previous night.
+
+Then one line per measure and the verdict. The verdict is `incomplete` while units
+are pending or the second verification is missing. It is `not usable` below 90%
+agreement, and `not enough errors yet` under about 100 confirmed errors. Otherwise it
+is `met`, or `not met:` with the failing lines. With several `--audit` cycles it says,
+per domain, how many consecutive cycles met. The cutover needs two. The gate's
+precision lines take the point estimate against the bar; the interval is printed
+beside it.
+
+Not measured: a statements cohort row (DQ951) is verified as a load, not on a filing,
+and is left out; a report on an older version of a period is unjudged; and an error
+on a line item outside a unit's list, which no engine named, is not looked for.
+
 ### Known false positives in dorq ≤ 0.8.1
 
 Two kinds of report are false positives until dorq's next release fixes them.

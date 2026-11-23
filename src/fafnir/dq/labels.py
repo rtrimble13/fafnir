@@ -1106,6 +1106,14 @@ def stated_label(row: dict) -> dict:
     extra: dict = {"label_id": int(row["label_id"])}
     if row.get("members"):
         extra["members"] = sorted(int(m) for m in row["members"])
+    # An audit cycle's label (DE-03): dorq's `sample` and `weight` (1 / the unit's
+    # inclusion probability), and the unit it judges.
+    if row.get("sample_id"):
+        extra["sample"] = row["sample_id"]
+        if row.get("sample_item") is not None:
+            extra["sample_item"] = int(row["sample_item"])
+    if row.get("weight") is not None:
+        extra["weight"] = float(row["weight"])
     scope = {f: row.get(f) for f in SCOPE_FIELDS}
     return _label(
         row["security_id"],

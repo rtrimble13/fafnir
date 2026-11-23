@@ -4,10 +4,10 @@ Every schema, table, view, materialized view and function fafnir stores or serve
 with its **grain**, **source**, **units**, **adjustment status** and **update
 cadence**. This is the contract between the warehouse and everything that reads it.
 
-It describes the schema at migration **0044** (`dq_label_statement_scope`). It was
+It describes the schema at migration **0047** (`dq_audit`). It was
 checked against the live catalog at 0040 (`pg_class`, `pg_attribute`,
 `pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
-on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's to 0044's objects
+on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's to 0047's objects
 are described from the migrations and their tests. A migration that adds, drops or re-types a column updates this file in
 the same pull request: the PR template's first box.
 
@@ -83,6 +83,7 @@ count, the planner's estimate otherwise. They are not maintained.
 | [`ops.vendor_correction`](#opsvendor_correction--rows-one-vendor-replaced-grain-correction_id) | table | `correction_id` | `vendor correct` | 704k |
 | [`ops.dq_label`](#opsdq_label--labels-a-person-stated-grain-label_id) | table | `label_id` | `dq label`, `dq accept\|resolve --label` | 129 |
 | [`ops.api_key`](#opsapi_key--keys-of-the-http-api-grain-key_id) | table | `key_id` | `fafnir api key create\|revoke` | — |
+| [`ops.dq_audit_cycle`, `ops.dq_audit_item`](#opsdq_audit_cycle--opsdq_audit_item--audit-cycles-grain-cycle_id-cycle_id-item_no) | tables | `cycle_id`; `(cycle_id, item_no)` | `dq sample --domain`, `dq audit verdicts` | — |
 | [`landing.fmp_raw`](#landingfmp_raw--raw-immutable-payloads-grain-raw_id) | table | `raw_id` | the FMP loaders | 915k (6.2 GB) |
 | [`landing.sharadar_file`](#landingsharadar_file--the-sharadar-file-ledger-grain-file_id) | table | `file_id` | `source sharadar-bulk\|delta\|prune` | 34 |
 | [`meta.schema_migration`](#metaschema_migration--migration-bookkeeping-grain-version) | table | `version` | `db migrate` | 40 |
@@ -1641,6 +1642,37 @@ NULL`.
 | `period_type` | TEXT CHECK | `quarter` or `annual`. NULL: either. |
 | `version_no` | INTEGER CHECK | The version, 1 or more. NULL: any. |
 | `item` | TEXT CHECK | The line item, a statement table's column; never blank. NULL: any. |
+| `sample_id` | TEXT | The audit cycle the label was judged in (`ops.dq_audit_cycle`); exported as dorq's `sample`. NULL: not from an audit (0047). |
+| `sample_item` | INTEGER | The audit unit it judges; FK with `sample_id` to `ops.dq_audit_item`. |
+| `weight` | DOUBLE PRECISION CHECK | The survey weight, 1 / the unit's inclusion probability, at least 1; exported as dorq's `weight`. NULL: 1. |
+
+---
+
+### `ops.dq_audit_cycle`, `ops.dq_audit_item` — audit cycles. **Grain:** `cycle_id`; `(cycle_id, item_no)`.
+
+Migration 0047, DE-03 (#268). The sample that decides the dorq cutover (doc/dorq.md,
+"The audit"). A cycle is one night of one domain drawn with a seed by `fafnir dq
+sample --domain`; its units are what it drew. A unit's verdict is its labels
+(`ops.dq_label` with the cycle's `sample_id` and the unit's `sample_item`), written by
+`dq audit verdicts`; `dq compare --audit` reads all three. Changes no data and no flag.
+
+| Column | Type | Notes |
+|---|---|---|
+| `dq_audit_cycle.cycle_id` | TEXT PK | The operator's name for it (`2026-11-24-bars`). |
+| `domain` | TEXT CHECK | `bars` or `statements`. |
+| `seed` | BIGINT | The same night and seed draw the same units on any host. |
+| `night`, `shadow_file` | DATE, TEXT | The shadow night sampled. |
+| `dorq_run_id`, `dorq_version`, `state_at` | BIGINT, TEXT, TIMESTAMPTZ | The dorq run that wrote the night; the engines' outputs are read as of its start. |
+| `design` | JSONB | Per stratum its frame size `N`, target, rate and units drawn; the volume as written per engine (standing, new per night). |
+| `created_by`, `created_at`, `note` | | |
+| `dq_audit_item.item_no` | INTEGER | In the order of the units' hash: it says nothing of the strata. |
+| `security_id`, `unit_date`, `period_type` | BIGINT, DATE, TEXT CHECK | The unit: a bar or missing session (`period_type` NULL), or a statement period (`annual`, `quarter`; `-` for a finding about no one period). Unique per cycle. |
+| `strata` | TEXT[] | Every stratum the unit is in: `dorq:<code>`, `dorq:error`, `dorq:withheld`, `sql:<check>:new\|standing`, `none:random`, `none:near`. |
+| `inclusion_p` | DOUBLE PRECISION CHECK | The probability it was drawn with: the largest rate of its strata. In (0, 1]. |
+| `data` | JSONB | What the verifier is shown: the data as it stood when drawn (the bar and its neighbours, the corporate actions; or each statement's versions with the items to verify). |
+| `engines` | JSONB | What dorq and the SQL checks said about the unit. Never shown to the verifier. |
+| `second_check`, `second` | BOOLEAN, JSONB | Drawn for the blind second verification; that verdict, kept apart from the labels. |
+| `status`, `status_note` | TEXT CHECK, TEXT | `pending`, `judged` or `unverifiable`. |
 
 ---
 
