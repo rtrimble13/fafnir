@@ -84,6 +84,11 @@ read through the `duk` CLI.
     off 2026-10-25)
   - [Fundamentals build prompt (FMP era)](plans/fundamentals-build-prompt-fmp.md) —
     the original fundamentals build prompt, retargeted to SF1 in SA-0801 (reference)
+  - [dorq efficacy](plans/dorq-efficacy.md) — how dorq comes to replace the SQL checks
+    only where it is significantly better in precision and recall: the success bar,
+    the operator's decisions of 2026-11-23, the audit, and phases DE-01 to DE-40;
+    dorq stays general purpose; tracked in [#267](https://github.com/rtrimble13/fafnir/issues/267)
+    (**approved**, not started)
 - Architecture Decision Records:
   - [ADR 0001 — Raw prices + adjustment factors](adr/0001-raw-prices-plus-adjustment-factors.md)
   - [ADR 0002 — Surrogate security_id & bitemporal readiness](adr/0002-surrogate-security-id-and-bitemporal-readiness.md)

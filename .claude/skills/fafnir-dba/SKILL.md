@@ -244,7 +244,10 @@ the flags individually is the wrong answer to it.
 ## Labels: record what you judged
 
 dorq is measured against labels (`fafnir dq compare --labels-from-db`; doc/dorq.md),
-and the labels are the decisions this queue records. A label is derived on its own
+and the labels are the decisions this queue records. Whether dorq replaces the SQL
+checks is decided by an audit, not by these labels: `doc/plans/dorq-efficacy.md`
+(#267). An audit label is verified by Claude on an outside source, cited in its note,
+and never judged from either engine's output; read that plan before labelling for it. A label is derived on its own
 only where the disposition is unambiguous: a repair (`reason` data_error), an
 outlier or `dorq_*` flag accepted or resolved. Everything else is stated, and the
 moment to state it is when you judge:

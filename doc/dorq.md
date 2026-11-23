@@ -9,6 +9,11 @@ reports the probability of an error, the evidence, and the repair it suggests.
 rather than instead of them. From dorq 0.13 it judges the financial statements too,
 in a run of their own ([Statements](#statements)).
 
+**Cutover is decided by the [dorq efficacy plan](plans/dorq-efficacy.md)** (#267). A
+domain (bars, statements) cuts over only when an audit that neither engine selected
+shows dorq significantly better in both precision and recall; until then it stays in
+shadow. That plan's bar supersedes the cutover criteria stated below where they differ.
+
 ## Install
 
 dorq is a single static binary, and fafnir needs version 0.8.0 or later. Version
