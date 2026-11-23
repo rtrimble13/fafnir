@@ -83,7 +83,7 @@ count, the planner's estimate otherwise. They are not maintained.
 | [`ops.vendor_correction`](#opsvendor_correction--rows-one-vendor-replaced-grain-correction_id) | table | `correction_id` | `vendor correct` | 704k |
 | [`ops.dq_label`](#opsdq_label--labels-a-person-stated-grain-label_id) | table | `label_id` | `dq label`, `dq accept\|resolve --label` | 129 |
 | [`ops.api_key`](#opsapi_key--keys-of-the-http-api-grain-key_id) | table | `key_id` | `fafnir api key create\|revoke` | — |
-| [`ops.dq_audit_cycle`, `ops.dq_audit_item`](#opsdq_audit_cycle--opsdq_audit_item--audit-cycles-grain-cycle_id-cycle_id-item_no) | tables | `cycle_id`; `(cycle_id, item_no)` | `dq sample --domain`, `dq audit verdicts` | — |
+| [`ops.dq_audit_cycle`, `ops.dq_audit_item`](#opsdq_audit_cycle-opsdq_audit_item--audit-cycles-grain-cycle_id-cycle_id-item_no) | tables | `cycle_id`; `(cycle_id, item_no)` | `dq sample --domain`, `dq audit verdicts` | — |
 | [`landing.fmp_raw`](#landingfmp_raw--raw-immutable-payloads-grain-raw_id) | table | `raw_id` | the FMP loaders | 915k (6.2 GB) |
 | [`landing.sharadar_file`](#landingsharadar_file--the-sharadar-file-ledger-grain-file_id) | table | `file_id` | `source sharadar-bulk\|delta\|prune` | 34 |
 | [`meta.schema_migration`](#metaschema_migration--migration-bookkeeping-grain-version) | table | `version` | `db migrate` | 40 |
