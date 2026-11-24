@@ -1,6 +1,8 @@
 # ADR 0011: One version, written in source, tagged `vX.Y.Z`
 
-- Status: Accepted
+- Status: Accepted; amended by [ADR 0022](0022-every-version-on-main-is-a-release.md)
+  (every version on main is a release: the merge publishes it, and the release
+  workflow makes the tag)
 - Date: 2026-09-10
 - Implemented by: `src/fafnir/__init__.py`, `pyproject.toml`, `scripts/release.sh`,
   `test/fafnir/test_version.py`, `.github/workflows/version.yml`
@@ -121,3 +123,14 @@ oldest dorq it runs is `DORQ_MIN_VERSION` (`src/fafnir/dq/dorq.py`), checked bef
 every run, and `test/fafnir/test_dorq_version.py` holds `doc/dorq.md`'s install
 steps to it ([doc/releasing.md](../releasing.md#which-dorq)). dorq's side is its ADR
 0006 (`doc/adr/0006-versions-and-releases.md` in rtrimble13/dorq).
+
+## Note, 2026-11-24: the merge is the release
+
+[ADR 0022](0022-every-version-on-main-is-a-release.md) changes how a version becomes
+a release, not where the number lives. A pull request that changes what the host
+runs raises `__version__` (`scripts/release.sh` on its branch; the `version`
+workflow holds it to that), and merging it publishes the release:
+`.github/workflows/release.yml` installs the merge commit, checks it says the
+number, and creates the tag and the GitHub release. `release.sh` no longer commits,
+tags or pushes; `--allow-patch` is a line `-- release: patch` in the migration. The
+number is still a source constant and still a person's choice.

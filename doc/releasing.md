@@ -1,8 +1,14 @@
 # Releasing and upgrading
 
 Fafnir is versioned `vX.Y.Z` and deployed by pulling a git checkout. Nothing is
-published to PyPI, so a release is two things: a number that says what is running,
-and a tag that names the commit it came from.
+published to PyPI, so a release is three things: a number that says what is running,
+a tag that names the commit it came from, and a GitHub release whose notes say what
+the operator runs after the pull.
+
+**Every version that reaches main is a release**
+([ADR 0022](adr/0022-every-version-on-main-is-a-release.md), as in
+rtrimble13/alpha-tango and dorq). A pull request that changes what the host runs
+raises the version, and merging it publishes the release. Nobody tags by hand.
 
 ## Before anything merges: the docs gate
 
@@ -21,45 +27,63 @@ The gate reports; it does not block. It is deliberately not a required status
 check in branch protection (Sharadar plan v2), so a red `docs-gate` is a prompt to
 add the docs or the label, and the reviewer decides.
 
-## Cutting a release
+## How a release happens
 
 ```bash
-make version                      # what is here now
-make release BUMP=minor DRY_RUN=1 # what would happen
-make release BUMP=minor           # do it
+make version                      # this branch, main, and the last release
+make bump BUMP=minor DRY_RUN=1    # what would happen
+make bump BUMP=minor              # set this branch's version; then commit it
 ```
 
-`scripts/release.sh` is the whole mechanism; the make targets just call it. It takes
-`patch`, `minor`, `major`, or an explicit `X.Y.Z`:
+1. **In the pull request**, `scripts/release.sh` (`make bump`) sets the version
+   the merge will release. It takes `patch`, `minor`, `major` or an explicit
+   `X.Y.Z`, counted from the version on `main`. Running it again on the same branch
+   gives the same number:
 
-| Command | 0.1.0 becomes |
-|---|---|
-| `scripts/release.sh patch` | 0.1.1 |
-| `scripts/release.sh minor` | 0.2.0 |
-| `scripts/release.sh major` | 1.0.0 |
-| `scripts/release.sh 1.4.2` | 1.4.2 |
+   | Command | 3.2.0 on main becomes |
+   |---|---|
+   | `scripts/release.sh patch` | 3.2.1 |
+   | `scripts/release.sh minor` | 3.3.0 |
+   | `scripts/release.sh major` | 4.0.0 |
+   | `scripts/release.sh 3.4.0` | 3.4.0 |
 
-It rewrites the one line that carries the number, checks every version in the
-repository still agrees, commits `Release vX.Y.Z`, and tags that commit. Then it
-stops and prints the push command rather than pushing: a pushed tag is awkward to
-take back, because a checkout that already has it will not pick up a moved one. Add
-`--push` when you want it to finish the job.
+   It rewrites the one line that carries the number. It checks the line against the
+   gate below (`scripts/check_version.py --base origin/main`) and checks that every
+   version in the repository still agrees. If either check fails, it puts the file
+   back. It refuses to run on `main`, and it does not commit: commit
+   `src/fafnir/__init__.py` with the change that needs it.
+2. **The `version` workflow** checks every pull request
+   (`.github/workflows/version.yml`, `scripts/check_version.py`):
+   - The version is `X.Y.Z` and never goes down.
+   - A change to what the host runs raises it above the base branch's: `src/`,
+     `sql/`, `scripts/`, `etc/` or `pyproject.toml`, less the repository's own
+     tooling (`scripts/check_*.py`, `scripts/release.sh`) and `etc/fafnirrc` and
+     `etc/crontab.example`, which are documentation. A pull request that changes
+     only docs, tests or CI keeps the version, and its merge releases nothing.
+   - A pull request that adds a migration raises the minor version at least (below).
+3. **The merge publishes it.** On each push to `main`, `.github/workflows/release.yml`
+   reads `__version__`. If GitHub has no release of it, the workflow installs the
+   commit as the host does. It checks that the source, the distribution metadata
+   and all four CLIs say the number, then creates the tag `vX.Y.Z` at that commit
+   and the GitHub release. The notes open with the deploy steps this release needs:
+   `pip install -e` when `pyproject.toml` changed, and `fafnir db migrate` with the
+   migrations by name. GitHub's list of the merged pull requests follows. A push
+   that leaves the version as released finds nothing to do, in seconds. A run that
+   failed can be run again from the Actions tab (`release`, "Run workflow", on
+   `main`).
 
-Nothing is half-done if it refuses. It stops before touching anything when the
-working tree is dirty, when you are not on `main`, when the tag already exists,
-when the new version does not come after the current one, or when a patch would
-carry a migration — and if the consistency check fails after the rewrite, it puts
-the file back.
+Never move or delete a pushed tag: a checkout that already has it will not pick up
+a moved one. Fix forward with the next version.
 
 **A migration is not a patch.** Each migration is an operator step after the pull
-([Deploying it](#deploying-it)), so the number has to say one is there. With no
-argument the script lists the migrations added since the last tag; a `patch` that
-would carry one is refused, and `minor` is the usual answer ([Choosing the
-number](#choosing-the-number)). `--allow-patch` releases it anyway, for a
-migration that only fixes (an index, a constraint) and adds nothing a reader
-sees. v3.1.1, v3.1.2 and v3.1.8 each shipped a migration as a patch before the
-script checked. After a release with migrations, the script's closing lines name
-them beside `fafnir db migrate`.
+([Deploying it](#deploying-it)), so the number has to say one is there. A pull
+request that adds one and raises only the patch number fails the gate, and
+`release.sh patch` refuses it; `minor` is the usual answer ([Choosing the
+number](#choosing-the-number)). A migration that only fixes (an index, a
+constraint) and adds nothing a reader sees can say so with a line
+`-- release: patch` in its `.up.sql`. When every migration a pull request adds says
+so, a patch passes. That line replaces `release.sh --allow-patch`. v3.1.1, v3.1.2
+and v3.1.8 each shipped a migration as a patch before the script checked.
 
 ## Deploying it
 
@@ -120,8 +144,9 @@ lockstep"): raise `DORQ_MIN_VERSION`, move the `version=` in doc/dorq.md's insta
 steps, and add an upgrade note here, since the operator installs the new dorq
 before pulling the fafnir release that needs it.
 
-dorq reports `X.Y.Z` only from its tagged release. A build of anything else, its
-main included, reports `X.Y.Z-dev`, and so does every flag it writes
+dorq reports `X.Y.Z` only from its tagged release. A build of anything else (a
+branch, or its main past a release) reports `X.Y.Z-dev`, and so does every flag it
+writes
 (`detail.dorq.version`). fafnir runs such a build when `X.Y.Z` meets the minimum,
 with a warning in the log and `a development build, not a release` in `fafnir
 status`. An audit cycle or a shadow night that names a `-dev` version did not run a
@@ -165,9 +190,12 @@ rather than derived from the git tag.
 
 - **Every push:** `test/fafnir/test_version.py` runs in the normal suite, so a
   reintroduced literal or a broken pyproject link fails a pull request.
-- **Every `v*` tag:** `.github/workflows/version.yml` installs the tagged commit
-  and refuses the tag if the code does not say what the tag says, or if any of the
-  three CLIs disagrees. That is what catches a tag pushed by hand.
+- **Every pull request:** the `version` workflow (`scripts/check_version.py`)
+  holds the version to the rules in [How a release happens](#how-a-release-happens).
+- **Every push to main:** the `release` workflow publishes a version that has no
+  release yet. First it installs the commit and refuses if the code, the metadata
+  or any of the four CLIs disagrees with the number. A tag already there (pushed by
+  hand) on another commit stops it too.
 
 ## Choosing the number
 

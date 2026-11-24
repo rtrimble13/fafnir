@@ -31,3 +31,8 @@ def docs_touched():
 @pytest.fixture(scope="session")
 def doc_links():
     return _load("check_doc_links")
+
+
+@pytest.fixture(scope="session")
+def check_version():
+    return _load("check_version")

@@ -1,0 +1,165 @@
+name: release
+
+# Publishes the version on main when it has no GitHub release yet: every version
+# that reaches main is a release (ADR 0022; rtrimble13/alpha-tango and dorq do the
+# same). The pull request chose the number, and the version workflow held it to the
+# rules. This installs the pushed commit the way the host does, checks that the
+# source constant, the distribution metadata and every CLI say that number, then
+# creates the tag vX.Y.Z at that commit with the GitHub release. The release notes
+# open with what the operator runs after the pull (a reinstall, migrations) and go
+# on with the merged pull requests. A push that leaves the version as released
+# finds nothing to do, in seconds.
+on:
+  push:
+    branches: [main]
+  # By hand, from the Actions tab: after a transient failure.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One release at a time, and never cancelled half-way.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tags: the previous release, for the notes, and whether this one
+          # is tagged already.
+          fetch-depth: 0
+
+      - name: Find the release that is due
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error::A release publishes from main; this run is on ${GITHUB_REF}." >&2
+            exit 1
+          fi
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/fafnir/__init__.py)"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::__version__ '${version}' is not X.Y.Z." >&2
+            exit 1
+          fi
+          if out="$(gh release view "v${version}" --repo "${GITHUB_REPOSITORY}" --json tagName 2>&1)"; then
+            echo "v${version} is published; nothing to release." | tee -a "${GITHUB_STEP_SUMMARY}"
+            echo "due=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          elif ! grep -qi 'release not found' <<< "${out}"; then
+            echo "::error::Could not ask GitHub whether v${version} is published: ${out}" >&2
+            exit 1
+          fi
+          # A tag already there (pushed by hand) must name this commit: the checks
+          # below run on this commit, not on another.
+          if tagged="$(git rev-parse -q --verify "refs/tags/v${version}^{commit}")" &&
+             [[ "${tagged}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::v${version} is tagged at ${tagged}, not at ${GITHUB_SHA}." \
+                 "Publish that tag's release by hand, or raise the version." >&2
+            exit 1
+          fi
+          echo "Releasing v${version} from $(git log -1 --format='%h (%s)' HEAD)." |
+            tee -a "${GITHUB_STEP_SUMMARY}"
+          { echo "due=true"; echo "version=${version}"; } >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-python@v5
+        if: steps.plan.outputs.due == 'true'
+        with:
+          python-version: "3.11"
+
+      # Installed, not just imported: this is also what proves the pyproject
+      # `dynamic = ["version"]` wiring reads the source constant, which is the one
+      # link the source-only tests cannot check.
+      - name: Install the commit as the host does
+        if: steps.plan.outputs.due == 'true'
+        run: pip install -e .[dev]
+
+      - name: The source, the metadata and every CLI say the version
+        if: steps.plan.outputs.due == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          SOURCE="$(python -c 'import fafnir; print(fafnir.__version__)')"
+          DIST="$(python -c 'import importlib.metadata as m; print(m.version("fafnir"))')"
+          echo "release  : v${VERSION}"
+          echo "source   : ${SOURCE}"
+          echo "metadata : ${DIST}"
+          if [[ "${SOURCE}" != "${VERSION}" || "${DIST}" != "${VERSION}" ]]; then
+            echo "::error::The source (${SOURCE}) and the distribution metadata (${DIST})" \
+                 "must both say ${VERSION}. The pyproject dynamic-version wiring is broken." >&2
+            exit 1
+          fi
+          for cli in fafnir duk fafnir-mcp fafnir-api; do
+            printf '%-12s %s\n' "${cli}" "$("${cli}" --version)"
+            test "$("${cli}" --version)" = "${VERSION}"
+          done
+
+      # The same assertions a developer sees locally; here the install is fresh, so
+      # nothing is deselected.
+      - name: Version consistency tests
+        if: steps.plan.outputs.due == 'true'
+        run: pytest test/fafnir/test_version.py -v
+
+      - name: Write the deploy notes
+        if: steps.plan.outputs.due == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude "v${VERSION}" HEAD 2>/dev/null || true)"
+          migrations=()
+          reinstall=false
+          if [[ -n "${prev}" ]]; then
+            mapfile -t migrations < <(git diff --name-only --diff-filter=A "${prev}" HEAD -- sql/migrations |
+                                      sed -n 's|^sql/migrations/\(.*\)\.up\.sql$|\1|p')
+            git diff --quiet "${prev}" HEAD -- pyproject.toml || reinstall=true
+          fi
+          {
+            echo "## Deploying it"
+            echo ""
+            echo '```bash'
+            echo "sudo -u fafnir -H git -C /opt/fafnir pull"
+            if [[ "${reinstall}" == true ]]; then
+              echo "sudo -u fafnir -H /opt/fafnir/.venv/bin/pip install -e /opt/fafnir    # pyproject.toml changed"
+            fi
+            if (( ${#migrations[@]} )); then
+              echo "sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir db migrate    # an operator command (ADR 0010)"
+            fi
+            echo "sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir --version    # ${VERSION}"
+            echo '```'
+            echo ""
+            if (( ${#migrations[@]} )); then
+              tick='`'
+              names=""
+              for m in "${migrations[@]}"; do names+="${tick}${m}${tick} "; done
+              echo "Migrations since ${prev}: ${names% }"
+              echo ""
+            fi
+            echo "See [doc/releasing.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/doc/releasing.md#deploying-it) for the upgrade notes."
+            echo ""
+          } | tee notes.md
+
+      - name: Create the tag and the GitHub release
+        if: steps.plan.outputs.due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          where=(--target "${GITHUB_SHA}")
+          git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null && where=(--verify-tag)
+          gh release create "v${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "fafnir ${VERSION}" \
+            "${where[@]}" \
+            --notes-file notes.md \
+            --generate-notes
