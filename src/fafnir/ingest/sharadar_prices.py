@@ -36,7 +36,9 @@ after the bar's date, exact, where it agrees with ``closeunadj / close`` within 
 two closes' 3-dp rounding (#49). Where it does not, a split is missing from ACTIONS
 or one is wrong: the bar is recovered with the vendor's own ratio, still loaded, and
 the security is flagged ``sharadar_split_ratio_mismatch`` once, with the count and
-the first and last such dates. Recovered with ACTIONS, a high can land below the
+the first and last such dates. Only the bars a run writes are flagged; a row it reads
+and does not write is counted ``ratio_mismatch_unwritten``
+(:func:`_note_mismatches`). Recovered with ACTIONS, a high can land below the
 exact close, or a low above it, by the recovery's own rounding; within that bound it
 is set to the close (:func:`clamp_to_close`), and beyond it the validator decides.
 
@@ -255,16 +257,38 @@ class _Target:
     mismatched: list = field(default_factory=list)  # dates
 
 
-def _recover(t: _Target, rows: list[dict], result: PricesResult) -> list[dict]:
-    """The rows' raw bars, in date order; the dates the vendor's ratio disagreed
-    with ACTIONS are noted on the target."""
-    bars = []
+def _recover(
+    t: _Target, rows: list[dict], result: PricesResult
+) -> tuple[list[dict], set[date]]:
+    """The rows' raw bars, in date order, and the dates the vendor's ratio
+    disagreed with ACTIONS. The caller notes on the target only the dates it
+    writes (:func:`_note_mismatches`)."""
+    bars, mismatched = [], set()
     for r in sorted(rows, key=lambda r: r["date"]):
         bar, agrees = recovered_bar(r, t.splits, result.counts)
         if agrees is False:
-            t.mismatched.append(r["date"])
+            mismatched.add(r["date"])
         bars.append(bar)
-    return bars
+    return bars, mismatched
+
+
+def _note_mismatches(
+    t: _Target, mismatched: set[date], written: list[dict], result: PricesResult
+) -> None:
+    """Note on the target the mismatched dates among the rows it writes.
+
+    The flag is about a bar the warehouse holds: one recovered with the vendor's
+    own ratio. A row read and not written -- another vendor's bar kept on a fed
+    security (``kept:fmp``), a date set aside or quarantined, a bar compared
+    ``--as-if-fed`` -- puts nothing in the warehouse, and flagging it raised a
+    standing flag on securities whose stored bars were untouched (13 of 18 open
+    on 2026-11-24, every flagged date FMP's). Those are counted
+    ``ratio_mismatch_unwritten``, not flagged."""
+    if not mismatched:
+        return
+    days = {row["trade_date"] for row in written} & mismatched
+    t.mismatched.extend(sorted(days))
+    result.counts["ratio_mismatch_unwritten"] += len(mismatched) - len(days)
 
 
 def _gate(
@@ -371,8 +395,9 @@ def _load_run(
     result.counts["held_or_outside"] += len(rows) - len(wanted)
     if not wanted:
         return
-    bars = _recover(t, wanted, result)
+    bars, mismatched = _recover(t, wanted, result)
     clean = _gate(db, t, bars, run=run, result=result)
+    _note_mismatches(t, mismatched, clean, result)
     _write(db, t, table, clean, run=run, result=result)
 
 
@@ -764,7 +789,8 @@ def _nightly_run(
     result.counts["future_or_outside"] += len(rows) - len(wanted)
     if not wanted:
         return
-    clean = _gate(db, t, _recover(t, wanted, result), run=run, result=result)
+    bars, mismatched = _recover(t, wanted, result)
+    clean = _gate(db, t, bars, run=run, result=result)
     stored = repo.stored_bars_on(db, t.security_id, [r["trade_date"] for r in clean])
     by_day = {r["date"]: r for r in wanted}
     write = []
@@ -786,6 +812,7 @@ def _nightly_run(
         ] += 1
         if outcome in ("new", "revised"):
             write.append(row)
+    _note_mismatches(t, mismatched, write, result)
     _write(db, t, table, write, run=run, result=result)
 
 

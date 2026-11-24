@@ -249,7 +249,8 @@ security that stays in it for several nights has stopped being served.
 
 The bars pass the backfill's gates. Raw prices are recovered from ACTIONS: on the
 capture day the vendor's ratio must be 1, or the security is flagged
-`sharadar_split_ratio_mismatch`. Non-session and operator-edited dates are set
+`sharadar_split_ratio_mismatch` (for a bar the night writes; another vendor's bar it
+keeps is counted `ratio_mismatch_unwritten`). Non-session and operator-edited dates are set
 aside, and the validator quarantines bad bars. A bar the overlapping deltas bring
 back is flagged once, in both bulk and nightly modes, because no Sharadar watermark
 waits on the count. The watermark `(sharadar, SEP|SFP,
@@ -586,7 +587,10 @@ amendment records:
   one is wrong. The bar is recovered with the vendor's own ratio, which is how its
   other prices were scaled. It is still loaded, and the security is flagged
   `sharadar_split_ratio_mismatch` once, with the count and the first and last such
-  dates.
+  dates. Only the bars the run writes count: a row read and not written (another
+  vendor's bar kept on a fed security, a date set aside or quarantined, a bar
+  compared `--as-if-fed`) changes nothing the warehouse holds, and is counted
+  `ratio_mismatch_unwritten` in the run's counts instead.
 - **Volume** is divided by the same factor, rounded to a whole share.
 - **A high below the close, or a low above it,** by no more than the recovery's own
   rounding (0.0005 × (factor + 1)) is set to the close, and counted
