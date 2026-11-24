@@ -1351,6 +1351,18 @@ rounding, so those bars were recovered with the vendor's ratio instead and still
 loaded. Record key `{"vendor": "sharadar", "vendor_key": K}`; `detail` has the bar
 count and the first and last such dates.
 
+Only the bars a run *writes* are counted. A row it reads and does not write
+(another vendor's bar kept on a fed security, a date set aside or quarantined, a
+bar compared `--as-if-fed`) is counted `ratio_mismatch_unwritten` in the run's
+`params.counts`, and not flagged. Before that fix, the revisions the nightly reads
+for old dates flagged securities whose stored bars were all FMP's. So for a flag
+raised before it, look first at the source of the stored bars on `first` and
+`last`. If they are FMP's, nothing was recovered with the vendor's ratio, and a
+`dq resolve` saying so stays closed.
+
+The key is the security, not a bar: a flag back after a resolve may name other
+dates. Compare `detail` with the closed flag's before calling it the same condition.
+
 **Diagnose.** A constant ratio over a date range that ends at a date is a split
 ACTIONS lacks (or records on another date): the stored raw bars are right, and the
 adjustment factors, built from ACTIONS (#73), are missing that split. Compare

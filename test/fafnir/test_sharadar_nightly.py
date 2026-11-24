@@ -493,6 +493,35 @@ def test_a_capture_day_ratio_off_one_is_flagged(db, tmp_path):
     assert flag["detail"] == {"bars": 1, "first": "2026-10-21", "last": "2026-10-21"}
 
 
+def test_a_ratio_off_one_on_a_bar_it_keeps_is_counted_not_flagged(db, tmp_path):
+    # FMP's bar is kept on a fed security: the vendor's row is read and not
+    # written, so the warehouse holds nothing recovered with its ratio. Flagging it
+    # raised standing flags on securities whose bars were untouched (2026-11-24).
+    fed = _security(db, "ZZK", source="sharadar", key="900103", feed=True)
+    _store(db, fed, Y(2026, 10, 20), "11", "fmp")
+    _fulls(db, tmp_path)
+    _record(
+        db,
+        tmp_path,
+        "stocks",
+        PRICES
+        + "ZZK,2026-10-20,5,5,5,5,200,5,10,2026-10-21\n"  # a 2:1 ACTIONS lacks; kept
+        + _csv_bar("ZZK", "2026-10-21", "12"),
+        kind="delta",
+        since="2026-10-18",
+    )
+    result = sp.nightly(db, tmp_path, as_of=Y(2026, 10, 22))
+    assert result.counts["kept:fmp"] == 1 and result.written == 1
+    assert result.mismatched_securities == 0
+    assert result.counts["ratio_mismatch_unwritten"] == 1
+    assert _bars(db, fed)[Y(2026, 10, 20)] == (D(11), "fmp")
+    assert not db.fetchall(
+        "SELECT 1 FROM ops.data_quality_flag WHERE check_name = %s "
+        "AND security_id = %s",
+        (sp.RATIO_CHECK, fed),
+    )
+
+
 def test_a_security_with_no_bars_reads_every_delta_since_the_full(db, tmp_path):
     _fulls(db, tmp_path)
     _record(
