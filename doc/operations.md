@@ -1045,6 +1045,50 @@ traded price. The vendor's payload has the same defect, so a re-fetch changes no
   mis-scaling *new* bars is not fixed by an edit of the past; those arrive on dates
   the edit does not cover.
 
+### A spin-off is a split row
+
+**The rule: a spin-off is adjusted as one split row on its ex-date, whose ratio
+carries the total-return factor (spin-as-split).** `core.corporate_action` holds
+splits and dividends only, and the adjustment engine turns a split row into a price
+factor, so this is the one form that puts a spin-off into the adjusted series. FMP
+files its spin-offs this way; Sharadar's ACTIONS records them as `spinoff` events,
+which `ingest sharadar-actions` keeps in `core.vendor_security_event` and never
+converts. An operator adds the row.
+
+The factor makes the ex-date's adjusted return a holder's total return: the parent's
+ex-date close against itself plus what one parent share received, valued at the
+spun-off company's ex-date close.
+
+```
+factor = parent_close_ex / (parent_close_ex + shares_received x spun_close_ex)
+split  = 1 / factor, written N:D        # e.g. 224278:100000 for factor 0.44587
+```
+
+VHI, 2007-03-27 (0.4776 TIMET per Valhi share; Valhi 8-K): 13.95 / (13.95 + 0.4776 x
+36.30) = 0.44587, so 224278:100000, and the ex-date adjusted return is +6.3%. A
+distribution with cash in it adds the cash to the denominator (NVRI 2026-06-01).
+
+```bash
+fafnir actions list --symbol VHI --type split
+fafnir actions delete 589630 -m "FMP's 1 - D/P spin factor: +15.3% on the ex-date against a holder's +6.3%" --dry-run
+fafnir actions add --security-id 14556 --ex-date 2007-03-27 --split 224278:100000 -m "<filing, prices, formula>" --dry-run
+```
+
+- **FMP's own factor is 1 − D/P,** the value distributed over the parent's close the
+  session before. For a small spin-off the two agree; for a large one FMP's overstates
+  the ex-date return (VHI: +15.3%, a 59% distribution). Replace it when the
+  difference is material: delete FMP's row, then add the operator's.
+- **No row is the other wrong answer.** Without one, the adjusted series shows the
+  ex-date drop as a loss (CTVA 2026-10-01: −84%).
+- **What a spin-as-split row also does,** because the warehouse reads every split row
+  as a share change:
+  - adjusted volume before the ex-date is scaled by the ratio (as for any split);
+  - share counts carried across the ex-date are put in the day's terms with it, so
+    `mart.fn_daily_market_cap` and the factor panel overstate the cap by the ratio
+    from the ex-date until the first balance sheet filed after it (VHI: 255.9M
+    shares, about 2.24 times its 114.1M, from 2007-03-27 to 2007-05-07).
+- Name the filing, the prices and the formula in `--note`; the row is the record.
+
 ### Separating two issuers held on one security
 
 A reused ticker arrives from the vendor as one continuous history — Sotheby's to

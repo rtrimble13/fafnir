@@ -678,9 +678,13 @@ Its other actions are lifecycle events, already in `core.vendor_security_event`
     nothing says the vendor's action was wrong. The dividend flags of a removed
     dividend are closed with it, and the factors are recomputed. Its run is
     `sharadar` / `actions:prune`.
-- **Spin-offs are not adjusted.** ACTIONS records them, and they are kept as events
-  in `core.vendor_security_event`; fafnir has never adjusted for them, and does not
-  start here.
+- **A spin-off is adjusted as a split row (spin-as-split), and this loader does not
+  write one.** ACTIONS' `spinoff` rows are kept as events in
+  `core.vendor_security_event`, and nothing converts them. The adjustment is one
+  split row on the ex-date whose ratio carries the total-return factor: an operator
+  adds it with `fafnir actions add` (see [operations.md › A spin-off is a split
+  row](operations.md#a-spin-off-is-a-split-row)). FMP files its spin-offs the same
+  way, so its history already holds such rows.
 - **Factors.** It recomputes the factors of the securities it changed itself,
   because `adjust --changed` reads FMP's actions runs. A security with no bars yet
   (a dead issuer before #75 loads its prices) waits: `fafnir adjust` after the price
