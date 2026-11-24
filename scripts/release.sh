@@ -9,9 +9,11 @@
 #   scripts/release.sh major              0.1.0 -> 1.0.0
 #   scripts/release.sh 1.4.2              set it explicitly
 #
-#   --dry-run   say what would happen and change nothing
-#   --push      push the branch and the tag when it is done (default: print
-#               the command and let you run it)
+#   --dry-run      say what would happen and change nothing
+#   --push         push the branch and the tag when it is done (default: print
+#                  the command and let you run it)
+#   --allow-patch  release a patch that adds a migration (one that fixes, and adds
+#                  nothing a reader sees); without it such a patch is refused
 #
 # The version lives in src/fafnir/__init__.py; fafnir_mcp and duk re-export it and
 # pyproject.toml reads it, so this script edits exactly one line. ADR 0011 says why
@@ -26,6 +28,7 @@ RELEASE_BRANCH="main"
 
 DRY_RUN=0
 PUSH=0
+ALLOW_PATCH=0
 BUMP=""
 
 die() { printf '%s\n' "error: $*" >&2; exit 1; }
@@ -43,7 +46,8 @@ while (( $# )); do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --push)    PUSH=1 ;;
-        -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --allow-patch) ALLOW_PATCH=1 ;;
+        -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)        die "unknown option $1 (try --help)" ;;
         *)         [[ -n "${BUMP}" ]] && die "give one version or bump, not two"
                    BUMP="$1" ;;
@@ -58,11 +62,29 @@ current_version() {
 CURRENT="$(current_version)"
 [[ -n "${CURRENT}" ]] || die "no __version__ found in ${VERSION_FILE}"
 
+LAST_TAG="$(git -C "${REPO_ROOT}" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+
+# The migrations added since the last release: each is an operator step after the
+# pull (doc/releasing.md, "Deploying it"), and adding one is a minor release at
+# least ("Choosing the number"). v3.1.1, v3.1.2 and v3.1.8 each added one as a patch.
+new_migrations() {
+    [[ -n "${LAST_TAG}" ]] || return 0
+    git -C "${REPO_ROOT}" diff --name-only --diff-filter=A "${LAST_TAG}" HEAD -- sql/migrations \
+        | sed -n 's|^sql/migrations/\(.*\)\.up\.sql$|\1|p'
+}
+
 # ------------------------------------------------------- no argument: report
 if [[ -z "${BUMP}" ]]; then
     note "current version : ${CURRENT}"
-    note "last tag        : $(git -C "${REPO_ROOT}" describe --tags --abbrev=0 2>/dev/null || echo '(none yet)')"
+    note "last tag        : ${LAST_TAG:-(none yet)}"
     note "deployed commit : $(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo '(unknown)')"
+    if [[ -n "${LAST_TAG}" ]]; then
+        note "since ${LAST_TAG}    : $(git -C "${REPO_ROOT}" rev-list --count --first-parent "${LAST_TAG}..HEAD") commit(s) on the first parent"
+        mapfile -t added < <(new_migrations)
+        if (( ${#added[@]} )); then
+            note "new migrations  : ${added[*]} (a minor release at least)"
+        fi
+    fi
     note ""
     note "To cut one:  scripts/release.sh {patch|minor|major|X.Y.Z}"
     exit 0
@@ -108,6 +130,17 @@ fi
 GREATEST="$(printf '%s\n%s\n' "${CURRENT}" "${NEW}" | sort -V | tail -1)"
 if [[ "${NEW}" == "${CURRENT}" || "${GREATEST}" != "${NEW}" ]]; then
     die "${NEW} does not come after ${CURRENT}. Versions only go up."
+fi
+
+# A migration is an operator step, and adding one is not a patch.
+mapfile -t ADDED < <(new_migrations)
+IFS='.' read -r NEW_MAJOR NEW_MINOR _ <<< "${NEW}"
+if (( ${#ADDED[@]} )) && [[ "${NEW_MAJOR}.${NEW_MINOR}" == "${CUR_MAJOR}.${CUR_MINOR}" ]] && (( ! ALLOW_PATCH )); then
+    die "${NEW} is a patch, and ${#ADDED[@]} migration(s) were added since ${LAST_TAG}:
+       ${ADDED[*]}.
+       Each is an operator step after the pull, and adding one is a minor release
+       at least (doc/releasing.md, \"Choosing the number\"). Use minor, or
+       --allow-patch for a migration that only fixes."
 fi
 
 # ----------------------------------------------------------- do it, and check
@@ -187,3 +220,7 @@ note ""
 note "Then on the warehouse host:"
 note "    sudo -u fafnir -H git -C /opt/fafnir pull"
 note "    sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir --version    # ${NEW}"
+if (( ${#ADDED[@]} )); then
+    note "and the operator applies the new migrations (${ADDED[*]}):"
+    note "    sudo -u fafnir -H /opt/fafnir/.venv/bin/fafnir db migrate"
+fi

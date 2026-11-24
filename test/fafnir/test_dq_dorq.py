@@ -700,7 +700,12 @@ def test_status_reports_the_dorq_version(db, fake_dorq, tmp_path, monkeypatch):
     monkeypatch.delenv("FAFNIR_DORQ_PATH", raising=False)
     result = CliRunner().invoke(cli.main, ["--config", str(rc), "status"])
     assert result.exit_code == 0, result.output
-    assert "dorq       : 9.9.9-fake (engine both, shadow)" in result.output
+    # The fake reports a version with a pre-release, as a dorq build of anything but
+    # its tagged release does: fafnir runs it, and says it is not a release.
+    assert (
+        "dorq       : 9.9.9-fake (engine both, shadow) -- a development build, not a release"
+        in result.output
+    )
 
 
 # ---------------------------------------------------------------------------
