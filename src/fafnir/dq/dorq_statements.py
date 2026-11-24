@@ -390,6 +390,7 @@ def judge(
     other security for one with no statements (DQ943).
     """
     version = engine.dorq_version(settings)
+    engine.require_supported(version)
     items = line_items(db)
     paths = export_context(db, workdir, items, security_ids)
     args = settings.base_args(settings.statements_config) + [

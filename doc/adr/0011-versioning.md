@@ -105,3 +105,19 @@ says how to make it.
 - Anyone reading `pip show fafnir` on the host can see a stale number. The
   documented answer is `fafnir --version` for the code and `git describe` for the
   commit, and `doc/releasing.md` has the table.
+
+## Note, 2026-11-24: what a person chooses, and the other version
+
+A review of v3.1.0 to v3.2.0 found the number chosen by a person drifting toward
+`patch`: v3.1.1, v3.1.2 and v3.1.8 each added a migration, which "Choosing the
+number" calls a minor release, and which an operator must apply after the pull.
+`scripts/release.sh` now lists the migrations added since the last tag and refuses
+a patch that carries one, unless `--allow-patch` (a migration that only fixes). The
+number is still a person's choice; the one mechanical case is no longer left to
+memory.
+
+fafnir also runs a second versioned program, dorq, whose output it reads. The
+oldest dorq it runs is `DORQ_MIN_VERSION` (`src/fafnir/dq/dorq.py`), checked before
+every run, and `test/fafnir/test_dorq_version.py` holds `doc/dorq.md`'s install
+steps to it ([doc/releasing.md](../releasing.md#which-dorq)). dorq's side is its ADR
+0006 (`doc/adr/0006-versions-and-releases.md` in rtrimble13/dorq).

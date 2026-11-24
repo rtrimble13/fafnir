@@ -37,6 +37,7 @@ import itertools
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -159,6 +160,82 @@ def settings_from(cfg) -> DorqSettings:
         statements_config=cfg.dorq_statements_config,
         work_dir=cfg.dorq_work_dir,
     )
+
+
+#: The oldest dorq this code runs: 0.13.0, the first release with every check fafnir
+#: reads (the statements' DQ901 to DQ951; doc/dorq.md, "Install"). It moves in the
+#: pull request that first reads a newer release's output, in lockstep with that
+#: release (dorq's CONTRIBUTING.md, "Callers move in lockstep"), and with the
+#: version doc/dorq.md's install steps name: test_dorq_version.py holds the three
+#: together. :func:`require_supported` refuses an older binary.
+DORQ_MIN_VERSION = "0.13.0"
+
+_DORQ_VERSION = re.compile(
+    r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+@dataclass(frozen=True)
+class DorqVersion:
+    """A dorq version: ``0.14.0``, or a build that is not a release, ``0.15.0-dev``
+    (dorq reports ``-dev`` from any build but its tagged release commit)."""
+
+    release: tuple[int, int, int]
+    prerelease: str = ""
+
+    @classmethod
+    def parse(cls, text: str) -> Optional["DorqVersion"]:
+        m = _DORQ_VERSION.match(text.strip())
+        if not m:
+            return None
+        return cls((int(m[1]), int(m[2]), int(m[3])), m[4] or "")
+
+    @property
+    def is_release(self) -> bool:
+        return not self.prerelease
+
+    def __str__(self) -> str:
+        text = ".".join(str(n) for n in self.release)
+        return f"{text}-{self.prerelease}" if self.prerelease else text
+
+
+def supported(version: str) -> tuple[bool, str]:
+    """Whether fafnir runs this dorq, and what to say about it: ``(True, "")`` for a
+    release at or above :data:`DORQ_MIN_VERSION`; ``(True, warning)`` for a build
+    that is not a release, whose own version meets it (``0.15.0-dev`` is main on its
+    way to 0.15.0, and fafnir's lockstep change reads what main has); ``(False,
+    reason)`` below it, or for a version that does not read as one."""
+    parsed = DorqVersion.parse(version)
+    minimum = DorqVersion.parse(DORQ_MIN_VERSION)
+    assert minimum is not None
+    if parsed is None:
+        return (
+            False,
+            f"dorq reports its version as {version!r}, which fafnir cannot read",
+        )
+    if parsed.release < minimum.release:
+        return False, (
+            f"dorq {version} is older than the {DORQ_MIN_VERSION} fafnir needs "
+            "(doc/dorq.md, Install)"
+        )
+    if not parsed.is_release:
+        return True, (
+            f"dorq {version} is a development build, not a release: its flags name a "
+            "version no archive has (doc/dorq.md, Install)"
+        )
+    return True, ""
+
+
+def require_supported(version: str) -> None:
+    """Raise :class:`DorqError` for a dorq fafnir does not run (:func:`supported`);
+    log a warning for a development build."""
+    ok, message = supported(version)
+    if not ok:
+        raise DorqError(
+            f"{message}. Install {DORQ_MIN_VERSION} or later, or set [dq] dorq_path."
+        )
+    if message:
+        logger.warning("%s", message)
 
 
 def dorq_version(settings: DorqSettings) -> str:
@@ -615,6 +692,7 @@ def run_dorq(
     ``--full`` and ``dq recheck`` all see the same reports.
     """
     version = dorq_version(settings)
+    require_supported(version)
     with work_dir(settings) as workdir:
         paths = export_context(db, workdir, exchange_code, security_ids)
         args = settings.base_args() + [

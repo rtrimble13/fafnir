@@ -46,9 +46,20 @@ take back, because a checkout that already has it will not pick up a moved one. 
 `--push` when you want it to finish the job.
 
 Nothing is half-done if it refuses. It stops before touching anything when the
-working tree is dirty, when you are not on `main`, when the tag already exists, or
-when the new version does not come after the current one — and if the consistency
-check fails after the rewrite, it puts the file back.
+working tree is dirty, when you are not on `main`, when the tag already exists,
+when the new version does not come after the current one, or when a patch would
+carry a migration — and if the consistency check fails after the rewrite, it puts
+the file back.
+
+**A migration is not a patch.** Each migration is an operator step after the pull
+([Deploying it](#deploying-it)), so the number has to say one is there. With no
+argument the script lists the migrations added since the last tag; a `patch` that
+would carry one is refused, and `minor` is the usual answer ([Choosing the
+number](#choosing-the-number)). `--allow-patch` releases it anyway, for a
+migration that only fixes (an index, a constraint) and adds nothing a reader
+sees. v3.1.1, v3.1.2 and v3.1.8 each shipped a migration as a patch before the
+script checked. After a release with migrations, the script's closing lines name
+them beside `fafnir db migrate`.
 
 ## Deploying it
 
@@ -93,6 +104,28 @@ The release also changes what the nightly writes: a vendor restatement beyond
 flagged `price_restatement_conflict` instead of stored (doc/ingestion.md), and the
 delisting sweep lands its payload. `fafnir source vendor-gaps` has a section in the
 nightly report.
+
+## Which dorq
+
+fafnir runs a dorq binary (`[dq] dorq_path`) and reads its output, so its code is
+written against a dorq release. `DORQ_MIN_VERSION` in `src/fafnir/dq/dorq.py` is
+the oldest it runs: every run reads `dorq --version` first and refuses an older
+binary before it exports a row, and `fafnir status` marks one (`TOO OLD`).
+[doc/dorq.md](dorq.md#install) installs a release at or above it, and
+`test/fafnir/test_dorq_version.py` fails when the two disagree.
+
+The minimum moves in the pull request that first reads a newer dorq's output, in
+lockstep with that dorq release (dorq's CONTRIBUTING.md, "Callers move in
+lockstep"): raise `DORQ_MIN_VERSION`, move the `version=` in doc/dorq.md's install
+steps, and add an upgrade note here, since the operator installs the new dorq
+before pulling the fafnir release that needs it.
+
+dorq reports `X.Y.Z` only from its tagged release. A build of anything else, its
+main included, reports `X.Y.Z-dev`, and so does every flag it writes
+(`detail.dorq.version`). fafnir runs such a build when `X.Y.Z` meets the minimum,
+with a warning in the log and `a development build, not a release` in `fafnir
+status`. An audit cycle or a shadow night that names a `-dev` version did not run a
+published dorq; the efficacy plan's measurements run releases.
 
 ## Which number to trust
 

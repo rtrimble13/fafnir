@@ -9610,6 +9610,14 @@ def _dorq_status(cfg) -> Optional[str]:
         version = dorq_engine.dorq_version(settings)
     except dorq_engine.DorqError:
         return f"dorq       : NOT FOUND at {settings.path} ({mode})"
+    ok, message = dorq_engine.supported(version)
+    if not ok:
+        return (
+            f"dorq       : {version} ({mode}) -- TOO OLD: fafnir needs "
+            f"{dorq_engine.DORQ_MIN_VERSION} or later"
+        )
+    if message:
+        return f"dorq       : {version} ({mode}) -- a development build, not a release"
     return f"dorq       : {version} ({mode})"
 
 

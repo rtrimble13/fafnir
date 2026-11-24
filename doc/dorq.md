@@ -16,13 +16,18 @@ shadow. That plan's bar supersedes the cutover criteria stated below where they 
 
 ## Install
 
-dorq is a single static binary, and fafnir needs version 0.8.0 or later. Version
-0.7.0 refuses its whole actions file over a dividend of zero, which
-`core.corporate_action` holds (see [What a run does](#what-a-run-does)). Check a
-release archive, unpack it and link it:
+dorq is a single static binary, and fafnir needs dorq 0.13.0 or later: the first
+release with every check fafnir reads, the statements' among them
+([Statements](#statements)). That is `DORQ_MIN_VERSION` in `src/fafnir/dq/dorq.py`.
+Every run checks the binary's version first and refuses an older one, and
+`fafnir status` marks it (`TOO OLD`). A development build of dorq, one not made
+from its tagged release, reports a version like `0.15.0-dev`: fafnir runs it when
+`0.15.0` meets the minimum, with a warning in the log, since its flags name a
+version no archive has. Production runs a release. Check a release archive,
+unpack it and link it:
 
 ```bash
-version=0.8.0
+version=0.14.0
 base="https://github.com/rtrimble13/dorq/releases/download/v${version}"
 curl -fsSLO "${base}/dorq-${version}-linux-x86_64.tar.gz"
 curl -fsSLO "${base}/SHA256SUMS"
@@ -43,8 +48,12 @@ move the link. To roll back, move it back.
 Or build it from source with the `release` preset (dorq's README). Either way the
 binary is `/opt/dorq/bin/dorq`, which is `[dq] dorq_path`'s default.
 
-The statements run ([Statements](#statements)) needs dorq 0.13.0 or later: the
-first release with every check that succeeds a SQL fundamentals check.
+The minimum moves in the pull request that first reads a newer dorq's output, in
+lockstep with that dorq release (the efficacy plan's decision 5), and the
+`version=` above moves with it. `test/fafnir/test_dorq_version.py` fails when the
+install steps name a version below the minimum, or this section states another.
+Before 0.13.0, the floor was 0.8.0: 0.7.0 refuses its whole actions file over a
+dividend of zero, which `core.corporate_action` holds.
 
 ## Configure
 

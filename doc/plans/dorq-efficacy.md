@@ -1,6 +1,7 @@
 # Plan: dorq efficacy
 
-- Status: **approved 2026-11-23**, not started. Tracking:
+- Status: **in progress** (approved 2026-11-23). Phase 0's code is merged; its
+  baseline audit (DE-05) is open. Tracking:
   [#267](https://github.com/rtrimble13/fafnir/issues/267).
 - dorq's side of the plan, with the code-level findings, is in the dorq repository at
   `doc/plans/dorq-efficacy-plan.md` (tracked in
@@ -155,6 +156,8 @@ Detail and file:line evidence are in the dorq plan.
 |---|---|
 | 2026-11-23 | Review of dorq 0.14.0. Plan approved; fafnir issues #267-#276 opened |
 | 2026-11-23 | Token extended to `rtrimble13/dorq`; dorq issues #40-#54 and dorq PR #55 (its plan doc) opened |
+| 2026-11-23 | DE-01 (dorq#56) and DE-02 (dorq#57) merged into dorq 0.15.0, untagged; DE-03 and DE-04 merged (#278). DE-05, the baseline, waits for a run on the host |
+| 2026-11-24 | DE-13 (dorq#45) implemented on dorq's `claude/wizardly-einstein-pgcegr`, in 0.15.0: a provisional bar finding the bar itself does not settle waits at info (`detail.pending`). The baseline is unaffected: the host runs 0.14.0, and a build of dorq's main reports `0.15.0-dev`. fafnir now states the oldest dorq it runs, `DORQ_MIN_VERSION` 0.13.0 ([releasing.md](../releasing.md#which-dorq)). fafnir needs no change for it: the bars run passes no `--show-info`, so a pending finding is not written until a later night, re-judging the last 5 sessions (`SINCE_OVERLAP_SESSIONS`), settles it (decision 4) |
 
 ## For agents working an item
 
