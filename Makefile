@@ -1,6 +1,6 @@
 # fafnir Makefile
 
-.PHONY: help build install test test-int fmt lint dist clean db-up migrate seed version release
+.PHONY: help build install test test-int fmt lint dist clean db-up migrate seed version bump release
 
 help:
 	@echo "Targets:"
@@ -11,7 +11,8 @@ help:
 	@echo "  fmt        Format + lint (black, isort, flake8)"
 	@echo "  lint       Lint only (check, no changes)"
 	@echo "  version    Show the current version, the last tag, and the deployed commit"
-	@echo "  release    Cut a release: make release BUMP=patch|minor|major|X.Y.Z"
+	@echo "  bump       Set this branch's version: make bump BUMP=patch|minor|major|X.Y.Z"
+	@echo "             (merging the pull request publishes it: doc/releasing.md)"
 	@echo "  migrate    Apply migrations to \$$FAFNIR_DSN"
 	@echo "  seed       Apply seeds + trading calendar"
 	@echo "  dist       Build wheel + sdist"
@@ -39,18 +40,24 @@ lint:
 	isort --check-only src test
 	flake8 src test
 
-# One version, in one place. `make version` reports; `make release` cuts one.
-# Both are scripts/release.sh -- see doc/releasing.md and ADR 0011.
+# One version, in one place. `make version` reports; `make bump` sets the version a
+# pull request releases, and merging it publishes the release (ADR 0022). Both are
+# scripts/release.sh -- see doc/releasing.md and ADR 0011.
 version:
 	@scripts/release.sh
 
-release:
+bump:
 	@test -n "$(BUMP)" || { \
-	    echo "Usage: make release BUMP=patch|minor|major|X.Y.Z"; \
-	    echo "       make release BUMP=minor DRY_RUN=1     # change nothing"; \
+	    echo "Usage: make bump BUMP=patch|minor|major|X.Y.Z"; \
+	    echo "       make bump BUMP=minor DRY_RUN=1     # change nothing"; \
 	    exit 1; \
 	}
-	scripts/release.sh $(BUMP) $(if $(DRY_RUN),--dry-run,) $(if $(PUSH),--push,)
+	scripts/release.sh $(BUMP) $(if $(DRY_RUN),--dry-run,)
+
+release:
+	@echo "A release is the merge of a pull request that raises the version (ADR 0022)."
+	@echo "On your branch: make bump BUMP=patch|minor|major, commit, and merge."
+	@exit 1
 
 migrate:
 	fafnir db migrate

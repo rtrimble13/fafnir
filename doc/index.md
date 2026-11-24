@@ -40,9 +40,11 @@ read through the `duk` CLI.
   automations and the DQ queue: schedule, mail transport, what it can and cannot see
 - [Fundamentals](fundamentals.md) — the researcher's guide: SF1's statements on two
   timelines (ADR 0018), point-in-time reads, the look-ahead rules, the factor panel
-- [Releasing and Upgrading](releasing.md) — cutting a `vX.Y.Z` release with
-  `make release`, deploying it to the host, and which of `--version`,
-  `git describe` and `pip show` answers which question
+- [Releasing and Upgrading](releasing.md) — every version on main is a release:
+  `make bump` in the pull request, published on merge
+  ([ADR 0022](adr/0022-every-version-on-main-is-a-release.md)); deploying it to the
+  host, and which of `--version`, `git describe` and `pip show` answers which
+  question
 
 ## Growing it
 
