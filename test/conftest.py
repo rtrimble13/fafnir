@@ -20,6 +20,22 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("FAFNIR_SQL_DIR", str(_REPO_ROOT / "sql"))
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_warehouse_api(monkeypatch):
+    """No test reads the warehouse of whoever runs it, over its HTTP API.
+
+    duk sends its warehouse reads to ``FAFNIR_API_URL``, with ``FAFNIR_API_KEY``,
+    ahead of any DSN its config file names (ADR 0021). On a machine set up to read
+    the warehouse that way (a laptop, or a cloud session with the API connected)
+    every duk test would otherwise be pointed at the real warehouse: a test that
+    replaces some reads with fakes fails, and the reads it did not replace go to
+    production. A test that wants an API address sets one (test/duk/test_remote.py,
+    test/fafnir_api/test_api_integration.py).
+    """
+    monkeypatch.delenv("FAFNIR_API_URL", raising=False)
+    monkeypatch.delenv("FAFNIR_API_KEY", raising=False)
+
+
 def pytest_collection_modifyitems(config, items):
     if TEST_DSN:
         return
