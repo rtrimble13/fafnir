@@ -32,8 +32,10 @@ and a key an operator deleted is set aside. The conversions are #56's:
 :func:`sharadar_map.as_declared_dividend` (ACTIONS' split-adjusted value times the
 split product after the ex-date). Two dividends on one ex-date (a regular and a
 special) are summed; identical rows count once. **A future ex-date is never stored**
-(ADR 0007, :func:`corporate_actions._within_horizon`). Spin-offs are not adjusted,
-as before: they stay events.
+(ADR 0007, :func:`corporate_actions._within_horizon`). ACTIONS' spin-offs stay
+events: nothing here converts them. A spin-off is adjusted by one split row carrying
+its total-return factor (spin-as-split), which an operator adds with ``fafnir actions
+add`` (doc/operations.md, "A spin-off is a split row").
 
 One ``ops.ingestion_run`` (``sharadar`` / ``actions``), a commit per 1,000
 securities, and a re-run writes nothing new. The factors of the securities it

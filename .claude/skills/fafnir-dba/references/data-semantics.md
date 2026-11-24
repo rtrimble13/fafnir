@@ -472,3 +472,23 @@ How to check a row:
   shares_outstanding_as_of × share_factor`, the same cap as `mart.fn_daily_market_cap`
   on the same day. EPS and issuance are per traded share. So a cap that is 5 times
   `close_raw × shares_outstanding_as_of` is an ADR's ratio, not an error.
+
+## 27. A spin-off is a split row whose ratio is not a share count
+
+The rule is spin-as-split: one split row on the ex-date whose ratio is the inverse of
+the total-return factor, `parent_close_ex / (parent_close_ex + value received)`
+([operations.md › A spin-off is a split
+row](../../../../doc/operations.md#a-spin-off-is-a-split-row)). FMP files its
+spin-offs this way (with a 1 − D/P factor); operator rows follow the formula (HON
+2026-06-29, NVRI 2026-06-01, CTVA 2026-10-01, VHI 2007-03-27). Sharadar's `spinoff`
+ACTIONS stay events, and nothing converts them.
+
+> **Wrong answer:** "VHI did a 2.24-for-1 split in 2007", or deleting a split row
+> because the raw close fell by something other than its ratio. Read an odd ratio
+> (10000:4109, 224278:100000) as a spin-off first, and look for a distribution in the
+> issuer's filings.
+
+> **Wrong answer:** trusting the share count or market cap across one. Every split
+> row is read as a share change, so the cap is overstated by the ratio from the
+> ex-date until the next balance sheet is known (VHI 2007-03-27..05-07: 255.9M shares
+> for 114.1M), and adjusted volume before the date is scaled by it.

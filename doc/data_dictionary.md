@@ -330,7 +330,7 @@ happened (ADR 0007).
 | `action_type` | TEXT NOT NULL CHECK | `split` or `dividend`. |
 | `ex_date` | DATE NOT NULL | Ex-date (the adjustment boundary). |
 | `record_date` `payment_date` `declaration_date` | DATE | Dividend dates (nullable). |
-| `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. Both `> 0` on a split (`ck_corp_action_split`). |
+| `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. Both `> 0` on a split (`ck_corp_action_split`). A spin-off is also a split row: its ratio is the inverse of the total-return factor, not a share count (spin-as-split, [operations.md](operations.md#a-spin-off-is-a-split-row)). |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. NOT NULL and `>= 0` on a dividend (`ck_corp_action_dividend`). |
 | `currency` | TEXT NOT NULL | Default `USD`. |
 | `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo` (reserved, unused), or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |

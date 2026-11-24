@@ -450,8 +450,10 @@ warehouse is refused, naming it).
 - `--exact` prints every number as the stored decimal text, JSON strings
   included (`"0.242500"`, `"4.000000"`), as `ph --exact` does. CSV is always the
   stored text.
-- Spinoffs, mergers and renames are not corporate actions here: a rename is a
-  ticker period (`duk th`), a delisting's reason is `mart.v_security_lifecycle`.
+- Mergers and renames are not corporate actions here: a rename is a ticker period
+  (`duk th`), a delisting's reason is `mart.v_security_lifecycle`. A spin-off
+  appears as a split row on its ex-date whose ratio is a total-return factor, not a
+  share count (spin-as-split; operations.md, "A spin-off is a split row").
 
 **`duk tc [EXCHANGE] [-s DATE] [-e DATE]`** -- the trading calendar.
 - Without `EXCHANGE`, every venue with a calendar: `first_date`, `last_date`,
