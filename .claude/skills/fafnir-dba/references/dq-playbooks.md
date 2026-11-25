@@ -1886,6 +1886,17 @@ statement flags, as of the market's latest session, and closes each one the run 
 longer emits. It skips `dorq_statement_key` and the cross-sectional
 `dorq_revision_cohort`.
 
+**dorq 0.18.0 reports one condition once.** A period's versions that carry one gap
+or value are one report on the first (`detail.version_nos`); the identities one
+wrong field breaks are one `dorq_identity_break` on the field (`item`, with
+`detail.identities` and the `should_be` that repairs them); a period's basic and
+diluted counts are one `dorq_share_count_mismatch`; and a series' restatements of
+one day are one `dorq_restatement_implausible` (`known_from`, `detail.restated`).
+Work the folded report as one condition: one filing, one verdict. A flag an
+earlier dorq wrote for it stays open while the queue has no flag under the new key,
+and `dq recheck` then closes it as `re-keyed by a dorq release`: that closure is no
+repair, so do not read it as one (doc/dorq.md, *One condition, one report*).
+
 **The warehouse never edits a statement value.** Every statement flag ends one of
 three ways, and each is a label `dq export-labels` writes for dorq (doc/dorq.md,
 *Labels*):

@@ -9505,9 +9505,14 @@ def dq_recheck(ctx, checks, note, resolved_by, dry_run, yes):
             total = sum(r.stale for r in results)
             width = max(len(r.check_name) for r in results)
             for r in results:
+                held = (
+                    "re-keyed by a dorq release"
+                    if r.kind == "rekeyed"
+                    else "no longer hold"
+                )
                 click.echo(
                     f"  {r.check_name:<{width}}  {r.stale:>7} of {r.open_flags:>7} "
-                    "no longer hold"
+                    f"{held}"
                 )
             if not total:
                 click.echo("Nothing to close: every open flag's condition still holds.")

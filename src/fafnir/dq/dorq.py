@@ -1394,6 +1394,121 @@ def condition_key(record: dict) -> tuple:
     )
 
 
+#: dorq 0.18.0 reports one condition once (its DE-12): a period's versions that
+#: carry the same value or gap fold into the first's report, the identities one
+#: wrong field breaks into one report on the field, a period's basic and diluted
+#: share counts into one, and a series' restatements of one day into one. These
+#: are the checks whose record keys that changed; dorq's doc/output.md, "Record
+#: keys in 0.18.0", maps each old key to the report that now holds it.
+FOLDED_KEYS_VERSION = "0.18.0"
+IMPOSSIBLE_VALUE_CHECK = "dorq_impossible_value"
+IDENTITY_BREAK_CHECK = "dorq_identity_break"
+SHARE_COUNT_MISMATCH_CHECK = "dorq_share_count_mismatch"
+RESTATEMENT_CHECK = "dorq_restatement_implausible"
+REKEYED_CHECKS = frozenset(
+    {
+        IMPOSSIBLE_VALUE_CHECK,
+        IDENTITY_BREAK_CHECK,
+        SHARE_COUNT_MISMATCH_CHECK,
+        RESTATEMENT_CHECK,
+    }
+)
+
+#: A period's version as DQ932 lists it (``detail.restated``): "income quarter
+#: 2014-06-30 v2".
+_RESTATED = re.compile(r"^(\S+) (\S+) (\d{4}-\d{2}-\d{2})(?: v(\d+))?$")
+
+
+def _names(text) -> list[str]:
+    """A comma-separated list in a report's detail, as dorq writes one."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [part for part in text.split(",") if part]
+
+
+def _versions(key: dict, inner: dict) -> list[Optional[int]]:
+    """The versions a report stands for: ``detail.version_nos`` where it folds
+    several (dorq 0.18.0), else its key's own (None on a whole period)."""
+    out = []
+    for part in _names(inner.get("version_nos")):
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    if out:
+        return out
+    version = key.get("version_no")
+    return [int(version) if version is not None else None]
+
+
+def _with_version(key: dict, version: Optional[int]) -> dict:
+    out = {k: v for k, v in key.items() if k != "version_no"}
+    if version is not None:
+        out["version_no"] = version
+    return out
+
+
+def condition_atoms(record: dict) -> frozenset:
+    """The conditions a report stands for, each keyed as dorq before 0.18.0 keyed
+    one: what lets a night on either side of :data:`FOLDED_KEYS_VERSION` be
+    compared with one on the other, and an earlier flag be matched to the report
+    that now holds it (fafnir DE-16).
+
+    Each atom is a :func:`condition_key`. For every check but
+    :data:`REKEYED_CHECKS` a report is one atom, its own key, whichever dorq wrote
+    it. For those four, an earlier key and a later report reduce to the same atoms:
+
+    * a version each: every one of ``detail.version_nos`` (DQ902, DQ903, DQ922);
+    * DQ903 an identity each, of ``detail.identities`` where one field breaks
+      several, and no ``item`` (an identity's report named the term its gap
+      matched, its condition is the identity's);
+    * DQ922 no ``item``: a period's basic and diluted counts are one condition;
+    * DQ932 a period each, of ``detail.restated`` where a day's restatements are
+      one report, and no ``known_from``.
+    """
+    check = record.get("check_name")
+    if check not in REKEYED_CHECKS or record.get("security_id") is None:
+        return frozenset({condition_key(record)})
+    sid = int(record["security_id"])
+    key = dict(record.get("record_key") or {})
+    inner = (record.get("detail") or {}).get("detail")
+    inner = inner if isinstance(inner, dict) else {}
+
+    def atom(k: dict) -> tuple:
+        return (check, sid, record_key_json(k))
+
+    if check == RESTATEMENT_CHECK:
+        key.pop("known_from", None)
+        out = {atom(key)}
+        for text in _names(inner.get("restated")):
+            m = _RESTATED.match(text.strip())
+            if m is None:
+                continue
+            member = {
+                "statement": m.group(1),
+                "period_type": m.group(2),
+                "fiscal_date": m.group(3),
+            }
+            if m.group(4):
+                member["version_no"] = int(m.group(4))
+            out.add(atom(member))
+        return frozenset(out)
+    if check in (IDENTITY_BREAK_CHECK, SHARE_COUNT_MISMATCH_CHECK):
+        key.pop("item", None)
+    identities = [None]
+    if check == IDENTITY_BREAK_CHECK:
+        identities = _names(inner.get("identities")) or [key.get("identity")]
+        key.pop("identity", None)
+    out = set()
+    for version in _versions(key, inner):
+        for identity in identities:
+            k = _with_version(key, version)
+            if identity is not None:
+                k["identity"] = identity
+            out.add(atom(k))
+    return frozenset(out)
+
+
 def backfill(
     db: Database,
     settings: DorqSettings,

@@ -59,12 +59,15 @@ logger = get_logger("dq")
 
 
 class RecheckResult(NamedTuple):
-    """What one check's re-evaluation found."""
+    """What one check's re-evaluation found. ``kind`` is ``rekeyed`` for the flags
+    a dorq release reports under another key (:func:`recheck_dorq`): their
+    condition holds, and the queue has it under the new key."""
 
     check_name: str
     open_flags: int
     stale_flag_ids: Sequence[int]
     reason: str
+    kind: str = ""
 
     @property
     def stale(self) -> int:
@@ -510,6 +513,16 @@ def recheck(
 # session (:func:`fafnir.dq.dorq_statements.run_statements`). Every other is re-run
 # on the bars. A flag is judged only by a run of its own kind, so a bars re-run
 # never closes a statement flag it could not have emitted.
+#
+# dorq 0.18.0 reports one condition once (its DE-12), and four statement checks'
+# keys changed with it (fafnir.dq.dorq.REKEYED_CHECKS). A flag an earlier dorq
+# wrote may not be emitted under its own key while its condition holds, folded
+# into a report under another: the re-run emits a report whose atoms
+# (fafnir.dq.dorq.condition_atoms) cover the flag's. Such a flag is not stale. It
+# stays open while the queue has no flag under the new key -- the statements
+# ingest withholds the report, the queue holding its condition already
+# (compare_statements.HeldUnderEarlierKeys) -- and once the new key's flag is
+# open, it is closed as re-keyed, its note naming the release.
 
 
 def dorq_recheck_excluded() -> frozenset[str]:
@@ -567,7 +580,11 @@ def recheck_dorq(
     flags = db.fetchall(
         """
         SELECT dq_flag_id, check_name, security_id, table_name, record_key,
-               detail->'dorq'->>'version' AS version
+               detail->'dorq'->>'version' AS version,
+               jsonb_build_object('detail', jsonb_build_object(
+                   'version_nos', detail->'detail'->'version_nos',
+                   'identities', detail->'detail'->'identities',
+                   'restated', detail->'detail'->'restated')) AS detail
           FROM ops.data_quality_flag
          WHERE check_name = ANY(%s) AND resolved_at IS NULL
            AND security_id IS NOT NULL
@@ -620,10 +637,39 @@ def recheck_dorq(
         emitted |= keys(statements_run.records)
     version = (run or statements_run).version
     statement_flags = {f["dq_flag_id"] for f in on_statements}
+    # The re-keyed checks' emitted reports by atom: what covers a flag an earlier
+    # dorq keyed otherwise.
+    covering: dict[tuple, set[tuple]] = {}
+    if statements_run is not None:
+        for r in statements_run.records:
+            if (
+                r.get("check_name") in dorq_engine.REKEYED_CHECKS
+                and r.get("security_id") is not None
+            ):
+                key = dorq_engine.condition_key(r)
+                for atom in dorq_engine.condition_atoms(r):
+                    covering.setdefault(atom, set()).add(key)
+    open_keys = {dorq_engine.condition_key(f) for f in flags}
+
+    def covered_by(f: dict) -> set[tuple]:
+        """The emitted reports whose atoms cover flag ``f``'s, if a re-keyed
+        check's statement flag."""
+        if f["check_name"] not in dorq_engine.REKEYED_CHECKS or (
+            f["dq_flag_id"] not in statement_flags
+        ):
+            return set()
+        found: Optional[set[tuple]] = None
+        for atom in dorq_engine.condition_atoms(f):
+            keys = covering.get(atom, set())
+            found = set(keys) if found is None else found & keys
+            if not found:
+                return set()
+        return found or set()
+
     out: list[RecheckResult] = []
     for name in sorted(wanted):
         mine = [f for f in flags if f["check_name"] == name]
-        stale = [
+        unemitted = [
             f
             for f in mine
             if (
@@ -633,6 +679,16 @@ def recheck_dorq(
             )
             not in emitted
         ]
+        stale = []
+        rekeyed = []
+        for f in unemitted:
+            by = covered_by(f)
+            if not by:
+                stale.append(f)
+            elif by & open_keys:
+                rekeyed.append(f)
+            # else: its condition holds under a key the queue does not have yet;
+            # the flag stays open and holds it.
         history = (
             "statements history"
             if mine and all(f["dq_flag_id"] in statement_flags for f in mine)
@@ -666,4 +722,30 @@ def recheck_dorq(
                 name, len(mine), [int(f["dq_flag_id"]) for f in stale], reason
             )
         )
+        if rekeyed:
+            written_by = sorted({f["version"] for f in rekeyed if f["version"]})
+            logger.info(
+                "recheck %s: %d of %d open flags re-keyed by dorq %s",
+                name,
+                len(rekeyed),
+                len(mine),
+                version,
+            )
+            out.append(
+                RecheckResult(
+                    name,
+                    len(mine),
+                    [int(f["dq_flag_id"]) for f in rekeyed],
+                    f"re-running dorq {version} still reports the condition, as one "
+                    "report under another record_key, which the queue holds open: "
+                    f"dorq {dorq_engine.FOLDED_KEYS_VERSION} reports one condition "
+                    "once (its DE-12)"
+                    + (
+                        f"; written by dorq {', '.join(written_by)}"
+                        if written_by
+                        else ""
+                    ),
+                    kind="rekeyed",
+                )
+            )
     return out
