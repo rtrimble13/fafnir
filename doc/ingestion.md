@@ -458,6 +458,10 @@ declared: AAPL's $0.77 of 2019-11-07 is 0.1925 (÷ 4). `core.corporate_action`
 holds the amount as declared, against the raw prior close (ADR 0001), so the loader
 multiplies by the product of the splits after the ex-date. A split missing from
 ACTIONS would mis-state every earlier dividend as well as the recovered prices.
+"After" is strict: a dividend on a split's own ex-date is left per post-split share,
+which is the basis `fafnir adjust` values it on (#286; [operations.md › A dividend
+on a split's ex-date is per post-split
+share](operations.md#a-dividend-on-a-splits-ex-date-is-per-post-split-share)).
 
 **Identity.**
 - **History is keyed by the current ticker.** META's bars start in 2012, under

@@ -274,15 +274,24 @@ OPNW (VerifyMe → OpenWorld, 2026-09/10) carried two rows with the same record 
 payment dates: $0.15 ex 09-29 under VRME, and $1.50 "ex 10-01" under OPNW. That was
 one dividend counted twice, and it put the adjusted prices about 17% low.
 
-When a split and a dividend share an ex-date, the stored dividend must be in
-**pre-split** terms. The factor is valued against the prior raw close, which is the
-pre-split close. A post-split amount there is wrong either way. After a large
-enough reverse split, like OPNW's 1-for-10, it exceeds that close: the factor goes
-negative (`dividend_exceeds_price`) and the dividend is skipped. After a forward
-split it is silently too small, and nothing flags it.
+When a split and a dividend share an ex-date, the stored dividend is in
+**post-split** terms (since v3.4.0, #286). `fafnir adjust` puts the prior raw close
+on the same basis before valuing the dividend: it multiplies by the split's den/num,
+so a 1-for-2 reverse split doubles it. Before v3.4.0 the rule was the reverse, and
+OPNW's operator row ($0.15 ex 2026-09-29 alongside its 1-for-10) was entered
+pre-split. That row and any vendor row like it must now be restated: ×10 for OPNW.
+
+The vendors do not agree on a basis. AVZO's Sharadar row ($27.80 ex 2026-11-23,
+with a 1-for-2) is post-split. It was skipped as `dividend_exceeds_price` until
+v3.4.0, and the adjusted series showed −86% on a day a holder made about 3%. Several
+FMP rows are pre-split. The tape decides it: a pre-split amount D on a split with
+price factor s opens near (P − D)·s, a post-split one near P·s − D.
+`dividend_split_basis_suspect` flags a row whose ex-day open fits the pre-split
+amount, or no dividend at all, better than the post-split one.
 
 > **Wrong answer:** two dividends with the same record and payment dates read as two
-> distributions, or the post-split amount "corrected" onto the split's ex-date.
+> distributions; or a pre-split amount left on a split's ex-date because "that was
+> the rule". Restate it per post-split share (`actions delete`, then `actions add`).
 
 ## 20. A venue transfer can arrive as a delisting
 

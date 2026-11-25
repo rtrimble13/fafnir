@@ -1089,6 +1089,37 @@ fafnir actions add --security-id 14556 --ex-date 2007-03-27 --split 224278:10000
     shares, about 2.24 times its 114.1M, from 2007-03-27 to 2007-05-07).
 - Name the filing, the prices and the formula in `--note`; the row is the record.
 
+### A dividend on a split's ex-date is per post-split share
+
+**The rule (since v3.4.0, #286): when a split and a cash dividend share an ex-date,
+the dividend is stored per post-split share.** `fafnir adjust` values it against the
+prior raw close times the split's den/num, so a 1-for-2 doubles that close and a
+2-for-1 halves it. The Sharadar loader already writes it that way:
+`split_product_after` restores a dividend's split-adjusted `value` with the splits
+*strictly after* its ex-date. FMP and operator rows are mixed. Before v3.4.0 the
+rule was the reverse, and the factor read every such dividend against the
+pre-split close.
+
+AVZO, 2026-11-23 (Rallybio's merger distribution, with a 1-for-2): Sharadar filed
+$27.80 per new share against a prior close of 15.47. Valued pre-split, the factor was
+negative, so the dividend was skipped and the adjusted series fell 86%. Valued
+post-split, (30.94 − 27.80) / 30.94 = 0.1015, and the adjusted move is the holder's
++3%.
+
+`dividend_split_basis_suspect` names the rows the ex-day open says were stated
+otherwise. Restate a pre-split amount (`fits: pre_split`) by dividing it by the split
+price factor: a 1-for-10 is ×10, a 2-for-1 is ÷2.
+
+```bash
+fafnir actions list --symbol OPNW --type dividend
+fafnir actions delete <id> -m "pre-split amount on the 1:10's ex-date (#286): 0.15 per old share" --dry-run
+fafnir actions add --symbol OPNW --ex-date 2026-09-29 --dividend 1.50 -m "<filing>; 0.15 per old share x 10" --dry-run
+```
+
+A `fits: no_dividend` row is a distribution the shares did not go ex on: usually one
+filed twice, at its pre-announced date as well as its real one. Delete it, citing
+the filing. Both commands recompute the factors.
+
 ### Separating two issuers held on one security
 
 A reused ticker arrives from the vendor as one continuous history — Sotheby's to
