@@ -283,7 +283,11 @@ pre-split. That row and any vendor row like it must now be restated: ×10 for OP
 
 The vendors do not agree on a basis. AVZO's Sharadar row ($27.80 ex 2026-11-23,
 with a 1-for-2) is post-split. It was skipped as `dividend_exceeds_price` until
-v3.4.0, and the adjusted series showed −86% on a day a holder made about 3%. Several
+v3.4.0, and the adjusted series showed −86% on a day a holder made about 3%. Since
+v3.4.0 it shows **+33%**: the dividend factor (P − D)/P gives an ex-date return of
+C₁ / (P − D) − 1, which equals a holder's (C₁ + D) / P − 1 only when the price falls by
+exactly D. A distribution worth 90% of the price magnifies the rest of the day's move.
+Do not read a large distribution's adjusted ex-date return as the holder's. Several
 FMP rows are pre-split. The tape decides it: a pre-split amount D on a split with
 price factor s opens near (P − D)·s, a post-split one near P·s − D.
 `dividend_split_basis_suspect` flags a row whose ex-day open fits the pre-split

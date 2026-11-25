@@ -1103,8 +1103,17 @@ pre-split close.
 AVZO, 2026-11-23 (Rallybio's merger distribution, with a 1-for-2): Sharadar filed
 $27.80 per new share against a prior close of 15.47. Valued pre-split, the factor was
 negative, so the dividend was skipped and the adjusted series fell 86%. Valued
-post-split, (30.94 − 27.80) / 30.94 = 0.1015, and the adjusted move is the holder's
-+3%.
+post-split, (30.94 − 27.80) / 30.94 = 0.1015, and the dividend applies.
+
+The adjusted move on the ex-date is then **+33%**, not the holder's +3.4%. A dividend
+factor (P − D)/P makes the ex-date's adjusted return C₁ / (P − D) − 1, while a
+holder's total return is (C₁ + D) / P − 1. The two agree only when the price falls by
+exactly the dividend. For an ordinary dividend the gap is negligible. For a
+distribution worth most of the price, the adjusted series amplifies whatever the
+price did besides going ex. AVZO's ex-day close was 4.19 against 30.94 − 27.80 =
+3.14 predicted, so the adjusted return is 4.19 / 3.14 − 1 = +33%. The holder's total
+return was (4.19 + 27.80) / 30.94 − 1 = +3.4%. The spin-as-split formula above, which
+divides by the ex-date close, is the one that gives a holder's return exactly.
 
 `dividend_split_basis_suspect` names the rows the ex-day open says were stated
 otherwise. Restate a pre-split amount (`fits: pre_split`) by dividing it by the split
