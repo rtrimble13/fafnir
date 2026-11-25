@@ -973,7 +973,11 @@ fafnir dq run --no-statements             # this run without them
    is written. A carry withholds a write, so it is held to the SQL check's own
    condition where the overlap's rule is looser: a flag keyed on a `version_no`
    carries only that version (a restated version that still fails is a new
-   condition), a `fundamentals_stale` flag only a report on its
+   condition; a dorq 0.18.0 report that folds several versions is carried only
+   when the flag's is its only one), a `balance_sheet_identity` or `cash_flow_tie`
+   flag only a report on its identity alone (one on several identities a wrong
+   field breaks is written: the acceptance is no verdict on the others), a
+   `fundamentals_stale` flag only a report on its
    `latest_fiscal_date` (a later filing is a new occurrence), and a
    `fundamentals_ttm_incomplete` flag only an income statement report. A shadow
    night withholds nothing: its file is dorq's whole view, and
@@ -983,6 +987,14 @@ fafnir dq run --no-statements             # this run without them
    day, and those carrying one finding in rows loaded that day. dorq keys both on the
    date, so fafnir's condition key adds which it is (`cohort`: `revisions` or
    `findings`).
+
+   **A condition the queue holds under an earlier dorq's key is not written
+   again.** dorq 0.18.0 re-keyed four checks
+   ([below](#one-condition-one-report-dorq-0180)), and the guards match keys
+   exactly. So the ingest also withholds a report whose own key the queue does not
+   hold, but every one of whose conditions an open or accepted flag of those checks
+   holds, under the key an earlier dorq gave it. A report with a condition no flag
+   holds (a third version, another identity) is written, as it was before the fold.
 5. **Record.** `ops.ingestion_run`, `source = 'dorq'`, endpoint `dq-statements-shadow`
    (or `dq-statements` into the queue), with its own watermark. The bars run's
    window, history pass and `dq compare` never read these rows. `params` holds:
@@ -990,6 +1002,8 @@ fafnir dq run --no-statements             # this run without them
    - `reports`;
    - `withheld` (into the queue only): the reports an accepted SQL flag carries,
      not written;
+   - `withheld_rekeyed` (into the queue only): the reports the queue holds under
+     an earlier dorq's key, not written;
    - `bytes` and `bytes_out`: the statements sent and dorq's output;
    - `dorq_max_rss_mb`: dorq's peak resident memory, as the kernel accounts for
      the child;
@@ -1104,7 +1118,8 @@ fafnir dq compare --statements --json
   | `fundamentals_coverage` | DQ943 | the security |
   | `fundamentals_currency_mismatch` | DQ944 | the reporting currency |
 
-  A period is the period type and fiscal date. Per dorq code: its reports, those at
+  A period is the period type and fiscal date. A dorq 0.18.0 report on several
+  identities covers a flag of any of them. Per dorq code: its reports, those at
   warn and above, those an open SQL flag covers, and those no SQL check made. Then
   the reports on an SQL flag accepted before the run, and how many of them the
   queue's ingest would withhold (an itemized flag carries only its items; see
@@ -1113,7 +1128,9 @@ fafnir dq compare --statements --json
   flags at warn and above. The bar is 30% or less.
 - **New per night.** The conditions in this night's file absent from the previous
   statements night's, against the SQL flags of the thirteen written between the two
-  runs' starts. The bar is 70% fewer.
+  runs' starts. The bar is 70% fewer. A condition is absent when none of its atoms
+  is in the previous night's, so a night on dorq 0.18.0 compares like with like
+  with one on an earlier release ([below](#one-condition-one-report-dorq-0180)).
 - **As written to the queue.** Standing and new per night again, on the conditions
   the ingest would write: less those an SQL flag accepted before the run carries.
   The file's figures count conditions the queue has judged already, under the SQL
@@ -1197,3 +1214,49 @@ not take every other security for one with no statements (DQ943). It skips
 `fundamentals_version_chain`, the repair is made on the host. It also skips
 `dorq_revision_cohort` (DQ951), a cohort that a subset of securities cannot
 reproduce.
+
+A flag an earlier dorq wrote for one of the checks dorq 0.18.0 re-keyed is judged
+by its conditions, not its key alone ([below](#one-condition-one-report-dorq-0180)).
+When the re-run reports its condition under another key, the flag is not stale. It
+stays open while the queue has no flag under the new key: the statements ingest
+withholds the report, the queue holding its condition already. Once the new key's
+flag is open, `dq recheck` closes the earlier one as re-keyed: it prints
+`re-keyed by a dorq release`, and the note says the re-run still reports the
+condition, under another record_key, and names the release.
+
+### One condition, one report (dorq 0.18.0)
+
+dorq 0.18.0 reports one condition once (dorq's DE-12; fafnir DE-16). Four
+statement checks' record keys change with it:
+
+| Check | Folds | Key |
+|---|---|---|
+| `dorq_impossible_value` (DQ902) | a period's versions that carry the same value | the first version's |
+| `dorq_identity_break` (DQ903) | the identities one wrong field breaks (`detail.identities`), and a period's versions that carry the same gap | `item`, the field, and no `identity`, where it folds identities; the first version's |
+| `dorq_share_count_mismatch` (DQ922) | a period's basic and diluted counts (`detail.items`) | no `item` |
+| `dorq_restatement_implausible` (DQ932) | a series' restatements of one day, wrong the same way (`detail.restated`) | adds `known_from`, the day |
+
+A report that folds versions lists them in `detail.version_nos`. dorq's
+`doc/output.md`, "Record keys in 0.18.0", maps every earlier key to its report.
+
+fafnir judges these checks' conditions by **atoms**
+(`fafnir.dq.dorq.condition_atoms`): each condition a report stands for, keyed as
+dorq before 0.18.0 keyed one. A report folding several has one atom for each
+version, identity or restated period it names; DQ903's and DQ922's atoms carry no
+`item`, and DQ932's no `known_from`. Any other check's report is one atom, its own
+condition key. So an earlier key and the report that now holds it reduce to the
+same atoms, and:
+
+- **`dq compare --statements` and the audit** count a condition new against the
+  previous night only when none of its atoms was there. A night on 0.18.0 after one
+  on 0.17.0 compares like with like, as two nights on one release do. On dorq's
+  synthetic statements universes, the first night on 0.18.0 is 20 to 145
+  conditions new and 35 to 278 closed by exact keys, and none either way by atoms.
+- **An accepted SQL flag** carries a folded report only where it covers all of it:
+  every identity, and its only version.
+- **The ingest** withholds a report the queue holds under its earlier keys.
+- **`dq recheck`** keeps an earlier flag open while its condition is reported under
+  a key the queue does not have, and closes it as re-keyed once it does.
+
+fafnir reads both releases' keys, so `DORQ_MIN_VERSION` stays where it is, and the
+host moves to 0.18.0 when the efficacy plan's next cycle installs it.

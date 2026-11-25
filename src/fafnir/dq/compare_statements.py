@@ -17,7 +17,10 @@ measures what the plan's cutover criteria (§6) ask of it:
     SQL checks' open flags at warn and above. The bar is 30% or less.
   * **New flags per night.** The conditions in this night's file absent from the
     previous night's, against the SQL flags written between the two runs' starts.
-    The bar is 70% fewer.
+    The bar is 70% fewer. A condition is absent when none of its atoms
+    (:func:`fafnir.dq.dorq.condition_atoms`) is in the previous night's, so a
+    night on dorq 0.18.0, which reports one condition once, compares like with
+    like with one on an earlier release.
   * **As written.** Both figures again on what the statements ingest would write
     to the queue: less the reports an SQL flag accepted before the run carries
     (:class:`AcceptedPredecessors`), which the ingest withholds. The queue judged
@@ -113,6 +116,11 @@ SUCCESSORS: dict[str, Rule] = {
 _SEVERE = ("warn", "error")
 
 
+def _csv(text) -> list[str]:
+    """A comma-separated list in a dorq report's detail (dorq writes scalars)."""
+    return [p for p in text.split(",") if p] if isinstance(text, str) else []
+
+
 def _int(value) -> Optional[int]:
     try:
         return int(value)
@@ -139,6 +147,24 @@ class StatementReport:
     currency: Optional[str] = None
     members: tuple[int, ...] = ()
     key: tuple = ()
+    # dorq 0.18.0 (DE-12): the identities one wrong field breaks
+    # (``detail.identities``) and the versions that carry one condition
+    # (``detail.version_nos``), where a report folds several. Empty for one that
+    # folds none: then ``name`` and ``version_no`` are the whole of it.
+    names: tuple[str, ...] = ()
+    versions: tuple[int, ...] = ()
+
+    @property
+    def identities(self) -> tuple[str, ...]:
+        """Every identity or tie the report is on."""
+        return self.names or ((self.name,) if self.name else ())
+
+    @property
+    def version_set(self) -> tuple[int, ...]:
+        """Every version the report is on; empty for one on a whole period."""
+        return self.versions or (
+            (self.version_no,) if self.version_no is not None else ()
+        )
 
     @classmethod
     def of(cls, record: dict) -> Optional["StatementReport"]:
@@ -168,6 +194,8 @@ class StatementReport:
                 tuple(engine.member_ids(inner.get("members"))) if sid is None else ()
             ),
             key=engine.condition_key(record),
+            names=tuple(_csv(inner.get("identities"))),
+            versions=tuple(v for v in map(_int, _csv(inner.get("version_nos"))) if v),
         )
 
 
@@ -188,7 +216,7 @@ def covers(rule: Rule, flag: dict, r: StatementReport) -> bool:
     statement = _flag_statement(rule, flag)
     if statement and r.statement and statement != r.statement:
         return False
-    if rule.names and r.name not in rule.names:
+    if rule.names and not set(r.identities) & set(rule.names):
         return False
     key = flag["record_key"] or {}
     if rule.match == "period":
@@ -236,14 +264,20 @@ def accepted_covers(flag: dict, r: StatementReport) -> bool:
     * a ``fundamentals_stale`` flag carries only a report on its
       ``latest_fiscal_date``: a later filing is a new occurrence;
     * a ``fundamentals_ttm_incomplete`` flag, read from the income statement,
-      carries only a report on it: no verdict on another statement's gap."""
+      carries only a report on it: no verdict on another statement's gap;
+    * a report that folds several identities or versions (dorq 0.18.0) is
+      carried only when the flag's check names every identity and the flag's
+      version is the report's only one: the acceptance is no verdict on the
+      others, which were written before the fold too."""
     check = flag["check_name"]
     rule = SUCCESSORS.get(check)
     if rule is None or not covers(rule, flag, r):
         return False
+    if rule.names and not set(r.identities) <= set(rule.names):
+        return False
     key = flag.get("record_key") or {}
     version = _int(key.get("version_no"))
-    if version is not None and r.version_no is not None and version != r.version_no:
+    if version is not None and r.version_set and set(r.version_set) != {version}:
         return False
     if check == "fundamentals_stale" and r.first != _date(
         key.get("latest_fiscal_date")
@@ -346,6 +380,71 @@ class AcceptedPredecessors:
             yield record
 
 
+class HeldUnderEarlierKeys:
+    """The queue's flags of the checks dorq 0.18.0 re-keyed
+    (:data:`fafnir.dq.dorq.REKEYED_CHECKS`), open or accepted, as the conditions
+    they hold (:func:`fafnir.dq.dorq.condition_atoms`).
+
+    dorq 0.18.0 reports one condition once, under a key an earlier release did
+    not write: a period's versions that carry one gap are one report on the
+    first, the identities one wrong field breaks one report on the field, and so
+    on (its DE-12). The ingest's guards match keys exactly, so each such report
+    would enter the queue again beside the flag an earlier dorq wrote for it,
+    and one the queue accepted would come back. The statements ingest withholds a
+    report whose own key the queue does not hold, but every one of whose atoms an
+    open or accepted flag does (:meth:`withhold`). One with an atom no flag holds
+    is written, as it was before the fold: a version or an identity in it is new.
+    ``dq recheck`` closes the earlier flag once the report's own is in the queue
+    (:func:`fafnir.dq.recheck.recheck_dorq`).
+    """
+
+    def __init__(self, flags: Iterable[dict]):
+        self.keys: set[tuple] = set()
+        self.atoms: set[tuple] = set()
+        for f in flags:
+            self.keys.add(engine.condition_key(f))
+            self.atoms |= engine.condition_atoms(f)
+        self.withheld = 0
+
+    @classmethod
+    def load(cls, db: Database) -> "HeldUnderEarlierKeys":
+        """The open and accepted flags of the re-keyed checks, with the few fields
+        of their detail a fold names."""
+        rows = db.fetchall(
+            """
+            SELECT check_name, security_id, record_key,
+                   jsonb_build_object('detail', jsonb_build_object(
+                       'version_nos', detail->'detail'->'version_nos',
+                       'identities', detail->'detail'->'identities',
+                       'restated', detail->'detail'->'restated')) AS detail
+              FROM ops.data_quality_flag
+             WHERE check_name = ANY(%s)
+               AND security_id IS NOT NULL
+               AND (resolved_at IS NULL OR accepted_at IS NOT NULL)
+            """,
+            (sorted(engine.REKEYED_CHECKS),),
+        )
+        return cls(rows)
+
+    def holds(self, record: dict) -> bool:
+        """Whether the queue holds ``record``'s condition under another key."""
+        if record.get("check_name") not in engine.REKEYED_CHECKS:
+            return False
+        if engine.condition_key(record) in self.keys:
+            return False  # the ingest's own guards see it
+        atoms = engine.condition_atoms(record)
+        return bool(atoms) and atoms <= self.atoms
+
+    def withhold(self, records: Iterable[dict]) -> Iterator[dict]:
+        """``records`` less those the queue holds under an earlier key, one at a
+        time; :attr:`withheld` counts what was left out."""
+        for record in records:
+            if self.holds(record):
+                self.withheld += 1
+                continue
+            yield record
+
+
 # ---------------------------------------------------------------------------
 # Labels
 # ---------------------------------------------------------------------------
@@ -359,7 +458,11 @@ def _label_overlaps(r: StatementReport, lab: Label, slack: int) -> bool:
     if not (
         _same(lab.statement, r.statement)
         and _same(lab.period_type, r.period_type)
-        and _same(lab.version_no, r.version_no)
+        and (
+            lab.version_no is None
+            or not r.version_set
+            or lab.version_no in r.version_set
+        )
         and _same(lab.item, r.item)
     ):
         return False
@@ -680,6 +783,12 @@ def compare(
     # the same, less the reports the ingest withholds: the queue's view
     written: set[int] = set()
     written_severe: set[int] = set()
+    # New against the previous night, by condition atoms: a release that re-keys a
+    # condition (dorq 0.18.0's DE-12) does not make it new (fafnir DE-16).
+    previous = previous_shadow_file(Path(shadow_file))
+    before = set(_atom_hashes(previous)) if previous is not None else None
+    new_keys: set[int] = set()
+    new_written_keys: set[int] = set()
     covered: set[int] = set()
     recall_reports: dict[int, list[StatementReport]] = {}
     for record in engine.read_records(shadow_file):
@@ -712,8 +821,13 @@ def compare(
                 out.withheld += withheld
             if r.security_id in error_sids and r.severity in _SEVERE:
                 recall_reports.setdefault(r.security_id, []).append(r)
+        fresh = before is not None and is_new(record, before)
+        if fresh:
+            new_keys.add(h)
         if not withheld:
             written.add(h)
+            if fresh:
+                new_written_keys.add(h)
             if r.severity in _SEVERE:
                 written_severe.add(h)
         entry["also_sql" if matched else "dorq_only"] += 1
@@ -760,11 +874,9 @@ def compare(
         },
     }
 
-    previous = previous_shadow_file(Path(shadow_file))
     if previous is not None:
-        before = set(_condition_hashes(previous))
-        new = keys - before
-        new_written = len(written - before)
+        new = new_keys
+        new_written = len(new_written_keys)
         prev_night = engine.night_run(
             db, dorq_statements.ENDPOINT_SHADOW, _date(previous.stem)
         )
@@ -795,12 +907,23 @@ def _key_hash(key: tuple) -> int:
     return hash(key)
 
 
-def _condition_hashes(shadow_file: Path) -> Iterator[int]:
-    """The condition keys of a night's reports, hashed, one at a time."""
+def _atom_hashes(shadow_file: Path) -> Iterator[int]:
+    """The conditions of a night's reports as atoms
+    (:func:`fafnir.dq.dorq.condition_atoms`: each keyed as dorq before 0.18.0
+    keyed one), hashed, one at a time."""
     for record in engine.read_records(shadow_file):
-        r = StatementReport.of(record)
-        if r is not None:
-            yield _key_hash(r.key)
+        if StatementReport.of(record) is not None:
+            for atom in engine.condition_atoms(record):
+                yield _key_hash(atom)
+
+
+def is_new(record: dict, before: set[int]) -> bool:
+    """Whether a report's condition is new against a night's atom hashes
+    (:func:`_atom_hashes`): none of its atoms was there. A night on dorq 0.18.0
+    against one on an earlier release compares like with like, as two nights on
+    one release do: a report that folds the earlier night's several is one
+    condition, and not a new one (fafnir DE-16)."""
+    return not any(_key_hash(a) in before for a in engine.condition_atoms(record))
 
 
 # ---------------------------------------------------------------------------

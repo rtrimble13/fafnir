@@ -564,6 +564,10 @@ def statements_frame(db: Database, night: Night) -> Frame:
     out = Frame(night)
     accepted = cst.AcceptedPredecessors.load(db, night.state_at)
     written: set[int] = set()
+    # New against the previous night by condition atoms (fafnir DE-16).
+    previous = cmp.previous_shadow_file(night.shadow_file)
+    before = set(cst._atom_hashes(previous)) if previous is not None else None
+    written_new: set[int] = set()
     for record in engine.read_records(night.shadow_file):
         r = cst.StatementReport.of(record)
         if r is None or r.security_id is None or r.severity not in SEVERE:
@@ -573,6 +577,8 @@ def statements_frame(db: Database, night: Night) -> Frame:
             out.add(unit, "dorq:withheld")
             continue
         written.add(cst._key_hash(r.key))
+        if before is not None and cst.is_new(record, before):
+            written_new.add(cst._key_hash(r.key))
         out.add(unit, f"dorq:{r.code}")
         if r.severity == "error":
             out.add(unit, "dorq:error")
@@ -587,10 +593,7 @@ def statements_frame(db: Database, night: Night) -> Frame:
             _statement_unit(int(f["security_id"]), scope.get("period_type"), first),
             f"sql:{f['check_name']}:{'new' if new else 'standing'}",
         )
-    previous = cmp.previous_shadow_file(night.shadow_file)
-    dorq_new = None
-    if previous is not None:
-        dorq_new = len(written - set(cst._condition_hashes(previous)))
+    dorq_new = len(written_new) if previous is not None else None
     out.volume = _volume(len(written), dorq_new, sql_standing, sql_new, previous)
     out.count_sizes()
     return out
@@ -1182,6 +1185,8 @@ def _statements_engines(db: Database, night: Night, units: Sequence[Unit]) -> di
                     "version_no": r.version_no,
                     "item": r.item,
                     "name": r.name,
+                    "names": list(r.names),
+                    "versions": list(r.versions),
                     "keyed": keyed,
                     "withheld": accepted.carries(r),
                 }
@@ -1836,6 +1841,8 @@ def _statement_report(sid: int, x: dict) -> cst.StatementReport:
         version_no=x.get("version_no"),
         item=x.get("item"),
         name=x.get("name"),
+        names=tuple(x.get("names") or ()),
+        versions=tuple(x.get("versions") or ()),
     )
 
 

@@ -23,7 +23,9 @@ module runs it on the three statement tables beside the bars run of
   * **ingest** -- :func:`fafnir.dq.dorq.ingest`, the open and accepted guards
     included, with each row's ``table_name`` its statement's table, less the rows
     an accepted flag of the SQL check it succeeds carries
-    (:class:`fafnir.dq.compare_statements.AcceptedPredecessors`).
+    (:class:`fafnir.dq.compare_statements.AcceptedPredecessors`), and less those
+    the queue holds under the key an earlier dorq gave them
+    (:class:`fafnir.dq.compare_statements.HeldUnderEarlierKeys`).
   * **shadow** -- or the rows go to ``<dorq_shadow_dir>/statements/<as-of>.jsonl``:
     never the shadow directory's top level, where ``dq compare`` takes the last
     ``*.jsonl`` as the newest night of bars.
@@ -510,6 +512,7 @@ def run(
             shadow_file = None
             flagged: dict[str, int] = {}
             withheld: Optional[int] = None
+            rekeyed: Optional[int] = None
             if shadow:
                 shadow_file = engine.write_shadow(
                     rows, engine.shadow_path(str(shadow_dir(settings)), as_of)
@@ -518,17 +521,25 @@ def run(
                 # A condition the queue accepted under an SQL check's name is
                 # accepted for its successor too (compare_statements.
                 # AcceptedPredecessors): dorq's own guard knows only dorq's names.
-                from fafnir.dq.compare_statements import AcceptedPredecessors
+                from fafnir.dq.compare_statements import (
+                    AcceptedPredecessors,
+                    HeldUnderEarlierKeys,
+                )
 
                 guard = AcceptedPredecessors.load(db)
+                # A condition the queue holds under the key an earlier dorq gave
+                # it (dorq 0.18.0 re-keyed four checks): not written again.
+                held = HeldUnderEarlierKeys.load(db)
                 flagged = engine.ingest(
-                    db, guard.withhold(rows), ingestion_run_id=run_id
+                    db, held.withhold(guard.withhold(rows)), ingestion_run_id=run_id
                 )
                 withheld = guard.withheld
+                rekeyed = held.withheld
                 logger.info(
                     "dorq statements: withheld %d reports an accepted SQL flag "
-                    "carries",
+                    "carries, and %d the queue holds under an earlier dorq's key",
                     withheld,
+                    rekeyed,
                 )
     except BaseException as exc:
         # As the bars run does: a COPY cut short when dorq exits can leave the
@@ -549,6 +560,7 @@ def run(
             "dorq_config_hash": rows.config_hash,
             "reports": rows.count,
             **({"withheld": withheld} if withheld is not None else {}),
+            **({"withheld_rekeyed": rekeyed} if rekeyed is not None else {}),
             **done.usage(),
         },
     )

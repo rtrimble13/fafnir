@@ -1584,3 +1584,61 @@ def test_real_dorq_recheck_closes_a_unit_error_the_vendor_corrected(db, tmp_path
     results = rc.recheck_dorq(db, settings)
     closed = {i for r in results for i in r.stale_flag_ids}
     assert {int(f["dq_flag_id"]) for f in flagged} <= closed
+
+
+def test_recheck_holds_a_condition_dorq_re_keyed_and_closes_it_as_re_keyed(
+    db, fake_dorq, tmp_path, monkeypatch
+):
+    """dorq 0.18.0 reports one condition once (its DE-12): two identities one
+    wrong total breaks are one report on the field. An earlier dorq's flags for
+    them are not emitted under their own keys, but their condition holds (fafnir
+    DE-16)."""
+    a, _ = _company(db, "STMA")
+    earlier = [
+        _statement_row(a, "2024-03-31", extra_key={"identity": "balance_sheet"}),
+        _statement_row(
+            a,
+            "2024-03-31",
+            extra_key={"identity": "assets_split", "item": "total_noncurrent_assets"},
+        ),
+    ]
+    gone = _statement_row(a, "2024-06-30", extra_key={"identity": "balance_sheet"})
+    for row in (*earlier, gone):
+        _flag(db, a, row)
+    folded = _statement_row(
+        a,
+        "2024-03-31",
+        extra_key={"item": "total_assets"},
+        inner={"identities": "assets_split,balance_sheet", "field": "total_assets"},
+    )
+    _emit(fake_dorq, [folded])
+    monkeypatch.setenv("FAKE_DORQ_FILTER", "1")
+    ids = {
+        (r["record_key"].get("identity"), r["record_key"]["fiscal_date"]): int(
+            r["dq_flag_id"]
+        )
+        for r in db.fetchall(
+            "SELECT dq_flag_id, record_key FROM ops.data_quality_flag"
+            " WHERE check_name = 'dorq_identity_break'"
+        )
+    }
+
+    # The queue has no flag under the new key: the earlier flags hold the
+    # condition, and the statements ingest withholds the report.
+    (result,) = rc.recheck_dorq(db, _settings(fake_dorq, tmp_path))
+    assert result.stale_flag_ids == [ids[("balance_sheet", "2024-06-30")]]
+    assert cst.HeldUnderEarlierKeys.load(db).holds(folded)
+
+    # Once the new key's flag is open, the earlier flags are closed as re-keyed,
+    # with a note that names the release.
+    _flag(db, a, folded)
+    results = rc.recheck_dorq(db, _settings(fake_dorq, tmp_path))
+    rekeyed = [r for r in results if r.kind == "rekeyed"]
+    assert len(rekeyed) == 1
+    assert sorted(rekeyed[0].stale_flag_ids) == sorted(
+        [ids[("balance_sheet", "2024-03-31")], ids[("assets_split", "2024-03-31")]]
+    )
+    assert "as one report under another record_key" in rekeyed[0].reason
+    assert "dorq 0.18.0 reports one condition once" in rekeyed[0].reason
+    (stale,) = [r for r in results if r.kind == ""]
+    assert stale.stale_flag_ids == [ids[("balance_sheet", "2024-06-30")]]
