@@ -786,8 +786,14 @@ predictions are close.
 
 **Repair.**
 - `pre_split`: restate the amount per post-split share. Run `actions delete <id>`,
-  then `actions add` with D ÷ s (×10 for a 1-for-10), on the same ex-date, citing the
-  filing. OPNW's operator row of 2026-09-29 ($0.15 with a 1-for-10) is the known one.
+  then `actions add` with D × s (s = den/num: ×10 for a 1-for-10, ×½ for a 2-for-1),
+  on the same ex-date, citing the filing. Take D from the filing, because a vendor
+  amount can be on neither basis (RIG 2007: FMP's 23.11 is $33.03 × 0.6996). An
+  operator row is replaced with `override revoke` on its add, then `actions add`.
+  The 2026-11-25 batch restated TMUS, JBIO, TRML, RIG, VXRT (Nabi) and OPNW.
+- `pre_split` that the filing contradicts: **accept**, citing the filing (EFSH
+  2022-08-03 was declared per post-split share). A resolve is written again by the
+  next `adjust`, because the open has not changed.
 - `no_dividend`: find where the distribution really went ex. A second row elsewhere
   is the real one: delete this one. A dividend that never happened: delete it.
 

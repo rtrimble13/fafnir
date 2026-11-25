@@ -1116,8 +1116,17 @@ return was (4.19 + 27.80) / 30.94 − 1 = +3.4%. The spin-as-split formula above
 divides by the ex-date close, is the one that gives a holder's return exactly.
 
 `dividend_split_basis_suspect` names the rows the ex-day open says were stated
-otherwise. Restate a pre-split amount (`fits: pre_split`) by dividing it by the split
-price factor: a 1-for-10 is ×10, a 2-for-1 is ÷2.
+otherwise. Restate a pre-split amount (`fits: pre_split`) by **multiplying** it by the
+split price factor s (den/num): a 1-for-10 is ×10, a 2-for-1 is ×½. The restated
+dividend factor is then exactly the old (P − D)/P.
+
+**Take the amount from the filing, not from the flag.** A vendor's amount can be on
+neither basis. RIG's 2007-11-27 reclassification paid $33.03 in cash and 0.6996 shares
+per old share (Transocean 10-K 2009). FMP stored 33.03 × 0.6996 = 23.11, so
+restating that number would have given 33.03, not the right 33.03 × 2500/1749 =
+47.21. A `pre_split` reading can also be wrong. EFSH's $0.13125 of 2022-08-03 was
+declared per post-split share; its open was a real fall, so its flag is accepted,
+not restated.
 
 ```bash
 fafnir actions list --symbol OPNW --type dividend
