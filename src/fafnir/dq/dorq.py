@@ -137,6 +137,12 @@ class DorqSettings:
     #: Where a run keeps its working files (``[dq] dorq_work_dir``); empty is
     #: ``dorq-work`` beside ``shadow_dir``. See :func:`work_root`.
     work_dir: str = ""
+    #: Whether the statements nightly reports info too (``[dq]
+    #: dorq_statements_info``; DE-15). See :mod:`fafnir.dq.dorq_statements`.
+    statements_info: bool = False
+    #: Where Sharadar's bulk files are (``[sharadar] bulk_dir``): the statements
+    #: run reads the ACTIONS file SF1's share counts were stored by (DE-15).
+    sharadar_bulk_dir: str = ""
 
     def base_args(self, config: Optional[str] = None) -> list[str]:
         """``dorq check`` with ``config`` (the bars run's by default)."""
@@ -159,6 +165,8 @@ def settings_from(cfg) -> DorqSettings:
         backfill_max=cfg.dorq_backfill_max,
         statements_config=cfg.dorq_statements_config,
         work_dir=cfg.dorq_work_dir,
+        statements_info=cfg.dorq_statements_info,
+        sharadar_bulk_dir=cfg.sharadar_bulk_dir,
     )
 
 
@@ -754,6 +762,9 @@ class Invocation:
     bytes_sent: int
     bytes_out: int
     max_rss_kb: Optional[int] = None
+    #: What the run was sent beside its rows, for its ``params``: the statements
+    #: run's ``split_basis`` (:func:`fafnir.dq.dorq_statements.share_basis`).
+    sent: dict = field(default_factory=dict)
 
     def usage(self) -> dict:
         """The figures a run records in its ``ops.ingestion_run.params``: the bytes

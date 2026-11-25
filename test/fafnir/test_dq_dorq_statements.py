@@ -612,6 +612,21 @@ def test_cli_statements_only_runs_no_sql_checks_and_no_bars(db, fake_dorq, tmp_p
     assert "1 violation written to the shadow file" in result.output
     (call,) = _calls(fake_dorq)
     assert "--kind statements" in call
+    assert "--show-info" not in call  # the nightly is at warn and above (DE-15)
+    again = CliRunner().invoke(
+        cli.main,
+        [
+            "--config",
+            str(rcfile),
+            "dq",
+            "run",
+            "--statements-only",
+            "--rerun",
+            "--statements-info",
+        ],
+    )
+    assert again.exit_code == 0, again.output
+    assert "--show-info" in _calls(fake_dorq)[-1]
 
     bad = CliRunner().invoke(
         cli.main, ["--config", str(rcfile), "dq", "run", "--statements-only", "--full"]
@@ -624,7 +639,7 @@ def test_cli_statements_only_runs_no_sql_checks_and_no_bars(db, fake_dorq, tmp_p
     )
     assert sql.exit_code == 0, sql.output
     assert "dorq statements: not run, the engine is sql" in sql.output
-    assert len(_calls(fake_dorq)) == 1
+    assert len(_calls(fake_dorq)) == 2
 
 
 def test_ingest_writes_statement_flags_with_the_open_and_accepted_guards(
@@ -1642,3 +1657,119 @@ def test_recheck_holds_a_condition_dorq_re_keyed_and_closes_it_as_re_keyed(
     assert "dorq 0.18.0 reports one condition once" in rekeyed[0].reason
     (stale,) = [r for r in results if r.kind == ""]
     assert stale.stale_flag_ids == [ids[("balance_sheet", "2024-06-30")]]
+
+
+# ---------------------------------------------------------------------------
+# DE-15: the nightly's input
+# ---------------------------------------------------------------------------
+
+
+def test_the_nightly_runs_at_warn_and_above_and_reports_info_on_demand(
+    db, fake_dorq, tmp_path
+):
+    """About 283k info reports a night, 87k of them DQ919's, which nothing reads at
+    warn and above: the nightly leaves them out (DE-15). ``[dq]
+    dorq_statements_info``, or ``dq run --statements-info``, adds them; a re-run
+    for ``dq recheck`` always does (the export test above)."""
+    _company(db)
+    settings = _settings(fake_dorq, tmp_path)
+    dorq_statements.run(db, settings, "NASDAQ", shadow=True)
+    args = (fake_dorq.parent / "args-0.txt").read_text().splitlines()
+    assert "--show-info" not in args
+    params = db.fetchval(
+        "SELECT params FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+    )
+    assert params["show_info"] is False
+    dorq_statements.run(db, settings, "NASDAQ", shadow=True, rerun=True, show_info=True)
+    assert "--show-info" in (fake_dorq.parent / "args-1.txt").read_text().splitlines()
+    with_info = _settings(fake_dorq, tmp_path, statements_info=True)
+    dorq_statements.run(db, with_info, "NASDAQ", shadow=True, rerun=True)
+    assert "--show-info" in (fake_dorq.parent / "args-2.txt").read_text().splitlines()
+
+
+def _actions_file(db, bulk, rows):
+    """A current Sharadar ACTIONS file in the ledger, on disk in ``bulk``."""
+    header = "date,action,ticker,name,value,contraticker,contraname\n"
+    body = (
+        header + "".join(f"{d},{a},{t},{t} Co,{v},,\n" for d, a, t, v in rows)
+    ).encode()
+    sha = hashlib.sha256(body).hexdigest()
+    bulk.mkdir(parents=True, exist_ok=True)
+    (bulk / f"{sha}.csv").write_bytes(body)
+    repo.record_sharadar_file(
+        db,
+        vendor_table="actions",
+        kind="full",
+        filters={},
+        path=f"{sha}.csv",
+        member=None,
+        sha256=sha,
+        nbytes=len(body),
+        rows=len(rows),
+        columns=None,
+        ingestion_run_id=None,
+    )
+
+
+def _split(db, sid, day, n, d, source):
+    db.execute(
+        "INSERT INTO core.corporate_action (security_id, action_type, ex_date,"
+        " split_numerator, split_denominator, source) VALUES (%s, 'split', %s, %s,"
+        " %s, %s)",
+        (sid, day, n, d, source),
+    )
+
+
+def _sent_splits(fake, n):
+    lines = (fake.parent / f"actions-{n}.csv").read_text().splitlines()
+    assert lines[0].startswith("security_id,ex_date,action_type,split_numerator")
+    return [tuple(ln.split(",")[:5]) for ln in lines[1:]]
+
+
+def test_the_share_terms_are_the_splits_sf1_was_stored_by(db, fake_dorq, tmp_path):
+    """SF1's share counts are stored divided by Sharadar's ACTIONS splits (ADR
+    0018 §4), so dorq is sent those (DE-15): not core.corporate_action, whose
+    spin-offs are split rows carrying a price factor (#283), and whose FMP and
+    operator rows SF1 was never adjusted by."""
+    sid, _ = _company(db)
+    _expect_statements(db, sid, "555001")
+    # A 2:1 ACTIONS lists; a spin-off stored as a split (the operator's), and an
+    # FMP split ACTIONS does not list.
+    _split(db, sid, dt.date(2022, 6, 1), 2, 1, "sharadar")
+    _split(db, sid, dt.date(2023, 3, 1), 224278, 100000, "operator")
+    _split(db, sid, dt.date(2021, 9, 1), 3, 2, "fmp")
+    bulk = tmp_path / "bulk"
+    settings = _settings(fake_dorq, tmp_path, sharadar_bulk_dir=str(bulk))
+
+    # No ACTIONS file on disk: the ACTIONS rows core.corporate_action holds.
+    dorq_statements.run(db, settings, "NASDAQ", shadow=True)
+    assert _sent_splits(fake_dorq, 0) == [
+        (str(sid), "2022-06-01", "split", "2.000000", "1.000000")
+    ]
+    params = db.fetchval(
+        "SELECT params FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+    )
+    assert params["split_basis"] == "core.corporate_action" and params["splits"] == 1
+
+    # With the ledger's ACTIONS file: its splits, through the security's links,
+    # none after the run's as-of date.
+    _actions_file(
+        db,
+        bulk,
+        [
+            ("2022-06-01", "split", "T555001", "2.0"),
+            ("2024-02-01", "split", "T555001", "0.25"),
+            ("2030-01-01", "split", "T555001", "3.0"),
+            ("2024-02-01", "dividend", "T555001", "0.5"),
+            ("2022-06-01", "split", "OTHER", "2.0"),
+        ],
+    )
+    dorq_statements.run(db, settings, "NASDAQ", shadow=True, rerun=True)
+    assert _sent_splits(fake_dorq, 1) == [
+        (str(sid), "2022-06-01", "split", "2", "1"),
+        (str(sid), "2024-02-01", "split", "1", "4"),
+    ]
+    params = db.fetchval(
+        "SELECT params FROM ops.ingestion_run ORDER BY ingestion_run_id DESC LIMIT 1"
+    )
+    assert params["split_basis"] == "sharadar_actions" and params["splits"] == 2

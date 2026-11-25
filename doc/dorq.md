@@ -861,6 +861,19 @@ labelled, as with dorq-synth. The warehouse's labels are not that complete.
 The `--holdout` figures are the ones to quote in the go/no-go. The fit changes
 `detail.dorq.config_hash`, so every flag records which calibration wrote it.
 
+**Unverified labels.** A label from a flag closed `--by-rule` (the bulk acceptances,
+SF1 as published) is marked `verified: false`. It is a rule's decision, not a check
+on EDGAR, and must not teach a fit as much as one (DE-15). dorq 0.16.0 and later
+leave such labels out of a calibration (`[calibration] unverified`, `"exclude"` by
+default; dorq's DE-02). With an older dorq, export without them:
+
+```bash
+fafnir dq export-labels --out labels.jsonl --drop-unverified
+```
+
+`--drop-unverified` keeps the labels that say neither (a vendor's correction,
+say), where `--verified-only` keeps only those marked `true`.
+
 ## Working dorq flags
 
 The `dorq_*` entries in the fafnir-dba skill's `dq-playbooks.md` say how to read a
@@ -898,6 +911,7 @@ engine = "both"
 dorq_statements = true            # off by default
 dorq_statements_config = "/etc/fafnir/dorq-statements.toml"
 dorq_statements_shadow = true     # <dorq_shadow_dir>/statements/, not the queue
+dorq_statements_info = false      # the nightly at warn and above (DE-15)
 ```
 
 ```toml
@@ -917,6 +931,7 @@ identities, so DQ903 judges none.
 fafnir dq run --engine both               # SQL, dorq on the bars, then the statements
 fafnir dq run --statements-only           # dorq on the statements alone
 fafnir dq run --statements-only --rerun   # judge the night again, after a repair
+fafnir dq run --statements-only --rerun --statements-info   # with info, on demand
 fafnir dq run --no-statements             # this run without them
 ```
 
@@ -931,7 +946,19 @@ fafnir dq run --no-statements             # this run without them
    reach keeps each lookup to one or two of `core.daily_price`'s yearly partitions,
    not every one before the date. Beside the stream go three files:
    - `ref.statement_line_item` (`--items`), as it is;
-   - `core.corporate_action` (`--actions`), as the bars run sends it;
+   - the splits SF1's share counts were stored by (`--actions`; DE-15). The SF1
+     loader stores each version's counts divided by Sharadar's splits after its
+     `known_from`, from the ledger's current ACTIONS file (ADR 0018 §4), and dorq
+     puts the counts back into one share terms with the splits it is sent. So it
+     is sent those: the current ACTIONS file's splits for each Sharadar link's key
+     (open or closed), one per ex-date, none after the run's as-of date. They undo
+     the loader's division exactly, so a step dorq finds (DQ921, DQ922) is SF1's
+     own. `core.corporate_action` is not that list: its spin-offs are split rows
+     carrying a price factor (spin-as-split, #283), and SF1 was adjusted by none of
+     its FMP or operator rows. With no current ACTIONS file on disk, the run sends
+     the ACTIONS rows `core.corporate_action` holds (`source = 'sharadar'`), its
+     nearest record of them. Before DE-15 it sent `core.corporate_action` whole,
+     as the bars run does;
    - the security master (`--meta`):
 
      | Field | From |
@@ -947,9 +974,15 @@ fafnir dq run --no-statements             # this run without them
    flags are theirs. **A night is judged once**, as for bars. A second run for a
    session a statements run already judged says which run judged it and does
    nothing; `--rerun` judges it again and replaces its file.
-3. **Run.** `dorq check --kind statements --format fafnir --exit-zero --show-info`.
-   Info is shown because some of the SQL checks this run succeeds write info flags:
-   a gap, a currency, a coverage hole.
+3. **Run.** `dorq check --kind statements --format fafnir --exit-zero`, at warn and
+   above (DE-15). With `--show-info` a night held about 283k info reports, 87k of
+   them DQ919's (a change that is probably real), that nothing at warn and above
+   reads: the standing count, new flags per night, precision and recall, the
+   sample and the audit all count warn and above. `[dq] dorq_statements_info =
+   true`, or `dq run --statements-info` for one run, adds them, for the overlap
+   with the SQL checks' info flags (a gap, a currency, a coverage hole), which the
+   compare otherwise counts only at warn and above. `dq recheck`'s re-run always
+   reports info, so a flag whose condition dorq still reports at info is not closed.
 4. **Write.** The rows stream from dorq's output file, one at a time, to where
    they go. The night is never held in memory (see [Memory](#memory-on-the-host)).
    In shadow mode the rows go to `<dorq_shadow_dir>/statements/<as-of>.jsonl`.
@@ -999,6 +1032,9 @@ fafnir dq run --no-statements             # this run without them
    (or `dq-statements` into the queue), with its own watermark. The bars run's
    window, history pass and `dq compare` never read these rows. `params` holds:
    - `kind: statements`, `full: true`, `dorq_version`, `dorq_config_hash`;
+   - `show_info`: whether the night reported info;
+   - `split_basis` (`sharadar_actions`, with the ACTIONS file's `file_id`, or
+     `core.corporate_action`) and `splits`, the splits sent;
    - `reports`;
    - `withheld` (into the queue only): the reports an accepted SQL flag carries,
      not written;

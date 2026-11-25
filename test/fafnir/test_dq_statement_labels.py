@@ -744,6 +744,15 @@ def test_verified_only_and_applies_until_behave_as_for_bars(db, tmp_path):
     # The correction is the vendor's, which nobody verified; the bulk acceptance
     # is by rule.
     assert kinds == {"balance_sheet_identity_accepted"}
+    # DE-15: the by-rule acceptance says it was not verified, which dorq 0.16.0's
+    # calibrate reads; for an older dorq --drop-unverified leaves it out, and keeps
+    # the correction, which says neither.
+    by_kind = {lab["kind"]: lab.get("verified") for lab in _labels(db)}
+    assert by_kind["cash_flow_tie_accepted"] is False
+    assert {lab["kind"] for lab in _labels(db, drop_unverified=True)} == {
+        "balance_sheet_identity_accepted",
+        "corrected_unit",
+    }
 
     labels = cmp.labels_from_db(db)
     unit = next(lab for lab in labels if lab.kind == "corrected_unit")

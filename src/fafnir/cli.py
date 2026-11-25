@@ -7118,6 +7118,13 @@ def _dq_engine(cfg, engine: Optional[str]) -> str:
     is_flag=True,
     help="dorq on the statements alone: no SQL checks, no bars.",
 )
+@click.option(
+    "--statements-info/--no-statements-info",
+    default=None,
+    help="The statements run reports info too (dorq's --show-info): on demand, as "
+    "the nightly runs at warn and above  [default: [dq] dorq_statements_info, "
+    "else no]",
+)
 @click.pass_context
 def dq_run(
     ctx,
@@ -7129,6 +7136,7 @@ def dq_run(
     rerun,
     statements,
     statements_only,
+    statements_info,
 ):
     """Run the data-quality checks; write flags to ops.data_quality_flag.
 
@@ -7138,6 +7146,7 @@ def dq_run(
       fafnir dq run --engine dorq --full     # dorq over the whole history
       fafnir dq run --engine dorq --rerun    # dorq on a night it already judged
       fafnir dq run --statements-only        # dorq on the statements alone
+      fafnir dq run --statements-only --rerun --statements-info  # with info
 
     The SQL engine is the gap / outlier / freshness / identity / classification
     checks. dorq (doc/dorq.md) judges every bar of the lookback for a data error
@@ -7176,7 +7185,7 @@ def dq_run(
                 database, cfg, exchange, outlier_threshold, engine, shadow, full, rerun
             )
         if statements and engine in ("dorq", "both"):
-            _dq_run_statements(database, cfg, exchange, rerun)
+            _dq_run_statements(database, cfg, exchange, rerun, statements_info)
         elif statements:
             click.echo(
                 "dorq statements: not run, the engine is sql (--engine both, or"
@@ -7250,8 +7259,9 @@ def _dq_run_bars(
             )
 
 
-def _dq_run_statements(database, cfg, exchange, rerun):
-    """dorq's statements run (:mod:`fafnir.dq.dorq_statements`), and its line."""
+def _dq_run_statements(database, cfg, exchange, rerun, show_info=None):
+    """dorq's statements run (:mod:`fafnir.dq.dorq_statements`), and its line.
+    ``show_info`` None takes ``[dq] dorq_statements_info``."""
     from fafnir.dq import dorq as dorq_engine
     from fafnir.dq import dorq_statements
 
@@ -7260,7 +7270,12 @@ def _dq_run_statements(database, cfg, exchange, rerun):
     started = time.monotonic()
     try:
         out = dorq_statements.run(
-            database, settings, exchange, shadow=shadow, rerun=rerun
+            database,
+            settings,
+            exchange,
+            shadow=shadow,
+            rerun=rerun,
+            show_info=show_info,
         )
     except dorq_engine.DorqError as exc:
         raise click.ClickException(f"dorq statements: {exc}") from exc
@@ -8026,9 +8041,22 @@ def _dq_compare_audit(cfg, cycle_ids, as_json) -> None:
     help="Only labels marked verified: flags closed --per-flag, and stated labels "
     "added --verified.",
 )
+@click.option(
+    "--drop-unverified",
+    is_flag=True,
+    help="Leave out the labels marked unverified (flags closed --by-rule), and keep "
+    "those that say neither: for `dorq calibrate` before 0.16.0, which does not "
+    "read `verified`.",
+)
 @click.pass_context
 def dq_export_labels(
-    ctx, out_path, restore_path, actions_path, statements_path, verified_only
+    ctx,
+    out_path,
+    restore_path,
+    actions_path,
+    statements_path,
+    verified_only,
+    drop_unverified,
 ):
     """Write the warehouse's repairs, judged flags and stated labels for dorq.
 
@@ -8050,6 +8078,12 @@ def dq_export_labels(
     the values as they stood, which --restore-statements writes) and from closed
     statement flags: accepted is a filing fact, resolved after SF1 corrected the
     period a data error.
+
+    A label is marked `verified: false` where a flag was closed --by-rule, as the
+    bulk acceptances were. dorq 0.16.0 and later leave those out of a calibration
+    ([calibration] unverified, "exclude" by default); with an older dorq, pass
+    --drop-unverified, so a by-rule decision does not teach the fit as much as one
+    checked on EDGAR (DE-15).
     """
     from pathlib import Path
 
@@ -8057,7 +8091,9 @@ def dq_export_labels(
     from fafnir.dq import labels as lb
 
     with Database(ctx.obj["config"].dsn) as database:
-        export = lb.build(database, verified_only=verified_only)
+        export = lb.build(
+            database, verified_only=verified_only, drop_unverified=drop_unverified
+        )
         items = None
         if statements_path and checks.statements_exist(database):
             from fafnir.dq.dorq_statements import line_items

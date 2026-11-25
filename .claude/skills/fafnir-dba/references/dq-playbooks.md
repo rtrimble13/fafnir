@@ -1872,7 +1872,7 @@ and version (and the item, identity or tie when the condition is per item). Read
 | `dorq_bad_value`, `dorq_unit_error`, `dorq_sign_error` | DQ911–913 | | the filing's figure against the stored one | `dq recheck` once SF1 corrects it; **accept** a figure the filing states |
 | `dorq_copied_period`, `dorq_absent_as_zero`, `dorq_cumulative_quarters` | DQ914–916 | `fundamentals_suspicious_zero`, `fundamentals_ytd_suspect` | as DQ911 | as DQ911 |
 | `dorq_large_change` | DQ919 | | info: a change that is probably real (an acquisition, a write-down) | judgement |
-| `dorq_share_terms_step`, `dorq_share_count_mismatch` | DQ921–922 | | a split missing from `core.corporate_action` (`actions add --split`), or counts in the wrong terms | the repair, then `dq recheck` |
+| `dorq_share_terms_step`, `dorq_share_count_mismatch` | DQ921–922 | | a split missing from Sharadar's ACTIONS (the splits SF1's counts were stored by), or counts in the wrong terms | report it to Sharadar; `dq recheck` once SF1 restates; **accept** with the 8-K named |
 | `dorq_filing_date_implausible` | DQ931 | `fundamentals_implausible_filing_lag` | the filing's date on EDGAR | `dq recheck`, else **accept** |
 | `dorq_restatement_implausible` | DQ932 | judging `fundamentals_restatement` | which version is the error | `dq recheck` once SF1 corrects it |
 | `dorq_period_gap` | DQ941 | `fundamentals_gap`, `fundamentals_ttm_incomplete` | is the period on EDGAR? a change of fiscal year is info | `dq recheck` once the period loads; **accept** a period never filed |
@@ -1990,10 +1990,17 @@ flagged it. Accept it when the filing explains the change.
 
 ### `dorq_share_terms_step` (DQ921) — share counts step by a split ratio
 
-`detail.item`, the step's `ratio` and the hypotheses. `missing_split` is a split
-missing from `core.corporate_action`: the repair is `actions add --split N:D` (§2d),
-then `dq recheck`. `wrong_terms` is counts recovered in the wrong share terms, which
-is the loader's or the vendor's. Check the split on the issuer's 8-K.
+`detail.item`, the step's `ratio` and the hypotheses. The statements run sends dorq
+the splits SF1's share counts were stored by, Sharadar's ACTIONS, not
+`core.corporate_action` (DE-15; doc/dorq.md, *What a run does*). So
+`missing_split` is a split missing from ACTIONS. Check it on the issuer's 8-K. If
+it is real, `actions add --split N:D` (§2d) puts the prices right but not the
+statements: SF1's counts are in the terms ACTIONS gave them, and only Sharadar's
+restatement changes them. Report it to Sharadar, and accept the flag naming the
+8-K (and the action added for the prices); `dq recheck` closes it once ACTIONS
+lists the split and SF1 restates. A spin-off stored as a split row is no longer
+read as a step in the counts. `wrong_terms` is counts recovered in the wrong share
+terms, which is the loader's or the vendor's.
 
 ### `dorq_share_count_mismatch` (DQ922) — weighted-average and outstanding shares disagree
 

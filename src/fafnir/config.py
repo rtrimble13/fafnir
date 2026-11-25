@@ -27,7 +27,8 @@ Config sections
     engine, dorq_path, dorq_config, dorq_shadow, dorq_shadow_dir, dorq_work_dir,
     dorq_lookback_sessions, dorq_threads, dorq_backfill_max -- see
     :mod:`fafnir.dq.dorq`; dorq_statements, dorq_statements_config,
-    dorq_statements_shadow -- see :mod:`fafnir.dq.dorq_statements`
+    dorq_statements_shadow, dorq_statements_info -- see
+    :mod:`fafnir.dq.dorq_statements`
 
 Environment overrides
 ---------------------
@@ -453,6 +454,15 @@ class FafnirConfig:
         """dorq's config for the statements run (one that includes dorq's
         ``priors/fafnir-statements.toml``). Empty runs dorq ``--isolated``."""
         return str(self._get("dq", "dorq_statements_config", "") or "")
+
+    @property
+    def dorq_statements_info(self) -> bool:
+        """Whether the statements nightly reports info too (dorq's
+        ``--show-info``). False by default (DE-15): about 283k info reports a
+        night, 87k of them DQ919's, which nothing reads at warn and above. A
+        run with ``fafnir dq run --statements-info`` judges with them on
+        demand, and ``dq recheck`` always does."""
+        return bool(self._get("dq", "dorq_statements_info", False))
 
     @property
     def dorq_statements_shadow(self) -> bool:

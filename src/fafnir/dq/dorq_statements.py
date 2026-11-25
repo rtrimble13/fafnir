@@ -10,14 +10,18 @@ module runs it on the three statement tables beside the bars run of
     ordered by security, statement, period type, fiscal date and version. Each
     row carries ``close``, the raw close on or before its ``known_from``, from a
     lateral join on ``core.daily_price``. Beside it go three files:
-    ``ref.statement_line_item`` (``--items``), ``core.corporate_action``
-    (``--actions``, as the bars run sends it) and the security master (``--meta``)
+    ``ref.statement_line_item`` (``--items``), the splits SF1's share counts were
+    stored by (``--actions``: Sharadar's ACTIONS file, :func:`share_basis`) and the
+    security master (``--meta``)
     with the trading span, the active and delisted state, the currency, the sector
     and industry, and ``statements_expected`` (the vendor master's
     ``first_quarter``).
-  * **run** -- ``dorq check --kind statements --format fafnir --show-info``, as of
-    the market's latest session. Info is shown because the SQL checks the run
-    succeeds write info flags (a gap, a currency, a coverage hole).
+  * **run** -- ``dorq check --kind statements --format fafnir``, as of the market's
+    latest session, at warn and above (DE-15): about 283k info reports a night, 87k
+    of them DQ919's, that nothing at warn and above reads. ``[dq]
+    dorq_statements_info`` or ``dq run --statements-info`` adds ``--show-info``;
+    ``dq recheck`` always does, so a flag whose condition is still reported at
+    info is not closed.
   * **window** -- the whole history, every night: the statements are small, and
     the plan's runtime target is two minutes on the host (plan §5.2, F4).
   * **ingest** -- :func:`fafnir.dq.dorq.ingest`, the open and accepted guards
@@ -48,6 +52,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 
 from psycopg import sql
 
+from fafnir.db import repository as repo
 from fafnir.db.connection import Database
 from fafnir.dq import dorq as engine
 from fafnir.dq.checks import STATEMENT_TABLES, statements_exist
@@ -147,13 +152,127 @@ def _scope(security_ids: Optional[Sequence[int]], alias: str) -> tuple[str, list
     return f" AND {alias}.security_id = ANY(%s)", [list(security_ids)]
 
 
+#: Where a statements run's splits came from (``params.split_basis``).
+BASIS_ACTIONS = "sharadar_actions"
+BASIS_STORED = "core.corporate_action"
+
+
+def share_basis(
+    db: Database,
+    bulk_dir: str,
+    as_of: Optional[dt.date],
+    security_ids: Optional[Sequence[int]] = None,
+) -> tuple[list[tuple], dict]:
+    """The splits SF1's share counts were stored by, as ``(security_id, ex_date,
+    numerator, denominator)``, and where they came from (DE-15).
+
+    The SF1 loader stores a version's counts in the terms of its ``known_from``:
+    SF1's value divided by Sharadar's splits after it, from the ledger's current
+    ACTIONS file (ADR 0018 §4; :mod:`fafnir.ingest.fundamentals`). dorq puts each
+    version's counts back into one terms with the splits it is sent, so those are
+    the ones to send: they undo the loader's division exactly, and a step dorq
+    finds is SF1's own. ``core.corporate_action`` is not that list. Its split rows
+    include the spin-offs stored as a split's price factor (spin-as-split, #283),
+    FMP's and the operator's, none of which SF1 was adjusted by, and each would
+    read as a step in the counts (DQ921, DQ922).
+
+    The ACTIONS file's splits, one per ex-date, none after ``as_of``, for each
+    Sharadar link's key (open or closed: a security's statements may have come
+    through either), on the linked securities. With no current ACTIONS file on
+    disk, the ACTIONS rows ``core.corporate_action`` holds (``source =
+    'sharadar'``), its nearest record of them.
+    """
+    from fafnir.ingest import sharadar_actions as sa
+    from fafnir.ingest import sharadar_ledger as ledger
+    from fafnir.ingest import sharadar_map
+    from fafnir.ingest.sharadar_master import SECURITY_TABLES
+    from fafnir.sources.sharadar_files import SharadarFileError
+
+    wanted = set(security_ids) if security_ids is not None else None
+    actions = repo.current_sharadar_full(db, "actions") if bulk_dir else None
+    if actions is not None:
+        keys: dict[str, set[int]] = {}
+        for link in repo.vendor_links(db, sa.VENDOR):
+            sid = int(link["security_id"])
+            if wanted is None or sid in wanted:
+                keys.setdefault(link["vendor_key"], set()).add(sid)
+        key_of = repo.vendor_keys_by_ticker(db, sa.VENDOR, SECURITY_TABLES)
+        try:
+            found = sa.key_actions(
+                ledger.rows(db, actions["file_id"], bulk_dir), set(keys), key_of
+            )
+        except SharadarFileError as exc:
+            logger.warning(
+                "dorq statements: the ACTIONS file cannot be read (%s); sending the "
+                "ACTIONS rows core.corporate_action holds",
+                exc,
+            )
+        else:
+            by_day: dict[tuple[int, dt.date], tuple[int, int]] = {}
+            for key, kinds in found.items():
+                for day, value in kinds.get("split", ()):
+                    if not value or value <= 0 or (as_of is not None and day > as_of):
+                        continue
+                    ratio = sharadar_map.split_ratio(value)
+                    for sid in keys[key]:
+                        by_day.setdefault((sid, day), ratio)
+            rows = sorted((sid, day, n, d) for (sid, day), (n, d) in by_day.items())
+            return rows, {"split_basis": BASIS_ACTIONS, "file_id": actions["file_id"]}
+    where, params = _scope(security_ids, "a")
+    stored = db.fetchall(
+        f"""
+        SELECT a.security_id, a.ex_date, a.split_numerator, a.split_denominator
+          FROM core.corporate_action a
+         WHERE a.action_type = 'split' AND a.source = 'sharadar'{where}
+           AND (%s::date IS NULL OR a.ex_date <= %s::date)
+         ORDER BY a.security_id, a.ex_date
+        """,
+        [*params, as_of, as_of],
+    )
+    rows = [
+        (r["security_id"], r["ex_date"], r["split_numerator"], r["split_denominator"])
+        for r in stored
+    ]
+    return rows, {"split_basis": BASIS_STORED}
+
+
+def write_share_basis(
+    db: Database,
+    path: Path,
+    bulk_dir: str,
+    as_of: Optional[dt.date],
+    security_ids: Optional[Sequence[int]] = None,
+) -> dict:
+    """:func:`share_basis` as dorq's ``--actions`` file; returns where the splits
+    came from, with their count."""
+    rows, basis = share_basis(db, bulk_dir, as_of, security_ids)
+    engine.write_csv(
+        path,
+        (
+            "security_id",
+            "ex_date",
+            "action_type",
+            "split_numerator",
+            "split_denominator",
+            "dividend_amount",
+        ),
+        ((sid, day, "split", n, d, None) for sid, day, n, d in rows),
+    )
+    return {**basis, "splits": len(rows)}
+
+
 def export_context(
     db: Database,
     workdir: Path,
     items: Sequence[dict],
     security_ids: Optional[Sequence[int]] = None,
+    *,
+    bulk_dir: str = "",
+    as_of: Optional[dt.date] = None,
 ) -> dict[str, Path]:
-    """Write the line items, corporate actions and security metadata dorq reads.
+    """Write the line items, the share terms' splits (:func:`share_basis`) and the
+    security metadata dorq reads. ``paths["basis"]`` is a dict, not a path: where
+    the splits came from.
 
     The metadata is what DQ94x judges coverage and freshness by (dorq's
     doc/context.md):
@@ -188,7 +307,7 @@ def export_context(
             for r in items
         ),
     )
-    engine.write_actions(db, paths["actions"], security_ids)
+    basis = write_share_basis(db, paths["actions"], bulk_dir, as_of, security_ids)
 
     where, params = _scope(security_ids, "s")
     meta = db.fetchall(
@@ -248,7 +367,7 @@ def export_context(
             for r in meta
         ),
     )
-    return paths
+    return {**paths, "basis": basis}
 
 
 #: The columns before the line items, as dorq's statements reader names them
@@ -380,9 +499,12 @@ def judge(
     workdir: Path,
     *,
     security_ids: Optional[Sequence[int]] = None,
+    show_info: bool = True,
 ) -> tuple[str, engine.Invocation]:
     """Export the statements and run dorq on them, its output left on disk in
-    ``workdir``; return dorq's version and the finished run. Writes nothing to the
+    ``workdir``; return dorq's version and the finished run. ``show_info`` adds
+    dorq's ``--show-info``: the nightly passes ``[dq] dorq_statements_info``
+    (false by default), a re-run for ``dq recheck`` always reports info. Writes nothing to the
     warehouse, and holds none of dorq's rows: the caller reads them, all at once
     (:func:`run_statements`) or as a stream (:func:`run`).
 
@@ -394,7 +516,14 @@ def judge(
     version = engine.dorq_version(settings)
     engine.require_supported(version)
     items = line_items(db)
-    paths = export_context(db, workdir, items, security_ids)
+    paths = export_context(
+        db,
+        workdir,
+        items,
+        security_ids,
+        bulk_dir=settings.sharadar_bulk_dir,
+        as_of=as_of,
+    )
     args = settings.base_args(settings.statements_config) + [
         "-",
         "--kind",
@@ -402,7 +531,7 @@ def judge(
         "--format",
         "fafnir",
         "--exit-zero",
-        "--show-info",
+        *(["--show-info"] if show_info else []),
         "--items",
         str(paths["items"]),
         "--actions",
@@ -415,6 +544,7 @@ def judge(
     done = engine.run_to_file(
         db, args, statements_copy_statement(items, security_ids), workdir, version
     )
+    done.sent.update(paths["basis"])
     logger.info(
         "dorq %s: %.1f MB of statements in, %.1f MB of reports out, at a peak of %s MB",
         version,
@@ -456,8 +586,11 @@ def run(
     *,
     shadow: bool,
     rerun: bool = False,
+    show_info: Optional[bool] = None,
 ) -> engine.DqRunOutcome:
-    """One statements night: the whole history, as of the market's latest session.
+    """One statements night: the whole history, as of the market's latest session,
+    at warn and above unless ``show_info`` (``[dq] dorq_statements_info`` when
+    None; DE-15).
 
     **A night is judged once**, as for bars (:func:`fafnir.dq.dorq.run`): when a
     statements run has already judged the market's latest session, this one
@@ -470,6 +603,8 @@ def run(
     failure included, and only a success moves the watermark.
     """
     endpoint = endpoint_for(shadow)
+    if show_info is None:
+        show_info = settings.statements_info
     as_of = engine.market_latest(db, exchange_code)
     window = engine.Window(as_of=as_of)
     nothing = engine.DqRunOutcome(version="", window=window, detected={}, flagged={})
@@ -503,7 +638,7 @@ def run(
     db.commit()
     try:
         with engine.work_dir(settings, WORK_PREFIX) as workdir:
-            version, done = judge(db, settings, as_of, workdir)
+            version, done = judge(db, settings, as_of, workdir, show_info=show_info)
             # dorq's rows stream from its output file to the shadow file or the
             # queue's COPY, counted on the way: the night is never held (#219).
             rows = engine.Tally(
@@ -559,6 +694,8 @@ def run(
             "dorq_version": version,
             "dorq_config_hash": rows.config_hash,
             "reports": rows.count,
+            "show_info": show_info,
+            **done.sent,
             **({"withheld": withheld} if withheld is not None else {}),
             **({"withheld_rekeyed": rekeyed} if rekeyed is not None else {}),
             **done.usage(),
