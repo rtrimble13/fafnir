@@ -6,7 +6,9 @@ per post-split share. The factor valued it against the raw prior close, 15.47,
 which is on the pre-split basis. The factor came out negative, so the dividend was
 skipped and the adjusted series fell 86% on a day a holder made about 3%.
 
-The prior close now goes onto the post-split basis first: 15.47 x 2 = 30.94. Rows
+The prior close now goes onto the post-split basis first: 15.47 x 2 = 30.94. The
+dividend applies, and the adjusted ex-date move is +33% under the (P - D)/P
+convention. That is not the holder's +3.4% (see the AVZO test). Rows
 whose ex-day open fits a pre-split amount, or no dividend at all, are flagged
 ``dividend_split_basis_suspect`` to be restated by hand. The factor itself is never
 read off the tape.
@@ -155,7 +157,9 @@ def test_avzo_values_the_dividend_on_the_post_split_basis(db):
     assert _factor_at(db, sid, MON) == pytest.approx(expected, rel=D("1e-20"))
     assert _flags(db, sid, "dividend_exceeds_price") == []
     assert _flags(db, sid, SPLIT_BASIS_CHECK) == []
-    # The adjusted move is the holder's: 30.94 of old shares became 4.19 + 27.80.
+    # The ex-date's adjusted return under (P - D)/P is C1 / (P - D) - 1 = 4.19 / 3.14
+    # - 1 = +33%. It is not the holder's (4.19 + 27.80) / 30.94 - 1 = +3.4%: the two
+    # agree only when the price falls by exactly the dividend.
     adj = {
         r["date"]: D(r["close"])
         for r in repo.read_price_history(db, "AVZO", None, None, adjusted=True)

@@ -1103,12 +1103,30 @@ pre-split close.
 AVZO, 2026-11-23 (Rallybio's merger distribution, with a 1-for-2): Sharadar filed
 $27.80 per new share against a prior close of 15.47. Valued pre-split, the factor was
 negative, so the dividend was skipped and the adjusted series fell 86%. Valued
-post-split, (30.94 − 27.80) / 30.94 = 0.1015, and the adjusted move is the holder's
-+3%.
+post-split, (30.94 − 27.80) / 30.94 = 0.1015, and the dividend applies.
+
+The adjusted move on the ex-date is then **+33%**, not the holder's +3.4%. A dividend
+factor (P − D)/P makes the ex-date's adjusted return C₁ / (P − D) − 1, while a
+holder's total return is (C₁ + D) / P − 1. The two agree only when the price falls by
+exactly the dividend. For an ordinary dividend the gap is negligible. For a
+distribution worth most of the price, the adjusted series amplifies whatever the
+price did besides going ex. AVZO's ex-day close was 4.19 against 30.94 − 27.80 =
+3.14 predicted, so the adjusted return is 4.19 / 3.14 − 1 = +33%. The holder's total
+return was (4.19 + 27.80) / 30.94 − 1 = +3.4%. The spin-as-split formula above, which
+divides by the ex-date close, is the one that gives a holder's return exactly.
 
 `dividend_split_basis_suspect` names the rows the ex-day open says were stated
-otherwise. Restate a pre-split amount (`fits: pre_split`) by dividing it by the split
-price factor: a 1-for-10 is ×10, a 2-for-1 is ÷2.
+otherwise. Restate a pre-split amount (`fits: pre_split`) by **multiplying** it by the
+split price factor s (den/num): a 1-for-10 is ×10, a 2-for-1 is ×½. The restated
+dividend factor is then exactly the old (P − D)/P.
+
+**Take the amount from the filing, not from the flag.** A vendor's amount can be on
+neither basis. RIG's 2007-11-27 reclassification paid $33.03 in cash and 0.6996 shares
+per old share (Transocean 10-K 2009). FMP stored 33.03 × 0.6996 = 23.11, so
+restating that number would have given 33.03, not the right 33.03 × 2500/1749 =
+47.21. A `pre_split` reading can also be wrong. EFSH's $0.13125 of 2022-08-03 was
+declared per post-split share; its open was a real fall, so its flag is accepted,
+not restated.
 
 ```bash
 fafnir actions list --symbol OPNW --type dividend
