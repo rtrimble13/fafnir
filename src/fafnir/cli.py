@@ -952,8 +952,9 @@ def ingest_sharadar_actions(
     --prune-outside-span removes the Sharadar actions such a security holds on or
     before its link's start, written before that rule held. Each is deleted through
     the override path, reason cleanup (kept in ops.operator_override, no label);
-    the dividend_no_prior_close and dividend_exceeds_price flags of a removed
-    dividend are closed with it. One ops.ingestion_run (sharadar/actions:prune).
+    the dividend_no_prior_close, dividend_exceeds_price and
+    dividend_split_basis_suspect flags of a removed dividend are closed with it.
+    One ops.ingestion_run (sharadar/actions:prune).
     """
     from fafnir.db import repository as repo
     from fafnir.ingest import sharadar_actions as sa

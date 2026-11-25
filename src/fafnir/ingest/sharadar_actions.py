@@ -284,7 +284,11 @@ def load(
 PRUNE_ENDPOINT = "actions:prune"
 #: The flags `adjust` keys on a dividend's ex-date. A removed dividend's are closed
 #: with it: nothing will write them again.
-DIVIDEND_FLAGS = ("dividend_no_prior_close", "dividend_exceeds_price")
+DIVIDEND_FLAGS = (
+    "dividend_no_prior_close",
+    "dividend_exceeds_price",
+    adjustments.SPLIT_BASIS_CHECK,
+)
 
 
 @dataclass
@@ -317,9 +321,10 @@ def prune_outside_span(
     row as it stood is kept in ``ops.operator_override`` and its key is set aside if
     the vendor files it again. No label is written: nothing says the vendor's
     action was wrong, only that no price of theirs stands behind it. The
-    ``dividend_no_prior_close`` and ``dividend_exceeds_price`` flags of a removed
-    dividend are closed with it, and the factors of the securities that hold bars
-    are recomputed. One ``ops.ingestion_run`` (``sharadar`` / ``actions:prune``).
+    ``dividend_no_prior_close``, ``dividend_exceeds_price`` and
+    ``dividend_split_basis_suspect`` flags of a removed dividend are closed with
+    it, and the factors of the securities that hold bars are recomputed. One
+    ``ops.ingestion_run`` (``sharadar`` / ``actions:prune``).
     """
     result = PruneResult(dry_run=dry_run)
     result.rows = repo.vendor_actions_outside_span(db, VENDOR, security_ids)

@@ -20,6 +20,10 @@ Per-event factors (applied to all prices STRICTLY BEFORE the ex-date):
   * split num:den  -> price x (den/num),  volume x (num/den)
   * cash dividend D, with P = raw close on the last trade day before ex-date:
         price x ((P - D) / P),            volume x 1
+  * a cash dividend on a split's ex-date is stated per POST-split share, so P is
+    first put on that basis: P x (den/num) of the date's splits (#286). A row the
+    tape says was stated per pre-split share is flagged
+    (``dividend_split_basis_suspect``) for restating, never re-based here.
 
 The cumulative price factor stored at ``effective_date = ex_date`` is the product
 of per-event price factors for all events with ex_date >= effective_date. The view
@@ -98,6 +102,27 @@ EARLY_ABORT_FAILURES = 50
 DUPLICATE_SPLIT_SESSIONS = 10
 DUPLICATE_SPLIT_CHECK = "split_duplicate_suspect"
 
+# A dividend that shares its ex-date with a split is stated per POST-split share
+# (#286). Its prior close is on the pre-split basis, so the factor values the
+# dividend against that close times the date's split price factor. Neither vendor
+# is consistent about it: of the 28 same-day pairs where the basis moves the factor
+# by more than 10%, the ex-day open fitted the post-split amount on 6 of Sharadar's
+# 9, and on about 4 of FMP's 18. Several FMP rows, and the OPNW operator repair of
+# 2026-10, fitted the pre-split amount. Those must be restated, not guessed at here:
+# a factor read off the tape would change whenever a bar is revised.
+#
+# So the tape is read only to flag. This check says the ex-day open fits a
+# pre-split amount, or no dividend at all, better than the post-split amount the
+# factor assumes.
+SPLIT_BASIS_CHECK = "dividend_split_basis_suspect"
+# The two bases must predict ex-day opens at least this far apart (as a share of
+# the post-split prior close) before the open can tell them apart. A $0.05 dividend
+# on a $40 stock that splits 2:1 differs by 0.1%, which is noise in any open.
+SPLIT_BASIS_MIN_SEPARATION = Decimal("0.05")
+# The ex-day open is read from the first bar on or after the ex-date, within this
+# many calendar days. A first bar further out belongs to a halt, not to the ex-date.
+SPLIT_BASIS_OPEN_WITHIN_DAYS = 10
+
 
 def compute_for_security(db: Database, security_id: int) -> list[dict]:
     """Compute (and persist) adjustment factors for one security. Returns the rows."""
@@ -116,14 +141,20 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
     # Pinned precision (not the ambient context) so every environment derives the
     # same factors from the same actions.
     with localcontext(Context(prec=PRECISION)):
+        # Splits first: a dividend on a split's ex-date is valued on the post-split
+        # basis, so it needs that date's split price factor (SPLIT_BASIS_CHECK).
+        split_price: dict = defaultdict(lambda: Decimal(1))
         for act in actions:
-            ex_date = act["ex_date"]
             if act["action_type"] == "split":
+                ex_date = act["ex_date"]
                 num = Decimal(act["split_numerator"])
                 den = Decimal(act["split_denominator"])
                 price_by_date[ex_date] *= den / num
                 vol_by_date[ex_date] *= num / den
-            elif act["action_type"] == "dividend":
+                split_price[ex_date] *= den / num
+        for act in actions:
+            ex_date = act["ex_date"]
+            if act["action_type"] == "dividend":
                 amount = Decimal(act["dividend_amount"] or 0)
                 if amount <= 0:
                     continue
@@ -139,9 +170,18 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
                         record_key={"ex_date": str(ex_date)},
                     )
                     continue
-                p = Decimal(prior_close)
+                raw = Decimal(prior_close)
+                # 1 with no split that day; den/num of the split when there is one.
+                s = split_price[ex_date] if ex_date in split_price else Decimal(1)
+                p = raw * s
+                if s != 1:
+                    _check_split_basis(db, security_id, ex_date, raw, s, amount)
                 factor = (p - amount) / p
                 if factor <= 0:
+                    detail = {"prior_close": float(raw), "dividend": float(amount)}
+                    if s != 1:
+                        detail["split_price_factor"] = float(s)
+                        detail["post_split_close"] = float(p)
                     repo.add_dq_flag_once(
                         db,
                         check_name="dividend_exceeds_price",
@@ -149,7 +189,7 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
                         security_id=security_id,
                         table_name="core.adjustment_factor",
                         record_key={"ex_date": str(ex_date)},
-                        detail={"prior_close": float(p), "dividend": float(amount)},
+                        detail=detail,
                     )
                     continue
                 price_by_date[ex_date] *= factor
@@ -179,6 +219,85 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
     _flag_if_extreme(db, security_id, factors)
     repo.replace_adjustment_factors(db, security_id, factors)
     return factors
+
+
+def split_basis_fit(
+    prior_close: Decimal, split_price_factor: Decimal, dividend: Decimal, ex_open
+) -> Optional[dict]:
+    """Which share basis a dividend on a split's ex-date fits, read off the tape.
+
+    ``prior_close`` is the raw close before the ex-date, on the pre-split basis.
+    ``split_price_factor`` is that date's den/num, and ``ex_open`` is the first raw
+    open on or after the ex-date. The ex-day open each reading predicts:
+
+    * ``post_split``: the amount is per post-split share (what the factor assumes):
+      ``P*s - D``;
+    * ``pre_split``: the amount is per pre-split share: ``(P - D)*s``;
+    * ``no_dividend``: the shares did not go ex at all: ``P*s``.
+
+    Returns None when the open cannot tell the two bases apart
+    (:data:`SPLIT_BASIS_MIN_SEPARATION`), or when there is no usable open. Otherwise
+    returns the three predictions and ``fits``, the one nearest the open. A
+    prediction at or below zero is impossible and never fits.
+    """
+    if ex_open is None or prior_close <= 0 or split_price_factor == 1:
+        return None
+    o = Decimal(ex_open)
+    if o <= 0:
+        return None
+    base = prior_close * split_price_factor
+    predicted = {
+        "post_split": base - dividend,
+        "pre_split": (prior_close - dividend) * split_price_factor,
+        "no_dividend": base,
+    }
+    if (
+        abs(predicted["post_split"] - predicted["pre_split"]) / base
+        < SPLIT_BASIS_MIN_SEPARATION
+    ):
+        return None
+    possible = {k: v for k, v in predicted.items() if v > 0}
+    fits = min(possible, key=lambda k: abs(o - possible[k]))
+    return {"fits": fits, "ex_open": o, "predicted_open": predicted}
+
+
+def _check_split_basis(
+    db: Database,
+    security_id: int,
+    ex_date,
+    prior_close: Decimal,
+    split_price_factor: Decimal,
+    dividend: Decimal,
+) -> None:
+    """Flag a dividend on a split's ex-date whose ex-day open fits a pre-split
+    amount, or no dividend, better than the post-split amount (SPLIT_BASIS_CHECK)."""
+    ex_open = db.fetchval(
+        "SELECT open FROM core.daily_price WHERE security_id = %s"
+        " AND trade_date >= %s AND trade_date <= %s::date + %s"
+        " ORDER BY trade_date LIMIT 1",
+        (security_id, ex_date, ex_date, SPLIT_BASIS_OPEN_WITHIN_DAYS),
+    )
+    fit = split_basis_fit(prior_close, split_price_factor, dividend, ex_open)
+    if fit is None or fit["fits"] == "post_split":
+        return
+    repo.add_dq_flag_once(
+        db,
+        check_name=SPLIT_BASIS_CHECK,
+        severity="warn",
+        security_id=security_id,
+        table_name="core.adjustment_factor",
+        record_key={"ex_date": str(ex_date)},
+        detail={
+            "fits": fit["fits"],
+            "dividend": float(dividend),
+            "prior_close": float(prior_close),
+            "split_price_factor": float(split_price_factor),
+            "ex_open": float(fit["ex_open"]),
+            "predicted_open": {
+                k: float(round(v, 6)) for k, v in fit["predicted_open"].items()
+            },
+        },
+    )
 
 
 def _split_ratio(action: dict) -> Optional[Decimal]:

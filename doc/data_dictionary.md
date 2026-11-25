@@ -1499,7 +1499,7 @@ A check marked † had written no row by 2026-10-31.
 | `split_invalid`†, `dividend_invalid`† | `ingest actions` | `core.corporate_action` | `symbol`, `date` |
 | `corporate_action_drift` | `ingest actions` (the calendar reconciliation) | `core.corporate_action` | `symbol` |
 | `split_duplicate_suspect` | `fafnir adjust` | `core.corporate_action` | `ex_dates` (two) |
-| `dividend_no_prior_close`, `dividend_exceeds_price` | `fafnir adjust` (`ingest sharadar-actions` closes those of a dividend it removes) | `core.adjustment_factor` | `ex_date` |
+| `dividend_no_prior_close`, `dividend_exceeds_price`, `dividend_split_basis_suspect` | `fafnir adjust` (`ingest sharadar-actions` closes those of a dividend it removes) | `core.adjustment_factor` | `ex_date` |
 | `adjustment_factor_extreme` | `fafnir adjust` | `core.adjustment_factor` | `effective_date` |
 | `adjustment_failed`† | `fafnir adjust` | `core.adjustment_factor` | none; `detail.error` is the exception |
 | `security_company_name_drift`, `security_inactive_but_trading` | `ingest securities`; the second also `ingest sharadar-universe` | `core.security` | `symbol` |

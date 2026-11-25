@@ -5846,7 +5846,9 @@ def close_before(db: Database, security_id: int, d: date) -> Optional[Decimal]:
     Used to value a dividend for adjustment: the reference price is the last close
     that still carried the dividend, i.e. the close before the ex-date, never the
     ex-date's own (already-lower) close. Returns NUMERIC as ``Decimal`` so the
-    factor math stays exact.
+    factor math stays exact. It is on the pre-split basis: when a split shares the
+    ex-date, ``adjustments.compute_for_security`` multiplies it by the split's
+    den/num before valuing the dividend (#286).
     """
     return db.fetchval(
         """

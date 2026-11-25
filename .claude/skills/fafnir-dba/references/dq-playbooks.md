@@ -59,7 +59,7 @@ and they are not interchangeable:
 |---|---|---|---|---|---|
 | `gap`, `sparse_coverage`, `outlier`, `stale`, `security_duplicate_identity`, `security_missing_classification` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes — except `security_duplicate_identity` |
 | `balance_sheet_identity`, `cash_flow_tie`, `cash_balance_tie`, `fundamentals_gap`, `fundamentals_stale`, `fundamentals_currency_mismatch`, `fundamentals_coverage`, `fundamentals_ttm_incomplete`, `fundamentals_negative_impossible`, `fundamentals_suspicious_zero`, `fundamentals_implausible_filing_lag`, `fundamentals_ytd_suspect`, `fundamentals_version_chain` | nightly `dq run` | `dq.checks` | the next `dq run`, if the condition still holds | yes | yes: the check's own query, run again (a flag at another severity, or keyed per version, closes) |
-| `dividend_no_prior_close`, `dividend_exceeds_price`, `adjustment_factor_extreme`, `adjustment_failed` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security | yes | `dividend_no_prior_close` only |
+| `dividend_no_prior_close`, `dividend_exceeds_price`, `dividend_split_basis_suspect`, `adjustment_factor_extreme`, `adjustment_failed` | `adjust` | `add_dq_flag_once` | the next `adjust` of that security | yes | `dividend_no_prior_close` only |
 | `price_scale_collapse` | price loader | `add_dq_flag_once` | a re-read of that bar | yes | no |
 | `price_restatement_conflict` | nightly price load (not `--from`) | `add_dq_flag_once` | a nightly re-read of that date while the vendor still restates it beyond the guard. An explicit `ingest prices --from` re-fetch of the date **resolves it itself** | yes | no |
 | `price_split_scale_mismatch` | price loader | `add_dq_flag` (**no dedupe**: a quarantine) | every re-read of that bar | **no** | no |
@@ -749,11 +749,53 @@ change.
 
 ## `dividend_exceeds_price` — dividend larger than the prior raw close
 
+On a split's ex-date the prior close is first put on the post-split basis (×
+den/num), and `detail` then carries `split_price_factor` and `post_split_close`.
+A flag there with a pre-split-looking amount is `dividend_split_basis_suspect`'s
+case: restate the amount (below).
+
 **Resolve when** it is a genuine special or liquidating distribution (these exist,
 and are large). Verify against the vendor payload and the price around the
 ex-date. **Escalate otherwise**: a dividend an order of magnitude over the price
 is usually a units error (cents reported as dollars), and loading it will poison
 the adjustment factor chain for the whole history.
+
+---
+
+## `dividend_split_basis_suspect` — a dividend on a split's ex-date the tape says is not per post-split share
+
+Warn, once per ex-date. Since v3.4.0 (#286), a dividend that shares its ex-date with
+a split is read as an amount per **post-split** share, and valued against the prior
+raw close × the split's den/num (data-semantics.md §19). `adjust` reads the first
+open on or after the ex-date (within 10 days). It flags the dividend when that open
+is nearer to a different reading's prediction:
+
+| `fits` | Predicted open | Means |
+|---|---|---|
+| `post_split` (not flagged) | P·s − D | the amount is per post-split share |
+| `pre_split` | (P − D)·s | the amount is per pre-split share: the factor undervalues it on a reverse split and overvalues it on a forward one |
+| `no_dividend` | P·s | the shares did not go ex at all: a phantom row, often one distribution filed twice |
+
+`detail` has `fits`, `dividend`, `prior_close` (raw), `split_price_factor` (s),
+`ex_open` and the three `predicted_open`s. It is not flagged when the two bases
+predict within 5% of each other: a small regular dividend cannot be read off an open.
+
+**Diagnose.** Read the filing for the per-share amount and its basis. An open moves
+on news as well as on the dividend, so `fits` is evidence, not proof, when the
+predictions are close.
+
+**Repair.**
+- `pre_split`: restate the amount per post-split share. Run `actions delete <id>`,
+  then `actions add` with D ÷ s (×10 for a 1-for-10), on the same ex-date, citing the
+  filing. OPNW's operator row of 2026-09-29 ($0.15 with a 1-for-10) is the known one.
+- `no_dividend`: find where the distribution really went ex. A second row elsewhere
+  is the real one: delete this one. A dividend that never happened: delete it.
+
+`actions delete` recomputes the factors in the same transaction. Then resolve with
+the evidence: once the row is gone or restated, nothing writes the flag again.
+`ingest sharadar-actions --prune-outside-span` closes it with the dividend it
+removes. **Accept** only a real distribution whose open is moved by something
+else, named in the note.
 
 ---
 
