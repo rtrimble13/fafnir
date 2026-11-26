@@ -1284,6 +1284,18 @@ Three things follow from the fund grain, and each is handled where it arises:
   NAV-pricing the same way the loader does, through `NAV_PRICED_PREDICATE`, and a
   test pins the two constants together. `dq recheck` negates the same CTEs, so a
   flag written under an older threshold clears on the next recheck.
+- **A security its vendor delivers late** (#285). Some thin Sharadar ETFs take
+  their bars days late, so both fixed thresholds read a late bar as a missing one,
+  and the flag reopened each time the next bar was late. Each security's own
+  delivery lag, measured from its bars (`delivery_lag_ctes` in `fafnir.dq.checks`):
+  a bar's lag is the open sessions from its trade date to the day it was loaded,
+  and over its last 20 bars from the last 90 days the 90th percentile, less the
+  on-time session, is its allowance, at most 8 sessions. Bars loaded more than 20
+  sessions late (a backfill) or with more than 5 of the window on one day (a
+  history load) do not count. `check_freshness` adds the allowance to the
+  threshold, at most `STALE_MAX_SESSIONS_BEHIND` (10) sessions in all, and
+  `check_gaps` waits until a missing session is older than it. Both flags carry it
+  as `detail.delivery_lag_sessions`, and `dq recheck` reads the same CTEs.
 - **Distributions.** Income dividends and capital-gain distributions both drop NAV by
   the distributed amount on the ex-date — arithmetically identical to a cash dividend
   — so they load as `action_type = 'dividend'`. No new action type, no change to the

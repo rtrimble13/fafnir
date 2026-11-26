@@ -41,7 +41,13 @@ def test_the_check_binds_every_placeholder_it_writes():
 
     assert db.sql.count("%s") == len(db.params)
     assert tuple(db.params[:5]) == checks.freshness_cutoff_params("NASDAQ")
-    assert db.params[5] == list(checks.NAV_LAGGING_ASSET_TYPES)
+    # Then the delivery lag's (#285), the NAV types for the select and the
+    # HAVING, and the stale test on the lag.
+    lag = checks.delivery_lag_params("NASDAQ", own_reference=False)
+    assert tuple(db.params[5 : 5 + len(lag)]) == lag
+    nav = list(checks.NAV_LAGGING_ASSET_TYPES)
+    assert db.params[5 + len(lag)] == nav and db.params[6 + len(lag)] == nav
+    assert tuple(db.params[7 + len(lag) :]) == checks.STALE_PAST_LAG_PARAMS
 
 
 def test_a_fund_is_nav_priced_whatever_its_asset_type():
@@ -52,7 +58,8 @@ def test_a_fund_is_nav_priced_whatever_its_asset_type():
     assert "s.is_fund" in checks.NAV_PRICED_PREDICATE
     assert checks.NAV_PRICED_PREDICATE in db.sql
     # Grouped on, or the HAVING that reads it would not compile.
-    assert "s.is_fund" in db.sql.split("GROUP BY", 1)[1].split("HAVING", 1)[0]
+    behind = db.sql.split("behind AS (", 1)[1]
+    assert "s.is_fund" in behind.split("GROUP BY", 1)[1].split("HAVING", 1)[0]
 
 
 def test_the_nav_rule_matches_the_loaders():

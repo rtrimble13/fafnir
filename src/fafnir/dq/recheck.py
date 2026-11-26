@@ -49,8 +49,14 @@ from fafnir.dq.checks import (
     FUNDAMENTALS_DETECTORS,
     GAP_MIN_SESSION_DENSITY,
     GAP_MIN_SESSIONS_FOR_DENSITY,
+    MARKET_LATEST,
     NAV_LAGGING_ASSET_TYPES,
     NAV_PRICED_PREDICATE,
+    STALE_PAST_LAG_PARAMS,
+    delivery_lag_ctes,
+    delivery_lag_params,
+    gap_awaited_sql,
+    stale_past_lag_sql,
     stale_sessions_required,
 )
 from fafnir.logging_config import get_logger
@@ -79,8 +85,12 @@ class RecheckResult(NamedTuple):
 # lands in the resolution note, and it names the predicate rather than the repair
 # -- the repair is whatever the operator did, and the note should say what was
 # *observed*, not what is assumed to have caused it.
-_GAP_SQL = """
-WITH f AS (
+# The delivery lag is check_gaps' own CTEs, verbatim (#285).
+_GAP_SQL = (
+    "WITH "
+    + delivery_lag_ctes()
+    + """,
+f AS (
     SELECT dq_flag_id, security_id, (record_key->>'trade_date')::date AS d
       FROM ops.data_quality_flag
      WHERE check_name = 'gap' AND resolved_at IS NULL
@@ -102,6 +112,7 @@ cov AS (
 SELECT f.dq_flag_id
   FROM f
   LEFT JOIN cov ON cov.security_id = f.security_id
+  LEFT JOIN delivery_lag dl ON dl.security_id = f.security_id
  WHERE
        -- the bar arrived
        EXISTS (SELECT 1 FROM core.daily_price p
@@ -120,7 +131,13 @@ SELECT f.dq_flag_id
        -- check_gaps would write sparse_coverage for it instead
     OR (cov.sessions >= %s
         AND cov.bars::numeric / nullif(cov.sessions, 0) < %s)
+       -- or the session is within the security's delivery lag: its bar is still
+       -- expected, and check_gaps waits for it (#285)
+    OR """
+    + gap_awaited_sql("f.d")
+    + """
 """
+)
 
 _DIVIDEND_SQL = """
 SELECT f.dq_flag_id
@@ -164,14 +181,20 @@ SELECT m.dq_flag_id
 _STALE_SQL = (
     "WITH "
     + FRESHNESS_CUTOFF_CTES
+    + ","
+    + delivery_lag_ctes(MARKET_LATEST)
     + """
 SELECT f.dq_flag_id
   FROM ops.data_quality_flag f
   LEFT JOIN core.security s ON s.security_id = f.security_id
+  LEFT JOIN delivery_lag dl ON dl.security_id = f.security_id
  CROSS JOIN cutoff co
  CROSS JOIN LATERAL (
      SELECT max(p.trade_date) AS d FROM core.daily_price p
       WHERE p.security_id = f.security_id) lb
+ CROSS JOIN LATERAL (SELECT """
+    + NAV_PRICED_PREDICATE
+    + """ AS nav) nv
  WHERE f.check_name = 'stale' AND f.resolved_at IS NULL
    AND (
         -- the security stopped trading, so check_freshness no longer considers it
@@ -186,11 +209,14 @@ SELECT f.dq_flag_id
         -- flag was written under an earlier, one-session threshold, or it is a fund
         -- that has only now been recognised as NAV-priced
      OR COALESCE(lb.d, DATE '1900-01-01') >= CASE
-            WHEN """
-    + NAV_PRICED_PREDICATE
-    + """ THEN co.nav_d
+            WHEN nv.nav THEN co.nav_d
             ELSE co.listed_d
         END
+        -- or it is within its own delivery lag: its vendor delivers its bars that
+        -- late (#285)
+     OR NOT """
+    + stale_past_lag_sql("COALESCE(lb.d, DATE '1900-01-01')", "nv.nav")
+    + """
    )
 """
 )
@@ -288,9 +314,10 @@ class _Rule(NamedTuple):
 RECHECKABLE: dict[str, _Rule] = {
     "gap": _Rule(
         _GAP_SQL,
-        ("exch", "exch", "min_sessions", "min_density"),
+        ("delivery_lag", "exch", "exch", "min_sessions", "min_density"),
         "a bar now exists for that session, or the calendar no longer calls it a "
-        "session, or the security is no longer checked per session",
+        "session, or the security is no longer checked per session, or the session "
+        "is within the security's delivery lag (its bar is still expected)",
     ),
     "dividend_no_prior_close": _Rule(
         _DIVIDEND_SQL,
@@ -306,10 +333,20 @@ RECHECKABLE: dict[str, _Rule] = {
     ),
     "stale": _Rule(
         _STALE_SQL,
-        ("exch", "exch", "stale_listed", "exch", "stale_nav", "nav_types"),
+        (
+            "exch",
+            "exch",
+            "stale_listed",
+            "exch",
+            "stale_nav",
+            "delivery_lag_after_market",
+            "nav_types",
+            "stale_past_lag",
+        ),
         "the security has taken a bar later than the last_date this flag records, "
-        "or is no longer far enough behind the market to be stale, or is no longer "
-        "actively trading, or no vendor feeds it any more (frozen, ADR 0020)",
+        "or is no longer far enough behind the market to be stale (its vendor's "
+        "delivery lag included), or is no longer actively trading, or no vendor "
+        "feeds it any more (frozen, ADR 0020)",
     ),
     "sparse_coverage": _Rule(
         _SPARSE_SQL,
@@ -467,12 +504,23 @@ def recheck(
         "stale_listed": stale_sessions_required(False),
         "stale_nav": stale_sessions_required(True),
         "nav_types": list(NAV_LAGGING_ASSET_TYPES),
+        # Several values each: the delivery lag's CTEs and the stale test on it
+        # (#285), both check_freshness's and check_gaps' own.
+        "delivery_lag": delivery_lag_params(exchange_code),
+        "delivery_lag_after_market": delivery_lag_params(
+            exchange_code, own_reference=False
+        ),
+        "stale_past_lag": STALE_PAST_LAG_PARAMS,
     }
     out: list[RecheckResult] = []
     for name in wanted:
         rule = RECHECKABLE[name]
         sql, reason = rule.sql, rule.reason
-        params = tuple(settings[k] for k in rule.params)
+        params = tuple(
+            v
+            for k in rule.params
+            for v in (settings[k] if isinstance(settings[k], tuple) else (settings[k],))
+        )
         open_flags = int(
             db.fetchval(
                 """

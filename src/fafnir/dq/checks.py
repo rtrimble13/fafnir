@@ -192,6 +192,169 @@ def freshness_cutoff_params(exchange_code: str) -> tuple:
     )
 
 
+# A security's own delivery lag (#285): how many sessions late its vendor delivers
+# its bars, measured from the bars themselves.
+#
+# Some thin Sharadar ETFs (SFP, under 500 shares a day) get their bars days late: on
+# 2026-11-25 the 26 flagged stale that night had their bars for 11-02..11-20 loaded a
+# median of 5 days, p90 11, max 15 after the trade date. A late bar is not a missing
+# one, but the two fixed thresholds read it as one: `stale` once a security is
+# STALE_MIN_SESSIONS_BEHIND sessions behind, `gap` once a later bar exists. The bar
+# lands a few nights on, `dq recheck` closes the flag, and the next late bar opens
+# it again -- 26 of 26 new stale flags and 7 of 11 new gaps that night were on
+# securities whose same check had been closed twice or more. A queue of them hides
+# the feed that really stopped.
+#
+# So each security's allowance is its own measured lag. A bar's lag is the open
+# sessions between its trade date and the day (UTC) it was loaded: 0 or 1 for a bar
+# delivered that night. Over the security's last DELIVERY_LAG_BARS such bars from the
+# last DELIVERY_LAG_WINDOW_DAYS, the lag's 90th percentile, less the one session of
+# a bar delivered on time, is its allowance, at most DELIVERY_LAG_MAX_ALLOWANCE
+# sessions. Only delivery counts: a bar loaded more than DELIVERY_LAG_HORIZON
+# sessions late was a backfill or a correction, not latency, and a day that loaded
+# more than DELIVERY_LAG_BULK_BARS of the security's window was a history load (a
+# mint, a re-pull). A security with fewer than DELIVERY_LAG_MIN_BARS such bars, or
+# a 90th percentile below 2 sessions, has no allowance, and the checks are as
+# before.
+DELIVERY_LAG_WINDOW_DAYS = 90
+DELIVERY_LAG_BARS = 20
+DELIVERY_LAG_MIN_BARS = 5
+DELIVERY_LAG_HORIZON = 20
+DELIVERY_LAG_BULK_BARS = 5
+DELIVERY_LAG_MAX_ALLOWANCE = 8
+
+# The most open sessions behind a security may be before `stale` calls it so,
+# whatever its delivery lag: a feed that really stopped is caught within two weeks.
+STALE_MAX_SESSIONS_BEHIND = 10
+
+# The newest open session holding a bar, as FRESHNESS_CUTOFF_CTES' market_latest
+# finds it. Binds the exchange.
+LATEST_SESSION_SQL = """
+    SELECT max(p.trade_date)
+      FROM core.daily_price p
+      JOIN ref.trading_calendar c
+        ON c.trade_date = p.trade_date
+       AND c.exchange_code = %s AND c.is_open"""
+
+#: The reference day for a query that already holds FRESHNESS_CUTOFF_CTES: its
+#: market_latest, not a second scan of core.daily_price.
+MARKET_LATEST = "SELECT d FROM market_latest"
+
+
+def delivery_lag_ctes(reference: str = LATEST_SESSION_SQL) -> str:
+    """Each security's delivery lag allowance, as CTEs to follow a WITH, shared
+    verbatim by check_freshness, check_gaps and their negations in ``dq recheck``.
+    ``reference`` is the day the lag is judged to: :data:`LATEST_SESSION_SQL` by
+    default, :data:`MARKET_LATEST` after FRESHNESS_CUTOFF_CTES. Binds
+    :func:`delivery_lag_params`.
+
+    ``lag_days`` numbers every calendar day of the window by the open sessions up
+    to it, so the sessions between two days (a weekend load included) are a
+    difference. ``delivery_lag`` holds ``allowance`` for the securities that have
+    one."""
+    return f"""
+lag_ref AS (
+    SELECT ({reference}) AS d
+),
+lag_days AS (""" + _DELIVERY_LAG_BODY
+
+
+_DELIVERY_LAG_BODY = """
+    SELECT g.d::date AS d, count(c.trade_date) OVER (ORDER BY g.d) AS n
+      FROM generate_series(
+               (SELECT d FROM lag_ref) - %s::int,
+               (SELECT d FROM lag_ref) + %s::int,
+               interval '1 day') AS g(d)
+      LEFT JOIN ref.trading_calendar c
+        ON c.exchange_code = %s AND c.is_open AND c.trade_date = g.d::date
+),
+lag_bars AS (
+    SELECT p.security_id, p.trade_date,
+           (p.loaded_at AT TIME ZONE 'UTC')::date AS loaded_d,
+           count(*) OVER (PARTITION BY p.security_id,
+                                       (p.loaded_at AT TIME ZONE 'UTC')::date) AS same_day
+      FROM core.daily_price p
+     WHERE p.trade_date > (SELECT d FROM lag_ref) - %s::int
+),
+lag_sessions AS (
+    SELECT b.security_id, ld.n - td.n AS lag,
+           row_number() OVER (PARTITION BY b.security_id
+                              ORDER BY b.trade_date DESC) AS k
+      FROM lag_bars b
+      JOIN lag_days td ON td.d = b.trade_date
+      JOIN lag_days ld ON ld.d = b.loaded_d
+     WHERE b.same_day <= %s
+       AND ld.n - td.n BETWEEN 0 AND %s
+),
+delivery_lag AS (
+    SELECT security_id,
+           percentile_disc(0.9) WITHIN GROUP (ORDER BY lag) AS lag_p90,
+           LEAST(percentile_disc(0.9) WITHIN GROUP (ORDER BY lag) - 1, %s) AS allowance
+      FROM lag_sessions
+     WHERE k <= %s
+     GROUP BY security_id
+    HAVING count(*) >= %s
+       AND percentile_disc(0.9) WITHIN GROUP (ORDER BY lag) >= 2
+)
+"""
+
+
+def delivery_lag_params(exchange_code: str, *, own_reference: bool = True) -> tuple:
+    """The values :func:`delivery_lag_ctes` binds, in placeholder order:
+    ``own_reference`` for its default reference day, which binds the exchange."""
+    return (*((exchange_code,) if own_reference else ()),) + (
+        DELIVERY_LAG_WINDOW_DAYS,
+        DELIVERY_LAG_WINDOW_DAYS,
+        exchange_code,
+        DELIVERY_LAG_WINDOW_DAYS,
+        DELIVERY_LAG_BULK_BARS,
+        DELIVERY_LAG_HORIZON,
+        DELIVERY_LAG_MAX_ALLOWANCE,
+        DELIVERY_LAG_BARS,
+        DELIVERY_LAG_MIN_BARS,
+    )
+
+
+def sessions_between_sql(earlier: str, later: str) -> str:
+    """SQL for the open sessions after day ``earlier`` up to day ``later``, from
+    :func:`delivery_lag_ctes`' ``lag_days``; NULL for a day outside its window."""
+    return (
+        f"((SELECT n FROM lag_days WHERE d = ({later}))"
+        f" - (SELECT n FROM lag_days WHERE d = ({earlier})))"
+    )
+
+
+def stale_past_lag_sql(last_date: str, nav: str) -> str:
+    """SQL true when a security already behind the fixed threshold (its last bar on
+    ``last_date``; ``nav`` says it is NAV-priced) is behind its delivery lag too:
+    :func:`stale_sessions_required` plus the allowance in ``delivery_lag`` (aliased
+    ``dl``), at most :data:`STALE_MAX_SESSIONS_BEHIND`. True for a security with no
+    allowance. Binds :data:`STALE_PAST_LAG_PARAMS`."""
+    behind = sessions_between_sql(last_date, "SELECT d FROM lag_ref")
+    return (
+        f"(dl.allowance IS NULL OR COALESCE({behind}, %s) >= LEAST("
+        f"CASE WHEN {nav} THEN %s ELSE %s END + dl.allowance, %s))"
+    )
+
+
+#: What :func:`stale_past_lag_sql` binds: a behind count for a day outside the
+#: window (far enough), the two classes' thresholds, and the ceiling.
+STALE_PAST_LAG_PARAMS = (
+    1_000_000,
+    stale_sessions_required(True),
+    stale_sessions_required(False),
+    STALE_MAX_SESSIONS_BEHIND,
+)
+
+
+def gap_awaited_sql(session: str) -> str:
+    """SQL true when a missing ``session`` is within its security's delivery lag
+    (``delivery_lag`` aliased ``dl``): its bar is still expected, so it is no gap
+    yet. False for a security with no allowance. Binds nothing."""
+    since = sessions_between_sql(session, "SELECT d FROM lag_ref")
+    return f"COALESCE(dl.allowance IS NOT NULL AND {since} <= dl.allowance, FALSE)"
+
+
 def check_gaps(
     db: Database,
     exchange_code: str = "NASDAQ",
@@ -207,7 +370,9 @@ def check_gaps(
     :data:`GAP_MIN_SESSION_DENSITY`. A security below that line gets a single
     ``sparse_coverage`` flag instead of one flag per session it did not trade.
     A window shorter than ``min_sessions`` is too short for density to mean
-    anything, so those securities stay on the per-session path.
+    anything, so those securities stay on the per-session path. A session within
+    its security's delivery lag is not a gap yet: its bar is still expected
+    (:func:`delivery_lag_ctes`, #285).
 
     Returns the number of new flags written, of both kinds -- a condition already
     open in the queue is not flagged again.
@@ -215,7 +380,8 @@ def check_gaps(
     limit_clause = f"LIMIT {int(limit_securities)}" if limit_securities else ""
     row = db.fetchone(
         f"""
-        WITH bounds AS (
+        WITH {delivery_lag_ctes()},
+        bounds AS (
             SELECT security_id, min(trade_date) AS dmin, max(trade_date) AS dmax,
                    count(*) AS bars
             FROM core.daily_price GROUP BY security_id {limit_clause}
@@ -242,21 +408,30 @@ def check_gaps(
         ),
         detected AS (
             SELECT d.security_id,
-                   jsonb_build_object('trade_date', c.trade_date::text) AS record_key
+                   jsonb_build_object('trade_date', c.trade_date::text) AS record_key,
+                   dl.allowance
             FROM dense d
             JOIN ref.trading_calendar c
               ON c.exchange_code = %s AND c.is_open
              AND c.trade_date BETWEEN d.dmin AND d.dmax
             LEFT JOIN core.daily_price p
               ON p.security_id = d.security_id AND p.trade_date = c.trade_date
+            LEFT JOIN delivery_lag dl ON dl.security_id = d.security_id
             WHERE p.security_id IS NULL
+              -- a session within the security's delivery lag: its bar is still
+              -- expected (#285)
+              AND NOT {gap_awaited_sql("c.trade_date")}
         ),
         written AS (
             INSERT INTO ops.data_quality_flag
                 (security_id, table_name, record_key, check_name, severity,
                  detail, detected_at)
             SELECT d.security_id, 'core.daily_price', d.record_key, 'gap', 'warn',
-                   jsonb_build_object('exchange', %s::text), now()
+                   jsonb_build_object('exchange', %s::text)
+                   || CASE WHEN d.allowance IS NULL THEN '{{}}'::jsonb
+                           ELSE jsonb_build_object('delivery_lag_sessions', d.allowance)
+                      END,
+                   now()
             FROM detected d
             WHERE NOT EXISTS (
                 SELECT 1 FROM ops.data_quality_flag f
@@ -314,6 +489,7 @@ def check_gaps(
                (SELECT count(*) FROM written_sparse) AS sparse_flagged
         """,
         (
+            *delivery_lag_params(exchange_code),
             exchange_code,
             min_sessions,
             min_density,
@@ -420,16 +596,20 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
     sessions, counting the market's latest. Securities priced at a NAV struck after
     the equity close -- :data:`NAV_LAGGING_ASSET_TYPES`, or ``is_fund`` -- get
     :data:`NAV_LAG_TRADING_DAYS` more. The reference dates are
-    :data:`FRESHNESS_CUTOFF_CTES`, which ``dq recheck`` negates.
+    :data:`FRESHNESS_CUTOFF_CTES`, which ``dq recheck`` negates. A security whose
+    vendor delivers its bars late has its measured delivery lag on top
+    (:func:`delivery_lag_ctes`, #285), at most :data:`STALE_MAX_SESSIONS_BEHIND`
+    sessions in all, and the flag's detail carries it (``delivery_lag_sessions``).
 
     A security no vendor feeds (``feed_frozen_on`` set, ADR 0020) is skipped: it
     trades, but nothing is expected to reach it, so there is no feed to measure.
     """
     row = db.fetchone(
         f"""
-        WITH {FRESHNESS_CUTOFF_CTES},
-        detected AS (
-            SELECT s.security_id, max(p.trade_date) AS last_date, ml.d AS market_date
+        WITH {FRESHNESS_CUTOFF_CTES}, {delivery_lag_ctes(MARKET_LATEST)},
+        behind AS (
+            SELECT s.security_id, max(p.trade_date) AS last_date, ml.d AS market_date,
+                   ({NAV_PRICED_PREDICATE}) AS nav
             FROM core.security s
             JOIN core.daily_price p ON p.security_id = s.security_id
             CROSS JOIN market_latest ml
@@ -442,6 +622,13 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
                        ELSE co.listed_d
                    END
         ),
+        -- And behind its own delivery lag too, where it has one (#285).
+        detected AS (
+            SELECT b.security_id, b.last_date, b.market_date, dl.allowance
+              FROM behind b
+              LEFT JOIN delivery_lag dl ON dl.security_id = b.security_id
+             WHERE {stale_past_lag_sql("b.last_date", "b.nav")}
+        ),
         written AS (
             INSERT INTO ops.data_quality_flag
                 (security_id, table_name, record_key, check_name, severity,
@@ -449,7 +636,10 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
             SELECT d.security_id, 'core.daily_price',
                    jsonb_build_object('last_date', d.last_date::text),
                    'stale', 'warn',
-                   jsonb_build_object('market_date', d.market_date::text),
+                   jsonb_build_object('market_date', d.market_date::text)
+                   || CASE WHEN d.allowance IS NULL THEN '{{}}'::jsonb
+                           ELSE jsonb_build_object('delivery_lag_sessions', d.allowance)
+                      END,
                    now()
             FROM detected d
             WHERE NOT EXISTS (
@@ -471,7 +661,13 @@ def check_freshness(db: Database, exchange_code: str = "NASDAQ") -> int:
         SELECT (SELECT count(*) FROM detected) AS detected,
                (SELECT count(*) FROM written)  AS flagged
         """,
-        (*freshness_cutoff_params(exchange_code), list(NAV_LAGGING_ASSET_TYPES)),
+        (
+            *freshness_cutoff_params(exchange_code),
+            *delivery_lag_params(exchange_code, own_reference=False),
+            list(NAV_LAGGING_ASSET_TYPES),
+            list(NAV_LAGGING_ASSET_TYPES),
+            *STALE_PAST_LAG_PARAMS,
+        ),
     )
     logger.info(
         "freshness check: %d stale securities, %d newly flagged",

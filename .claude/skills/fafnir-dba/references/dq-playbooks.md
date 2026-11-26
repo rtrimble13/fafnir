@@ -104,6 +104,12 @@ and no per-session `gap` flags at all. Windows shorter than
 `GAP_MIN_SESSIONS_FOR_DENSITY` (60 sessions) are always treated as dense, so a
 newly-listed symbol is still checked per session.
 
+**A session within the security's delivery lag is no gap yet:** its bar is still
+expected. `gap` waits until a missing session is more than the security's
+allowance (below, under `stale`) old, and `dq recheck --check gap` closes a gap
+flag the allowance now covers. A gap on a late-delivered security that keeps
+reopening after the bar lands is what this stops (#285).
+
 **Diagnose.** Count securities per gap date first (the query in SKILL.md). Then:
 
 ```sql
@@ -431,6 +437,46 @@ market's latest; a NAV-priced one gets `NAV_LAG_TRADING_DAYS` (1) more. FMP
 publishes thin names' bars a day late often enough that a lower threshold turned
 the vendor's lag into a queue. Anything that clears itself overnight is not a
 defect: **recheck it the next day, do not accept it.**
+
+**A security its vendor delivers late** (#285) gets its own **delivery lag**.
+Some thin Sharadar ETFs (SFP) take their bars days late: on 2026-11-25 the 26
+flagged stale had bars loaded a median of 5 days after the trade date, p90 11. A
+late bar is not a missing one. The lag is measured from the security's own bars,
+`delivery_lag_ctes` in `fafnir.dq.checks`:
+
+- a bar's lag is the open sessions between its trade date and the day (UTC) it was
+  loaded (`core.daily_price.loaded_at`): 0 or 1 for a bar delivered that night;
+- over the security's last `DELIVERY_LAG_BARS` (20) bars from the last
+  `DELIVERY_LAG_WINDOW_DAYS` (90) days, the lag's 90th percentile, less the one
+  session of an on-time bar, is its **allowance**, at most
+  `DELIVERY_LAG_MAX_ALLOWANCE` (8) sessions;
+- only delivery counts: a bar loaded more than `DELIVERY_LAG_HORIZON` (20) sessions
+  late was a backfill or a correction, and a day that loaded more than
+  `DELIVERY_LAG_BULK_BARS` (5) of the security's window was a history load (a mint,
+  a re-pull). Fewer than `DELIVERY_LAG_MIN_BARS` (5) such bars, or a 90th
+  percentile under 2 sessions, and there is no allowance.
+
+The flag's `detail.delivery_lag_sessions` carries the allowance where there is
+one. To see a security's lags:
+
+```sql
+SELECT p.trade_date, (p.loaded_at AT TIME ZONE 'UTC')::date AS loaded,
+       (SELECT count(*) FROM ref.trading_calendar c
+         WHERE c.exchange_code = 'NASDAQ' AND c.is_open
+           AND c.trade_date > p.trade_date
+           AND c.trade_date <= (p.loaded_at AT TIME ZONE 'UTC')::date) AS lag_sessions
+  FROM core.daily_price p
+ WHERE p.security_id = <id> AND p.trade_date > current_date - 90
+ ORDER BY p.trade_date DESC LIMIT 20;
+```
+
+`stale` adds the allowance to the threshold, at most `STALE_MAX_SESSIONS_BEHIND`
+(10) sessions in all, so a feed that really stopped is still flagged within two
+weeks. A stale flag on a security with an allowance is past it: the feed is later
+than even its own vendor's habit. Before #285 these reopened every time a late bar
+landed, and `prior_resolutions >= 2` stopped the sweep on them; a flag still open
+from then is closed by `dq recheck --check stale` once its security's allowance
+covers it.
 
 **To test whether the screener still lists a name**, read `core.security.updated_at`
 — the nightly security-master load stamps it. `landing.fmp_raw` does **not** keep
