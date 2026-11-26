@@ -1163,13 +1163,17 @@ def _series_order(series: str) -> int:
     return -1 if series == "*" else int(series)
 
 
-def build(db: Database, *, verified_only: bool = False) -> LabelExport:
+def build(
+    db: Database, *, verified_only: bool = False, drop_unverified: bool = False
+) -> LabelExport:
     """Every label the warehouse can state, in a stable order.
 
     The derived labels, then the stated ones (ops.dq_label). Where a stated label
     and a derived one are the same decision -- same security, overlapping dates,
     same class -- the stated one wins. ``verified_only`` keeps the labels marked
-    ``verified: true``.
+    ``verified: true``; ``drop_unverified`` leaves out those marked ``false`` and
+    keeps those that say neither (DE-15: a ``dorq calibrate`` before 0.16.0 reads
+    no ``verified``).
     """
     out = LabelExport()
     repaired = _price_overrides(db, out)
@@ -1190,6 +1194,8 @@ def build(db: Database, *, verified_only: bool = False) -> LabelExport:
         ] + stated
     if verified_only:
         out.labels = [lab for lab in out.labels if lab.get("verified") is True]
+    elif drop_unverified:
+        out.labels = [lab for lab in out.labels if lab.get("verified") is not False]
     out.labels.sort(
         key=lambda lab: (
             _series_order(lab["series"]),

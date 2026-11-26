@@ -156,6 +156,10 @@ log_dir = "var/fafnir/log"
 # dorq_statements_config = "/etc/fafnir/dorq-statements.toml"   # includes
 #     /opt/dorq/share/dorq/priors/fafnir-statements.toml; empty: dorq's defaults
 # dorq_statements_shadow = true
+# The statements nightly reports at warn and above: about 283k info reports a
+# night, 87k of them DQ919's, that nothing at warn and above reads. true adds them
+# (dorq's --show-info), as `dq run --statements-info` does for one run.
+# dorq_statements_info = false
 
 # --- duk (read CLI) settings -------------------------------------------------
 # duk reuses [api].fmp_key (-S fmp), [api].sharadar_key (-S sharadar) and
