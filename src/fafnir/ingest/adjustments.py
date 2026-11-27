@@ -18,12 +18,17 @@ Conventions
 -----------
 Per-event factors (applied to all prices STRICTLY BEFORE the ex-date):
   * split num:den  -> price x (den/num),  volume x (num/den)
+  * spin factor num:den (a spin-off stored as a split, ``split_kind =
+    'spin_factor'``; spin-as-split, #282, #283)
+                   -> price x (den/num),  volume x 1: no share count changed
   * cash dividend D, with P = raw close on the last trade day before ex-date:
         price x ((P - D) / P),            volume x 1
   * a cash dividend on a split's ex-date is stated per POST-split share, so P is
     first put on that basis: P x (den/num) of the date's splits (#286). A row the
     tape says was stated per pre-split share is flagged
-    (``dividend_split_basis_suspect``) for restating, never re-based here.
+    (``dividend_split_basis_suspect``) for restating, never re-based here. A spin
+    factor is no split here either: the share the dividend is paid on is the one
+    the prior close priced, so P is not re-based by it.
 
 The cumulative price factor stored at ``effective_date = ex_date`` is the product
 of per-event price factors for all events with ex_date >= effective_date. The view
@@ -124,6 +129,11 @@ SPLIT_BASIS_MIN_SEPARATION = Decimal("0.05")
 SPLIT_BASIS_OPEN_WITHIN_DAYS = 10
 
 
+def is_spin_factor(action: dict) -> bool:
+    """A split row that is a spin-off's price factor, not a share split (#283)."""
+    return action.get("split_kind") == repo.SPLIT_KIND_SPIN
+
+
 def compute_for_security(db: Database, security_id: int) -> list[dict]:
     """Compute (and persist) adjustment factors for one security. Returns the rows."""
     actions = repo.corporate_actions_for(db, security_id)
@@ -150,6 +160,9 @@ def compute_for_security(db: Database, security_id: int) -> list[dict]:
                 num = Decimal(act["split_numerator"])
                 den = Decimal(act["split_denominator"])
                 price_by_date[ex_date] *= den / num
+                if is_spin_factor(act):
+                    # The price falls by what was spun off; no share count changed.
+                    continue
                 vol_by_date[ex_date] *= num / den
                 split_price[ex_date] *= den / num
         for act in actions:

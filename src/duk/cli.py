@@ -2835,7 +2835,9 @@ def emit_records(
 
 
 def _split_ratio(row):
-    """``2-for-1`` from a split's numerator and denominator, as stored."""
+    """``2-for-1`` from a split's numerator and denominator, as stored; a spin-off
+    stored as a split (fafnir #283) is ``spin factor 224278:100000``: its ratio is
+    a price factor, not shares for shares."""
     num, den = row.get("split_numerator"), row.get("split_denominator")
     if num is None or den is None:
         return None
@@ -2843,6 +2845,8 @@ def _split_ratio(row):
     def text(value):
         return f"{Decimal(value).normalize():f}"
 
+    if row.get("split_kind") == "spin_factor":
+        return f"spin factor {text(num)}:{text(den)}"
     return f"{text(num)}-for-{text(den)}"
 
 
@@ -3047,9 +3051,11 @@ def ca(
     SYMBOL as for `duk ph`: a ticker, an identifier, sid:, or TICKER@YYYY-MM-DD.
     One row per event from mart.v_corporate_action: the ex-date (entitlement),
     record and payment dates (the cash), the split ratio or the dividend per
-    share, and the vendor that supplied it. Spinoffs, mergers and renames are not
-    corporate actions here: a rename is `duk th`. --exact prints the stored
-    NUMERIC text, as `ph --exact` does. The warehouse only (-S db).
+    share, and the vendor that supplied it. A spin-off is a split row whose ratio
+    is its total-return factor, shown as a spin factor (split_kind): it adjusts
+    prices and is no share change. Mergers and renames are not corporate actions
+    here: a rename is `duk th`. --exact prints the stored NUMERIC text, as `ph
+    --exact` does. The warehouse only (-S db).
     """
     logger = ctx.obj.get("logger", logging.getLogger("duk"))
     if verbose:
@@ -3078,7 +3084,8 @@ def ca(
         click.echo(f"No security found for {symbol}.", err=True)
         sys.exit(1)
     rows = found["rows"]
-    splits = sum(1 for r in rows if r["action_type"] == "split")
+    spins = sum(1 for r in rows if r.get("split_kind") == "spin_factor")
+    splits = sum(1 for r in rows if r["action_type"] == "split") - spins
     view = [
         {
             "ex_date": r["ex_date"],
@@ -3093,7 +3100,9 @@ def ca(
         for r in rows
     ]
     emit_records(
-        rows,
+        # JSON and CSV are portable's contract (test_db_portable_reads_integration):
+        # the kind is shown in the table, and left out of them until portable reads it.
+        [{k: v for k, v in r.items() if k != "split_kind"} for r in rows],
         table_rows=view,
         console=console,
         output=output,
@@ -3103,7 +3112,8 @@ def ca(
         exact=exact,
         empty_message=f"No corporate actions for {symbol}",
         footer=f"{symbol} · {tables.plural(splits, 'split')} · "
-        f"{tables.plural(len(rows) - splits, 'dividend')}",
+        + (f"{tables.plural(spins, 'spin factor')} · " if spins else "")
+        + f"{tables.plural(len(rows) - splits - spins, 'dividend')}",
     )
 
 

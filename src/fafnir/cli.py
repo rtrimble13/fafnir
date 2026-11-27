@@ -4156,8 +4156,12 @@ def _resolve_one_security(database, symbol, security_id) -> tuple[int, str]:
 
 def _fmt_action_value(row) -> str:
     if row["action_type"] == "split":
-        return (
+        ratio = (
             f"{_fmt_num(row['split_numerator'])}:{_fmt_num(row['split_denominator'])}"
+        )
+        # A spin-off stored as a split (#283): a price factor, not a share change.
+        return (
+            f"{ratio} spin factor" if row.get("split_kind") == "spin_factor" else ratio
         )
     return _fmt_num(row["dividend_amount"])
 
@@ -4336,6 +4340,12 @@ def actions_list(ctx, symbol, security_id, action_type, from_date, to_date):
 )
 @click.option("--dividend", metavar="AMOUNT", help="A cash dividend per share.")
 @click.option(
+    "--spin-factor",
+    is_flag=True,
+    help="The --split is a spin-off's total-return factor (spin-as-split), not a "
+    "share split: it adjusts prices, and no share count or volume.",
+)
+@click.option(
     "--note",
     "-m",
     required=True,
@@ -4355,6 +4365,7 @@ def actions_add(
     ex_date,
     split_ratio,
     dividend,
+    spin_factor,
     note,
     created_by,
     reason,
@@ -4374,6 +4385,14 @@ def actions_add(
 
     A key that already holds a row is refused: delete that row first, so the record
     says what was replaced. To move a misdated action use `fafnir actions redate`.
+
+    A spin-off is a split row carrying its total-return factor (doc/operations.md,
+    "A spin-off is a split row"); --spin-factor marks it as one, so the market cap,
+    the factor panel and adjusted volume do not read it as a share change:
+
+    \b
+      fafnir actions add --security-id 14556 --ex-date 2007-03-27 --split 224278:100000 \\
+          --spin-factor -m "<filing, prices, formula>" --dry-run
     """
     from decimal import Decimal, InvalidOperation
 
@@ -4382,6 +4401,8 @@ def actions_add(
 
     if (split_ratio is None) == (dividend is None):
         raise click.ClickException("Give exactly one of --split or --dividend.")
+    if spin_factor and split_ratio is None:
+        raise click.ClickException("--spin-factor marks a --split.")
     split = _parse_split(split_ratio) if split_ratio else None
     amount = None
     if dividend is not None:
@@ -4398,6 +4419,8 @@ def actions_add(
         sid, sym = _resolve_one_security(database, symbol, security_id)
         kind = "split" if split else "dividend"
         value = f"{_fmt_num(split[0])}:{_fmt_num(split[1])}" if split else amount
+        if spin_factor:
+            value = f"{value} spin factor"
         click.echo(f"{sym} (security {sid}): add {kind} {value} on {ex}")
         _echo_price_context(database, sid, ex, split)
         before = _factor_summary(database, sid)
@@ -4415,6 +4438,9 @@ def actions_add(
                 note=note,
                 created_by=created_by,
                 reason=reason,
+                split_kind=(
+                    repo.SPLIT_KIND_SPIN if spin_factor else repo.SPLIT_KIND_SHARES
+                ),
             )
         except repo.OverrideRefused as exc:
             raise click.ClickException(str(exc)) from exc
@@ -4619,6 +4645,286 @@ def actions_redate(ctx, action_id, ex_date, note, created_by, reason, dry_run, y
     )
     click.echo(f"Factors: {before} -> {after}.")
     click.echo(_OVERRIDE_HINT)
+
+
+_KIND_HINT = (
+    "Run `fafnir db refresh-marts`: the market cap and the factor panel read the "
+    "kind on their next refresh."
+)
+
+
+def _apply_kinds(database, changes, *, created_by) -> list[tuple[dict, int]]:
+    """Set each ``(row, kind, basis, evidence, note)`` and recompute the factors of
+    the securities touched (adjusted volume reads the kind). Returns the rows
+    changed, with their change ids."""
+    from fafnir.db import repository as repo
+    from fafnir.ingest import adjustments
+
+    done = []
+    for row, kind, basis, evidence, note in changes:
+        change_id = repo.set_split_kind(
+            database,
+            corporate_action_id=int(row["corporate_action_id"]),
+            kind=kind,
+            basis=basis,
+            note=note,
+            created_by=created_by,
+            evidence=evidence,
+        )
+        if change_id is not None:
+            done.append((row, change_id))
+    for sid in dict.fromkeys(int(r["security_id"]) for r, _ in done):
+        adjustments.compute_for_security(database, sid)
+    return done
+
+
+@actions.command("kind")
+@click.argument("action_ids", nargs=-1, type=int, required=True, metavar="ID...")
+@click.option(
+    "--spin-factor",
+    "kind",
+    flag_value="spin_factor",
+    help="A spin-off's total-return factor stored as a split.",
+)
+@click.option(
+    "--shares", "kind", flag_value="shares", help="A share split (the default kind)."
+)
+@click.option(
+    "--note",
+    "-m",
+    required=True,
+    help="The evidence: the filing, the spun-off company, the prices. Required.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="Make the change, show it, and roll it back."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def actions_kind(ctx, action_ids, kind, note, created_by, dry_run, yes):
+    """Say whether split rows are share splits or spin factors (#283).
+
+    \b
+      fafnir actions list --symbol VHI --type split
+      fafnir actions kind 589630 --spin-factor \\
+          -m "TIMET distribution, Valhi 8-K 2007-03-27; ratio is 1/total-return factor" \\
+          --dry-run
+
+    A spin factor adjusts prices as a split does, and changes no share count: the
+    market cap, the factor panel and adjusted volume skip it. The ratio, source and
+    load lineage are left alone, so the loaders and the reconciliation see the row
+    they wrote. Each change is recorded in ops.split_kind_change; adjustment factors
+    are recomputed in the same transaction. `fafnir actions mark-spins` marks the
+    rows the warehouse's own evidence names.
+    """
+    from fafnir.db import repository as repo
+
+    if kind is None:
+        raise click.ClickException("Give one of --spin-factor or --shares.")
+    created_by = created_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        rows = []
+        for aid in dict.fromkeys(action_ids):
+            row = repo.corporate_action_by_id(database, aid)
+            if row is None:
+                raise click.ClickException(f"No corporate action {aid}.")
+            if row["action_type"] != "split":
+                raise click.ClickException(
+                    f"Corporate action {aid} is a {row['action_type']}: only a split "
+                    "has a kind."
+                )
+            rows.append(row)
+        _echo_table(
+            ["ID", "SYMBOL", "SECURITY", "EX_DATE", "VALUE", "SOURCE"],
+            [
+                [
+                    str(r["corporate_action_id"]),
+                    r["primary_symbol"],
+                    str(r["security_id"]),
+                    str(r["ex_date"]),
+                    _fmt_action_value(r),
+                    r["source"],
+                ]
+                for r in rows
+            ],
+            right=(0, 2),
+        )
+        pending = [r for r in rows if r["split_kind"] != kind]
+        if not pending:
+            click.echo(f"Nothing to change: every row is already {kind}.")
+            return
+        if not dry_run and not yes:
+            click.confirm(f"Mark {_plural(len(pending), 'split')} {kind}?", abort=True)
+        try:
+            done = _apply_kinds(
+                database,
+                [(r, kind, "operator", {}, note) for r in pending],
+                created_by=created_by,
+            )
+        except repo.OverrideRefused as exc:
+            raise click.ClickException(str(exc)) from exc
+        if dry_run:
+            database.rollback()
+            click.echo(
+                f"Dry run: {_plural(len(done), 'split')} would be marked {kind}. "
+                "Nothing changed."
+            )
+            return
+        database.commit()
+    click.echo(
+        f"Marked {_plural(len(done), 'split')} {kind} as {created_by} (changes "
+        f"{', '.join(str(c) for _, c in done)})."
+    )
+    click.echo(_KIND_HINT)
+
+
+def _spin_event_text(event) -> str:
+    if not event:
+        return ""
+    party = event.get("contra_ticker") or event.get("contra_name") or "?"
+    value = event.get("value")
+    return f"{event['action']} {party} {event['event_date']}" + (
+        f" ({_fmt_num(value)})" if value is not None else ""
+    )
+
+
+def _mark_note(candidate) -> str:
+    """The record of one rule's marking: what the evidence was."""
+    if candidate["basis"] == "operator_note":
+        return (
+            "actions mark-spins: operator's add (override "
+            f"{candidate['noted']['override_id']}) names a spin-off"
+        )
+    return (
+        "actions mark-spins: Sharadar ACTIONS "
+        f"{_spin_event_text(candidate['event'])} on the ex-date"
+    )
+
+
+@actions.command("mark-spins")
+@click.option("--symbol", help="One security by ticker.")
+@click.option("--security-id", type=int, help="One security by id.")
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    help="Also list the candidates no rule marks (a ratio with a side of 1,000 or "
+    "more, or a spin-off within 7 days), for classifying by hand.",
+)
+@click.option("--by", "created_by", help="Who  [default: the OS user]")
+@click.option(
+    "--dry-run", is_flag=True, help="List what would be marked; change nothing."
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation.")
+@click.pass_context
+def actions_mark_spins(ctx, symbol, security_id, show_all, created_by, dry_run, yes):
+    """Mark the split rows the warehouse's own evidence says are spin factors (#283).
+
+    \b
+      fafnir actions mark-spins --dry-run --all
+      fafnir actions mark-spins
+
+    Two rules, each recorded as its basis in ops.split_kind_change:
+
+    \b
+      operator_note     an operator's split whose add names a spin-off in its note
+                        (the spin-as-split repairs: HON, NVRI, CTVA, VHI);
+      sharadar_spinoff  an FMP split on the ex-date of a spin-off in Sharadar's
+                        ACTIONS (spinoff, spinoffdividend) of the security's key.
+
+    Every other candidate stays a share split until an operator classifies it with
+    `fafnir actions kind`: the ratio's shape cannot tell a spin factor from an odd
+    split or a stock dividend (21:20 is a share change). --all lists them, with the
+    nearest spin-off event. Re-running marks only what is new. Adjustment factors
+    are recomputed in the same transaction; then `fafnir db refresh-marts`.
+    """
+    from fafnir.db import repository as repo
+
+    created_by = created_by or _os_user()
+    with Database(ctx.obj["config"].dsn) as database:
+        sid = None
+        if symbol or security_id:
+            sid, _ = _resolve_one_security(database, symbol, security_id)
+        found = repo.spin_factor_candidates(database, security_id=sid)
+        marked = [c for c in found if c["basis"] is not None]
+        left = [c for c in found if c["basis"] is None]
+
+        def table(rows):
+            _echo_table(
+                [
+                    "ID",
+                    "SYMBOL",
+                    "SECURITY",
+                    "EX_DATE",
+                    "SPLIT",
+                    "SOURCE",
+                    "BASIS",
+                    "EVIDENCE",
+                ],
+                [
+                    [
+                        str(c["corporate_action_id"]),
+                        c["primary_symbol"],
+                        str(c["security_id"]),
+                        str(c["ex_date"]),
+                        f"{_fmt_num(c['split_numerator'])}:"
+                        f"{_fmt_num(c['split_denominator'])}",
+                        c["source"],
+                        c["basis"] or "-",
+                        (
+                            f"override {c['noted']['override_id']}"
+                            if c["basis"] == "operator_note"
+                            else _spin_event_text(c["event"])
+                        ),
+                    ]
+                    for c in rows
+                ],
+                right=(0, 2),
+            )
+
+        click.echo(f"{_plural(len(marked), 'split')} a rule marks as a spin factor.")
+        if marked:
+            table(marked)
+        shared = [c for c in marked if c["dividend_same_day"]]
+        if shared:
+            click.echo(
+                f"{_plural(len(shared), 'of them shares', 'of them share')} an ex-date "
+                "with a cash dividend, whose adjusted prices before it move: the "
+                "dividend is valued against the raw prior close, not re-based by the "
+                'ratio (doc/operations.md, "Marking spin factors").'
+            )
+        click.echo(
+            f"{_plural(len(left), 'other candidate')} left as share splits"
+            + (":" if show_all and left else " (--all lists them).")
+        )
+        if show_all and left:
+            table(left)
+        if not marked:
+            return
+        if dry_run:
+            click.echo("Dry run: nothing changed.")
+            return
+        if not yes:
+            click.confirm(
+                f"Mark {_plural(len(marked), 'split')} spin_factor?", abort=True
+            )
+        changes = [
+            (
+                c,
+                repo.SPLIT_KIND_SPIN,
+                c["basis"],
+                {"event": c["event"], "noted": c["noted"]},
+                _mark_note(c),
+            )
+            for c in marked
+        ]
+        done = _apply_kinds(database, changes, created_by=created_by)
+        database.commit()
+    click.echo(
+        f"Marked {_plural(len(done), 'split')} spin_factor as {created_by}, on "
+        f"{_plural(len({int(r['security_id']) for r, _ in done}), 'security', 'securities')}."
+    )
+    click.echo(_KIND_HINT)
 
 
 @main.group()

@@ -501,7 +501,13 @@ ACTIONS stay events, and nothing converts them.
 > (10000:4109, 224278:100000) as a spin-off first, and look for a distribution in the
 > issuer's filings.
 
-> **Wrong answer:** trusting the share count or market cap across one. Every split
-> row is read as a share change, so the cap is overstated by the ratio from the
-> ex-date until the next balance sheet is known (VHI 2007-03-27..05-07: 255.9M shares
-> for 114.1M), and adjusted volume before the date is scaled by it.
+> **Wrong answer:** trusting the share count or market cap across an unmarked one.
+> `core.corporate_action.split_kind` (v3.8.0, #283) says which split rows are spin
+> factors: `spin_factor` rows adjust prices and nothing else, and the market cap, the
+> screener, the factor panel and adjusted volume skip them. A row still `shares` is
+> read as a share change, so the cap is overstated by the ratio from the ex-date until
+> the next balance sheet is known (VHI 2007-03-27..05-07: 255.9M shares for 114.1M),
+> and adjusted volume before the date is scaled by it. Check the kind
+> (`mart.v_corporate_action.split_kind`, `actions list` shows `spin factor`); `fafnir
+> actions mark-spins --dry-run --all` lists what is marked by evidence and what is
+> left to classify with `actions kind` (operations.md, "Marking spin factors").

@@ -1239,3 +1239,56 @@ def test_undo_refuses_while_the_source_holds_its_own_bar_on_a_moved_date(two_iss
         )
         == active
     )
+
+
+def test_a_spin_factor_moves_and_comes_back_as_one(two_issuers):
+    """A history split keeps a split's kind (#283): the destination's copy is a spin
+    factor, and so is the row an undo puts back."""
+    db, sid = two_issuers
+    repo.upsert_corporate_action(
+        db,
+        security_id=sid,
+        action_type="split",
+        ex_date=dt.date(2024, 1, 3),
+        split_numerator=224278,
+        split_denominator=100000,
+    )
+    action_id = repo.corporate_action_at(
+        db, security_id=sid, action_type="split", ex_date=dt.date(2024, 1, 3)
+    )["corporate_action_id"]
+    repo.set_split_kind(
+        db,
+        corporate_action_id=action_id,
+        kind=repo.SPLIT_KIND_SPIN,
+        basis="operator",
+        note="a spin-off",
+        created_by="tester",
+    )
+
+    def kinds(s):
+        return {
+            str(r["ex_date"]): r["split_kind"]
+            for r in db.fetchall(
+                "SELECT ex_date, split_kind FROM core.corporate_action"
+                " WHERE security_id = %s AND action_type = 'split'",
+                (s,),
+            )
+        }
+
+    assert _split_off("--yes").exit_code == 0
+    dest = _dest(db, sid)
+    assert kinds(dest) == {"2024-01-03": "spin_factor"} and kinds(sid) == {}
+    out = _run(
+        "security",
+        "split-history",
+        "--symbol",
+        "BID",
+        "--into-security-id",
+        str(dest),
+        "--undo",
+        "-m",
+        "wrong boundary",
+        "--yes",
+    )
+    assert out.exit_code == 0, out.output
+    assert kinds(sid) == {"2024-01-03": "spin_factor"}

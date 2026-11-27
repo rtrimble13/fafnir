@@ -1350,7 +1350,7 @@ def ticker_history(
 _CORPORATE_ACTIONS_SQL = """
     SELECT ex_date, action_type, split_numerator, split_denominator,
            dividend_amount, currency, record_date, payment_date, declaration_date,
-           corporate_action_id, security_id, source
+           corporate_action_id, security_id, source, split_kind
       FROM mart.v_corporate_action
      WHERE security_id = %(sid)s
        AND (%(start)s::date IS NULL OR ex_date >= %(start)s::date)

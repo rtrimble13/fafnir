@@ -147,3 +147,26 @@ is no float adjustment: SF1 carries no float.
     count × factor, so a class conversion is not read as issuance.
   - **`shares_outstanding_as_of` stays SF1's count**, with the factor in a new
     `share_factor` column.
+
+## Amendment (2026-11): a spin factor is not a split (#283)
+
+Decision 3's "the warehouse's splits" are its **share splits**. A spin-off is stored
+as one split row whose ratio is the inverse of its total-return factor (spin-as-split,
+#282; operations.md, "A spin-off is a split row"): the price factor it gives is right,
+but no share count changed. Read as a split, it put a count in the next day's terms ×
+the spin ratio, and overstated the cap from the ex-date until the next balance sheet
+was known (VHI 2007-03-27 to 05-07: 255.9M shares for 114.1M).
+
+- **The rows are marked, not inferred.** `core.corporate_action.split_kind` is `shares`
+  or `spin_factor` (migration 0048). A ratio's shape cannot tell them apart: 21:20 is a
+  stock dividend, 10000:4109 FMP's spin factor. The operator marks a row (`actions
+  add --spin-factor`, `actions kind`), or `actions mark-spins` marks what the
+  warehouse's evidence names: the operator's own note, or Sharadar's spin-off event on
+  an FMP split's ex-date. Each change is recorded (`ops.split_kind_change`).
+- **Who reads which.** The price factors read both kinds, so adjusted prices do not
+  move. Decision 3's expression, in `mart.fn_daily_market_cap`,
+  `mart.v_security_attributes` and the factor panel (counts, weighted shares,
+  dividends per share), reads share splits only, as does the volume factor.
+- **Unmarked is a share split.** Until a row is marked it is read as before, so a
+  spin-off that reaches the feeds after a marking run overstates the cap until the
+  next one.

@@ -1071,8 +1071,12 @@ distribution with cash in it adds the cash to the denominator (NVRI 2026-06-01).
 ```bash
 fafnir actions list --symbol VHI --type split
 fafnir actions delete 589630 -m "FMP's 1 - D/P spin factor: +15.3% on the ex-date against a holder's +6.3%" --dry-run
-fafnir actions add --security-id 14556 --ex-date 2007-03-27 --split 224278:100000 -m "<filing, prices, formula>" --dry-run
+fafnir actions add --security-id 14556 --ex-date 2007-03-27 --split 224278:100000 --spin-factor -m "<filing, prices, formula>" --dry-run
 ```
+
+`--spin-factor` marks the row a spin factor (`split_kind`, since v3.8.0, #283): it
+adjusts prices like any split, and no share count or volume. Always pass it for a
+spin-off; `actions list` shows the ratio as `224278:100000 spin factor`.
 
 - **FMP's own factor is 1 − D/P,** the value distributed over the parent's close the
   session before. For a small spin-off the two agree; for a large one FMP's overstates
@@ -1080,14 +1084,50 @@ fafnir actions add --security-id 14556 --ex-date 2007-03-27 --split 224278:10000
   difference is material: delete FMP's row, then add the operator's.
 - **No row is the other wrong answer.** Without one, the adjusted series shows the
   ex-date drop as a loss (CTVA 2026-10-01: −84%).
-- **What a spin-as-split row also does,** because the warehouse reads every split row
-  as a share change:
-  - adjusted volume before the ex-date is scaled by the ratio (as for any split);
-  - share counts carried across the ex-date are put in the day's terms with it, so
-    `mart.fn_daily_market_cap` and the factor panel overstate the cap by the ratio
-    from the ex-date until the first balance sheet filed after it (VHI: 255.9M
-    shares, about 2.24 times its 114.1M, from 2007-03-27 to 2007-05-07).
+- **A spin factor that is not marked is read as a share change.** Every split row is
+  `shares` until marked, and a `shares` row:
+  - scales adjusted volume before the ex-date by the ratio;
+  - puts share counts carried across the ex-date in the day's terms with it, so
+    `mart.fn_daily_market_cap`, the screener and the factor panel overstate the cap
+    by the ratio from the ex-date until the first balance sheet filed after it (VHI:
+    255.9M shares, about 2.24 times its 114.1M, from 2007-03-27 to 2007-05-07).
+  Marked `spin_factor`, it does neither, and the adjusted prices are the same.
 - Name the filing, the prices and the formula in `--note`; the row is the record.
+
+#### Marking spin factors
+
+FMP's spin-offs arrive as split rows, and nothing in a ratio says it is one (21:20
+is a stock dividend), so `fafnir actions mark-spins` marks what the warehouse's own
+evidence names:
+
+- **`operator_note`:** an operator's split whose add names a spin-off in its note
+  (the repairs above);
+- **`sharadar_spinoff`:** an FMP split on the ex-date of a `spinoff` or
+  `spinoffdividend` in Sharadar's ACTIONS for the security's key
+  (`core.vendor_security_event`).
+
+Every other candidate is left a share split: a ratio with a side of 1,000 or more, or
+a spin-off event within 7 days of a split. `--all` lists them with the nearest
+event, to classify by hand with `actions kind`, from the filing:
+
+```bash
+fafnir actions mark-spins --dry-run --all
+fafnir actions mark-spins
+fafnir actions kind 3637912 --spin-factor -m "<filing: what was distributed, the formula>" --dry-run
+fafnir db refresh-marts
+```
+
+- Each change is recorded in `ops.split_kind_change`, with its basis and evidence.
+  `actions kind <ID> --shares` undoes a marking, recorded the same way.
+- Adjustment factors are recomputed in the same transaction (the volume factor reads
+  the kind). Adjusted closes do not move, but one case does: a cash dividend on a
+  spin factor's ex-date is valued against the raw prior close, not re-based by the
+  spin factor as a split's would be (#286's rule is for share splits).
+- A re-run marks only what is new, so run it after a spin-off reaches both feeds.
+  The kind is the row's, and no loader writes it: FMP revising a marked row's ratio
+  keeps it, and `actions redate` and `security split-history` carry it. A row that
+  is deleted and comes back from the feed (a revoked `actions delete`) comes back
+  `shares`; `mark-spins` marks it again where a rule holds.
 
 ### A dividend on a split's ex-date is per post-split share
 
