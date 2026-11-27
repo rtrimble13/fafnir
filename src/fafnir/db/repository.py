@@ -3331,7 +3331,7 @@ def corporate_actions_for(db: Database, security_id: int) -> list[dict]:
     return db.fetchall(
         """
         SELECT action_type, ex_date, split_numerator, split_denominator,
-               dividend_amount, source
+               dividend_amount, source, split_kind
         FROM core.corporate_action
         WHERE security_id = %s
         ORDER BY ex_date ASC
@@ -3370,6 +3370,17 @@ def delete_corporate_action(
 # ---------------------------------------------------------------------------
 
 OPERATOR_SOURCE = "operator"
+
+#: What a split row is (core.corporate_action.split_kind, migration 0048, #283): a
+#: share split, or a spin-off's total-return factor stored as a split
+#: (spin-as-split, #282), which the price factors read and the share counts and
+#: adjusted volume do not.
+SPLIT_KIND_SHARES = "shares"
+SPLIT_KIND_SPIN = "spin_factor"
+SPLIT_KINDS = (SPLIT_KIND_SHARES, SPLIT_KIND_SPIN)
+#: Why a row's kind changed (ops.split_kind_change.basis): by hand; the operator's
+#: add names a spin-off; Sharadar's ACTIONS has a spin-off on the ex-date.
+SPLIT_KIND_BASES = ("operator", "operator_note", "sharadar_spinoff")
 
 #: Why an operator edit was made (ops.operator_override.reason, migration 0028).
 #: Only a ``data_error`` override is a statement that the vendor's row was wrong,
@@ -3451,7 +3462,7 @@ def corporate_action_by_id(db: Database, corporate_action_id: int) -> Optional[d
                ca.action_type, ca.ex_date, ca.record_date, ca.payment_date,
                ca.declaration_date, ca.split_numerator, ca.split_denominator,
                ca.dividend_amount, ca.currency, ca.source, ca.ingestion_run_id,
-               ca.loaded_at
+               ca.loaded_at, ca.split_kind
           FROM core.corporate_action ca
           JOIN core.security s USING (security_id)
          WHERE ca.corporate_action_id = %s
@@ -3466,7 +3477,7 @@ def corporate_action_at(
     return db.fetchone(
         """
         SELECT corporate_action_id, action_type, ex_date, split_numerator,
-               split_denominator, dividend_amount, source
+               split_denominator, dividend_amount, source, split_kind
           FROM core.corporate_action
          WHERE security_id = %s AND action_type = %s AND ex_date = %s
         """,
@@ -3496,7 +3507,8 @@ def list_corporate_actions(
     return db.fetchall(
         f"""
         SELECT corporate_action_id, action_type, ex_date, split_numerator,
-               split_denominator, dividend_amount, currency, source, loaded_at
+               split_denominator, dividend_amount, currency, source, loaded_at,
+               split_kind
           FROM core.corporate_action
          WHERE {' AND '.join(clauses)}
          ORDER BY ex_date, action_type
@@ -3518,6 +3530,239 @@ _SPLIT_OF_ANOTHER_VENDOR = """
         false
     )
 """
+
+
+def set_split_kind(
+    db: Database,
+    *,
+    corporate_action_id: int,
+    kind: str,
+    basis: str,
+    note: str,
+    created_by: str,
+    evidence: Optional[dict] = None,
+) -> Optional[int]:
+    """Mark a split row a spin factor or a share split (#283), and record the change
+    in ``ops.split_kind_change``. Returns the change id, or None when the row is
+    already of that kind (nothing changes, nothing is recorded).
+
+    Only the kind changes: the ratio, the source and the load lineage stay, so the
+    reconciliation and the loaders see the row they wrote. Does not recompute the
+    adjustment factors: the caller does, once per security.
+    """
+    import json
+
+    if kind not in SPLIT_KINDS:
+        raise OverrideRefused(f"Unknown split kind {kind!r}.")
+    if basis not in SPLIT_KIND_BASES:
+        raise OverrideRefused(f"Unknown basis {basis!r}.")
+    if not (note or "").strip():
+        raise OverrideRefused("A change of kind needs a note: it is the record.")
+    row = corporate_action_by_id(db, corporate_action_id)
+    if row is None:
+        raise OverrideRefused(f"No corporate action {corporate_action_id}.")
+    if row["action_type"] != "split":
+        raise OverrideRefused(
+            f"Corporate action {corporate_action_id} is a {row['action_type']}: only "
+            "a split has a kind."
+        )
+    if row["split_kind"] == kind:
+        return None
+    db.execute(
+        "UPDATE core.corporate_action SET split_kind = %s"
+        " WHERE corporate_action_id = %s",
+        (kind, corporate_action_id),
+    )
+    return int(
+        db.fetchval(
+            """
+            INSERT INTO ops.split_kind_change
+                (corporate_action_id, security_id, ex_date, split_numerator,
+                 split_denominator, source, old_kind, new_kind, basis, evidence,
+                 note, created_by)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING change_id
+            """,
+            (
+                corporate_action_id,
+                row["security_id"],
+                row["ex_date"],
+                row["split_numerator"],
+                row["split_denominator"],
+                row["source"],
+                row["split_kind"],
+                kind,
+                basis,
+                json.dumps(evidence or {}, default=str),
+                note,
+                created_by,
+            ),
+        )
+    )
+
+
+def split_kind_changes(
+    db: Database, *, security_id: Optional[int] = None, limit: int = 0
+) -> list[dict]:
+    """The record of split kinds changed, newest first."""
+    where = "WHERE security_id = %s" if security_id is not None else ""
+    lim = f"LIMIT {int(limit)}" if limit else ""
+    return db.fetchall(
+        f"""
+        SELECT change_id, corporate_action_id, security_id, ex_date, split_numerator,
+               split_denominator, source, old_kind, new_kind, basis, evidence, note,
+               created_by, created_at
+          FROM ops.split_kind_change
+          {where}
+         ORDER BY change_id DESC
+          {lim}
+        """,
+        [security_id] if security_id is not None else [],
+    )
+
+
+#: Sharadar's ACTIONS names for a spin-off on the parent's ticker. The spun-off
+#: company's own row (``spunofffrom``) is not one: no split of the child is a spin
+#: factor.
+SPINOFF_ACTIONS = ("spinoff", "spinoffdividend")
+#: An operator's add whose note matches this names a spin-off (#282's repairs: HON,
+#: NVRI, CTVA, VHI).
+SPIN_NOTE_PATTERN = r"spin|spun"
+#: A spin-off event this many calendar days from a split's ex-date is shown beside
+#: the split for the operator to judge; only the same date marks it.
+SPIN_EVENT_NEAR_DAYS = 7
+#: The shape #283 counted candidates by: a ratio with a side of 1,000 or more. An
+#: upper bound on the spin factors: odd real splits and stock dividends have it too.
+SPIN_SHAPE_MIN = 1000
+
+
+def spin_factor_candidates(
+    db: Database, *, security_id: Optional[int] = None
+) -> list[dict]:
+    """The share splits that may be spin factors (#283), each with ``basis``: the
+    rule that marks it, or None for one left for an operator to classify.
+
+    - ``operator_note``: an operator row whose active add's note names a spin-off.
+    - ``sharadar_spinoff``: an FMP row on the ex-date of a spin-off in Sharadar's
+      ACTIONS (``core.vendor_security_event``, :data:`SPINOFF_ACTIONS`) of a key
+      linked to the security, open or closed.
+    - None: any other split with a side of :data:`SPIN_SHAPE_MIN` or more, or with a
+      spin-off within :data:`SPIN_EVENT_NEAR_DAYS`: an odd split, a stock dividend,
+      or a spin factor no rule can tell.
+
+    Each row has ``event`` (the nearest spin-off event, or None), ``noted`` (the
+    add override's id and note, or None) and ``dividend_same_day``: a cash dividend
+    on the ex-date, the one case whose adjusted prices a marking moves (the dividend
+    is no longer re-based by the ratio). Rows already marked are not candidates.
+    """
+    rows = db.fetchall(
+        """
+        WITH splits AS (
+            SELECT ca.corporate_action_id, ca.security_id, s.primary_symbol,
+                   ca.ex_date, ca.split_numerator, ca.split_denominator, ca.source
+              FROM core.corporate_action ca
+              JOIN core.security s USING (security_id)
+             WHERE ca.action_type = 'split' AND ca.split_kind = %(shares)s
+               AND (%(sid)s::bigint IS NULL OR ca.security_id = %(sid)s::bigint)
+        ),
+        spin AS (
+            SELECT DISTINCT ON (x.corporate_action_id)
+                   x.corporate_action_id, e.event_date, e.action, e.ticker,
+                   e.contra_ticker, e.contra_name, e.value, e.vendor_key
+              FROM splits x
+              JOIN core.security_vendor_xref l
+                ON l.security_id = x.security_id AND l.vendor = 'sharadar'
+              JOIN core.vendor_security_event e
+                ON e.vendor = 'sharadar' AND e.vendor_key = l.vendor_key
+               AND e.action = ANY(%(actions)s::text[])
+               AND e.event_date BETWEEN x.ex_date - %(near)s AND x.ex_date + %(near)s
+             ORDER BY x.corporate_action_id, abs(e.event_date - x.ex_date),
+                      e.event_date, e.action
+        ),
+        noted AS (
+            SELECT DISTINCT ON (x.corporate_action_id)
+                   x.corporate_action_id, o.override_id, o.note
+              FROM splits x
+              JOIN ops.operator_override o
+                ON o.security_id = x.security_id AND o.target = 'corporate_action'
+               AND o.action_type = 'split' AND o.key_date = x.ex_date
+               AND o.operation = 'add' AND o.revoked_at IS NULL
+             WHERE x.source = %(operator)s AND o.note ~* %(pattern)s
+             ORDER BY x.corporate_action_id, o.override_id DESC
+        )
+        SELECT x.*,
+               sp.event_date, sp.action AS event_action, sp.ticker AS event_ticker,
+               sp.contra_ticker, sp.contra_name, sp.value AS event_value,
+               sp.vendor_key AS event_vendor_key,
+               n.override_id, n.note AS override_note,
+               EXISTS (SELECT 1 FROM core.corporate_action d
+                        WHERE d.security_id = x.security_id
+                          AND d.action_type = 'dividend'
+                          AND d.ex_date = x.ex_date) AS dividend_same_day
+          FROM splits x
+          LEFT JOIN spin sp USING (corporate_action_id)
+          LEFT JOIN noted n USING (corporate_action_id)
+         WHERE sp.corporate_action_id IS NOT NULL
+            OR n.corporate_action_id IS NOT NULL
+            OR x.split_numerator >= %(shape)s OR x.split_denominator >= %(shape)s
+         ORDER BY x.security_id, x.ex_date
+        """,
+        {
+            "shares": SPLIT_KIND_SHARES,
+            "sid": security_id,
+            "actions": list(SPINOFF_ACTIONS),
+            "near": SPIN_EVENT_NEAR_DAYS,
+            "operator": OPERATOR_SOURCE,
+            "pattern": SPIN_NOTE_PATTERN,
+            "shape": SPIN_SHAPE_MIN,
+        },
+    )
+    out = []
+    for r in rows:
+        event = (
+            {
+                "event_date": r["event_date"],
+                "action": r["event_action"],
+                "ticker": r["event_ticker"],
+                "contra_ticker": r["contra_ticker"],
+                "contra_name": r["contra_name"],
+                "value": r["event_value"],
+                "vendor_key": r["event_vendor_key"],
+            }
+            if r["event_date"] is not None
+            else None
+        )
+        noted = (
+            {"override_id": r["override_id"], "note": r["override_note"]}
+            if r["override_id"] is not None
+            else None
+        )
+        if noted is not None:
+            basis = "operator_note"
+        elif (
+            event is not None
+            and event["event_date"] == r["ex_date"]
+            and r["source"] == "fmp"
+        ):
+            basis = "sharadar_spinoff"
+        else:
+            basis = None
+        out.append(
+            {
+                "corporate_action_id": r["corporate_action_id"],
+                "security_id": r["security_id"],
+                "primary_symbol": r["primary_symbol"],
+                "ex_date": r["ex_date"],
+                "split_numerator": r["split_numerator"],
+                "split_denominator": r["split_denominator"],
+                "source": r["source"],
+                "basis": basis,
+                "event": event,
+                "noted": noted,
+                "dividend_same_day": bool(r["dividend_same_day"]),
+            }
+        )
+    return out
 
 
 def suppressed_action_keys(
@@ -3675,14 +3920,20 @@ def add_operator_action(
     created_by: str,
     detail_extra: Optional[dict] = None,
     reason: str = DEFAULT_OVERRIDE_REASON,
+    split_kind: str = SPLIT_KIND_SHARES,
 ) -> tuple[int, int]:
     """Write a corporate action the feed has wrong or missing.
 
     Returns ``(corporate_action_id, override_id)``. Refuses a key that already holds
     a row -- delete that one first, so the record says what was replaced -- and a
     future ex-date, for the reason the loader refuses one (see the module docstring of
-    fafnir.ingest.corporate_actions).
+    fafnir.ingest.corporate_actions). ``split_kind`` is a split's
+    (:data:`SPLIT_KINDS`): ``spin_factor`` for a spin-off stored as a split.
     """
+    if split_kind not in SPLIT_KINDS:
+        raise OverrideRefused(f"Unknown split kind {split_kind!r}.")
+    if split_kind != SPLIT_KIND_SHARES and action_type != "split":
+        raise OverrideRefused("Only a split can be a spin factor.")
     if action_type == "split":
         if not (
             split_numerator
@@ -3717,8 +3968,9 @@ def add_operator_action(
             """
             INSERT INTO core.corporate_action
                 (security_id, action_type, ex_date, split_numerator,
-                 split_denominator, dividend_amount, currency, source, loaded_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+                 split_denominator, dividend_amount, currency, source, split_kind,
+                 loaded_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
             RETURNING corporate_action_id
             """,
             (
@@ -3730,6 +3982,7 @@ def add_operator_action(
                 dividend_amount,
                 currency,
                 OPERATOR_SOURCE,
+                split_kind,
             ),
         )
     )
@@ -3748,6 +4001,7 @@ def add_operator_action(
                     "split_denominator": split_denominator,
                     "dividend_amount": dividend_amount,
                     "currency": currency,
+                    "split_kind": split_kind,
                 }
             ),
             **(detail_extra or {}),
@@ -3826,6 +4080,7 @@ def redate_operator_action(
             "redated_from_override": delete_id,
         },
         reason=reason,
+        split_kind=row["split_kind"],
     )
     db.execute(
         "UPDATE ops.operator_override SET detail = detail || %s WHERE override_id = %s",
@@ -4304,9 +4559,10 @@ def revoke_price_edit(
             INSERT INTO core.corporate_action
                 (security_id, action_type, ex_date, record_date, payment_date,
                  declaration_date, split_numerator, split_denominator,
-                 dividend_amount, currency, source, ingestion_run_id, loaded_at)
+                 dividend_amount, currency, source, ingestion_run_id, loaded_at,
+                 split_kind)
             VALUES (%s,%s,%s,%s,%s,%s,%s::numeric,%s::numeric,%s::numeric,%s,%s,%s,
-                    COALESCE(%s::timestamptz, now()))
+                    COALESCE(%s::timestamptz, now()), %s)
             ON CONFLICT (security_id, action_type, ex_date) DO NOTHING
             """,
             (
@@ -4323,6 +4579,7 @@ def revoke_price_edit(
                 row.get("source") or "fmp",
                 row.get("ingestion_run_id"),
                 row.get("loaded_at"),
+                row.get("split_kind") or SPLIT_KIND_SHARES,
             ),
         )
     db.execute(
@@ -4998,7 +5255,8 @@ def plan_history_split(
         """
         SELECT corporate_action_id, action_type, ex_date, record_date, payment_date,
                declaration_date, split_numerator, split_denominator,
-               dividend_amount, currency, source, ingestion_run_id, loaded_at
+               dividend_amount, currency, source, ingestion_run_id, loaded_at,
+               split_kind
           FROM core.corporate_action
          WHERE security_id = %s AND ex_date BETWEEN %s AND %s
          ORDER BY ex_date, action_type
@@ -5410,8 +5668,8 @@ def split_security_history(
                 INSERT INTO core.corporate_action
                     (security_id, action_type, ex_date, record_date, payment_date,
                      declaration_date, split_numerator, split_denominator,
-                     dividend_amount, currency, source, loaded_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                     dividend_amount, currency, source, split_kind, loaded_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                 RETURNING corporate_action_id
                 """,
                 (
@@ -5426,6 +5684,7 @@ def split_security_history(
                     a["dividend_amount"],
                     a["currency"],
                     OPERATOR_SOURCE,
+                    a["split_kind"],
                 ),
             )
         )
@@ -5734,9 +5993,10 @@ def undo_history_split(
                 INSERT INTO core.corporate_action
                     (security_id, action_type, ex_date, record_date, payment_date,
                      declaration_date, split_numerator, split_denominator,
-                     dividend_amount, currency, source, ingestion_run_id, loaded_at)
+                     dividend_amount, currency, source, ingestion_run_id, loaded_at,
+                     split_kind)
                 VALUES (%s,%s,%s,%s,%s,%s,%s::numeric,%s::numeric,%s::numeric,%s,%s,
-                        %s, COALESCE(%s::timestamptz, now()))
+                        %s, COALESCE(%s::timestamptz, now()), %s)
                 ON CONFLICT (security_id, action_type, ex_date) DO NOTHING
                 """,
                 (
@@ -5753,6 +6013,7 @@ def undo_history_split(
                     row.get("source") or "fmp",
                     row.get("ingestion_run_id"),
                     row.get("loaded_at"),
+                    row.get("split_kind") or SPLIT_KIND_SHARES,
                 ),
             )
             _revoke(o["override_id"])

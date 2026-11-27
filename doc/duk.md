@@ -453,7 +453,10 @@ warehouse is refused, naming it).
 - Mergers and renames are not corporate actions here: a rename is a ticker period
   (`duk th`), a delisting's reason is `mart.v_security_lifecycle`. A spin-off
   appears as a split row on its ex-date whose ratio is a total-return factor, not a
-  share count (spin-as-split; operations.md, "A spin-off is a split row").
+  share count (spin-as-split; operations.md, "A spin-off is a split row"). Marked
+  (`split_kind`, fafnir #283), the table shows it as `spin factor 224278:100000`, and
+  the footer counts it apart from the splits. JSON and CSV are unchanged, since they
+  are portable's contract: read `mart.v_corporate_action.split_kind` for the kind.
 
 **`duk tc [EXCHANGE] [-s DATE] [-e DATE]`** -- the trading calendar.
 - Without `EXCHANGE`, every venue with a calendar: `first_date`, `last_date`,

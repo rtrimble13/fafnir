@@ -20,7 +20,6 @@ import pytest
 
 from fafnir.db import migrate as m
 from fafnir.db import repository as repo
-from fafnir.ingest import adjustments
 from fafnir.ingest import fundamentals as fu
 
 pytestmark = pytest.mark.integration
@@ -394,7 +393,26 @@ def _warehouse(db, tmp_path):
         ex_date=Y(2020, 8, 28),
         dividend_amount=0.82,
     )
-    adjustments.adjust_all(db, security_ids=[live])
+    # The factors fafnir adjust derives from these two actions, written directly:
+    # this warehouse is built on a schema rolled back to before 0035, and today's
+    # engine reads core.corporate_action.split_kind (0048), which that schema lacks.
+    split, dividend = D("0.25"), (D("500.04") - D("0.82")) / D("500.04")
+    repo.replace_adjustment_factors(
+        db,
+        live,
+        [
+            {
+                "effective_date": Y(2020, 8, 28),
+                "cumulative_price_factor": split * dividend,
+                "cumulative_volume_factor": D(4),
+            },
+            {
+                "effective_date": Y(2020, 8, 31),
+                "cumulative_price_factor": split,
+                "cumulative_volume_factor": D(4),
+            },
+        ],
+    )
     repo.add_dq_flag_once(
         db, check_name="stale", security_id=dead, record_key={"last_date": "2021-03-31"}
     )

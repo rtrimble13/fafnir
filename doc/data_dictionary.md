@@ -4,10 +4,10 @@ Every schema, table, view, materialized view and function fafnir stores or serve
 with its **grain**, **source**, **units**, **adjustment status** and **update
 cadence**. This is the contract between the warehouse and everything that reads it.
 
-It describes the schema at migration **0047** (`dq_audit`). It was
+It describes the schema at migration **0048** (`split_kind`). It was
 checked against the live catalog at 0040 (`pg_class`, `pg_attribute`,
 `pg_constraint`, `pg_index`, `pg_proc`, the view definitions and the column comments)
-on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's to 0047's objects
+on 2026-10-31; 0041 adds calendar rows and changes no object. 0042's to 0048's objects
 are described from the migrations and their tests. A migration that adds, drops or re-types a column updates this file in
 the same pull request: the PR template's first box.
 
@@ -80,6 +80,7 @@ count, the planner's estimate otherwise. They are not maintained.
 | [`ops.data_quality_flag`](#opsdata_quality_flag--quarantineanomaly-queue-grain-dq_flag_id) | table | `dq_flag_id` | the loaders, `dq run`, dorq | 1.56M |
 | [`ops.load_watermark`](#opsload_watermark--incremental-marks-grain-source-endpoint-security_id) | table | `(source, endpoint, security_id)` | the loaders, dorq | 128k |
 | [`ops.operator_override`](#opsoperator_override--operator-corrections-grain-override_id) | table | `override_id` | `actions`, `prices`, `security split-history` | 343k |
+| [`ops.split_kind_change`](#opssplit_kind_change--split-kinds-changed-grain-change_id) | table | `change_id` | `actions kind\|mark-spins` | — |
 | [`ops.vendor_correction`](#opsvendor_correction--rows-one-vendor-replaced-grain-correction_id) | table | `correction_id` | `vendor correct` | 704k |
 | [`ops.dq_label`](#opsdq_label--labels-a-person-stated-grain-label_id) | table | `label_id` | `dq label`, `dq accept\|resolve --label` | 129 |
 | [`ops.api_key`](#opsapi_key--keys-of-the-http-api-grain-key_id) | table | `key_id` | `fafnir api key create\|revoke` | — |
@@ -330,10 +331,11 @@ happened (ADR 0007).
 | `action_type` | TEXT NOT NULL CHECK | `split` or `dividend`. |
 | `ex_date` | DATE NOT NULL | Ex-date (the adjustment boundary). |
 | `record_date` `payment_date` `declaration_date` | DATE | Dividend dates (nullable). |
-| `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. Both `> 0` on a split (`ck_corp_action_split`). A spin-off is also a split row: its ratio is the inverse of the total-return factor, not a share count (spin-as-split, [operations.md](operations.md#a-spin-off-is-a-split-row)). |
+| `split_numerator` / `split_denominator` | NUMERIC(20,6) | 2-for-1 ⇒ 2 / 1. Both `> 0` on a split (`ck_corp_action_split`). A spin-off is also a split row: its ratio is the inverse of the total-return factor, not a share count (spin-as-split, [operations.md](operations.md#a-spin-off-is-a-split-row)); `split_kind` says which. |
+| `split_kind` | TEXT NOT NULL CHECK (0048) | `shares` (default): the split changes the share count by its ratio. `spin_factor`: a spin-off's total-return factor stored as a split (#283). The price factors read both; the share counts (`mart.fn_daily_market_cap`, `mart.v_security_attributes`, the factor panel) and the volume factor skip a spin factor. `shares` on every dividend (`ck_corp_action_spin_factor_split`). Set by `fafnir actions add --spin-factor`, `actions kind` and `actions mark-spins`, each change recorded in `ops.split_kind_change`; no loader writes it, so a vendor's revision of a marked row's ratio keeps the kind. A re-date and a history split carry it. |
 | `dividend_amount` | NUMERIC(20,6) | Cash per share. NOT NULL and `>= 0` on a dividend (`ck_corp_action_dividend`). |
 | `currency` | TEXT NOT NULL | Default `USD`. |
-| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo` (reserved, unused), or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Spin-offs are not stored here, from either vendor: they are events. |
+| `source` | TEXT | Who supplied the row: `fmp`, `sharadar`, `tiingo` (reserved, unused), or `operator` for a row written by `fafnir actions add` / `redate` (see `ops.operator_override`). Writes follow ADR 0015 precedence, as for `core.daily_price.source`: a replaced vendor row is kept in `ops.vendor_correction`. The loaders never overwrite an `operator` row, and the FMP reconciliation compares only `fmp` rows against its feed: an `operator` or `sharadar` row is never reported as drift. `sharadar` rows come from `fafnir ingest sharadar-actions` (#73): every split and dividend of a security Sharadar minted, and, fill-only, what an FMP security linked to Sharadar lacks. A Sharadar dividend is stored as declared (its ACTIONS value times the later splits' product). Sharadar's spin-offs are not stored here: they are events (`core.vendor_security_event`). FMP's are split rows (spin factors), as the operator's spin-as-split repairs are. |
 | `ingestion_run_id` | BIGINT → ops.ingestion_run | The run that last **changed** this row, not the last that read it — an unchanged re-load leaves both lineage columns alone, which is what makes `fafnir adjust --changed` a small set. NULL on an `operator` row. |
 | `loaded_at` | TIMESTAMPTZ | Last change, as above. |
 
@@ -352,7 +354,7 @@ actions load. Deterministic and point-in-time stable.
 | `security_id` | BIGINT NOT NULL → core.security | Primary key `(security_id, effective_date)`. |
 | `effective_date` | DATE NOT NULL | An ex-date boundary. |
 | `cumulative_price_factor` | NUMERIC NOT NULL | Default 1.0. Multiply RAW price by this for `trade_date < effective_date`. Unconstrained scale (0013); `> 0` (`ck_adj_factor_positive`). |
-| `cumulative_volume_factor` | NUMERIC NOT NULL | Default 1.0. Multiply RAW volume by this for `trade_date < effective_date`. Moves inversely to the price factor. `> 0`. |
+| `cumulative_volume_factor` | NUMERIC NOT NULL | Default 1.0. Multiply RAW volume by this for `trade_date < effective_date`. Moves inversely to the price factor, by the share splits only: a spin factor (`split_kind = 'spin_factor'`) moves the price factor and leaves volume alone, since no share count changed (#283). `> 0`. |
 | `computed_at` | TIMESTAMPTZ NOT NULL | |
 
 A bar reads the factor of the **first boundary after its date**. A bar on or after
@@ -758,7 +760,12 @@ computed by the client (`duk.return_utils`), not here.
 Columns: `split_count`, `first_split_date`, `last_split_date`,
 `last_split_numerator`/`_denominator`, `dividend_count`, `first_dividend_date`,
 `last_dividend_date`, `last_dividend_amount`, `last_dividend_currency`,
-`ttm_dividend_amount`, `adjustment_factor_rows`, `latest_factor_effective_date`.
+`ttm_dividend_amount`, `adjustment_factor_rows`, `latest_factor_effective_date`,
+`spin_factor_count`, `last_spin_factor_date`.
+
+The split columns count share splits only (`split_kind = 'shares'`, 0048): a spin-off
+stored as a split is in `spin_factor_count` and `last_spin_factor_date`, so a
+company summary's "last split" is never a spin factor's ratio.
 
 `ttm_dividend_amount` is the 365 days ending at **the security's own latest
 ex-date**, not at `now()` — so the row does not change with the clock, and a
@@ -776,9 +783,13 @@ would double that cost next time. A client wanting back-adjustment depth reads
 
 Columns: `corporate_action_id, security_id, action_type, ex_date, record_date,
 payment_date, declaration_date, split_numerator, split_denominator, dividend_amount,
-currency, source`. `action_type` is `split` or `dividend`; the ratios and the amount
+currency, source, split_kind`. `action_type` is `split` or `dividend`; the ratios and the amount
 are `NUMERIC(20,6)`, as stored. `source` says which vendor supplied the row, or
 `operator` for one written by `fafnir actions add|redate` (ADR 0015 precedence).
+`split_kind` (0048, the last column) is `spin_factor` for a spin-off stored as a
+split, whose ratio is a price factor and no share change, and `shares` otherwise: a
+reader putting share counts or per-share amounts in another day's terms takes the
+`shares` splits only, as the warehouse's own readers do.
 Lineage (`ingestion_run_id`, `loaded_at`) is left out, as in `mart.v_daily_price_raw`.
 
 The event-level counterpart of `mart.v_security_action_summary`, which aggregates and
@@ -953,9 +964,10 @@ clipped or filled.
 | Share factor | `share_factor` (0043, the last column): SF1's, applied; NULL with no count |
 
 - **Share terms** (ADR 0019 §3). `shares_outstanding_as_of` is the basis's count put in
-  `as_of_date`'s terms with the warehouse's splits (`mart.v_corporate_action`), the list
-  the raw prices follow. `market_cap` is the raw close times it: never a vendor
-  snapshot. EPS and dividends per share are in the same terms.
+  `as_of_date`'s terms with the warehouse's share splits (`mart.v_corporate_action`,
+  `split_kind = 'shares'`; a spin factor changes no count, 0048), the list the raw
+  prices follow. `market_cap` is the raw close times it: never a vendor snapshot. EPS
+  and dividends per share are in the same terms.
 - **The share factor** (0043; [ADR 0019's amendment](adr/0019-derived-metrics-not-vendor-metrics.md#amendment-2026-11-daily-market-cap-and-the-share-factor)).
   SF1's `sharefactor` turns the count into the traded line's: an ADR's ratio, or a
   multi-class issuer's primary class.
@@ -1024,8 +1036,11 @@ security in `[start_date, end_date]` (NULL leaves that end open), ordered by
   in force on the day, if it ended within 730 days. Versions and timelines are ADR
   0018's.
   - **Steps:** it changes on a filing's `known_from`. Between filings only splits move
-    it: × the warehouse's splits with an ex-date in `(known_from, trade_date]`, the
-    expression of the factor panel and `mart.v_security_attributes`.
+    it: × the warehouse's share splits with an ex-date in `(known_from, trade_date]`,
+    the expression of the factor panel and `mart.v_security_attributes`. A spin factor
+    (`split_kind = 'spin_factor'`, 0048) is no share change and does not move it: before
+    0048 the count across a spin-off was × its ratio until the next balance sheet
+    (VHI 2007-03-27 to 05-07: 255.9M shares for 114.1M, #283).
   - **No look-ahead:** a later restatement or filing never reaches an earlier day.
   - **Excluded:** superseded rows.
 - **The share factor** is the same period's income version's in force on the day
@@ -1152,8 +1167,9 @@ of `core.security` is written.
   - **How it is derived** (ADR 0019 §5, `mart.fn_daily_market_cap`'s expression on the
     last bar): the last raw close × `shares_outstanding` of the latest balance sheet in
     force on that day, ended within 730 days, put in that day's share terms with the
-    warehouse's splits, × the period's share factor (0042; 1 where SF1 gives none). It
-    is derived for USD-traded securities only. A test holds it equal to the function.
+    warehouse's share splits (no spin factor, 0048), × the period's share factor (0042;
+    1 where SF1 gives none). It is derived for USD-traded securities only. A test holds
+    it equal to the function.
   - **The record:** `market_cap_source` is `derived`, `market_cap_as_of` the close's date,
     `market_cap_fiscal_date` the balance sheet's period.
   - **Otherwise** (no SF1 shares: funds, ETFs, secondary share classes, names Sharadar
@@ -1585,6 +1601,25 @@ On 2026-10-31: 342,685 overrides.
   rescale transforms), 4,403 `delete`/`out_of_scope` and 388 `delete`/`cleanup`.
 - **Actions:** 702 `delete`/`data_error`, 2,748 `delete`/`cleanup` and 341
   `add`/`data_error`.
+
+### `ops.split_kind_change` — split kinds changed. **Grain:** `change_id`.
+Every change of a split row's `core.corporate_action.split_kind` (migration 0048,
+#283), with the row as it stood. Written by `fafnir actions kind` and `fafnir actions
+mark-spins`, in the transaction that changes the row; a row added as a spin factor
+(`actions add --spin-factor`) is recorded by its add override instead
+(`detail.row.split_kind`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `change_id` | BIGINT IDENTITY PK | |
+| `corporate_action_id`, `security_id`, `ex_date` | BIGINT, BIGINT, DATE | The row. No FK, as `operator_override`: a merge or an operator delete is not blocked, and the record stays. |
+| `split_numerator`, `split_denominator`, `source` | NUMERIC, NUMERIC, TEXT | The row's ratio and source when its kind changed. |
+| `old_kind`, `new_kind` | TEXT CHECK | `shares` / `spin_factor`; never equal. |
+| `basis` | TEXT CHECK | `operator`: by hand (`actions kind`). `operator_note`: `mark-spins`, the operator's add names a spin-off. `sharadar_spinoff`: `mark-spins`, an FMP split on the ex-date of a Sharadar ACTIONS `spinoff`/`spinoffdividend` of the security's key. |
+| `evidence` | JSONB | `mark-spins`: `event` (the Sharadar event: date, action, contra ticker and name, value, key) and `noted` (the add override's id and note). |
+| `note`, `created_by`, `created_at` | TEXT, TEXT, TIMESTAMPTZ | Not blank. |
+
+Indexed on `(security_id, ex_date)`.
 
 ### `ops.vendor_correction` — rows one vendor replaced. **Grain:** `correction_id`.
 Every `core.daily_price` / `core.corporate_action` row a higher-ranked vendor

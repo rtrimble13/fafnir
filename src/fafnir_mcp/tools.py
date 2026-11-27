@@ -819,9 +819,11 @@ def corporate_actions(
         note=(
             "Splits and cash dividends only, one row per event. Entitlement is the "
             "ex_date; the cash arrives on payment_date. A split is "
-            "split_numerator-for-split_denominator. Spinoffs, mergers and renames "
-            "are not corporate actions here: a rename is a ticker period "
-            "(ticker_history)."
+            "split_numerator-for-split_denominator. A split with split_kind "
+            "spin_factor is a spin-off: its ratio is the inverse of the total-return "
+            "factor, which adjusts prices and is no change in the share count. "
+            "Mergers and renames are not corporate actions here: a rename is a "
+            "ticker period (ticker_history)."
         ),
     )
 

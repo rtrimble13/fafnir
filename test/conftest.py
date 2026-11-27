@@ -74,7 +74,7 @@ def db(migrated_dsn):
                      core.security, ops.data_quality_flag, ops.ingestion_run,
                      ops.load_watermark, ops.operator_override, ops.dq_label,
                      ops.dq_audit_item, ops.dq_audit_cycle,
-                     ops.vendor_correction,
+                     ops.vendor_correction, ops.split_kind_change,
                      core.security_vendor_xref, core.security_vendor_rejection,
                      core.vendor_security,
                      core.vendor_security_event,

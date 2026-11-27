@@ -204,6 +204,33 @@ class TestCa:
         csv_out = run(["ca", "AAPL", "--csv"]).output
         assert "4.000000,1.000000" in csv_out, "CSV is the stored text"
 
+    def test_a_spin_factor_is_shown_as_one(self, run, monkeypatch):
+        row = {
+            "ex_date": dt.date(2007, 3, 27),
+            "action_type": "split",
+            "split_numerator": Decimal("224278.000000"),
+            "split_denominator": Decimal("100000.000000"),
+            "dividend_amount": None,
+            "currency": "USD",
+            "record_date": None,
+            "payment_date": None,
+            "declaration_date": None,
+            "corporate_action_id": 4,
+            "security_id": 7,
+            "source": "operator",
+            "split_kind": "spin_factor",
+        }
+        monkeypatch.setattr(
+            ds_db, "corporate_actions", lambda **kw: {"security_id": 7, "rows": [row]}
+        )
+        result = run(["ca", "VHI", "--table"])
+        assert result.exit_code == 0, result.output
+        assert "spin factor 224278:100000" in result.output
+        assert "-for-" not in result.output
+        assert "0 splits · 1 spin factor · 0 dividends" in result.output
+        # JSON and CSV keep portable's contract: no new field.
+        assert "split_kind" not in run(["ca", "VHI", "--csv"]).output
+
     def test_no_such_security(self, run, monkeypatch):
         monkeypatch.setattr(
             ds_db, "corporate_actions", lambda **kw: {"security_id": None, "rows": []}
