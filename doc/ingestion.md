@@ -397,6 +397,23 @@ fafnir ingest fundamentals                         # the SF1 deltas since the la
   report and loads as version 1, known from its date. The later ones are counted
   (`later_filing`) and not loaded: what they change reaches the period through its
   restated row, as a restatement. Rows that differ only in `lastupdated` are one row.
+- **Re-dated periods.** SF1 sometimes corrects a period's `reportperiod`, the filing
+  unchanged: a 52/53-week year end moved by a few days (GAP's FY2012 from 2013-01-29 to
+  2013-02-02). A period is keyed by its `reportperiod`, so before planning, an incoming
+  period is matched to a held one of the same key, period type and fiscal label, at
+  most 14 days apart, with the same first filing (or neither filed), that the rows do
+  not also carry, and that was last loaded no later than their file was fetched. With
+  nothing held under the new date, the held period's versions move to it: copied with
+  their values and knowledge intervals, the originals superseded, so a `load_as_of`
+  read before the run still finds them. With the new date already held, the old one
+  is superseded. Both are corrections in `fundamentals_vendor_correction`, moving
+  `fiscal_date`. Distinct periods SF1 files under one label (a fiscal-year change, a
+  transition year) differ in filing or lie further apart, and none matched on
+  production. A file older than the load that moved a period does not bring the old
+  date back: its rows for that period are counted `stale_date` and not read.
+  `fafnir ingest fundamentals --redated [--symbols ...] [--dry-run]` retires the pairs
+  loads before this rule kept, from the database alone: of the two, the one first
+  written after the other was last written is SF1's.
 - **Flags.** Restatements are flagged `fundamentals_restatement` and corrections
   `fundamentals_vendor_correction`, once per security and run, with the largest moves.
   A restatement is `warn` from the nightly and `info` from a backfill, which observes

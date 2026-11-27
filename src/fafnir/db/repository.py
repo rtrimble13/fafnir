@@ -8223,6 +8223,131 @@ def supersede_statement_row(
     )
 
 
+#: The columns a re-dating sets rather than copies.
+_REDATE_SET = (
+    "fiscal_date",
+    "calendar_date",
+    "loaded_at",
+    "superseded_at",
+    "ingestion_run_id",
+)
+
+
+def redate_statement_period(
+    db: Database,
+    table: str,
+    *,
+    security_id: int,
+    period_type: str,
+    from_date: date,
+    to_date: date,
+    calendar_date: Optional[date],
+    run_id: Optional[int],
+) -> int:
+    """Re-date a period SF1 moved: copy its current rows, every version, to
+    ``to_date`` (values, versions and knowledge intervals as they are, ``extra``
+    byte for byte), then supersede the originals, so a read on the load timeline
+    before now still finds them. Returns rows copied."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    schema, name = table.split(".")
+    cols = [
+        r["column_name"]
+        for r in db.fetchall(
+            """
+            SELECT column_name FROM information_schema.columns
+             WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position
+            """,
+            (schema, name),
+        )
+        if r["column_name"] not in _REDATE_SET
+    ]
+    kept = ", ".join(cols)
+    copied = db.execute(
+        f"""
+        INSERT INTO {table} ({kept}, fiscal_date, calendar_date, ingestion_run_id)
+        SELECT {kept}, %s, coalesce(%s, calendar_date), %s FROM {table}
+         WHERE security_id = %s AND period_type = %s AND fiscal_date = %s
+           AND superseded_at IS NULL
+        """,
+        (to_date, calendar_date, run_id, security_id, period_type, from_date),
+    )
+    retire_statement_period(
+        db,
+        table,
+        security_id=security_id,
+        period_type=period_type,
+        fiscal_date=from_date,
+    )
+    return copied
+
+
+def redated_statement_pairs(
+    db: Database,
+    table: str,
+    *,
+    max_days: int,
+    security_ids: Optional[Sequence[int]] = None,
+) -> list[dict]:
+    """Periods a load kept twice when SF1 re-dated them (``ingest.fundamentals``,
+    *Re-dated periods*): two periods of one security and key with current rows, one
+    period type and fiscal label, at most ``max_days`` apart, the same first filing
+    (or neither filed), the newer first written after the older was last written.
+    One row per pair: ``security_id``, ``vendor_key``, ``period_type``,
+    ``old_date``, ``new_date``, ``old_runs``."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    ids = list(security_ids) if security_ids is not None else None
+    return db.fetchall(
+        f"""
+        WITH p AS (
+            SELECT security_id, vendor_key, period_type, fiscal_year, fiscal_period,
+                   fiscal_date, min(loaded_at) AS first_load, max(loaded_at) AS last_load,
+                   min(filing_date) FILTER (WHERE version_no = 1
+                                              AND knowledge_source = 'filed') AS filing,
+                   array_agg(DISTINCT ingestion_run_id) AS runs
+              FROM {table}
+             WHERE superseded_at IS NULL
+               AND (%s::bigint[] IS NULL OR security_id = ANY(%s::bigint[]))
+             GROUP BY security_id, vendor_key, period_type, fiscal_year, fiscal_period,
+                      fiscal_date)
+        SELECT o.security_id, o.vendor_key, o.period_type,
+               o.fiscal_date AS old_date, n.fiscal_date AS new_date, o.runs AS old_runs
+          FROM p o JOIN p n
+            ON n.security_id = o.security_id AND n.vendor_key = o.vendor_key
+           AND n.period_type = o.period_type AND n.fiscal_year = o.fiscal_year
+           AND n.fiscal_period = o.fiscal_period AND n.fiscal_date <> o.fiscal_date
+           AND abs(n.fiscal_date - o.fiscal_date) <= %s
+           AND n.filing IS NOT DISTINCT FROM o.filing
+           AND n.first_load > o.last_load
+         ORDER BY o.security_id, o.period_type, o.fiscal_date, n.fiscal_date
+        """,
+        (ids, ids, max_days),
+    )
+
+
+def retire_statement_period(
+    db: Database,
+    table: str,
+    *,
+    security_id: int,
+    period_type: str,
+    fiscal_date: date,
+) -> int:
+    """Supersede every current row of a period: one SF1 no longer files under this
+    date. Returns rows superseded."""
+    if table not in STATEMENT_TABLES:
+        raise ValueError(f"not a statement table: {table}")
+    return db.execute(
+        f"""
+        UPDATE {table} SET superseded_at = now()
+         WHERE security_id = %s AND period_type = %s AND fiscal_date = %s
+           AND superseded_at IS NULL
+        """,
+        (security_id, period_type, fiscal_date),
+    )
+
+
 def _move_statements(db: Database, *, from_id: int, to_id: int) -> int:
     """Move a security's statements to the one that survives a merge. A period both
     hold keeps the survivor's versions, as bars do: the victim's are dropped, every

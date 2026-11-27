@@ -803,9 +803,15 @@ def _echo_sharadar_prices(result) -> None:
     show_default=True,
 )
 @click.option("--limit", type=int, help="Only the first N vendor keys in scope.")
+@click.option(
+    "--redated",
+    is_flag=True,
+    help="Retire the periods SF1 re-dated that earlier loads kept twice; reads no "
+    "file.",
+)
 @click.option("--dry-run", is_flag=True, help="Read and print counts; write nothing.")
 @click.pass_context
-def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
+def ingest_fundamentals(ctx, backfill, symbols, period, limit, redated, dry_run):
     """Load SF1's statements into the three statement tables (#90; ADR 0018).
 
     \b
@@ -827,6 +833,15 @@ def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
     nothing either. Bad rows are quarantined (fundamentals_* flags) and the rest
     load. One ops.ingestion_run, committed per vendor key.
 
+    SF1 sometimes re-dates a period (a 52/53-week year end moved by days, the
+    filing unchanged): the loader moves the period's versions to the new date.
+    Loads before it kept both dates; --redated retires the older, from the
+    database alone (with --symbols, for those securities), and flags each as a
+    vendor correction.
+
+    \b
+      fafnir ingest fundamentals --redated --dry-run
+
     A run for some securities, periods or keys leaves the delta files pending for
     the rest. A security linked after the backfill gets its history from
     --backfill --symbols. Until a backfill has loaded the statements, the nightly
@@ -838,6 +853,10 @@ def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
 
     if limit is not None and limit < 1:
         raise click.ClickException("--limit is a positive number of keys.")
+    if redated and (backfill or limit is not None or period != "both"):
+        raise click.ClickException(
+            "--redated reads no file: it takes --symbols and --dry-run only."
+        )
     cfg = ctx.obj["config"]
     with Database(cfg.dsn) as database:
         ids = None
@@ -848,6 +867,11 @@ def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
                 (ids.append(sid) if sid is not None else missing.append(sym))
             if missing:
                 raise click.ClickException(f"No security for: {', '.join(missing)}")
+        if redated:
+            _echo_redated(
+                fu.retire_redated(database, security_ids=ids, dry_run=dry_run)
+            )
+            return
         try:
             result = fu.load(
                 database,
@@ -861,6 +885,24 @@ def ingest_fundamentals(ctx, backfill, symbols, period, limit, dry_run):
         except (fu.FundamentalsError, SharadarFileError, FileNotFoundError) as exc:
             raise click.ClickException(str(exc)) from exc
     _echo_fundamentals(result)
+
+
+def _echo_redated(result) -> None:
+    n = len(result.retired)
+    head = (
+        f"Dry run: {n} re-dated periods would be retired"
+        if result.dry_run
+        else (
+            f"Run {result.run_id}: {n} re-dated periods retired"
+            if result.run_id is not None
+            else "No re-dated periods to retire"
+        )
+    )
+    click.echo(f"{head}, on {result.securities} securities.")
+    for table, sid, period_type, old, new in result.retired:
+        click.echo(f"  {table:<26} {sid:>8} {period_type:<8} {old} -> {new}")
+    if result.ambiguous:
+        click.echo(f"  left alone, matched to more than one period: {result.ambiguous}")
 
 
 def _echo_fundamentals(result) -> None:
