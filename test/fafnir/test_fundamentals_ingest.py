@@ -747,3 +747,195 @@ def test_the_command(db, tmp_path, monkeypatch):
     out = run()
     assert out.exit_code == 0, out.output
     assert "SF1 delta file(s): none." in out.output
+
+
+# ---------------------------------------------------------------------------
+# Re-dated periods: SF1 moves a period's reportperiod, the filing unchanged
+# ---------------------------------------------------------------------------
+
+OLD_END, NEW_END, CAL = "2013-01-29", "2013-02-02", "2012-12-31"
+
+
+def _year(end, **values):
+    """FY2012 and its Q4 as filed 2013-03-26 and FY2012 restated, ending ``end``:
+    GAP's year SF1 moved to its 53rd week (2026-11-26)."""
+    return (
+        _row("ARY", end, "2013-03-26", "2012-FY", calendardate=CAL, **values),
+        _row("MRY", end, "", "2012-FY", calendardate=CAL, revenue=990, **values),
+        _row("ARQ", end, "2013-03-26", "2012-Q4", calendardate=CAL, **values),
+    )
+
+
+def _redating(db, tmp_path):
+    """A backfill holding the old date and a delta re-dating it."""
+    sid = _security(db, "ZZA", KEY)
+    _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(*_year(OLD_END), _row("ARQ", "2012-10-27", "2012-12-05", "2012-Q3")),
+    )
+    _record(db, tmp_path, "actions", ACTIONS)
+    fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
+    _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(*_year(NEW_END, stamp="2026-10-24")),
+        kind="delta",
+        since="2026-10-24",
+    )
+    return sid
+
+
+def _current(db, sid, table="core.income_statement"):
+    return {
+        (r["period_type"], r["fiscal_date"], r["version_no"]): r
+        for r in _rows(db, table, sid)
+        if r["superseded_at"] is None
+    }
+
+
+def test_the_nightly_redates_a_period_sf1_moved(db, tmp_path):
+    sid = _redating(db, tmp_path)
+    result = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+
+    for table in repo.STATEMENT_TABLES:
+        current = _current(db, sid, table)
+        assert {d for _, d, _ in current} == {Y(2012, 10, 27), Y(2013, 2, 2)}, table
+    income = _current(db, sid)
+    # The versions moved as they were: the restatement still known from the
+    # backfill, not from tonight.
+    v1, v2 = income[("annual", Y(2013, 2, 2), 1)], income[("annual", Y(2013, 2, 2), 2)]
+    assert (v1["knowledge_source"], v1["known_from"], v1["known_to"]) == (
+        "filed",
+        Y(2013, 3, 26),
+        BACKFILL_DAY,
+    )
+    assert (v2["knowledge_source"], v2["known_from"], v2["known_to"]) == (
+        "observed",
+        BACKFILL_DAY,
+        None,
+    )
+    assert (v2["revenue"], v2["calendar_date"]) == (D("990.00"), Y(2012, 12, 31))
+    assert v2["ingestion_run_id"] == result.run_id
+    # The old date is superseded, not deleted: the load timeline still holds it.
+    old = [r for r in _rows(db, sid=sid) if r["fiscal_date"] == Y(2013, 1, 29)]
+    assert len(old) == 3 and all(r["superseded_at"] is not None for r in old)
+    assert result.counts["income:redated"] == 2
+    assert result.counts["income:unchanged"] == 3
+    # The copies: FY's two versions and Q4 in income, FY and Q4 elsewhere (the
+    # restatement moved revenue only).
+    assert result.written == 3 + 2 + 2
+
+    (flag,) = _flags(db, fu.CORRECTION)
+    assert flag["detail"]["redated"] == 6
+    assert flag["detail"]["largest"][0]["moved"] == {
+        "fiscal_date": ["2013-01-29", "2013-02-02"]
+    }
+    _invariants(db)
+
+    # Nothing pending; and a backfill from the older full file, which still files
+    # the old date, does not bring it back.
+    again = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert (again.files, again.written) == ([], 0)
+    before = {t: _current(db, sid, t) for t in repo.STATEMENT_TABLES}
+    stale = fu.load(db, tmp_path, backfill=True, as_of=NIGHT)
+    assert stale.counts["statements:stale_date"] == 2
+    assert stale.written == 0
+    assert {t: _current(db, sid, t) for t in repo.STATEMENT_TABLES} == before
+
+
+def test_periods_sf1_files_apart_are_not_redated(db, tmp_path):
+    sid = _security(db, "ZZA", KEY)
+    # Two quarters one file holds under one label and filing: both are SF1's.
+    _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(
+            _row("ARQ", "2020-03-20", "2020-05-01", "2020-Q1"),
+            _row("ARQ", "2020-03-31", "2020-05-01", "2020-Q1", revenue=1100),
+            _row("ARQ", "2021-03-20", "2021-05-01", "2021-Q1"),
+        ),
+    )
+    _record(db, tmp_path, "actions", ACTIONS)
+    fu.load(db, tmp_path, backfill=True, as_of=BACKFILL_DAY)
+    # A new period beside a held one, ten days on, under another filing.
+    _record(
+        db,
+        tmp_path,
+        "fundamentals",
+        _sf1(_row("ARQ", "2021-03-30", "2021-05-14", "2021-Q1", stamp="2026-10-24")),
+        kind="delta",
+        since="2026-10-24",
+    )
+    result = fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert {d for _, d, _ in _current(db, sid)} == {
+        Y(2020, 3, 20),
+        Y(2020, 3, 31),
+        Y(2021, 3, 20),
+        Y(2021, 3, 30),
+    }
+    assert result.counts["income:redated"] == 0
+    assert not _flags(db, fu.CORRECTION)
+
+
+def test_retire_redated_repairs_a_period_kept_twice(db, tmp_path, monkeypatch):
+    sid = _redating(db, tmp_path)
+    # The nightly before the rule: both dates kept.
+    monkeypatch.setattr(fu, "REDATE_DAYS", -1)
+    fu.load(db, tmp_path, backfill=False, as_of=NIGHT)
+    assert {d for _, d, _ in _current(db, sid)} == {
+        Y(2012, 10, 27),
+        Y(2013, 1, 29),
+        Y(2013, 2, 2),
+    }
+    monkeypatch.undo()
+
+    dry = fu.retire_redated(db, dry_run=True)
+    assert (len(dry.retired), dry.securities, dry.ambiguous) == (6, 1, 0)
+    assert {r[3:] for r in dry.retired} == {(Y(2013, 1, 29), Y(2013, 2, 2))}
+    assert len(_current(db, sid)) == 1 + (2 + 1) * 2  # untouched
+
+    done = fu.retire_redated(db)
+    for table in repo.STATEMENT_TABLES:
+        assert {d for _, d, _ in _current(db, sid, table)} == {
+            Y(2012, 10, 27),
+            Y(2013, 2, 2),
+        }
+    run = db.fetchone(
+        "SELECT endpoint, params FROM ops.ingestion_run WHERE ingestion_run_id = %s",
+        (done.run_id,),
+    )
+    assert run["endpoint"] == fu.REDATED_ENDPOINT
+    assert (run["params"]["retired"], run["params"]["securities"]) == (6, 1)
+    (flag,) = [
+        f
+        for f in _flags(db, fu.CORRECTION)
+        if f["record_key"] == {"ingestion_run_id": done.run_id}
+    ]
+    assert flag["detail"]["redated"] == 6
+    _invariants(db)
+    assert fu.retire_redated(db).retired == []
+
+
+def test_the_redated_command(db, tmp_path, monkeypatch):
+    _redating(db, tmp_path)
+    monkeypatch.setenv("FAFNIR_DSN", db.dsn)
+    rc = tmp_path / "fafnirrc"
+    rc.write_text(f'[sharadar]\nbulk_dir = "{tmp_path}"\n')
+
+    def run(*args):
+        return CliRunner().invoke(
+            cli.main, ["--config", str(rc), "ingest", "fundamentals", *args]
+        )
+
+    out = run("--redated", "--dry-run")
+    assert out.exit_code == 0, out.output
+    assert "Dry run: 0 re-dated periods would be retired, on 0 securities." in (
+        out.output
+    )
+    out = run("--redated", "--backfill")
+    assert out.exit_code != 0
+    assert "--redated reads no file" in out.output

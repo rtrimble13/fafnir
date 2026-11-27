@@ -40,6 +40,23 @@ fafnir does not link is outside the universe, and only counted.
    issuer's first filing for a period ending on or after it (``estimated``), or with
    none from the load day (``observed``).
 
+**Re-dated periods.** SF1 sometimes corrects a period's ``reportperiod``: a
+52/53-week year end moved by a few days (GAP's FY2012 from 2013-01-29 to 2013-02-02),
+the filing unchanged. A period is keyed by its ``reportperiod``, so the corrected row
+would be a second period beside the first, both in force. Before planning, an
+incoming period is matched to a held one of the same key, period type and fiscal
+label (``2012-FY``), at most :data:`REDATE_DAYS` apart, with the same first filing (or
+neither filed), that this batch of rows does not also carry and that was last loaded
+no later than the file was fetched (an older file never undoes a newer load). With
+nothing held under the new date, the held period's versions are re-dated: copied to
+it, intervals and values unchanged, and the originals superseded. With the new date
+already held, a load before this rule kept both, and the old one is superseded
+(retired). Both are vendor corrections (``fundamentals_vendor_correction``, moving
+``fiscal_date``). SF1 also holds distinct periods under one label (a fiscal-year
+change, a transition year): their filings differ, or they lie further apart, or one
+file holds both, and none of them matches. :func:`retire_redated` retires the pairs
+the loader kept before this rule, from the database alone.
+
 **Share terms** (§4.7). A version is stored in the terms of its ``known_from``. SF1's
 share counts are in today's terms, so they are divided by the product of Sharadar's
 splits (ACTIONS, as exact ratios) with an ex-date after that day, and rounded to the
@@ -78,7 +95,7 @@ import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -157,6 +174,10 @@ SHARE_TOLERANCE = Decimal(1000)
 SHARE_RELATIVE = Decimal("0.000001")
 #: The cover count: first-reported rows only, and never compared for a restatement.
 COVER_COUNT = "shares_outstanding"
+#: The furthest a period's end moves when SF1 re-dates it. On production
+#: (2026-11-27) every re-dated pair lay within 6 days, and no two periods one file
+#: holds under one label and filing lay within 14.
+REDATE_DAYS = 14
 #: Entries a restatement or correction flag lists, the largest moves first.
 FLAG_ENTRIES = 10
 FLAG_FIELDS = 5
@@ -382,6 +403,8 @@ class Version:
     fiscal_period: Optional[str] = None
     reported_currency: Optional[str] = None
     extra: dict = field(default_factory=dict)
+    #: When the row was written: held rows only.
+    loaded_at: Optional[datetime] = None
     #: Planned by this run, not yet written: closing it sets its ``known_to``
     #: before the insert, rather than updating a row.
     planned: bool = False
@@ -404,22 +427,31 @@ class Version:
             values={i.column: row[i.column] for i in fm.STATEMENTS[statement]},
             content_hash=row["content_hash"],
             vendor_key=row["vendor_key"],
+            calendar_date=row.get("calendar_date"),
+            fiscal_year=row.get("fiscal_year"),
+            fiscal_period=row.get("fiscal_period"),
+            loaded_at=row.get("loaded_at"),
         )
 
 
 @dataclass(frozen=True)
 class Op:
     """One write: ``supersede`` a version's current row, ``close`` the version in
-    force (set its ``known_to``), or ``insert`` a row."""
+    force (set its ``known_to``), ``insert`` a row, ``redate`` a whole period (its
+    current rows copied to ``to_date``, the originals superseded) or ``retire`` one
+    (every current row superseded)."""
 
     kind: str
     version: Version
     known_to: Optional[date] = None
+    to_date: Optional[date] = None
+    calendar_date: Optional[date] = None
 
 
 @dataclass
 class Event:
-    kind: str  # inserted, unchanged, corrected, restated, refused, other_key
+    kind: str  # inserted, unchanged, corrected, restated, refused, other_key,
+    # redated, retired
     statement: str
     period: tuple[str, date]
     version: Optional[Version] = None
@@ -445,6 +477,14 @@ class Book:
             v for v in self.versions(statement, period).values() if v.known_to is None
         ]
         return max(open_, key=lambda v: v.version_no) if open_ else None
+
+    def periods(self, statement: str) -> list[tuple]:
+        return [
+            p for (s, p), versions in self._rows.items() if s == statement and versions
+        ]
+
+    def drop(self, statement: str, period: tuple) -> dict[int, Version]:
+        return self._rows.pop((statement, period), {})
 
     def filings(self) -> list[tuple[date, date]]:
         """``(fiscal_date, filing_date)`` of every filed version held."""
@@ -506,13 +546,24 @@ def plan(
     currency: Optional[str],
     splits: Sequence[tuple[date, Fraction]],
     as_of: date,
+    file_time: Optional[datetime] = None,
 ) -> tuple[list[Op], list[Event]]:
-    """What one security's rows write, in order, and why: first-reported rows first
-    (corrections), then restated rows (restatements), per statement (§4.6). ``book``
-    is updated as it goes, so a restated row meets the version its first-reported
-    twin just wrote."""
+    """What one security's rows write, in order, and why: re-dated periods first,
+    then first-reported rows (corrections), then restated rows (restatements), per
+    statement (§4.6). ``book`` is updated as it goes, so a restated row meets the
+    version its first-reported twin just wrote. ``file_time`` is when the rows' file
+    was fetched: a held period loaded after it is never re-dated or retired."""
     ops: list[Op] = []
     events: list[Event] = []
+    stale: set[tuple] = set()
+    for statement in fm.STATEMENTS:
+        stale |= _redate(statement, rows, book, ops, events, vendor_key, file_time)
+    if stale:
+        # A file older than the load that re-dated these periods: its rows are the
+        # date SF1 has since moved, and are not read (an older file never undoes a
+        # newer load).
+        events += [Event("stale_date", "statements", p) for p in sorted(stale)]
+        rows = [r for r in rows if r.period not in stale]
     filings = sorted(
         {(r.fiscal_date, r.filing_date) for r in rows if r.first_reported}
         | set(book.filings())
@@ -542,6 +593,77 @@ def plan(
                     estimated_from=next_filing(row.fiscal_date),
                 )
     return ops, events
+
+
+def _label(versions: dict[int, Version]) -> tuple:
+    v = next(iter(versions.values()))
+    return v.fiscal_year, v.fiscal_period
+
+
+def _v1_filing(versions: dict[int, Version]) -> Optional[date]:
+    """Version 1's filing date when it was filed, else None."""
+    v1 = versions.get(1)
+    return v1.filing_date if v1 is not None and v1.knowledge_source == FILED else None
+
+
+def _redate(statement, rows, book, ops, events, vendor_key, file_time) -> set[tuple]:
+    """Match each incoming period to a held one SF1 has re-dated (the module's
+    *Re-dated periods*), and re-date or retire it. Returns the incoming periods
+    whose match was loaded after the rows' file was fetched: rows of a date SF1 has
+    since moved."""
+    stale: set[tuple] = set()
+    incoming: dict[tuple, list[Sf1Row]] = defaultdict(list)
+    for r in rows:
+        incoming[r.period].append(r)
+    claimed: set[tuple] = set()
+    for period, group in sorted(incoming.items()):
+        first = [r for r in group if r.first_reported]
+        label = (group[0].fiscal_year, group[0].fiscal_period)
+        calendar = (first or group)[0].calendar_date
+        held_new = book.versions(statement, period)
+        if any(v.vendor_key != vendor_key for v in held_new.values()):
+            continue
+        if first:
+            filing = first[0].filing_date
+        elif held_new:
+            filing = _v1_filing(held_new)
+        else:
+            filing = None
+        matches, newer = [], []
+        for other in book.periods(statement):
+            if other == period or other in incoming or other in claimed:
+                continue
+            if other[0] != period[0] or abs((other[1] - period[1]).days) > REDATE_DAYS:
+                continue
+            versions = book.versions(statement, other)
+            if _label(versions) != label or _v1_filing(versions) != filing:
+                continue
+            if any(v.vendor_key != vendor_key for v in versions.values()):
+                continue
+            loaded = [v.loaded_at for v in versions.values() if v.loaded_at is not None]
+            if file_time is not None and loaded and max(loaded) > file_time:
+                newer.append(other)  # held from a newer file than these rows'
+                continue
+            matches.append(other)
+        if newer and not held_new:
+            stale.add(period)
+            continue
+        if len(matches) != 1:
+            continue  # none, or no telling which
+        (old,) = matches
+        claimed.add(old)
+        versions = book.drop(statement, old)
+        force = max(versions.values(), key=lambda v: v.version_no)
+        change = {"fiscal_date": (old[1], period[1])}
+        if held_new:
+            ops.append(Op("retire", force))
+            events.append(Event("retired", statement, period, force, change))
+            continue
+        ops.append(Op("redate", force, to_date=period[1], calendar_date=calendar))
+        for v in versions.values():
+            book.put(replace(v, fiscal_date=period[1], calendar_date=calendar))
+        events.append(Event("redated", statement, period, force, change))
+    return stale
 
 
 def _first_reported(statement, row, book, ops, events, vendor_key, currency, splits):
@@ -692,8 +814,11 @@ def _json(value) -> str:
 def _write(db: Database, security_id: int, ops: Sequence[Op], run_id: int) -> int:
     """Apply one security's ops: the updates in order, then the inserts, one batch per
     table. An update touches only a row already written (a planned version is closed
-    in its insert), so every update can go first. Returns rows inserted."""
+    in its insert), so every update can go first; a re-dating, which copies a
+    period's rows in SQL, is one of them, and precedes the updates to its copies.
+    Returns rows inserted, a re-dating's copies included."""
     inserts: dict[str, list[dict]] = defaultdict(list)
+    copied = 0
     for op in ops:
         v = op.version
         table = fm.TABLES[v.statement]
@@ -703,7 +828,26 @@ def _write(db: Database, security_id: int, ops: Sequence[Op], run_id: int) -> in
             fiscal_date=v.fiscal_date,
             version_no=v.version_no,
         )
-        if op.kind == "supersede":
+        if op.kind == "redate":
+            copied += repo.redate_statement_period(
+                db,
+                table,
+                security_id=security_id,
+                period_type=v.period_type,
+                from_date=v.fiscal_date,
+                to_date=op.to_date,
+                calendar_date=op.calendar_date,
+                run_id=run_id,
+            )
+        elif op.kind == "retire":
+            repo.retire_statement_period(
+                db,
+                table,
+                security_id=security_id,
+                period_type=v.period_type,
+                fiscal_date=v.fiscal_date,
+            )
+        elif op.kind == "supersede":
             repo.supersede_statement_row(db, table, **where)
         elif op.kind == "close":
             repo.close_statement_version(db, table, known_to=op.known_to, **where)
@@ -729,7 +873,7 @@ def _write(db: Database, security_id: int, ops: Sequence[Op], run_id: int) -> in
             )
     for table, rows in inserts.items():
         repo.insert_statement_rows(db, table, rows)
-    return sum(len(rows) for rows in inserts.values())
+    return copied + sum(len(rows) for rows in inserts.values())
 
 
 # ---------------------------------------------------------------------------
@@ -994,10 +1138,14 @@ def load(
             )
         result.files = [full["file_id"]]
         files, through = [], None
+        file_time = full["fetched_at"]
     else:
         files, through = pending_deltas(db)
         result.files = [f["file_id"] for f in files]
         result.through = through if partial else max(result.files, default=through)
+        # The earliest: a period loaded after any file tonight reads is not
+        # re-dated by it.
+        file_time = min((f["fetched_at"] for f in files), default=None)
     # By the ticker the file files each key's rows under: the full file's, through
     # the TICKERS file fetched with it; a delta's is tonight's (#238).
     targets = {
@@ -1058,6 +1206,7 @@ def load(
                 chosen=chosen,
                 periods=PERIODS[period],
                 as_of=as_of,
+                file_time=file_time,
                 run=run,
                 result=result,
             )
@@ -1102,6 +1251,96 @@ def load(
     with run:
         result.run_id = run.run_id
         scan(run)
+    return result
+
+
+#: The run of :func:`retire_redated`.
+REDATED_ENDPOINT = "fundamentals:redated"
+
+
+@dataclass
+class RedatedResult:
+    dry_run: bool
+    run_id: Optional[int] = None
+    #: ``(table, security_id, period_type, old_date, new_date)``, retired or to be.
+    retired: list[tuple] = field(default_factory=list)
+    #: Pairs left alone: an old period matched to two new ones, or the reverse.
+    ambiguous: int = 0
+    securities: int = 0
+
+
+def retire_redated(
+    db: Database,
+    *,
+    security_ids: Optional[Sequence[int]] = None,
+    dry_run: bool = False,
+) -> RedatedResult:
+    """Retire the periods loads before the *Re-dated periods* rule kept twice: of two
+    periods :func:`repo.redated_statement_pairs` pairs, the older, which SF1 no longer
+    files under that date. Reads no file: the newer period is the later load, and
+    the deltas are applied in the order SF1 wrote them. A vendor correction flag per
+    security, as the loader writes. One run unless ``dry_run``."""
+    result = RedatedResult(dry_run=dry_run)
+    plan_: list[tuple] = []
+    for statement, table in fm.TABLES.items():
+        pairs = repo.redated_statement_pairs(
+            db, table, max_days=REDATE_DAYS, security_ids=security_ids
+        )
+        olds = Counter(
+            (p["security_id"], p["period_type"], p["old_date"]) for p in pairs
+        )
+        news = Counter(
+            (p["security_id"], p["period_type"], p["new_date"]) for p in pairs
+        )
+        for p in pairs:
+            o = (p["security_id"], p["period_type"], p["old_date"])
+            n = (p["security_id"], p["period_type"], p["new_date"])
+            if olds[o] > 1 or news[n] > 1:
+                result.ambiguous += 1
+                continue
+            plan_.append((statement, table, p))
+    result.retired = [
+        (t, p["security_id"], p["period_type"], p["old_date"], p["new_date"])
+        for _, t, p in plan_
+    ]
+    result.securities = len({p["security_id"] for _, _, p in plan_})
+    if dry_run or not plan_:
+        return result
+    run = RunLog(
+        db,
+        source=VENDOR,
+        endpoint=REDATED_ENDPOINT,
+        params={"security_ids": list(security_ids) if security_ids else None},
+    )
+    with run:
+        result.run_id = run.run_id
+        by_security: dict[tuple, list[Event]] = defaultdict(list)
+        for statement, table, p in plan_:
+            repo.retire_statement_period(
+                db,
+                table,
+                security_id=p["security_id"],
+                period_type=p["period_type"],
+                fiscal_date=p["old_date"],
+            )
+            by_security[(p["security_id"], p["vendor_key"])].append(
+                Event(
+                    "retired",
+                    statement,
+                    (p["period_type"], p["new_date"]),
+                    moved={"fiscal_date": (p["old_date"], p["new_date"])},
+                )
+            )
+        for (sid, key), events in sorted(by_security.items()):
+            _flag(db, sid, _Key(key, "", None), events, run=run, backfill=False)
+        run.rows_inserted = 0
+        run.params.update(
+            retired=len(plan_),
+            ambiguous=result.ambiguous,
+            securities=result.securities,
+            by_table=dict(Counter(t for _, t, _ in plan_)),
+        )
+        db.commit()
     return result
 
 
@@ -1169,6 +1408,7 @@ def _load_key(
     chosen: Optional[set[int]],
     periods: Sequence[str],
     as_of: date,
+    file_time: Optional[datetime] = None,
     run: Optional[RunLog],
     result: FundamentalsResult,
 ) -> set[int]:
@@ -1265,6 +1505,7 @@ def _load_key(
             currency=key.currency,
             splits=key.splits,
             as_of=as_of,
+            file_time=file_time,
         )
         _count(result, events)
         if ops:
@@ -1341,7 +1582,7 @@ def _flag(
     and one (standing) for its estimated knowledge dates."""
     for check, kinds, severity in (
         (RESTATEMENT, ("restated",), "info" if backfill else "warn"),
-        (CORRECTION, ("corrected", "refused"), "info"),
+        (CORRECTION, ("corrected", "refused", "redated", "retired"), "info"),
     ):
         hits = [e for e in events if e.kind in kinds]
         if not hits:
@@ -1358,6 +1599,7 @@ def _flag(
                 "vendor_key": key.vendor_key,
                 "by_table": dict(Counter(fm.TABLES[e.statement] for e in hits)),
                 "refused": sum(1 for e in hits if e.kind == "refused"),
+                "redated": sum(1 for e in hits if e.kind in ("redated", "retired")),
                 "largest": [_entry(e) for e in hits[:FLAG_ENTRIES]],
             },
             ingestion_run_id=run.run_id,

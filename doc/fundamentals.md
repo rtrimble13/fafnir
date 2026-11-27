@@ -48,7 +48,10 @@ half-open. How `known_from` was set is `knowledge_source`:
 
 A vendor correction is on the other timeline. When SF1 fixes its record of a filing, the old
 row is superseded (`superseded_at`) and the corrected one takes its version and interval. The
-filing did not change, so what was known when did not either.
+filing did not change, so what was known when did not either. A period SF1 re-dates (a
+year end moved by days, the same filing) is a correction too: its versions move to the new
+`fiscal_date` with their intervals, and the old date is superseded
+([ingestion.md](ingestion.md), *Re-dated periods*).
 
 ### Coverage
 

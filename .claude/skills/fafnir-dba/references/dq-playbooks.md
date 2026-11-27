@@ -1752,6 +1752,12 @@ with `load_as_of` before the run reproduces what fafnir held. Resolve once read.
 correction that moves `known_from` (a corrected filing date) moves what a backtest
 could know, so say so in the note.
 
+An entry whose `moved` is `fiscal_date` is a **re-dated period**: SF1 moved the
+period's end by days, the filing unchanged, and the loader moved its versions to the
+new date (or, with `detail.redated` from a `fundamentals:redated` run, retired the
+old date a load before the rule kept). Nothing a backtest could know moved. Resolve
+once read.
+
 ### `fundamentals_estimated_knowledge_date` — a restated period with no first report
 
 SF1 holds only the restated row, so the period is known from the issuer's next
@@ -1845,6 +1851,13 @@ missing quarter, a mislabelled one, or a fiscal-year change. The panel falls bac
 the fiscal year there. Accept a fiscal-year change; a missing quarter is a coverage
 question for SF1. A year whose quarters are Q2 and Q4 alone is a half-yearly
 reporter's, and not judged.
+
+**Two quarters under one label, days apart, filed the same day** (GAP's 2013-01-29
+and 2013-02-02) are one period SF1 re-dated that a load before the re-dating rule
+kept twice, not a fiscal-year change. Never accept it: run
+`fafnir ingest fundamentals --redated --dry-run`, then for real on a yes, and
+`dq recheck --check fundamentals_ttm_incomplete` (and the cash ties, which the
+duplicate also breaks) closes what it caused.
 
 ### `fundamentals_negative_impossible` — a negative revenue, total assets or share count
 
