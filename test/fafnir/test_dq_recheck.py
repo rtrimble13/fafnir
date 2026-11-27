@@ -41,9 +41,19 @@ def test_recheck_never_covers_a_price_quarantine():
 
 
 def test_every_rule_binds_the_settings_its_sql_asks_for():
-    """A rule whose params do not match its placeholders binds the wrong value."""
+    """A rule whose params do not match its placeholders binds the wrong value.
+
+    Two settings bind several values each (#285): the delivery lag's CTEs and the
+    stale test on it."""
+    width = {
+        "delivery_lag": len(checks.delivery_lag_params("NASDAQ")),
+        "delivery_lag_after_market": len(
+            checks.delivery_lag_params("NASDAQ", own_reference=False)
+        ),
+        "stale_past_lag": len(checks.STALE_PAST_LAG_PARAMS),
+    }
     for name, rule in rc.RECHECKABLE.items():
-        assert rule.sql.count("%s") == len(rule.params), name
+        assert rule.sql.count("%s") == sum(width.get(k, 1) for k in rule.params), name
         assert set(rule.params) <= {
             "exch",
             "threshold",
@@ -52,6 +62,9 @@ def test_every_rule_binds_the_settings_its_sql_asks_for():
             "stale_listed",
             "stale_nav",
             "nav_types",
+            "delivery_lag",
+            "delivery_lag_after_market",
+            "stale_past_lag",
         }
 
 
@@ -78,6 +91,10 @@ def test_the_stale_negation_judges_against_the_checks_own_reference_dates():
     rule = rc.RECHECKABLE["stale"]
     assert checks.FRESHNESS_CUTOFF_CTES in rule.sql
     assert checks.NAV_PRICED_PREDICATE in rule.sql
+    # And the delivery lag the check adds (#285), verbatim, as check_gaps' is in
+    # the gap negation.
+    assert checks.delivery_lag_ctes(checks.MARKET_LATEST) in rule.sql
+    assert checks.delivery_lag_ctes() in rc.RECHECKABLE["gap"].sql
 
 
 # ---------------------------------------------------------------------------
@@ -424,3 +441,147 @@ def test_the_stale_negation_closes_a_frozen_security():
     and the check disagree about the same security."""
     rule = rc.RECHECKABLE["stale"]
     assert "s.feed_frozen_on IS NOT NULL" in rule.sql
+
+
+# ---------------------------------------------------------------------------
+# A security's delivery lag (#285)
+# ---------------------------------------------------------------------------
+
+
+def _sessions(db, count, *, through):
+    rows = db.fetchall(
+        "SELECT trade_date FROM ref.trading_calendar WHERE exchange_code = 'NASDAQ'"
+        " AND is_open AND trade_date <= %s ORDER BY trade_date DESC LIMIT %s",
+        (through, count),
+    )
+    return sorted(r["trade_date"] for r in rows)
+
+
+def _delivered(db, sid, sessions):
+    """Each of ``sid``'s bars loaded ``sessions`` open sessions after its trade date
+    (at 03:00 UTC), as a vendor that delivers it that late loads it."""
+    db.execute(
+        """
+        UPDATE core.daily_price p SET loaded_at = (
+            SELECT (c.trade_date + time '03:00') AT TIME ZONE 'UTC'
+              FROM ref.trading_calendar c
+             WHERE c.exchange_code = 'NASDAQ' AND c.is_open
+               AND c.trade_date > p.trade_date
+             ORDER BY c.trade_date OFFSET %s LIMIT 1)
+         WHERE p.security_id = %s
+        """,
+        (sessions - 1, sid),
+    )
+
+
+def _bulk_loaded(db, sid, day):
+    """Every bar of ``sid`` loaded on one day: a history load, not delivery."""
+    db.execute(
+        "UPDATE core.daily_price SET loaded_at = (%s::date + time '03:00')"
+        " AT TIME ZONE 'UTC' WHERE security_id = %s",
+        (day, sid),
+    )
+
+
+def _stale_on(db, sid):
+    return db.fetchall(
+        "SELECT record_key, detail FROM ops.data_quality_flag"
+        " WHERE check_name = 'stale' AND security_id = %s",
+        (sid,),
+    )
+
+
+@pytest.mark.integration
+def test_stale_waits_for_a_security_delivered_late_and_no_longer(db):
+    """A thin ETF whose vendor delivers its bars six sessions late is not stale four
+    sessions behind (#285); one delivered on time is, and so is one whose bars came
+    in one history load. Past its lag, or past the cap, it is stale."""
+    days = _sessions(db, 40, through=dt.date(2024, 6, 28))
+    leader = _mk(db, "RLAGL")
+    _bar(db, leader, days[-1])
+    late, on_time, loaded = _mk(db, "RLAGA"), _mk(db, "RLAGB"), _mk(db, "RLAGC")
+    for sid in (late, on_time, loaded):
+        for d in days[-25:-4]:  # the last bar four sessions behind the market
+            _bar(db, sid, d)
+    _delivered(db, late, 6)
+    _delivered(db, on_time, 1)
+    _bulk_loaded(db, loaded, days[-2])
+
+    checks.check_freshness(db)
+    assert _stale_on(db, late) == []
+    assert len(_stale_on(db, on_time)) == 1
+    assert len(_stale_on(db, loaded)) == 1
+
+    # Its lag is 6, so it waits 5 sessions more than an on-time one: 2 + 5 = 7.
+    db.execute("DELETE FROM core.daily_price WHERE security_id = %s", (late,))
+    for d in days[-30:-7]:  # seven behind
+        _bar(db, late, d)
+    _delivered(db, late, 6)
+    checks.check_freshness(db)
+    (flag,) = _stale_on(db, late)
+    assert flag["detail"]["delivery_lag_sessions"] == 5
+
+
+@pytest.mark.integration
+def test_stale_is_capped_whatever_the_lag(db):
+    """A feed that really stopped is caught within STALE_MAX_SESSIONS_BEHIND."""
+    days = _sessions(db, 60, through=dt.date(2024, 6, 28))
+    leader = _mk(db, "RCAPL")
+    _bar(db, leader, days[-1])
+    slow = _mk(db, "RCAPA")
+    for d in days[-40 : -checks.STALE_MAX_SESSIONS_BEHIND]:
+        _bar(db, slow, d)
+    # Delivered 15 sessions late: an allowance of 8, the most there is; 2 + 8 = 10.
+    _delivered(db, slow, 15)
+    checks.check_freshness(db)
+    assert len(_stale_on(db, slow)) == 1
+
+
+@pytest.mark.integration
+def test_gap_waits_for_a_session_within_the_lag_and_recheck_agrees(db):
+    """A missing session within a late-delivered security's lag is awaited, not a
+    gap (#285); one older than the lag is a gap. ``dq recheck`` closes a gap or a
+    stale flag the lag explains, and keeps the rest."""
+    days = _sessions(db, 30, through=dt.date(2024, 6, 28))
+    late, on_time = _mk(db, "RGLGA"), _mk(db, "RGLGB")
+    awaited, old = days[-4], days[-10]  # 3 and 9 sessions before the latest
+    for sid in (late, on_time):
+        for d in days:
+            if d not in (awaited, old):
+                _bar(db, sid, d)
+    _delivered(db, late, 6)
+    _delivered(db, on_time, 1)
+
+    checks.check_gaps(db)
+    gaps = {
+        (r["security_id"], r["record_key"]["trade_date"]): r["detail"]
+        for r in db.fetchall(
+            "SELECT security_id, record_key, detail FROM ops.data_quality_flag"
+            " WHERE check_name = 'gap'"
+        )
+    }
+    assert set(gaps) == {
+        (late, old.isoformat()),
+        (on_time, awaited.isoformat()),
+        (on_time, old.isoformat()),
+    }
+    assert gaps[(late, old.isoformat())]["delivery_lag_sessions"] == 5
+    assert "delivery_lag_sessions" not in gaps[(on_time, old.isoformat())]
+
+    # A gap and a stale flag written before the lag counted (by hand here): the
+    # recheck closes them, and keeps the gap the lag does not explain.
+    early = _flag(db, check="gap", sid=late, record_key={"trade_date": str(awaited)})
+    kept = db.fetchval(
+        "SELECT dq_flag_id FROM ops.data_quality_flag WHERE check_name = 'gap'"
+        " AND security_id = %s AND record_key->>'trade_date' = %s",
+        (late, old.isoformat()),
+    )
+    closed = _stale_ids(db, "gap")
+    assert early in closed and kept not in closed
+
+    db.execute(
+        "DELETE FROM core.daily_price WHERE security_id = %s AND trade_date > %s",
+        (late, days[-5]),
+    )
+    behind = _flag(db, check="stale", sid=late, record_key={"last_date": str(days[-5])})
+    assert behind in _stale_ids(db, "stale")
